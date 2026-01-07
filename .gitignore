@@ -1,0 +1,39 @@
+# PDF files - stored in S3, not Git
+# Download from s3://agr-pdf-extraction-benchmark/
+test_pdfs/core/*.pdf
+test_pdfs/extended/*.pdf
+test_pdfs/core/manifest.json
+
+# Results directory contents (keep directory structure)
+results/*.json
+results/*.csv
+results/*.html
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.env.local
