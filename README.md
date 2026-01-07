@@ -160,20 +160,20 @@ This is an exploratory project. The goal is to understand each tool's capabiliti
 
 A GPU instance (g4dn.xlarge) is available for running benchmarks:
 
-- **Instance ID:** `i-084041f4ad289ed85`
+- **Instance ID:** `i-0105504873df917c0`
 - **Specs:** 4 vCPU, 16GB RAM, T4 GPU (16GB VRAM)
-- **Private IP:** `172.31.92.31` (connect via Alliance VPN)
+- **Private IP:** `172.31.91.230` (connect via Alliance VPN)
 - **Pre-installed:** Docker, Python 3, NVIDIA drivers, CUDA
 
 ```bash
 # Start the instance
-aws ec2 start-instances --instance-ids i-084041f4ad289ed85
+aws ec2 start-instances --instance-ids i-0105504873df917c0
 
 # SSH in (after connecting to VPN)
-ssh -i pedro-benchmark-key.pem ec2-user@172.31.92.31
+ssh -i pedro-benchmark-key.pem ec2-user@172.31.91.230
 
 # Stop when done
-aws ec2 stop-instances --instance-ids i-084041f4ad289ed85
+aws ec2 stop-instances --instance-ids i-0105504873df917c0
 ```
 
 ---
