@@ -158,10 +158,10 @@ This is an exploratory project. The goal is to understand each tool's capabiliti
 
 ## EC2 Instance
 
-A GPU instance (g4dn.xlarge) is available for running benchmarks:
+A GPU instance (g5.2xlarge) is available for running benchmarks:
 
 - **Instance ID:** `i-0105504873df917c0`
-- **Specs:** 4 vCPU, 16GB RAM, T4 GPU (16GB VRAM)
+- **Specs:** 8 vCPU, 32GB RAM, A10G GPU (24GB VRAM)
 - **Private IP:** `172.31.91.230` (connect via Alliance VPN)
 - **Pre-installed:** Docker, Python 3, NVIDIA drivers, CUDA
 
