@@ -1,204 +1,89 @@
-# PDF Extraction Benchmarking Toolkit
+# PDF Extraction Benchmark
 
-A benchmarking workspace for evaluating PDF extraction tools for scientific literature processing in the Alliance of Genome Resources AI curation pipeline.
+This project benchmarks and compares multiple scientific PDF extraction tools—**GROBID**, **Docling**, **Marker**, and an LLM-based merger—by providing a web interface to upload PDFs, extract structured content, and download or view results.
 
-## Project Goal
+## Features
 
-Evaluate and compare PDF extraction tools to determine the best approach for processing ~2 million scientific PDFs in the Alliance literature corpus. We need to understand how each tool performs, what parameters can be tuned, and which output formats work best for downstream AI processing.
+- Upload scientific PDFs and extract content using multiple tools.
+- Compare outputs from GROBID, Docling, and Marker.
+- Merge extractions using a Large Language Model (Anthropic Claude).
+- Caching for fast repeated access.
+- Download individual or merged extractions in Markdown format.
+- Simple web interface (Flask-based).
 
-## Tools Being Evaluated
+## Requirements
 
-| Tool | Type | GPU Support | Output Formats |
-|------|------|-------------|----------------|
-| **[GROBID](tools/grobid/)** | Self-hosted (Docker) | No | TEI-XML, BibTeX |
-| **[Docling](tools/docling/)** | Self-hosted (pip) | Optional | Markdown, JSON, HTML |
-| **[AWS Textract](tools/textract/)** | Cloud API | N/A | JSON (structured) |
-| **[Marker](tools/marker/)** | Self-hosted (pip) | Yes (recommended) | Markdown, JSON |
+- Python 3.8+
+- Linux (recommended)
+- [Anthropic API key](https://docs.anthropic.com/claude/docs/quickstart) (for LLM merging)
+- System dependencies for extraction tools (see below)
 
-Each tool has its own directory under `tools/` with:
-- **README.md** - Overview, installation instructions, configuration options
-- **example.py** - Working extraction script to get started
+## Installation
 
----
+1. **Clone the repository:**
+    ```bash
+    git clone https://github.com/yourusername/pdf_extraction_benchmark.git
+    cd pdf_extraction_benchmark
+    ```
 
-## Repository Structure
+2. **Create and activate a virtual environment:**
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate
+    ```
 
-```
-pdf_extraction_benchmark/
-├── README.md                    # This file
-├── AWS_ACCESS_GUIDE.md          # S3 access and AWS CLI setup
-│
-├── tools/                       # Extraction tool documentation & examples
-│   ├── grobid/
-│   │   ├── README.md            # Docker setup, API usage, config options
-│   │   └── example.py           # Python extraction example
-│   ├── docling/
-│   │   ├── README.md            # pip install, pipeline options, GPU acceleration
-│   │   └── example.py
-│   ├── textract/
-│   │   ├── README.md            # AWS setup, API options, cost considerations
-│   │   └── example.py
-│   └── marker/
-│       ├── README.md            # GPU setup, batch processing, quality settings
-│       └── example.py
-│
-├── test_pdfs/                   # Download from S3 (not in Git)
-│   ├── README.md                # Full manifest of test documents
-│   ├── core/                    # 12 curated PDFs (~61 MB)
-│   └── extended/                # 42 GROBID failure cases (~213 MB)
-│
-├── benchmarks/
-│   └── README.md                # Metrics to capture, comparison ideas
-│
-└── results/                     # Your benchmark outputs go here
-```
+3. **Install Python dependencies:**
+    ```bash
+    pip3 install -r requirements.txt
+    ```
 
----
+4. **Install system dependencies for extraction tools:**
+    - **GROBID:** Requires Java and GROBID server running (see [GROBID docs](https://github.com/kermitt2/grobid)). We recommend using docker. Make sure the server is running: ```bash
+    docker run --rm --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.8.2
+    ```. The default GROBID URL is set to http://localhost:8070. For a custom location, change grobid.py.
+    - **Docling** and **Marker:** May require additional binaries or Python packages. See their respective documentation.
 
-## Getting Started
+5. **Set your Anthropic API key (for LLM merging):**
+    - **Setting an env variable:** ```bash
+    export ANTHROPIC_API_KEY=sk-...your-key...
+    ```
+    - **Editting config.py:** ```bash
+    ANTHROPIC_API_KEY = "sk-...your-key..."
+    ```
 
-### 1. Download Test PDFs from S3
+## Usage
 
-Test PDFs are stored in a private S3 bucket (~274 MB total):
+1. **Start the Flask server:**
+    ```bash
+    python server.py
+    ```
 
-```bash
-# Download all test PDFs
-aws s3 sync s3://agr-pdf-extraction-benchmark/test_pdfs/ ./test_pdfs/
+2. **Open your browser and go to:**
+    ```
+    http://localhost:5000
+    ```
 
-# Or just the core set to start (~61 MB)
-aws s3 sync s3://agr-pdf-extraction-benchmark/test_pdfs/core/ ./test_pdfs/core/
-```
+3. **Upload a PDF, select extraction methods, and process.**
+    - Download or view the extracted Markdown outputs.
+    - Optionally merge outputs using the LLM.
 
-### 2. Set Up Python Environment
+## Running tests
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install pandas numpy matplotlib boto3
+python3 -m pytest
 ```
 
-### 3. Try the Tools
+## Notes
 
-Each tool directory has an `example.py` you can run immediately:
+- Ensure all extraction tools are installed and accessible.
+- The LLM merge feature requires a valid Anthropic API key.
+- For production, set `debug=False` in `run.py`.
 
-```bash
-# Pick a test PDF
-PDF="test_pdfs/core/AGRKB_101000000645569_mbc-31-1411.pdf"
+## License
 
-# Try each tool
-python tools/grobid/example.py $PDF
-python tools/docling/example.py $PDF
-python tools/textract/example.py $PDF
-python tools/marker/example.py $PDF
-```
-
-See individual `tools/*/README.md` files for installation and configuration details.
+MIT License
 
 ---
 
-## Test PDFs
-
-### Core Set (`test_pdfs/core/`) - 12 PDFs
-
-A curated selection covering:
-- All 7 Model Organism Databases (MODs)
-- 10 unique journals
-- Mix of tables, figures, reviews, research articles
-- 2 known GROBID failure cases
-- Size range: 0.92 - 10.23 MB
-
-### Extended Set (`test_pdfs/extended/`) - 42 PDFs
-
-PDFs from SCRUM-5561 that caused GROBID failures:
-- 13 main papers + 29 supplementary files
-- Known problematic documents (complex layouts, scanned content, etc.)
-- Good for stress-testing extraction tools
-
-See **[test_pdfs/README.md](test_pdfs/README.md)** for the complete manifest with file sizes, journals, and known issues.
-
----
-
-## What to Explore
-
-This is an exploratory project. The goal is to understand each tool's capabilities and find what works best for our use case. Some areas to investigate:
-
-### Performance
-- Processing speed (time per PDF, pages per second)
-- Memory usage
-- GPU vs CPU performance (where applicable)
-- Batch processing capabilities
-- Cost (for Textract)
-
-### Extraction Quality
-- Text accuracy and completeness
-- Structure preservation (sections, headings, paragraphs)
-- Table extraction and formatting
-- Figure/image handling
-- Reference/bibliography parsing
-- Metadata extraction (title, authors, abstract, DOI)
-
-### Configuration & Tuning
-- What parameters can be adjusted?
-- Quality vs speed tradeoffs
-- Output format options (Markdown, JSON, XML, etc.)
-- Which format is easiest for downstream AI processing?
-
-### Robustness
-- How do tools handle problematic PDFs?
-- Failure rates on the extended test set
-- Error messages and recovery options
-
-### Output Comparison
-- Compare the same PDF across all 4 tools
-- Which preserves structure best?
-- Which handles tables best?
-- Which is most "AI-ready" for LLM consumption?
-
----
-
-## EC2 Instance
-
-A GPU instance (g5.2xlarge) is available for running benchmarks:
-
-- **Instance ID:** `REDACTED-INSTANCE-ID`
-- **Specs:** 8 vCPU, 32GB RAM, A10G GPU (24GB VRAM)
-- **Private IP:** `REDACTED-IP` (connect via Alliance VPN)
-- **Pre-installed:** Docker, Python 3, NVIDIA drivers, CUDA
-
-```bash
-# Start the instance
-aws ec2 start-instances --instance-ids REDACTED-INSTANCE-ID
-
-# SSH in (after connecting to VPN)
-ssh -i REDACTED-KEY-NAME.pem ec2-user@REDACTED-IP
-
-# Stop when done
-aws ec2 stop-instances --instance-ids REDACTED-INSTANCE-ID
-```
-
----
-
-## Deliverables
-
-When you've explored the tools, we're looking for:
-
-1. **Findings** - What works, what doesn't, surprises discovered
-2. **Recommendations** - Which tool(s) should we use for the AI pipeline?
-3. **Sample outputs** - Examples of extraction results for comparison
-4. **Any scripts/tools** you create along the way
-
-Format is flexible - could be a report, Jupyter notebooks, comparison spreadsheets, whatever communicates the findings best.
-
----
-
-## Related Resources
-
-**S3 Buckets:**
-- `s3://agr-pdf-extraction-benchmark/` - Test PDFs for this project
-- `s3://agr-literature/prod/reference/documents/` - Full literature corpus (~2M PDFs)
-
-**Jira:**
-- KANBAN-874 - This benchmarking project
-- SCRUM-5561 - Original GROBID benchmarking (source of extended test set)
-
-**Contact:** Chris Tabone (Alliance)
+**Questions?**  
+Open an issue or contact the maintainer.
