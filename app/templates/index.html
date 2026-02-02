@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PDF Processor</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        h1 { color: #333; }
+        .upload-form { background: #f5f5f5; padding: 20px; border-radius: 8px; }
+        input[type="file"] { margin: 10px 0; }
+        .method-selection { margin: 20px 0; padding: 15px; background: white; border-radius: 4px; }
+        .method-selection label { display: block; margin: 8px 0; cursor: pointer; }
+        .method-selection input[type="checkbox"] { margin-right: 8px; }
+        .merge-option { margin: 15px 0; padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; }
+        .merge-option label { cursor: pointer; }
+        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #6c757d; cursor: not-allowed; }
+        .download-btn { background: #28a745; margin: 5px; display: inline-block; text-decoration: none; padding: 10px 20px; color: white; border-radius: 4px; }
+        .download-btn:hover { background: #218838; }
+        .result { margin-top: 20px; padding: 20px; background: #e9ecef; border-radius: 8px; }
+        .error { color: red; }
+        .success { color: green; }
+        .warning { color: #856404; background: #fff3cd; padding: 10px; border-radius: 4px; margin: 10px 0; }
+        .cache-info { color: #666; font-style: italic; margin: 10px 0; }
+        pre { background: white; padding: 15px; border-radius: 4px; overflow-x: auto; max-height: 500px; }
+        .downloads { margin: 15px 0; }
+        .method-info { font-size: 0.9em; color: #666; margin-left: 25px; }
+    </style>
+</head>
+<body>
+    <h1>PDF Processor</h1>
+    <div class="upload-form">
+        <h2>Upload Scientific Paper (PDF)</h2>
+        <p class="cache-info">📁 Extractions are cached. Re-uploading the same file will use cached results.</p>
+        
+        <form id="uploadForm" enctype="multipart/form-data">
+            <input type="file" name="file" accept=".pdf" required>
+            
+            <div class="method-selection">
+                <h3>Select Extraction Methods:</h3>
+                <label>
+                    <input type="checkbox" name="methods" value="grobid" checked>
+                    <strong>GROBID</strong>
+                    <div class="method-info">Best for extracting structured academic metadata and citations</div>
+                </label>
+                <label>
+                    <input type="checkbox" name="methods" value="docling" checked>
+                    <strong>Docling</strong>
+                    <div class="method-info">Good for general document structure and layout preservation</div>
+                </label>
+                <label>
+                    <input type="checkbox" name="methods" value="marker" checked>
+                    <strong>Marker</strong>
+                    <div class="method-info">Advanced PDF to Markdown with excellent table and figure handling</div>
+                </label>
+            </div>
+            
+            <div class="merge-option">
+                <label>
+                    <input type="checkbox" name="merge" id="mergeCheckbox" checked>
+                    <strong>Merge extractions with LLM</strong>
+                </label>
+                <div class="method-info">Uses Claude to intelligently combine selected methods into a structured output</div>
+            </div>
+            
+            <button type="submit" id="submitBtn">Process PDF</button>
+        </form>
+    </div>
+    
+    <div id="result" class="result" style="display:none;">
+        <h2>Processing Result</h2>
+        <div id="message"></div>
+        <div id="downloads" class="downloads"></div>
+        <div id="outputSection"></div>
+    </div>
+
+    <script>
+        const form = document.getElementById('uploadForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const mergeCheckbox = document.getElementById('mergeCheckbox');
+        
+        // Validate that at least one method is selected
+        form.addEventListener('change', (e) => {
+            if (e.target.name === 'methods') {
+                const checkedMethods = form.querySelectorAll('input[name="methods"]:checked');
+                submitBtn.disabled = checkedMethods.length === 0;
+                
+                // If only one method selected, disable merge option
+                if (checkedMethods.length < 2) {
+                    mergeCheckbox.checked = false;
+                    mergeCheckbox.disabled = true;
+                } else {
+                    mergeCheckbox.disabled = false;
+                }
+            }
+        });
+        
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const formData = new FormData(e.target);
+            const selectedMethods = formData.getAll('methods');
+            
+            if (selectedMethods.length === 0) {
+                alert('Please select at least one extraction method');
+                return;
+            }
+            
+            const resultDiv = document.getElementById('result');
+            const messageDiv = document.getElementById('message');
+            const downloadsDiv = document.getElementById('downloads');
+            const outputSection = document.getElementById('outputSection');
+            
+            messageDiv.innerHTML = '<p>Processing... This may take a few minutes.</p>';
+            outputSection.innerHTML = '';
+            downloadsDiv.innerHTML = '';
+            resultDiv.style.display = 'block';
+            
+            try {
+                const response = await fetch('/process', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    let cacheMsg = '';
+                    if (data.cached_methods && data.cached_methods.length > 0) {
+                        cacheMsg = `<p class="cache-info">ℹ️ Used cached extractions for: ${data.cached_methods.join(', ')}</p>`;
+                    }
+                    
+                    let processingMsg = `<p class="success">✓ Processing completed successfully!</p>`;
+                    processingMsg += `<p class="cache-info">Methods used: ${data.methods_used.join(', ')}</p>`;
+                    messageDiv.innerHTML = processingMsg + cacheMsg;
+                    
+                    // Build download section
+                    let downloadHTML = '<h3>Download Extractions:</h3>';
+                    data.methods_used.forEach(method => {
+                        downloadHTML += `<a href="/download/${data.file_hash}/${method.toLowerCase()}" class="download-btn">📥 Download ${method}</a>`;
+                    });
+                    
+                    if (data.merged_output) {
+                        downloadHTML += `<a href="/download/${data.file_hash}/merged" class="download-btn">📥 Download Merged</a>`;
+                    }
+                    downloadsDiv.innerHTML = downloadHTML;
+                    
+                    // Build output section
+                    let outputHTML = '';
+                    
+                    if (data.merged_output) {
+                        outputHTML += '<h3>Merged and Structured Output:</h3>';
+                        outputHTML += `<pre>${escapeHtml(data.merged_output)}</pre>`;
+                    } else {
+                        // Show individual outputs
+                        if (data.individual_outputs) {
+                            for (const [method, content] of Object.entries(data.individual_outputs)) {
+                                outputHTML += `<h3>${method} Output:</h3>`;
+                                outputHTML += `<pre>${escapeHtml(content)}</pre>`;
+                            }
+                        }
+                    }
+                    
+                    outputSection.innerHTML = outputHTML;
+                } else {
+                    messageDiv.innerHTML = `<p class="error">✗ Error: ${data.error}</p>`;
+                }
+            } catch (error) {
+                messageDiv.innerHTML = `<p class="error">✗ Error: ${error.message}</p>`;
+            }
+        });
+        
+        function escapeHtml(text) {
+            const map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return text.replace(/[&<>"']/g, m => map[m]);
+        }
+    </script>
+</body>
+</html>
