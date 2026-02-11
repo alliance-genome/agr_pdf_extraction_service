@@ -10,6 +10,7 @@ def app_context():
     app = Flask(__name__)
     app.config['ALLOWED_EXTENSIONS'] = {'pdf'}
     app.config['CACHE_FOLDER'] = tempfile.mkdtemp()
+    app.config['EXTRACTION_CONFIG_VERSION'] = '1'
     with app.app_context():
         yield app
 
@@ -32,15 +33,16 @@ def test_get_file_hash(tmp_path, app_context):
 
 def test_get_cached_path(app_context):
     path = get_cached_path("abc123", "grobid")
-    assert path.endswith("abc123_grobid.md")
+    assert path.endswith("v1_abc123_grobid.md")
     assert app_context.config['CACHE_FOLDER'] in path
 
-def test_is_extraction_cached(app_context, tmp_path):
+def test_is_extraction_cached(app_context):
     file_hash = "abc123"
     method = "grobid"
-    cache_file = os.path.join(app_context.config['CACHE_FOLDER'], f"{file_hash}_{method}.md")
     # Should not exist yet
     assert not is_extraction_cached(file_hash, method)
-    # Create the file
+    # Create the file with the versioned name
+    cache_file = os.path.join(app_context.config['CACHE_FOLDER'], f"v1_{file_hash}_{method}.md")
     with open(cache_file, "w") as f:
         f.write("test")
+    assert is_extraction_cached(file_hash, method)

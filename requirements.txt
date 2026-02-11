@@ -1,8 +1,21 @@
+# Web framework
+flask
+
+# PDF extraction tools
 requests
 docling[vlm]
 marker-pdf
-uvicorn
-fastapi
+
+# LLM
+anthropic
+
+# Background task queue
+celery[redis]
+redis
+
+# Production WSGI server
+gunicorn
+
+# Utilities
 boto3
 python-multipart
-flask

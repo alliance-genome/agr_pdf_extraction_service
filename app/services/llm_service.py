@@ -1,31 +1,30 @@
 import anthropic
 from app.services.pdf_extractor import PDFExtractor
 
+
 class LLM(PDFExtractor):
-  def __init__(self, api_key, model='claude-sonnet-4-20250514'):
-    self.client = client = anthropic.Anthropic(api_key=api_key)
-    self.model = model
+    def __init__(self, api_key, model="claude-sonnet-4-20250514", max_tokens=16000):
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = model
+        self.max_tokens = max_tokens
 
-  def extract(self, grobid_md, docling_md, marker_md):
-    prompt = self.create_prompt(grobid_md, docling_md, marker_md)
+    def extract(self, grobid_md, docling_md, marker_md):
+        prompt = self.create_prompt(grobid_md, docling_md, marker_md)
 
-    try:
-      message = self.client.messages.create(
-          model=self.model,
-          max_tokens=16000,
-          messages=[
-              {"role": "user", "content": prompt}
-          ]
-      )
-      
-      return message.content[0].text
-    except Exception as e:
-      raise Exception(f"Error in LLM processing: {str(e)}")
+        try:
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+            )
+            return message.content[0].text
+        except Exception as e:
+            raise Exception(f"Error in LLM processing: {str(e)}")
 
-    return merged_md
-
-  def create_prompt(self, grobid_md, docling_md, marker_md):
-    return f"""You are processing a scientific article that has been extracted using three different tools: GROBID, Docling, and Marker. 
+    def create_prompt(self, grobid_md, docling_md, marker_md):
+        return f"""You are processing a scientific article that has been extracted using three different tools: GROBID, Docling, and Marker.
 Each tool produces different quality outputs with varying levels of detail.
 
 Your task is to:
@@ -63,5 +62,3 @@ Here are the three extractions:
 {marker_md}
 
 Please provide a single, well-structured markdown document with clear section headers and all elements properly organized."""
-
-
