@@ -4,15 +4,24 @@ import tempfile
 import pytest
 from unittest.mock import patch, MagicMock
 
-from app.server import app
+from app import create_app
 
 @pytest.fixture
 def client():
+    app = create_app()
     app.config['TESTING'] = True
     app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp()
     app.config['CACHE_FOLDER'] = tempfile.mkdtemp()
     app.config['ANTHROPIC_API_KEY'] = "dummy"
     app.config['LLM_MODEL'] = "dummy"
+    app.config['LLM_MAX_TOKENS'] = 16000
+    app.config['EXTRACTION_CONFIG_VERSION'] = "1"
+    app.config['GROBID_REQUEST_TIMEOUT'] = 120
+    app.config['GROBID_INCLUDE_COORDINATES'] = False
+    app.config['GROBID_INCLUDE_RAW_CITATIONS'] = False
+    app.config['DOCLING_DEVICE'] = "cpu"
+    app.config['MARKER_DEVICE'] = "cpu"
+    app.config['MARKER_EXTRACT_IMAGES'] = False
     with app.test_client() as client:
         yield client
 
@@ -54,7 +63,7 @@ def test_process_pdf_no_methods(client):
 @patch('app.server.Marker')
 @patch('app.server.LLM')
 @patch('app.server.get_file_hash', return_value='dummyhash')
-@patch('app.server.get_cached_path', side_effect=lambda h, m: os.path.join(tempfile.gettempdir(), f"{h}_{m}.md"))
+@patch('app.server.get_cached_path', side_effect=lambda h, m: os.path.join(tempfile.gettempdir(), f"v1_{h}_{m}.md"))
 @patch('app.server.is_extraction_cached', return_value=False)
 def test_process_pdf_grobid(
     mock_is_cached, mock_get_cached_path, mock_get_file_hash,
@@ -79,7 +88,7 @@ def test_process_pdf_grobid(
 @patch('app.server.Marker')
 @patch('app.server.LLM')
 @patch('app.server.get_file_hash', return_value='dummyhash')
-@patch('app.server.get_cached_path', side_effect=lambda h, m: os.path.join(tempfile.gettempdir(), f"{h}_{m}.md"))
+@patch('app.server.get_cached_path', side_effect=lambda h, m: os.path.join(tempfile.gettempdir(), f"v1_{h}_{m}.md"))
 @patch('app.server.is_extraction_cached', return_value=False)
 def test_process_pdf_merge(
     mock_is_cached, mock_get_cached_path, mock_get_file_hash,
