@@ -237,12 +237,36 @@ def _detect_special_blocks(text: str) -> str | None:
 
 
 def normalize_text(text: str) -> str:
-    """Normalize text for comparison: unicode, whitespace, markdown syntax."""
+    """Normalize text for comparison: unicode, whitespace, markdown syntax.
+
+    Aggressively strips extractor-specific artifacts so that identical
+    content from different extractors produces identical normalized text.
+    The original source_md on each Block is preserved for final assembly.
+    """
     # Unicode normalization
     text = unicodedata.normalize("NFKC", text)
-    # Normalize markdown bold/italic syntax variations
-    text = re.sub(r"__(.+?)__", r"**\1**", text)
-    text = re.sub(r"_(.+?)_", r"*\1*", text)
+
+    # Marker: <span id="page-X-Y"> ... </span> anchors
+    text = re.sub(r"<span[^>]*>", "", text)
+    text = re.sub(r"</span>", "", text)
+
+    # Docling: HTML comments like <!-- image -->
+    text = re.sub(r"<!--.*?-->", "", text)
+
+    # Marker: image references ![alt](path)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+
+    # Markdown links [text](url) -> text
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+
+    # Strip all bold/italic markers for comparison
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"_(.+?)_", r"\1", text)
+    text = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", text)
+
+    # Strip heading markers (treat heading levels as equivalent for comparison)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
     # Lowercase for comparison
@@ -447,7 +471,18 @@ def align_blocks(
 # ---------------------------------------------------------------------------
 
 _NUMERIC_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
-_CITATION_KEY_RE = re.compile(r"\[(?:\d+|[A-Za-z]+(?:\s+et\s+al\.?)?\s*\d{4})\]")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_LINK_URL_RE = re.compile(r"\]\([^)]*\)")
+_CITATION_KEY_RE = re.compile(
+    r"\["
+    r"(?:"
+    r"\d+(?:\s*[-–,]\s*\d+)*"  # [8], [8-10], [8–10], [6,7]
+    r"|"
+    r"[A-Za-z]+(?:\s+et\s+al\.?)?\s*\d{4}"  # [Smith et al. 2024]
+    r")"
+    r"\]"
+)
 
 # Per-block-type source preference for AGREE_NEAR
 _SOURCE_PREFERENCE = {
@@ -461,11 +496,17 @@ _SOURCE_PREFERENCE = {
 
 
 def _extract_numeric_tokens(text: str) -> set[str]:
-    return set(_NUMERIC_RE.findall(text))
+    """Extract numeric tokens, ignoring numbers inside tags and URLs."""
+    cleaned = _HTML_TAG_RE.sub("", text)
+    cleaned = _IMAGE_REF_RE.sub("", cleaned)
+    cleaned = _LINK_URL_RE.sub("]", cleaned)
+    return set(_NUMERIC_RE.findall(cleaned))
 
 
 def _extract_citation_keys(text: str) -> set[str]:
-    return set(_CITATION_KEY_RE.findall(text))
+    """Extract citation keys after removing HTML tags."""
+    cleaned = _HTML_TAG_RE.sub("", text)
+    return set(_CITATION_KEY_RE.findall(cleaned))
 
 
 def _get_present_blocks(triple: AlignedTriple) -> list[Block]:
@@ -582,6 +623,45 @@ def classify_triples(
 
         # Everything else is CONFLICT
         triple.classification = CONFLICT
+
+        # Debug diagnostics: why this triple fell through to CONFLICT
+        if logger.isEnabledFor(logging.DEBUG):
+            reasons: list[str] = []
+            best_token = 0.0
+            best_lev = 0.0
+            for i in range(len(blocks)):
+                for j in range(i + 1, len(blocks)):
+                    token_ratio = (
+                        fuzz.token_set_ratio(normalized_texts[i], normalized_texts[j]) / 100.0
+                    )
+                    max_len = max(len(normalized_texts[i]), len(normalized_texts[j]), 1)
+                    lev_dist = Levenshtein.distance(normalized_texts[i], normalized_texts[j])
+                    lev_sim = 1.0 - (lev_dist / max_len)
+                    best_token = max(best_token, token_ratio)
+                    best_lev = max(best_lev, lev_sim)
+
+                    if token_ratio < near_threshold:
+                        reasons.append(f"token_ratio={token_ratio:.3f}<{near_threshold}")
+                    if lev_sim < levenshtein_threshold:
+                        reasons.append(f"lev_sim={lev_sim:.3f}<{levenshtein_threshold}")
+
+                    nums_i = _extract_numeric_tokens(raw_texts[i])
+                    nums_j = _extract_numeric_tokens(raw_texts[j])
+                    if nums_i != nums_j:
+                        reasons.append(f"numeric_diff={nums_i.symmetric_difference(nums_j)}")
+
+                    cites_i = _extract_citation_keys(raw_texts[i])
+                    cites_j = _extract_citation_keys(raw_texts[j])
+                    if cites_i != cites_j:
+                        reasons.append(f"citation_diff={cites_i.symmetric_difference(cites_j)}")
+
+            logger.debug(
+                "CONFLICT %s: best_token=%.3f best_lev=%.3f reasons=%s",
+                triple.segment_id,
+                best_token,
+                best_lev,
+                "; ".join(reasons[:5]),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +810,28 @@ def merge_with_consensus(
         "Parsed blocks: grobid=%d, docling=%d, marker=%d",
         len(grobid_blocks), len(docling_blocks), len(marker_blocks),
     )
+
+    # Exclude extractors with dramatically fewer blocks to avoid poisoning
+    # consensus alignment in sparse-output failure modes.
+    block_counts = {src: len(blocks) for src, blocks in blocks_by_source.items()}
+    max_count = max(block_counts.values()) if block_counts else 0
+    disparity_threshold = 0.30  # extractor must have >=30% of max block count
+
+    if max_count > 0:
+        sparse_sources = [
+            src for src, count in block_counts.items()
+            if 0 < count < (max_count * disparity_threshold)
+        ]
+        for src in sparse_sources:
+            logger.warning(
+                "Consensus pipeline: excluding %s from alignment (only %d blocks vs max %d, "
+                "below %.0f%% threshold)",
+                src,
+                block_counts[src],
+                max_count,
+                disparity_threshold * 100,
+            )
+            del blocks_by_source[src]
 
     # Step 2: Align
     logger.info("Consensus pipeline: aligning blocks...")
