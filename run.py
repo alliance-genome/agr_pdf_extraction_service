@@ -13,8 +13,8 @@ from app import create_app
 app = create_app()
 
 if __name__ == "__main__":
-    if not app.config.get("ANTHROPIC_API_KEY"):
-        print("WARNING: ANTHROPIC_API_KEY environment variable not set!")
+    if not app.config.get("OPENAI_API_KEY"):
+        print("WARNING: OPENAI_API_KEY environment variable not set!")
 
     print(f"Cache folder: {app.config['CACHE_FOLDER']}")
     print(f"Upload folder: {app.config['UPLOAD_FOLDER']}")
