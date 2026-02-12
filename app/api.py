@@ -127,9 +127,12 @@ def _get_run_by_process_id(process_id):
 
 
 def _collect_artifact_keys(value, path="$"):
+    """Collect S3 keys from artifact JSON, filtering out non-S3 strings like filenames."""
     keys = []
     if isinstance(value, str):
-        keys.append((path, value))
+        # Only treat as S3 key if it looks like one (contains '/' suggesting a path prefix)
+        if "/" in value:
+            keys.append((path, value))
         return keys
     if isinstance(value, dict):
         for key, nested in value.items():

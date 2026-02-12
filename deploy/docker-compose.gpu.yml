@@ -1,0 +1,175 @@
+# docker-compose.gpu.yml for agr_pdf_extraction_service
+# GPU-accelerated deployment on g5.2xlarge (A10G 24GB VRAM)
+#
+# Usage:
+#   docker build -t pdfx-gpu -f deploy/Dockerfile.gpu .
+#   docker-compose -f docker-compose.gpu.yml -p pdfx up -d
+
+x-shared-env: &shared-env
+  GROBID_URL: http://grobid:8070
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  DATABASE_URL: postgresql://pdfx:${POSTGRES_PASSWORD:-pdfx}@postgres:5432/pdfx
+  UPLOAD_FOLDER: /app/data/uploads
+  CACHE_FOLDER: /app/data/cache
+  HF_HOME: /app/data/models
+  TRANSFORMERS_CACHE: /app/data/models
+  TORCH_HOME: /app/data/models
+  GELF_HOST: logs.alliancegenome.org
+  GELF_PORT: "12201"
+  GELF_ENABLED: "true"
+
+x-shared-volumes: &shared-volumes
+  - ../data/cache:/app/data/cache
+  - ../data/uploads:/app/data/uploads
+  - ../data/models:/app/data/models
+  - ../logs:/app/logs
+  - ../app:/app/app:ro
+  - ../celery_app.py:/app/celery_app.py:ro
+  - ../config.py:/app/config.py:ro
+
+services:
+  app:
+    image: pdfx-gpu
+    container_name: pdfx-app
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - ../.env
+    environment:
+      <<: *shared-env
+      TORCH_DEVICE: cpu
+      CUDA_VISIBLE_DEVICES: ""
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+    volumes: *shared-volumes
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      grobid:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    command: >
+      python3.11 -m gunicorn -w 2 -b 0.0.0.0:5000
+      --timeout 600
+      --graceful-timeout 300
+      "app:create_app()"
+
+  worker:
+    image: pdfx-gpu
+    container_name: pdfx-worker
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      <<: *shared-env
+      # --- GPU settings ---
+      TORCH_DEVICE: "auto"
+      MARKER_DEVICE: "auto"
+      DOCLING_DEVICE: "cuda"
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      # --- Thread settings (8 vCPU host) ---
+      OMP_NUM_THREADS: "8"
+      MKL_NUM_THREADS: "8"
+      NUMEXPR_NUM_THREADS: "8"
+      DOCLING_NUM_THREADS: "8"
+    volumes: *shared-volumes
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      grobid:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      celery -A celery_app worker
+      --loglevel=info
+      --concurrency=1
+      -Q default
+
+  grobid:
+    image: grobid/grobid:0.8.2-crf
+    container_name: pdfx-grobid
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8070:8070"
+    ulimits:
+      core: 0
+    mem_limit: 6g
+    environment:
+      JAVA_OPTS: "-Xms2g -Xmx4g -XX:+UseG1GC"
+    logging:
+      driver: gelf
+      options:
+        gelf-address: "udp://logs.alliancegenome.org:12201"
+        tag: "pdfx-grobid"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8070/api/isalive"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  redis:
+    image: redis:7-alpine
+    container_name: pdfx-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    logging:
+      driver: gelf
+      options:
+        gelf-address: "udp://logs.alliancegenome.org:12201"
+        tag: "pdfx-redis"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: pdfx-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: pdfx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pdfx}
+      POSTGRES_DB: pdfx
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    logging:
+      driver: gelf
+      options:
+        gelf-address: "udp://logs.alliancegenome.org:12201"
+        tag: "pdfx-postgres"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdfx"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  redis-data:
+  postgres-data:

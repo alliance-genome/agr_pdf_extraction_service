@@ -11,6 +11,22 @@ from app.services.pdf_extractor import PDFExtractor
 
 logger = logging.getLogger(__name__)
 
+# Process-level model cache — survives across Celery tasks within the same fork
+_cached_models = {}  # keyed by (device_type, dtype)
+_cached_converters = {}  # keyed by (device_type, dtype)
+
+
+def _get_converter(device, dtype):
+    """Return a cached PdfConverter, creating models on first call."""
+    key = (str(device), str(dtype))
+    if key not in _cached_converters:
+        logger.info("Marker: loading models for %s/%s (first call in this worker process)", device, dtype)
+        artifact_dict = create_model_dict(device=device, dtype=dtype)
+        _cached_models[key] = artifact_dict
+        _cached_converters[key] = PdfConverter(artifact_dict=artifact_dict)
+        logger.info("Marker: models loaded and cached")
+    return _cached_converters[key]
+
 
 class Marker(PDFExtractor):
     def __init__(self, device="cpu", extract_images=False):
@@ -27,10 +43,10 @@ class Marker(PDFExtractor):
             dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.float16 if dev.type == "cuda" else torch.float32
 
-        artifact_dict = create_model_dict(device=dev, dtype=dtype)
-        converter = PdfConverter(artifact_dict=artifact_dict)
+        converter = _get_converter(dev, dtype)
 
-        rendered = converter(pdf_path)
+        with torch.inference_mode():
+            rendered = converter(pdf_path)
         text, file_ext, images = text_from_rendered(rendered)
 
         metadata = rendered.metadata
