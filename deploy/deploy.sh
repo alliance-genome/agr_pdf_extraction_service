@@ -53,7 +53,13 @@ docker compose -p $PROJECT_NAME up -d --build
 echo "Waiting for services to start..."
 sleep 10
 
-# Step 6: Health checks
+# Step 6: Run database migrations
+echo "Running database migrations..."
+docker compose -p $PROJECT_NAME exec -T app alembic upgrade head 2>/dev/null && \
+    echo "  Database migrations applied." || \
+    echo "  WARNING: Migration failed or Alembic not available. DB tracking may not work."
+
+# Step 7: Health checks
 echo ""
 echo "=== Health Checks ==="
 
@@ -68,6 +74,14 @@ fi
 # Check Redis
 echo -n "  Redis: "
 if docker exec ${PROJECT_NAME}-redis-1 redis-cli ping 2>/dev/null | grep -q PONG; then
+    echo "HEALTHY"
+else
+    echo "NOT READY"
+fi
+
+# Check Postgres
+echo -n "  Postgres: "
+if docker exec pdfx-postgres pg_isready -U pdfx 2>/dev/null | grep -q "accepting connections"; then
     echo "HEALTHY"
 else
     echo "NOT READY"

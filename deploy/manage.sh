@@ -31,6 +31,8 @@ case "$1" in
         curl -s http://localhost:8070/api/isalive > /dev/null 2>&1 && echo "HEALTHY" || echo "DOWN"
         echo -n "  Redis:   "
         docker exec ${PROJECT_NAME}-redis-1 redis-cli ping 2>/dev/null | grep -q PONG && echo "HEALTHY" || echo "DOWN"
+        echo -n "  Postgres:"
+        docker exec pdfx-postgres pg_isready -U pdfx 2>/dev/null | grep -q "accepting connections" && echo " HEALTHY" || echo " DOWN"
         echo -n "  App:     "
         curl -s http://localhost:5000/api/v1/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "DOWN"
         ;;
