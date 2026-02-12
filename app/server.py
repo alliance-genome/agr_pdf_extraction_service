@@ -136,7 +136,7 @@ def process_pdf():
                 llm = LLM(
                     api_key=cfg["OPENAI_API_KEY"],
                     model=cfg["LLM_MODEL"],
-                    max_tokens=cfg["LLM_MAX_TOKENS"],
+                    reasoning_effort=cfg.get("LLM_REASONING_EFFORT", "medium"),
                 )
 
                 merged_md = None

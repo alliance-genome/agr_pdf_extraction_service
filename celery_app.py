@@ -712,7 +712,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
             llm = LLM(
                 api_key=Config.OPENAI_API_KEY,
                 model=Config.LLM_MODEL,
-                max_tokens=Config.LLM_MAX_TOKENS,
+                reasoning_effort=Config.LLM_REASONING_EFFORT,
             )
 
             grobid_text = extractions.get("grobid", "")
