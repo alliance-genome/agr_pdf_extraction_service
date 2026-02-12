@@ -19,11 +19,13 @@ class Grobid(PDFExtractor):
         try:
             response = requests.get(f"{self.base_url}/api/isalive", timeout=5)
             return response.status_code == 200
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            logger.warning("GROBID health check failed: %s", e)
             return False
 
     def process_fulltext(self, pdf_path):
         url = f"{self.base_url}/api/processFulltextDocument"
+        logger.info("GROBID: sending PDF to %s (timeout=%ds)", url, self.timeout)
 
         with open(pdf_path, "rb") as pdf_file:
             files = {"input": pdf_file}
@@ -38,6 +40,7 @@ class Grobid(PDFExtractor):
             try:
                 response = requests.post(url, files=files, data=data, timeout=self.timeout)
                 response.raise_for_status()
+                logger.info("GROBID: received TEI XML (%d bytes)", len(response.text))
                 return response.text
             except requests.exceptions.RequestException as e:
                 raise RuntimeError(f"Error processing PDF with GROBID: {e}")
@@ -70,5 +73,11 @@ class Grobid(PDFExtractor):
 
         tei_xml = self.process_fulltext(pdf_path)
 
+        plain_text = self.extract_plain_text(tei_xml)
+        if plain_text is None:
+            raise RuntimeError("GROBID returned no extractable text from the PDF")
+
+        logger.info("GROBID: extracted %d chars of plain text", len(plain_text))
+
         with open(output_filename, "w", encoding="utf-8") as f:
-            f.write(self.extract_plain_text(tei_xml))
+            f.write(plain_text)

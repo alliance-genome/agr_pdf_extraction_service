@@ -30,7 +30,7 @@ case "$1" in
         echo -n "  GROBID:  "
         curl -s http://localhost:8070/api/isalive > /dev/null 2>&1 && echo "HEALTHY" || echo "DOWN"
         echo -n "  Redis:   "
-        docker exec ${PROJECT_NAME}-redis-1 redis-cli ping 2>/dev/null | grep -q PONG && echo "HEALTHY" || echo "DOWN"
+        docker exec ${PROJECT_NAME}-redis redis-cli ping 2>/dev/null | grep -q PONG && echo "HEALTHY" || echo "DOWN"
         echo -n "  Postgres:"
         docker exec pdfx-postgres pg_isready -U pdfx 2>/dev/null | grep -q "accepting connections" && echo " HEALTHY" || echo " DOWN"
         echo -n "  App:     "
@@ -47,7 +47,7 @@ case "$1" in
 
     shell)
         echo "Opening shell in app container..."
-        docker exec -it ${PROJECT_NAME}-app-1 /bin/bash
+        docker exec -it ${PROJECT_NAME}-app /bin/bash
         ;;
 
     rebuild)
@@ -77,7 +77,7 @@ case "$1" in
 
     worker-status)
         echo "=== Celery Worker Status ==="
-        docker exec ${PROJECT_NAME}-worker-1 celery -A celery_app inspect active 2>/dev/null || echo "No workers running"
+        docker exec ${PROJECT_NAME}-worker celery -A celery_app inspect active 2>/dev/null || echo "No workers running"
         ;;
 
     cleanup)

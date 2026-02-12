@@ -24,6 +24,17 @@ class LLM(PDFExtractor):
                 max_tokens=self.max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
+            usage = response.usage
+            if usage:
+                logger.info(
+                    "LLM full merge complete: model=%s, tokens=%d (prompt=%d, completion=%d)",
+                    self.model, usage.total_tokens, usage.prompt_tokens, usage.completion_tokens,
+                    extra={
+                        "_event": "llm_resolve_complete",
+                        "_llm_model": self.model,
+                        "_llm_tokens_used": usage.total_tokens,
+                    },
+                )
             return response.choices[0].message.content
         except Exception as e:
             raise Exception(f"Error in LLM processing: {str(e)}")
@@ -64,6 +75,18 @@ class LLM(PDFExtractor):
                     ],
                     response_format={"type": "json_object"},
                 )
+
+                usage = response.usage
+                if usage:
+                    logger.info(
+                        "LLM conflict resolution: model=%s, tokens=%d (prompt=%d, completion=%d)",
+                        self.model, usage.total_tokens, usage.prompt_tokens, usage.completion_tokens,
+                        extra={
+                            "_event": "llm_resolve_complete",
+                            "_llm_model": self.model,
+                            "_llm_tokens_used": usage.total_tokens,
+                        },
+                    )
 
                 raw = response.choices[0].message.content
                 parsed = json.loads(raw)

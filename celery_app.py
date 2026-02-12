@@ -2,15 +2,48 @@ import os
 import uuid
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from celery import Celery
+from celery.signals import worker_process_init
 
 from config import Config
 from app.models import ExtractionRun, get_session
 from app.services.audit_logger import AuditLogger
+from app.logging_config import setup_logging, MergingLoggerAdapter
 
 logger = logging.getLogger(__name__)
+
+
+@worker_process_init.connect
+def _init_worker_process(**kwargs):
+    """Configure torch threading and GPU once per forked worker process."""
+    setup_logging(component="worker")
+    try:
+        import torch
+        num_threads = int(os.environ.get("OMP_NUM_THREADS", 8))
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(max(1, num_threads // 4))
+
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            vram_bytes = getattr(props, 'total_memory', 0) or getattr(props, 'total_mem', 0)
+            vram_gb = vram_bytes / (1024 ** 3) if vram_bytes else 0
+            logger.info(
+                "Worker process initialized: GPU=%s (%.1fGB VRAM), CUDA=%s, "
+                "torch threads=%d, interop=%d",
+                gpu_name, vram_gb, torch.version.cuda,
+                torch.get_num_threads(), torch.get_num_interop_threads(),
+            )
+        else:
+            logger.info(
+                "Worker process initialized: CPU-only, torch threads=%d, interop=%d",
+                torch.get_num_threads(), torch.get_num_interop_threads(),
+            )
+    except Exception as exc:
+        logger.warning("Failed to configure torch/GPU: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Celery app
@@ -28,10 +61,31 @@ celery.conf.update(
     result_expires=86400,  # 24 hours
     task_track_started=True,
     task_acks_late=True,
+    task_default_queue="default",  # explicit: workers listen on -Q default
     worker_prefetch_multiplier=1,  # one job at a time per worker process
-    task_soft_time_limit=1800,     # 30 min soft limit (raises SoftTimeLimitExceeded)
+    task_soft_time_limit=1800,     # 30 min soft limit (GPU: seconds per paper; CPU fallback: 30+ min)
     task_time_limit=2100,          # 35 min hard kill
 )
+
+
+# ---------------------------------------------------------------------------
+# GPU snapshot helper
+# ---------------------------------------------------------------------------
+
+def _gpu_snapshot():
+    """Return GPU memory stats or empty dict if unavailable."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info(0)
+            used = total - free
+            return {
+                "_gpu_mem_used_gb": round(used / (1024 ** 3), 2),
+                "_gpu_mem_total_gb": round(total / (1024 ** 3), 2),
+            }
+    except Exception:
+        pass
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -291,19 +345,49 @@ def extract_pdf(
         dict with status, file_hash, per-method outputs, and optional merged output.
     """
     process_id = str(process_id or uuid.uuid4())
+    file_hash = None
     db_session = _get_db_session()
     audit_logger = None
 
+    # Per-job adapter — merges identity fields with per-event fields for GELF
+    adapter = MergingLoggerAdapter(logger, {
+        "_process_id": process_id,
+        "_reference_curie": reference_curie or "",
+        "_mod_abbreviation": mod_abbreviation or "",
+        "_file_hash": "",
+    })
+
     os.makedirs(Config.CACHE_FOLDER, exist_ok=True)
 
-    file_hash = _get_file_hash(pdf_path)
+    try:
+        file_hash = _get_file_hash(pdf_path)
+        adapter.extra["_file_hash"] = file_hash
+    except FileNotFoundError:
+        adapter.error(
+            "PDF file not found",
+            extra={"_event": "job_failed", "_error_code": "file_not_found"},
+        )
+        if db_session:
+            _safe_upsert_extraction_run(db_session, process_id=process_id,
+                                        status="failed", error_message=f"PDF file not found: {pdf_path}")
+            _safe_close_session(db_session)
+        return {"status": "failed", "error": f"PDF file not found: {pdf_path}", "process_id": process_id}
 
     try:
         audit_logger = AuditLogger(process_id, Config)
     except Exception as exc:
-        logger.warning("Failed to initialize audit logger for process_id=%s: %s", process_id, exc)
+        adapter.warning("Failed to initialize audit logger: %s", exc)
 
     _safe_log_event(audit_logger, "run", "queued", detail="Task accepted")
+
+    adapter.info(
+        "Job accepted: methods=%s, merge=%s",
+        methods, merge,
+        extra={
+            "_event": "job_accepted",
+            "_stage": "init",
+        },
+    )
 
     started_at = _now_utc()
     total_start = time.monotonic()
@@ -336,12 +420,18 @@ def extract_pdf(
             merge,
             file_hash=file_hash,
             audit_logger=audit_logger,
+            adapter=adapter,
         )
 
         artifacts_json = _upload_artifacts(audit_logger, result, merge, pdf_path=pdf_path)
 
         total_duration = round(time.monotonic() - total_start, 3)
         _safe_log_event(audit_logger, "finalize", "succeeded", total_duration_s=total_duration)
+
+        adapter.info(
+            "Job complete in %.1fs", total_duration,
+            extra={"_event": "job_complete", "_duration_s": total_duration},
+        )
 
         log_s3_key = audit_logger.get_log_s3_key() if audit_logger else None
         ended_at = _now_utc()
@@ -377,6 +467,16 @@ def extract_pdf(
             total_duration_s=total_duration,
         )
 
+        error_code = "timeout" if "SoftTimeLimitExceeded" in type(exc).__name__ else type(exc).__name__
+        adapter.error(
+            "Job failed: %s", exc,
+            extra={
+                "_event": "job_failed",
+                "_error_code": error_code,
+                "_duration_s": total_duration,
+            },
+        )
+
         if db_session:
             _safe_upsert_extraction_run(
                 db_session,
@@ -410,13 +510,102 @@ def extract_pdf(
             os.remove(pdf_path)
 
 
-def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger=None):
+def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, adapter=None):
+    """Run one extractor and return (method, output_text, cached_flag).
+
+    This is a standalone function so it can be dispatched to a ThreadPoolExecutor.
+    GROBID is HTTP-bound (talks to a separate container) while Docling/Marker are
+    CPU-bound, so running GROBID concurrently with the others saves wall-clock time.
+    """
+    log = adapter or logger
+    output_path = _cached_path(file_hash, method)
+    stage = f"extract_{method}"
+
+    if _is_cached(file_hash, method):
+        _safe_log_event(audit_logger, stage, "cache_hit", detail=f"Using cached {method} output")
+        log.info(
+            "Cache hit for %s", method,
+            extra={"_event": "extractor_cache_hit", "_extractor": method, "_cached": True},
+        )
+        with open(output_path, "r", encoding="utf-8") as f:
+            return method, f.read(), True
+
+    started = time.monotonic()
+    _safe_log_event(audit_logger, stage, "started")
+
+    log.info(
+        "Starting %s extraction", method,
+        extra={"_event": "extractor_start", "_extractor": method, **_gpu_snapshot()},
+    )
+
+    try:
+        if method == "grobid":
+            from app.services.grobid_service import Grobid
+            extractor = Grobid(
+                base_url=config.GROBID_URL,
+                timeout=config.GROBID_REQUEST_TIMEOUT,
+                include_coordinates=config.GROBID_INCLUDE_COORDINATES,
+                include_raw_citations=config.GROBID_INCLUDE_RAW_CITATIONS,
+            )
+        elif method == "docling":
+            from app.services.docling_service import Docling
+            extractor = Docling(device=config.DOCLING_DEVICE)
+        elif method == "marker":
+            from app.services.marker_service import Marker
+            extractor = Marker(
+                device=config.MARKER_DEVICE,
+                extract_images=config.MARKER_EXTRACT_IMAGES,
+            )
+        else:
+            raise ValueError(f"Unknown extraction method: {method}")
+
+        extractor.extract(pdf_path, output_path)
+
+        duration_s = round(time.monotonic() - started, 3)
+        _safe_log_event(
+            audit_logger, stage, "completed",
+            duration_s=duration_s,
+        )
+        log.info(
+            "%s extraction complete in %.1fs", method, duration_s,
+            extra={
+                "_event": "extractor_complete",
+                "_extractor": method,
+                "_duration_s": duration_s,
+                "_cached": False,
+                "_status": "success",
+                **_gpu_snapshot(),
+            },
+        )
+    except Exception as exc:
+        duration_s = round(time.monotonic() - started, 3)
+        _safe_log_event(
+            audit_logger, stage, "failed",
+            detail=str(exc),
+            duration_s=duration_s,
+        )
+        log.error(
+            "%s extraction failed: %s", method, exc,
+            extra={
+                "_event": "extractor_complete",
+                "_extractor": method,
+                "_duration_s": duration_s,
+                "_status": "failed",
+                "_error_code": type(exc).__name__,
+            },
+        )
+        raise
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        return method, f.read(), False
+
+
+def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger=None, adapter=None):
     """Inner extraction logic, separated so caller can wrap with finally."""
 
-    from app.services.grobid_service import Grobid
-    from app.services.docling_service import Docling
-    from app.services.marker_service import Marker
     from app.services.llm_service import LLM
+
+    log = adapter or logger
 
     if file_hash is None:
         file_hash = _get_file_hash(pdf_path)
@@ -425,125 +614,76 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
     methods_used = []
     cached_methods = []
     total_steps = len(methods) + (1 if merge else 0)
-    current_step = 0
 
-    # --- Run each extractor ---------------------------------------------------
+    # --- Run extractors (parallel where possible) -----------------------------
+    # GROBID is HTTP-bound (separate container), Docling/Marker are CPU-bound.
+    # Running GROBID in a thread overlapping with CPU extractors saves wall time.
 
-    if "grobid" in methods:
-        output_path = _cached_path(file_hash, "grobid")
-        stage = "extract_grobid"
-        if _is_cached(file_hash, "grobid"):
-            cached_methods.append("grobid")
-            _safe_log_event(audit_logger, stage, "cache_hit", detail="Using cached grobid output")
-        else:
-            self.update_state(state="PROGRESS", meta={
-                "step": "grobid", "current": current_step, "total": total_steps
-            })
-            logger.info("Running GROBID extraction...")
-            grobid = Grobid(
-                base_url=Config.GROBID_URL,
-                timeout=Config.GROBID_REQUEST_TIMEOUT,
-                include_coordinates=Config.GROBID_INCLUDE_COORDINATES,
-                include_raw_citations=Config.GROBID_INCLUDE_RAW_CITATIONS,
+    non_cached = [m for m in methods if not _is_cached(file_hash, m)]
+    has_grobid_work = "grobid" in non_cached
+    cpu_methods = [m for m in non_cached if m != "grobid"]
+    use_parallel = has_grobid_work and len(cpu_methods) > 0
+
+    self.update_state(state="PROGRESS", meta={
+        "step": "extracting", "current": 0, "total": total_steps,
+        "parallel": use_parallel,
+    })
+
+    if use_parallel:
+        # Run GROBID in a thread while CPU extractors run sequentially in main thread
+        log.info("Running GROBID in parallel with %s", cpu_methods)
+        errors = []
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="grobid") as pool:
+            grobid_future = pool.submit(
+                _run_single_extractor, "grobid", pdf_path, file_hash, Config, audit_logger, adapter,
             )
-            started = time.monotonic()
-            _safe_log_event(audit_logger, stage, "started")
-            try:
-                grobid.extract(pdf_path, output_path)
-                _safe_log_event(
-                    audit_logger,
-                    stage,
-                    "completed",
-                    duration_s=round(time.monotonic() - started, 3),
-                )
-            except Exception as exc:
-                _safe_log_event(
-                    audit_logger,
-                    stage,
-                    "failed",
-                    detail=str(exc),
-                    duration_s=round(time.monotonic() - started, 3),
-                )
-                raise
-        with open(output_path, "r", encoding="utf-8") as f:
-            extractions["grobid"] = f.read()
-        methods_used.append("grobid")
-        current_step += 1
 
-    if "docling" in methods:
-        output_path = _cached_path(file_hash, "docling")
-        stage = "extract_docling"
-        if _is_cached(file_hash, "docling"):
-            cached_methods.append("docling")
-            _safe_log_event(audit_logger, stage, "cache_hit", detail="Using cached docling output")
-        else:
-            self.update_state(state="PROGRESS", meta={
-                "step": "docling", "current": current_step, "total": total_steps
-            })
-            logger.info("Running Docling extraction...")
-            docling = Docling(device=Config.DOCLING_DEVICE)
-            started = time.monotonic()
-            _safe_log_event(audit_logger, stage, "started")
-            try:
-                docling.extract(pdf_path, output_path)
-                _safe_log_event(
-                    audit_logger,
-                    stage,
-                    "completed",
-                    duration_s=round(time.monotonic() - started, 3),
-                )
-            except Exception as exc:
-                _safe_log_event(
-                    audit_logger,
-                    stage,
-                    "failed",
-                    detail=str(exc),
-                    duration_s=round(time.monotonic() - started, 3),
-                )
-                raise
-        with open(output_path, "r", encoding="utf-8") as f:
-            extractions["docling"] = f.read()
-        methods_used.append("docling")
-        current_step += 1
+            # Run CPU extractors sequentially in the main thread
+            for method in cpu_methods:
+                try:
+                    m, text, was_cached = _run_single_extractor(
+                        method, pdf_path, file_hash, Config, audit_logger, adapter,
+                    )
+                    extractions[m] = text
+                    methods_used.append(m)
+                    if was_cached:
+                        cached_methods.append(m)
+                except Exception as exc:
+                    errors.append((method, exc))
 
-    if "marker" in methods:
-        output_path = _cached_path(file_hash, "marker")
-        stage = "extract_marker"
-        if _is_cached(file_hash, "marker"):
-            cached_methods.append("marker")
-            _safe_log_event(audit_logger, stage, "cache_hit", detail="Using cached marker output")
-        else:
-            self.update_state(state="PROGRESS", meta={
-                "step": "marker", "current": current_step, "total": total_steps
-            })
-            logger.info("Running Marker extraction...")
-            marker = Marker(
-                device=Config.MARKER_DEVICE,
-                extract_images=Config.MARKER_EXTRACT_IMAGES,
+            # Collect GROBID result
+            try:
+                m, text, was_cached = grobid_future.result(timeout=Config.GROBID_REQUEST_TIMEOUT + 60)
+                extractions[m] = text
+                methods_used.append(m)
+                if was_cached:
+                    cached_methods.append(m)
+            except Exception as exc:
+                errors.append(("grobid", exc))
+
+        # Also pick up any cached-only methods not in non_cached
+        for method in methods:
+            if method not in methods_used and _is_cached(file_hash, method):
+                m, text, _ = _run_single_extractor(
+                    method, pdf_path, file_hash, Config, audit_logger, adapter,
+                )
+                extractions[m] = text
+                methods_used.append(m)
+                cached_methods.append(m)
+
+        if errors:
+            # Raise the first error (same behavior as sequential)
+            raise errors[0][1]
+    else:
+        # Sequential fallback (no GROBID work, or only one method)
+        for method in methods:
+            m, text, was_cached = _run_single_extractor(
+                method, pdf_path, file_hash, Config, audit_logger, adapter,
             )
-            started = time.monotonic()
-            _safe_log_event(audit_logger, stage, "started")
-            try:
-                marker.extract(pdf_path, output_path)
-                _safe_log_event(
-                    audit_logger,
-                    stage,
-                    "completed",
-                    duration_s=round(time.monotonic() - started, 3),
-                )
-            except Exception as exc:
-                _safe_log_event(
-                    audit_logger,
-                    stage,
-                    "failed",
-                    detail=str(exc),
-                    duration_s=round(time.monotonic() - started, 3),
-                )
-                raise
-        with open(output_path, "r", encoding="utf-8") as f:
-            extractions["marker"] = f.read()
-        methods_used.append("marker")
-        current_step += 1
+            extractions[m] = text
+            methods_used.append(m)
+            if was_cached:
+                cached_methods.append(m)
 
     # --- Optional LLM merge ---------------------------------------------------
 
@@ -566,7 +706,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                 merged_md = f.read()
         else:
             self.update_state(state="PROGRESS", meta={
-                "step": "llm_merge", "current": current_step, "total": total_steps
+                "step": "llm_merge", "current": len(methods_used), "total": total_steps
             })
 
             llm = LLM(
@@ -586,23 +726,44 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                 if (Config.CONSENSUS_ENABLED
                         and grobid_text and docling_text and marker_text):
                     from app.services.consensus_service import merge_with_consensus
-                    logger.info("Attempting consensus merge...")
+                    log.info("Attempting consensus merge...")
                     try:
                         consensus_md, consensus_metrics = merge_with_consensus(
                             grobid_text, docling_text, marker_text, llm,
                         )
                         if consensus_md is not None:
                             merged_md = consensus_md
-                            logger.info("Consensus merge succeeded: %s", consensus_metrics)
+                            log.info(
+                                "Consensus merge succeeded",
+                                extra={
+                                    "_event": "consensus_classify_summary",
+                                    "_conflict_count": consensus_metrics.get("conflict", 0),
+                                    "_agree_exact": consensus_metrics.get("agree_exact", 0),
+                                    "_agree_near": consensus_metrics.get("agree_near", 0),
+                                    "_gap": consensus_metrics.get("gap", 0),
+                                    "_conflict_ratio": consensus_metrics.get("conflict_ratio", 0.0),
+                                    "_alignment_confidence": consensus_metrics.get("alignment_confidence", 0.0),
+                                    "_tokens_saved": consensus_metrics.get("tokens_saved_estimate", 0),
+                                },
+                            )
                         else:
-                            logger.info("Consensus fallback triggered: %s", consensus_metrics)
+                            log.info(
+                                "Consensus fallback triggered: %s",
+                                consensus_metrics.get("fallback_reason"),
+                                extra={
+                                    "_event": "consensus_fallback",
+                                    "_fallback_reason": consensus_metrics.get("fallback_reason", ""),
+                                    "_conflict_ratio": consensus_metrics.get("conflict_ratio", 0.0),
+                                    "_alignment_confidence": consensus_metrics.get("alignment_confidence", 0.0),
+                                },
+                            )
                     except Exception as e:
-                        logger.warning("Consensus pipeline error, falling back to full-LLM merge: %s", e)
+                        log.warning("Consensus pipeline error, falling back to full-LLM merge: %s", e)
                         consensus_metrics = {"fallback_triggered": True, "fallback_reason": "pipeline_error"}
 
                 # Fallback to full-LLM merge
                 if merged_md is None:
-                    logger.info("Merging outputs with full-LLM merge...")
+                    log.info("Merging outputs with full-LLM merge...")
                     merged_md = llm.extract(grobid_text, docling_text, marker_text)
 
                 with open(merged_cache_path, "w", encoding="utf-8") as f:

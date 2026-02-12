@@ -1,15 +1,11 @@
 import os
-import logging
 from flask import Flask
 from config import Config
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+from app.logging_config import setup_logging
 
 
 def create_app():
+    setup_logging(component="app")
     app = Flask(__name__)
     app.config.from_object(Config)
 

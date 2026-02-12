@@ -21,6 +21,9 @@ redis
 # Production WSGI server
 gunicorn
 
+# Structured GELF logging
+pygelf~=0.4.2
+
 # Utilities
 boto3
 python-multipart
