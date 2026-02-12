@@ -53,13 +53,31 @@ class Grobid(PDFExtractor):
             if body_elem is not None:
                 text_parts = []
                 for div in body_elem.findall(".//tei:div", self.tei_ns):
+                    # Emit section heading once.
                     head = div.find("tei:head", self.tei_ns)
                     if head is not None and head.text:
                         text_parts.append(f"\n## {head.text}\n")
 
-                    div_text = "".join(div.itertext()).strip()
-                    if div_text:
-                        text_parts.append(div_text)
+                    # Emit each paragraph as a separate block.
+                    paragraphs = div.findall("tei:p", self.tei_ns)
+                    if paragraphs:
+                        for paragraph in paragraphs:
+                            paragraph_text = "".join(paragraph.itertext()).strip()
+                            if paragraph_text:
+                                text_parts.append(paragraph_text)
+                    else:
+                        # Fallback for divs without <p>: gather child text except heading
+                        # to avoid duplicating the heading in output.
+                        parts = []
+                        for child in div:
+                            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                            if tag == "head":
+                                continue
+                            child_text = "".join(child.itertext()).strip()
+                            if child_text:
+                                parts.append(child_text)
+                        if parts:
+                            text_parts.append("\n\n".join(parts))
 
                 return "\n\n".join(text_parts)
             return None

@@ -1,7 +1,5 @@
 """Tests for the selective LLM merge consensus pipeline."""
 
-import json
-import pytest
 from unittest.mock import MagicMock, patch
 
 from app.services.consensus_service import (
@@ -13,6 +11,8 @@ from app.services.consensus_service import (
     CONFLICT,
     _SOURCE_PREFERENCE,
     _pick_preferred_text,
+    _extract_numeric_tokens,
+    _extract_citation_keys,
     normalize_text,
     parse_markdown,
     align_blocks,
@@ -177,6 +177,21 @@ class TestNormalization:
 
     def test_strip_whitespace(self):
         assert normalize_text("  hello  ") == "hello"
+
+    def test_strip_marker_span_artifacts(self):
+        text = '<span id="page-0-3">Drosophila</span> sleep genes'
+        assert normalize_text(text) == "drosophila sleep genes"
+
+    def test_strip_image_and_comment_artifacts(self):
+        text = "Alpha <!-- image --> ![fig](_page_4_Picture_7.jpeg) Beta"
+        assert normalize_text(text) == "alpha beta"
+
+    def test_strip_link_url_keep_text(self):
+        text = "See [Sleep genes](https://doi.org/10.1234/example)."
+        assert normalize_text(text) == "see sleep genes."
+
+    def test_strip_heading_markers(self):
+        assert normalize_text("# Methods") == normalize_text("#### Methods")
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +450,17 @@ class TestClassification:
         classify_triples([t])
         assert t.classification == CONFLICT
 
+    def test_numeric_tokens_ignore_html_tag_attributes(self):
+        assert _extract_numeric_tokens('<span id="page-0-3">25 6 7 5</span>') == {
+            "25", "6", "7", "5",
+        }
+
+    def test_citation_keys_include_ranges_and_lists(self):
+        keys = _extract_citation_keys("Prior work [8-10], [6,7], [Smith et al. 2024].")
+        assert "[8-10]" in keys
+        assert "[6,7]" in keys
+        assert "[Smith et al. 2024]" in keys
+
 
 # ---------------------------------------------------------------------------
 # Guard tests
@@ -686,6 +712,30 @@ class TestMergeWithConsensus:
 
         if result is not None:
             assert metrics["tokens_saved_estimate"] > 0
+
+    @patch("config.Config")
+    def test_sparse_extractor_is_excluded_from_alignment(self, mock_config, caplog):
+        mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
+        mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
+        mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.4
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
+        mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
+
+        llm = MagicMock()
+        grobid_md = "# Tiny\n\nOnly one paragraph."
+
+        shared_blocks = "\n\n".join([
+            f"Paragraph {i}: matching content for docling and marker." for i in range(12)
+        ])
+        docling_md = f"# Title\n\n{shared_blocks}"
+        marker_md = f"# Title\n\n{shared_blocks}"
+
+        with caplog.at_level("WARNING"):
+            result, metrics = merge_with_consensus(grobid_md, docling_md, marker_md, llm)
+
+        assert result is not None
+        assert metrics["fallback_triggered"] is False
+        assert "excluding grobid from alignment" in caplog.text
 
 
 # ---------------------------------------------------------------------------
