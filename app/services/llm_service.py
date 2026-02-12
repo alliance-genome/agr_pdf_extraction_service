@@ -9,10 +9,10 @@ logger = logging.getLogger(__name__)
 
 
 class LLM(PDFExtractor):
-    def __init__(self, api_key, model="gpt-5.2", max_tokens=16000):
+    def __init__(self, api_key, model="gpt-5.2", reasoning_effort="medium"):
         self.client = OpenAI(api_key=api_key)
         self.model = model
-        self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
 
     def extract(self, grobid_md, docling_md, marker_md):
         """Full-document LLM merge (fallback path)."""
@@ -21,7 +21,7 @@ class LLM(PDFExtractor):
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                max_tokens=self.max_tokens,
+                reasoning_effort=self.reasoning_effort,
                 messages=[{"role": "user", "content": prompt}],
             )
             usage = response.usage
@@ -68,7 +68,7 @@ class LLM(PDFExtractor):
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
-                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
                     messages=[
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": prompt_payload},

@@ -46,7 +46,7 @@ class Config:
     # ---- LLM (merge) ---------------------------------------------------------
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
     LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.2")
-    LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", 16000))
+    LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "medium")
 
     # ---- Consensus pipeline --------------------------------------------------
     CONSENSUS_ENABLED = os.environ.get("CONSENSUS_ENABLED", "true").lower() == "true"
