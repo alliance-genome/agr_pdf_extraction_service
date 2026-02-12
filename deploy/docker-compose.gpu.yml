@@ -101,7 +101,7 @@ services:
     command: >
       celery -A celery_app worker
       --loglevel=info
-      --concurrency=1
+      --pool=solo
       -Q default
 
   grobid:
