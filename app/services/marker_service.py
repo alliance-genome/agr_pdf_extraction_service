@@ -41,9 +41,9 @@ class Marker(PDFExtractor):
             f.write(text)
 
         if self.extract_images and images:
-            pdf_name = Path(pdf_path).stem
+            output_stem = Path(output_filename).stem
             output_dir = Path(output_filename).parent
-            images_dir = os.path.join(output_dir, f"images/{pdf_name}_marker")
+            images_dir = os.path.join(output_dir, "images", output_stem)
             os.makedirs(images_dir, exist_ok=True)
 
             for img_name, img in images.items():

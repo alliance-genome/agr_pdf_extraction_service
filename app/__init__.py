@@ -16,12 +16,12 @@ def create_app():
     os.makedirs(app.config["CACHE_FOLDER"], exist_ok=True)
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
-    with app.app_context():
-        # Web UI routes (existing)
-        from app import server  # noqa: F401
+    # Web UI routes
+    from app.server import web as web_blueprint
+    app.register_blueprint(web_blueprint)
 
-        # REST API v1
-        from app.api import api as api_blueprint
-        app.register_blueprint(api_blueprint)
+    # REST API v1
+    from app.api import api as api_blueprint
+    app.register_blueprint(api_blueprint)
 
     return app

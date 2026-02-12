@@ -1,5 +1,8 @@
 import os
+import re
 import hashlib
+from urllib.parse import quote
+
 from flask import current_app as app
 
 
@@ -24,3 +27,37 @@ def get_cached_path(file_hash, method):
 def is_extraction_cached(file_hash, method):
     cached_path = get_cached_path(file_hash, method)
     return os.path.exists(cached_path)
+
+
+def get_images_dir(file_hash):
+    """Compute the images directory for a given file hash. Works for both fresh and cached."""
+    marker_cache_path = get_cached_path(file_hash, "marker")
+    stem = os.path.splitext(os.path.basename(marker_cache_path))[0]
+    return os.path.join(app.config["CACHE_FOLDER"], "images", stem)
+
+
+def list_images(file_hash):
+    """List image files for a file_hash. Returns list of {"filename": ..., "size_bytes": ...}."""
+    images_dir = get_images_dir(file_hash)
+    if not os.path.isdir(images_dir):
+        return []
+    result = []
+    for f in sorted(os.listdir(images_dir)):
+        fpath = os.path.join(images_dir, f)
+        if os.path.isfile(fpath) and f.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
+            result.append({"filename": f, "size_bytes": os.path.getsize(fpath)})
+    return result
+
+
+def rewrite_image_paths(markdown, file_hash):
+    """Rewrite ![alt](filename) to ![alt](/download/{hash}/images/{filename}) at response time."""
+    images_dir = get_images_dir(file_hash)
+
+    def _replace(match):
+        alt, filename = match.group(1), match.group(2)
+        basename = os.path.basename(filename)
+        if os.path.exists(os.path.join(images_dir, basename)):
+            return f"![{alt}](/download/{file_hash}/images/{quote(basename)})"
+        return match.group(0)
+
+    return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", _replace, markdown)

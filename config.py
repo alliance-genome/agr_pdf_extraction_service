@@ -12,11 +12,23 @@ class Config:
 
     # ---- Cache versioning ----------------------------------------------------
     # Bump this when extractor config changes to invalidate old cached outputs.
-    EXTRACTION_CONFIG_VERSION = os.environ.get("EXTRACTION_CONFIG_VERSION", "1")
+    EXTRACTION_CONFIG_VERSION = os.environ.get("EXTRACTION_CONFIG_VERSION", "3")
 
     # ---- Celery / Redis ------------------------------------------------------
     CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
     CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+
+    # ---- Database --------------------------------------------------------
+    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://pdfx:pdfx@localhost:5432/pdfx")
+
+    # ---- Audit Trail (S3) -----------------------------------------------
+    AUDIT_S3_BUCKET = os.environ.get("AUDIT_S3_BUCKET", "agr-pdf-extraction-benchmark")
+    AUDIT_S3_PREFIX = os.environ.get("AUDIT_S3_PREFIX", "pdfx/audit")
+
+    # ---- AWS (for S3 access from off-AWS deployment) --------------------
+    AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
     # ---- GROBID --------------------------------------------------------------
     GROBID_URL = os.environ.get("GROBID_URL", "http://localhost:8070")
@@ -29,9 +41,17 @@ class Config:
 
     # ---- Marker --------------------------------------------------------------
     MARKER_DEVICE = os.environ.get("MARKER_DEVICE", "cpu")
-    MARKER_EXTRACT_IMAGES = os.environ.get("MARKER_EXTRACT_IMAGES", "false").lower() == "true"
+    MARKER_EXTRACT_IMAGES = os.environ.get("MARKER_EXTRACT_IMAGES", "true").lower() == "true"
 
     # ---- LLM (merge) ---------------------------------------------------------
-    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-    LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514")
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+    LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.2")
     LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", 16000))
+
+    # ---- Consensus pipeline --------------------------------------------------
+    CONSENSUS_ENABLED = os.environ.get("CONSENSUS_ENABLED", "true").lower() == "true"
+    CONSENSUS_NEAR_THRESHOLD = float(os.environ.get("CONSENSUS_NEAR_THRESHOLD", 0.92))
+    CONSENSUS_LEVENSHTEIN_THRESHOLD = float(os.environ.get("CONSENSUS_LEVENSHTEIN_THRESHOLD", 0.90))
+    CONSENSUS_CONFLICT_RATIO_FALLBACK = float(os.environ.get("CONSENSUS_CONFLICT_RATIO_FALLBACK", 0.4))
+    CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = float(os.environ.get("CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK", 0.5))
+    CONSENSUS_ALWAYS_ESCALATE_TABLES = os.environ.get("CONSENSUS_ALWAYS_ESCALATE_TABLES", "true").lower() == "true"
