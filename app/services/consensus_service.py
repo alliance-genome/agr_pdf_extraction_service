@@ -76,6 +76,18 @@ _CITATION_LIST_RE = re.compile(
     re.MULTILINE,
 )
 
+# Output cleaning and QA: strip extractor artifacts, keep meaningful markdown.
+_SPAN_OPEN_RE = re.compile(r"<span[^>]*>")
+_SPAN_CLOSE_RE = re.compile(r"</span>")
+_HTML_COMMENT_OUTPUT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+_MULTI_SPACE_RE = re.compile(r"  +")
+
+# Flanking context budget (~150 tokens, conservative 4 chars/token estimate).
+_CHARS_PER_TOKEN = 4
+_FLANK_TOKEN_BUDGET = 150
+_FLANK_CHAR_BUDGET = _FLANK_TOKEN_BUDGET * _CHARS_PER_TOKEN
+
 
 def _has_child_type(token: dict, child_type: str) -> bool:
     """Check if a token has a child of the given type (recursive)."""
@@ -272,6 +284,16 @@ def normalize_text(text: str) -> str:
     # Lowercase for comparison
     text = text.lower()
     return text
+
+
+def clean_output_md(text: str) -> str:
+    """Strip extractor-specific artifacts while preserving markdown formatting."""
+    text = _SPAN_OPEN_RE.sub("", text)
+    text = _SPAN_CLOSE_RE.sub("", text)
+    text = _HTML_COMMENT_OUTPUT_RE.sub("", text)
+    text = _MULTI_NEWLINE_RE.sub("\n\n", text)
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    return text.strip()
 
 
 def parse_markdown(markdown_text: str, source: str) -> list[Block]:
@@ -703,6 +725,176 @@ def check_guards(
     return False, None
 
 
+def dedup_gap_triples(
+    triples: list[AlignedTriple],
+    window: int = 3,
+    similarity_threshold: float = 0.85,
+    length_ratio_threshold: float = 0.7,
+) -> int:
+    """Remove near-duplicate GAP blocks within a local window."""
+    removed = 0
+
+    for i, t_i in enumerate(triples):
+        if t_i.classification != GAP or not t_i.agreed_text or not t_i.agreed_text.strip():
+            continue
+
+        norm_i = normalize_text(t_i.agreed_text)
+        if not norm_i:
+            continue
+
+        for j in range(i + 1, min(i + window + 1, len(triples))):
+            t_j = triples[j]
+            if t_j.classification != GAP or not t_j.agreed_text or not t_j.agreed_text.strip():
+                continue
+
+            norm_j = normalize_text(t_j.agreed_text)
+            if not norm_j:
+                continue
+
+            len_ratio = min(len(norm_i), len(norm_j)) / max(len(norm_i), len(norm_j))
+            if len_ratio < length_ratio_threshold:
+                continue
+
+            similarity = fuzz.token_set_ratio(norm_i, norm_j) / 100.0
+            if similarity >= similarity_threshold:
+                if len(norm_i) <= len(norm_j):
+                    logger.debug(
+                        "GAP dedup: dropping %s (dup of %s, sim=%.2f)",
+                        t_i.segment_id, t_j.segment_id, similarity,
+                    )
+                    t_i.agreed_text = ""
+                    removed += 1
+                    break
+
+                logger.debug(
+                    "GAP dedup: dropping %s (dup of %s, sim=%.2f)",
+                    t_j.segment_id, t_i.segment_id, similarity,
+                )
+                t_j.agreed_text = ""
+                removed += 1
+
+    return removed
+
+
+def dedup_gap_against_all(
+    triples: list[AlignedTriple],
+    similarity_threshold: float = 0.85,
+    partial_threshold: float = 0.90,
+    length_ratio_cap: float = 0.7,
+    min_text_len: int = 50,
+) -> int:
+    """Remove GAP blocks that duplicate content from ANY other block.
+
+    Unlike ``dedup_gap_triples`` (which only checks GAP-vs-GAP within a
+    local window), this function compares every GAP block against ALL other
+    blocks regardless of classification or distance.  Two checks:
+
+    1. **Near-equal**: ``token_set_ratio > similarity_threshold``
+    2. **Containment**: ``partial_ratio > partial_threshold`` AND the shorter
+       normalised text is less than ``length_ratio_cap`` × the longer one.
+
+    Headings (``block_type == "heading"``) and very short texts are skipped
+    to avoid false positives.
+    """
+    removed = 0
+
+    # Pre-build candidate texts from all non-empty triples.
+    # Each entry: (index, normalised_text, is_gap, raw_text)
+    # NOTE: CONFLICT triples are excluded — their text is provisional
+    # (not yet LLM-resolved) and comparing against it could wrongly
+    # remove valid GAP content.
+    candidates: list[tuple[int, str, bool, str]] = []
+    for idx, t in enumerate(triples):
+        if t.classification == CONFLICT:
+            continue  # skip unresolved conflicts
+        text = t.agreed_text
+        if not text or not text.strip():
+            continue
+        norm = normalize_text(text)
+        if not norm or len(norm) < min_text_len:
+            continue
+        # Skip headings
+        blocks = _get_present_blocks(t)
+        if blocks and all(b.block_type == "heading" for b in blocks):
+            continue
+        if not blocks and text.lstrip().startswith("#"):
+            continue
+        candidates.append((idx, norm, t.classification == GAP, text))
+
+    # For each GAP candidate, check against every other candidate.
+    gap_indices_to_blank: set[int] = set()
+    for c_idx, (triple_idx, gap_norm, is_gap, gap_raw) in enumerate(candidates):
+        if not is_gap:
+            continue
+        if triple_idx in gap_indices_to_blank:
+            continue
+
+        for o_idx, (other_triple_idx, other_norm, other_is_gap, other_raw) in enumerate(candidates):
+            if c_idx == o_idx:
+                continue
+            if other_triple_idx in gap_indices_to_blank:
+                continue
+
+            # Near-equal check
+            tsr = fuzz.token_set_ratio(gap_norm, other_norm) / 100.0
+            near_equal_match = False
+            if tsr >= similarity_threshold:
+                # Numeric/citation guardrail: for containment (subset),
+                # allow if shorter's values are a subset of longer's.
+                gap_nums = _extract_numeric_tokens(gap_raw)
+                other_nums = _extract_numeric_tokens(other_raw)
+                gap_cites = _extract_citation_keys(gap_raw)
+                other_cites = _extract_citation_keys(other_raw)
+                shorter_nums = gap_nums if len(gap_norm) <= len(other_norm) else other_nums
+                longer_nums = other_nums if len(gap_norm) <= len(other_norm) else gap_nums
+                shorter_cites = gap_cites if len(gap_norm) <= len(other_norm) else other_cites
+                longer_cites = other_cites if len(gap_norm) <= len(other_norm) else gap_cites
+                if shorter_nums.issubset(longer_nums) and shorter_cites.issubset(longer_cites):
+                    near_equal_match = True
+                elif gap_nums == other_nums and gap_cites == other_cites:
+                    near_equal_match = True
+
+            if near_equal_match:
+                # GAP vs non-GAP: always blank the GAP regardless of length
+                if not other_is_gap:
+                    gap_indices_to_blank.add(triple_idx)
+                    break
+                # GAP vs GAP: drop the shorter one
+                if len(gap_norm) <= len(other_norm):
+                    gap_indices_to_blank.add(triple_idx)
+                    break
+                gap_indices_to_blank.add(other_triple_idx)
+                continue
+
+            # Containment check: is the GAP a fragment of the other?
+            shorter, longer = (gap_norm, other_norm) if len(gap_norm) <= len(other_norm) else (other_norm, gap_norm)
+            if len(shorter) < len(longer) * length_ratio_cap:
+                pr = fuzz.partial_ratio(shorter, longer) / 100.0
+                if pr >= partial_threshold:
+                    # GAP vs non-GAP: always blank the GAP
+                    if not other_is_gap:
+                        gap_indices_to_blank.add(triple_idx)
+                        break
+                    # GAP vs GAP: drop the shorter side
+                    if len(gap_norm) <= len(other_norm):
+                        gap_indices_to_blank.add(triple_idx)
+                        break
+                    gap_indices_to_blank.add(other_triple_idx)
+
+    # Blank the identified duplicates
+    for idx in gap_indices_to_blank:
+        t = triples[idx]
+        logger.info(
+            "Global GAP dedup: dropping %s (text=%.60s...)",
+            t.segment_id,
+            (t.agreed_text or "")[:60],
+        )
+        t.agreed_text = ""
+        removed += 1
+
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Step 5: ASSEMBLE — Build final merged markdown
 # ---------------------------------------------------------------------------
@@ -711,13 +903,13 @@ def assemble(
     triples: list[AlignedTriple],
     resolved_conflicts: dict[str, str],
 ) -> str:
-    """Assemble the final merged markdown from classified triples and LLM resolutions."""
+    """Assemble final markdown and clean non-LLM blocks for output quality."""
     parts: list[str] = []
 
     for triple in triples:
         if triple.classification in (AGREE_EXACT, AGREE_NEAR, GAP):
             if triple.agreed_text:
-                parts.append(triple.agreed_text)
+                parts.append(clean_output_md(triple.agreed_text))
         elif triple.classification == CONFLICT:
             resolved = resolved_conflicts.get(triple.segment_id)
             if resolved:
@@ -726,9 +918,471 @@ def assemble(
                 # Fallback: use first available block text
                 blocks = _get_present_blocks(triple)
                 if blocks:
-                    parts.append(blocks[0].source_md or blocks[0].raw_text)
+                    parts.append(clean_output_md(blocks[0].source_md or blocks[0].raw_text))
 
     return "\n\n".join(parts)
+
+
+def dedup_assembled_paragraphs(
+    text: str,
+    similarity_threshold: float = 0.85,
+    partial_threshold: float = 0.90,
+    length_ratio_cap: float = 0.7,
+    min_text_len: int = 50,
+) -> tuple[str, int]:
+    """Post-assembly global paragraph dedup — safety net for Layer 1.
+
+    Splits assembled text on blank lines, does O(n²) pairwise comparison
+    on qualifying paragraphs (>min_text_len chars, not headings), and removes
+    the shorter duplicate.  Returns (cleaned_text, removed_count).
+    """
+    paragraphs = text.split("\n\n")
+    removed_indices: set[int] = set()
+
+    # Build list of (index, normalised, raw) for qualifying paragraphs
+    qualifying: list[tuple[int, str, str]] = []
+    for i, para in enumerate(paragraphs):
+        stripped = para.strip()
+        if not stripped or len(stripped) < min_text_len:
+            continue
+        # Skip headings
+        if stripped.startswith("#"):
+            continue
+        # Skip table rows
+        if stripped.startswith("|") and stripped.endswith("|"):
+            continue
+        qualifying.append((i, normalize_text(stripped), stripped))
+
+    # O(n²) pairwise
+    for a in range(len(qualifying)):
+        idx_a, norm_a, raw_a = qualifying[a]
+        if idx_a in removed_indices:
+            continue
+        for b in range(a + 1, len(qualifying)):
+            idx_b, norm_b, raw_b = qualifying[b]
+            if idx_b in removed_indices:
+                continue
+
+            # Near-equal check
+            tsr = fuzz.token_set_ratio(norm_a, norm_b) / 100.0
+            near_equal_match = False
+            if tsr >= similarity_threshold:
+                # Numeric/citation guardrail: for containment (subset),
+                # allow if shorter's values are a subset of longer's.
+                nums_a = _extract_numeric_tokens(raw_a)
+                nums_b = _extract_numeric_tokens(raw_b)
+                cites_a = _extract_citation_keys(raw_a)
+                cites_b = _extract_citation_keys(raw_b)
+                shorter_nums = nums_a if len(norm_a) <= len(norm_b) else nums_b
+                longer_nums = nums_b if len(norm_a) <= len(norm_b) else nums_a
+                shorter_cites = cites_a if len(norm_a) <= len(norm_b) else cites_b
+                longer_cites = cites_b if len(norm_a) <= len(norm_b) else cites_a
+                if shorter_nums.issubset(longer_nums) and shorter_cites.issubset(longer_cites):
+                    near_equal_match = True
+                elif nums_a == nums_b and cites_a == cites_b:
+                    near_equal_match = True
+
+            if near_equal_match:
+                # Drop the shorter paragraph
+                victim = idx_a if len(norm_a) <= len(norm_b) else idx_b
+                logger.info(
+                    "Post-assembly dedup: dropping paragraph %d (near-equal to %d, tsr=%.2f)",
+                    victim, idx_a if victim == idx_b else idx_b, tsr,
+                )
+                removed_indices.add(victim)
+                if victim == idx_a:
+                    break
+                continue
+
+            # Containment check
+            shorter_norm, longer_norm = (norm_a, norm_b) if len(norm_a) <= len(norm_b) else (norm_b, norm_a)
+            shorter_idx = idx_a if len(norm_a) <= len(norm_b) else idx_b
+            if len(shorter_norm) < len(longer_norm) * length_ratio_cap:
+                pr = fuzz.partial_ratio(shorter_norm, longer_norm) / 100.0
+                if pr >= partial_threshold:
+                    logger.info(
+                        "Post-assembly dedup: dropping paragraph %d (contained in %d, pr=%.2f)",
+                        shorter_idx,
+                        idx_b if shorter_idx == idx_a else idx_a,
+                        pr,
+                    )
+                    removed_indices.add(shorter_idx)
+                    if shorter_idx == idx_a:
+                        break
+
+    cleaned = "\n\n".join(
+        para for i, para in enumerate(paragraphs) if i not in removed_indices
+    )
+    return cleaned, len(removed_indices)
+
+
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+
+
+def resolve_header_hierarchy(merged_md: str, llm: "LLM") -> str:
+    """Resolve flat heading levels into a proper hierarchy via LLM.
+
+    Extracts all heading lines, asks the LLM to classify each one, validates
+    the response, and rewrites heading levels in-place.  On any validation
+    failure the original markdown is returned unchanged.
+    """
+    from config import Config
+
+    # 1. Extract headings with their line positions
+    matches = list(_HEADING_LINE_RE.finditer(merged_md))
+    if not matches:
+        logger.info("Header hierarchy: no headings found, skipping")
+        return merged_md
+
+    # 2. Build payload for LLM
+    lines = merged_md.split("\n")
+    headers: list[dict] = []
+    for idx, m in enumerate(matches):
+        text = m.group(2).strip()
+        # Content preview: grab ~100 chars of text following this heading
+        line_end = m.end()
+        preview = merged_md[line_end:line_end + 200].strip()
+        # Trim to first ~100 meaningful chars (skip blank lines)
+        preview_clean = " ".join(preview.split())[:100]
+        headers.append({
+            "index": idx,
+            "text": text,
+            "content_preview": preview_clean,
+        })
+
+    # 2b. Extract opening text (~1000 chars) for title detection
+    opening_text = merged_md[:1000]
+
+    logger.info(
+        "Header hierarchy: extracted %d headings, calling LLM (model=%s, reasoning=%s)",
+        len(headers), Config.HIERARCHY_LLM_MODEL, Config.HIERARCHY_LLM_REASONING,
+    )
+
+    # 3. Call LLM
+    response = llm.resolve_header_hierarchy(
+        headers,
+        model=Config.HIERARCHY_LLM_MODEL,
+        reasoning_effort=Config.HIERARCHY_LLM_REASONING,
+        opening_text=opening_text,
+    )
+
+    # 4. Validate (includes text-fidelity check against what we sent)
+    decisions = response.decisions
+    detected_title = (response.detected_title or "").strip() or None
+    original_levels = [len(m.group(1)) for m in matches]
+    validation_error = _validate_hierarchy_decisions(
+        decisions, len(headers), headers, original_levels,
+        detected_title=detected_title,
+    )
+    if validation_error:
+        logger.warning("Header hierarchy validation failed: %s — returning original markdown", validation_error)
+        return merged_md
+
+    # 5. Apply — build replacement map (match start → new line text)
+    # Process in reverse order so character offsets stay valid
+    result = merged_md
+    for decision in sorted(decisions, key=lambda d: d.heading_index, reverse=True):
+        match = matches[decision.heading_index]
+        original_level = len(match.group(1))
+        heading_text = match.group(2)
+
+        if decision.action == "keep_level":
+            logger.info(
+                "  [%d] KEEP H%d: %s",
+                decision.heading_index, original_level, heading_text[:80],
+            )
+            continue
+        elif decision.action == "set_level":
+            new_prefix = "#" * decision.new_level
+            new_line = f"{new_prefix} {heading_text}"
+            logger.info(
+                "  [%d] SET H%d → H%d: %s",
+                decision.heading_index, original_level, decision.new_level, heading_text[:80],
+            )
+            result = result[:match.start()] + new_line + result[match.end():]
+        elif decision.action == "demote_to_text":
+            logger.info(
+                "  [%d] DEMOTE H%d → text: %s",
+                decision.heading_index, original_level, heading_text[:80],
+            )
+            result = result[:match.start()] + heading_text + result[match.end():]
+
+    # 6. Insert detected title as H1 if the LLM found one in the opening text
+    if detected_title:
+        title_stripped = detected_title.strip()
+        # Try to find the title as a standalone line first
+        lines = result.split("\n")
+        inserted = False
+        for i, line in enumerate(lines):
+            if line.strip() == title_stripped:
+                lines[i] = f"# {title_stripped}"
+                logger.info("  TITLE MARKED as H1 (existing line): %s", title_stripped[:80])
+                inserted = True
+                break
+        if inserted:
+            result = "\n".join(lines)
+        else:
+            # Title exists only embedded in other text (e.g. citation line) —
+            # prepend it as a new H1 at the top of the document.
+            result = f"# {title_stripped}\n\n{result.lstrip()}"
+            logger.info("  TITLE PREPENDED as H1: %s", title_stripped[:80])
+
+    # Log summary
+    actions = {"keep_level": 0, "set_level": 0, "demote_to_text": 0}
+    for d in decisions:
+        actions[d.action] = actions.get(d.action, 0) + 1
+    logger.info(
+        "Header hierarchy complete: %d headings (set_level=%d, demote=%d, keep=%d, title_detected=%s)",
+        len(decisions), actions["set_level"], actions["demote_to_text"], actions["keep_level"],
+        bool(detected_title),
+    )
+
+    return result
+
+
+def _validate_hierarchy_decisions(
+    decisions: list,
+    expected_count: int,
+    original_headers: list[dict] | None = None,
+    original_levels: list[int] | None = None,
+    detected_title: str | None = None,
+) -> str | None:
+    """Validate LLM hierarchy decisions. Returns error string or None if valid.
+
+    Args:
+        decisions: List of HeaderDecision from the LLM.
+        expected_count: Number of headings we sent.
+        original_headers: The header dicts we sent to the LLM (with 'text' keys).
+            Used to verify the LLM didn't fabricate or modify heading text.
+        original_levels: Original heading levels (1-6) from the markdown, indexed
+            by heading position.  Used to resolve keep_level into an effective
+            level for the H1 and jump checks.
+        detected_title: If set, the LLM found the title in the opening text
+            (not among headings), so 0 H1 headings is acceptable.
+    """
+    # Count check
+    if len(decisions) != expected_count:
+        return f"expected {expected_count} decisions, got {len(decisions)}"
+
+    # Index uniqueness and completeness: must be exactly {0..n-1}
+    indices = [d.heading_index for d in decisions]
+    if sorted(indices) != list(range(expected_count)):
+        seen = set()
+        dupes = [i for i in indices if i in seen or seen.add(i)]
+        if dupes:
+            return f"duplicate heading_index values: {dupes}"
+        return f"heading_index values {sorted(indices)} do not cover 0..{expected_count - 1}"
+
+    # CRITICAL: Text fidelity check — the LLM must not modify heading text
+    if original_headers:
+        for d in decisions:
+            if d.heading_index < 0 or d.heading_index >= len(original_headers):
+                return f"heading_index {d.heading_index} out of range (0-{len(original_headers) - 1})"
+            expected_text = original_headers[d.heading_index]["text"]
+            if d.original_text.strip() != expected_text.strip():
+                return (
+                    f"LLM modified heading text at index {d.heading_index}: "
+                    f"expected {expected_text!r}, got {d.original_text!r}"
+                )
+
+    # Validate new_level values for set_level actions
+    for d in decisions:
+        if d.action == "set_level":
+            if d.new_level is None:
+                return f"heading_index {d.heading_index}: set_level requires new_level but got None"
+            if not (1 <= d.new_level <= 6):
+                return f"heading_index {d.heading_index}: new_level {d.new_level} out of range (1-6)"
+
+    # Build effective levels (resolving keep_level using original_levels)
+    def _effective_level(d) -> int | None:
+        if d.action == "set_level":
+            return d.new_level
+        if d.action == "keep_level" and original_levels:
+            return original_levels[d.heading_index]
+        return None  # unknown
+
+    # H1 count: exactly 1 among headings, OR 0 if detected_title is set
+    h1_count = sum(
+        1 for d in decisions
+        if _effective_level(d) == 1 and d.action != "demote_to_text"
+    )
+    if detected_title:
+        # Title is in plain text — no heading should be H1
+        if h1_count != 0:
+            return f"detected_title is set but {h1_count} headings are also H1 (expected 0)"
+    else:
+        if h1_count != 1:
+            return f"expected exactly 1 H1 (title), got {h1_count}"
+
+    # No level jumps > 1 (among headings with known levels)
+    # keep_level headings without original_levels reset tracking to avoid
+    # false positives.
+    prev_level = None
+    for d in sorted(decisions, key=lambda x: x.heading_index):
+        if d.action == "demote_to_text":
+            continue
+        level = _effective_level(d)
+        if level is None:
+            # Unknown level — reset so we don't compare across the gap
+            prev_level = None
+            continue
+        if prev_level is not None and level > prev_level + 1:
+            return f"level jump from {prev_level} to {level} (max allowed jump is 1)"
+        prev_level = level
+
+    # Demotion cap: < 50%
+    demote_count = sum(1 for d in decisions if d.action == "demote_to_text")
+    if expected_count > 0 and demote_count >= expected_count * 0.5:
+        return f"too many demotions: {demote_count}/{expected_count} (>= 50%)"
+
+    return None
+
+
+def run_qa_gates(
+    merged_md: str,
+    similarity_threshold: float = 0.85,
+    partial_threshold: float = 0.90,
+    length_ratio_cap: float = 0.7,
+    min_text_len: int = 50,
+) -> dict:
+    """Run post-assembly quality checks including **global** duplicate detection.
+
+    The duplicate scan is now O(n²) over all paragraph pairs (not just
+    adjacent) and includes containment checks, matching the thresholds used
+    by the dedup layers.
+    """
+    results: dict[str, int | bool] = {}
+
+    span_count = len(_SPAN_OPEN_RE.findall(merged_md))
+    results["span_tag_count"] = span_count
+    if span_count > 0:
+        logger.warning("QA gate: found %d <span> tags in assembled output", span_count)
+
+    comment_count = len(_HTML_COMMENT_OUTPUT_RE.findall(merged_md))
+    results["html_comment_count"] = comment_count
+    if comment_count > 0:
+        logger.warning("QA gate: found %d HTML comments in assembled output", comment_count)
+
+    # --- Global duplicate detection (replaces adjacent-only check) ----------
+    paragraphs = [p.strip() for p in merged_md.split("\n\n") if p.strip()]
+
+    # Build qualifying list (skip headings, tables, short paragraphs)
+    qualifying: list[tuple[int, str, str]] = []  # (index, normalised, raw)
+    for i, para in enumerate(paragraphs):
+        if len(para) < min_text_len:
+            continue
+        if para.startswith("#"):
+            continue
+        if para.startswith("|") and para.endswith("|"):
+            continue
+        qualifying.append((i, normalize_text(para), para))
+
+    global_dup_count = 0
+    for a in range(len(qualifying)):
+        idx_a, norm_a, raw_a = qualifying[a]
+        for b in range(a + 1, len(qualifying)):
+            idx_b, norm_b, raw_b = qualifying[b]
+
+            # Near-equal
+            tsr = fuzz.token_set_ratio(norm_a, norm_b) / 100.0
+            near_equal_match = False
+            if tsr >= similarity_threshold:
+                # Numeric/citation guardrail: for containment (subset),
+                # allow if shorter's values are a subset of longer's.
+                nums_a = _extract_numeric_tokens(raw_a)
+                nums_b = _extract_numeric_tokens(raw_b)
+                cites_a = _extract_citation_keys(raw_a)
+                cites_b = _extract_citation_keys(raw_b)
+                shorter_nums = nums_a if len(norm_a) <= len(norm_b) else nums_b
+                longer_nums = nums_b if len(norm_a) <= len(norm_b) else nums_a
+                shorter_cites = cites_a if len(norm_a) <= len(norm_b) else cites_b
+                longer_cites = cites_b if len(norm_a) <= len(norm_b) else cites_a
+                if shorter_nums.issubset(longer_nums) and shorter_cites.issubset(longer_cites):
+                    near_equal_match = True
+                elif nums_a == nums_b and cites_a == cites_b:
+                    near_equal_match = True
+
+            if near_equal_match:
+                logger.warning(
+                    "QA gate: paragraphs %d and %d are %.0f%% similar (global duplicate)",
+                    idx_a, idx_b, tsr * 100,
+                )
+                global_dup_count += 1
+                continue
+
+            # Containment
+            shorter, longer = (norm_a, norm_b) if len(norm_a) <= len(norm_b) else (norm_b, norm_a)
+            if len(shorter) < len(longer) * length_ratio_cap:
+                pr = fuzz.partial_ratio(shorter, longer) / 100.0
+                if pr >= partial_threshold:
+                    shorter_idx = idx_a if len(norm_a) <= len(norm_b) else idx_b
+                    longer_idx = idx_b if shorter_idx == idx_a else idx_a
+                    logger.warning(
+                        "QA gate: paragraph %d contained in %d (partial=%.0f%%, global duplicate)",
+                        shorter_idx, longer_idx, pr * 100,
+                    )
+                    global_dup_count += 1
+
+    results["global_duplicate_count"] = global_dup_count
+
+    results["qa_passed"] = (span_count == 0 and comment_count == 0 and global_dup_count == 0)
+    if results["qa_passed"]:
+        logger.info("QA gates: all checks passed")
+    else:
+        logger.warning(
+            "QA gates: %d issues detected (spans=%d, comments=%d, global_dupes=%d)",
+            span_count + comment_count + global_dup_count,
+            span_count, comment_count, global_dup_count,
+        )
+
+    return results
+
+
+def _find_flanking_text(
+    triples: list[AlignedTriple],
+    conflict_index: int,
+    direction: str,
+) -> str:
+    """Return nearest non-empty, non-CONFLICT agreed_text in the given direction."""
+    if direction == "before":
+        indices = range(conflict_index - 1, -1, -1)
+    else:
+        indices = range(conflict_index + 1, len(triples))
+
+    for i in indices:
+        triple = triples[i]
+        if triple.classification != CONFLICT and triple.agreed_text and triple.agreed_text.strip():
+            return triple.agreed_text
+    return ""
+
+
+def _truncate_to_token_budget(text: str, budget_chars: int = _FLANK_CHAR_BUDGET) -> str:
+    """Truncate to a conservative character budget approximating token limits."""
+    if len(text) <= budget_chars:
+        return text
+    return text[:budget_chars].rstrip() + "..."
+
+
+def _build_flanking_context(
+    triples: list[AlignedTriple],
+    conflict_index: int,
+) -> tuple[str, str]:
+    """Build cleaned context_before/context_after around a conflict triple."""
+    raw_before = _find_flanking_text(triples, conflict_index, "before")
+    if raw_before:
+        cleaned_before = clean_output_md(raw_before)
+        if len(cleaned_before) > _FLANK_CHAR_BUDGET:
+            cleaned_before = "..." + cleaned_before[-_FLANK_CHAR_BUDGET:].lstrip()
+    else:
+        cleaned_before = ""
+
+    raw_after = _find_flanking_text(triples, conflict_index, "after")
+    if raw_after:
+        cleaned_after = _truncate_to_token_budget(clean_output_md(raw_after))
+    else:
+        cleaned_after = ""
+
+    return cleaned_before, cleaned_after
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +1425,128 @@ def compute_metrics(
 
 
 # ---------------------------------------------------------------------------
+# Audit entries — Per-decision log for curator review
+# ---------------------------------------------------------------------------
+
+
+def _build_audit_entries(
+    triples: list[AlignedTriple],
+    resolved_conflicts: dict[str, str],
+    near_threshold: float = 0.92,
+    levenshtein_threshold: float = 0.90,
+) -> list[dict]:
+    """Build audit entries for every non-AGREE_EXACT triple.
+
+    Each entry records the classification, what each extractor produced,
+    what text was chosen, and classification-specific details so curators
+    can review pipeline decisions.
+    """
+    entries: list[dict] = []
+
+    for idx, triple in enumerate(triples):
+        if triple.classification == AGREE_EXACT:
+            continue
+
+        blocks = _get_present_blocks(triple)
+        if not blocks:
+            continue
+
+        block_type = blocks[0].block_type
+        sources_present = [b.source for b in blocks]
+        extractor_texts = {b.source: b.source_md or b.raw_text for b in blocks}
+
+        entry: dict = {
+            "segment_id": triple.segment_id,
+            "classification": triple.classification,
+            "block_type": block_type,
+            "sources_present": sources_present,
+            "extractor_texts": extractor_texts,
+            "chosen_text": "",
+            "chosen_source": "",
+            "details": {},
+        }
+
+        if triple.classification == AGREE_NEAR:
+            normalized_texts = [b.normalized_text for b in blocks]
+            raw_texts = [b.raw_text for b in blocks]
+            near_pair = None
+            best_score = 0.0
+
+            for i in range(len(blocks)):
+                for j in range(i + 1, len(blocks)):
+                    token_ratio = fuzz.token_set_ratio(
+                        normalized_texts[i], normalized_texts[j],
+                    ) / 100.0
+                    max_len = max(len(normalized_texts[i]), len(normalized_texts[j]), 1)
+                    lev_dist = Levenshtein.distance(
+                        normalized_texts[i], normalized_texts[j],
+                    )
+                    lev_sim = 1.0 - (lev_dist / max_len)
+
+                    if token_ratio >= near_threshold and lev_sim >= levenshtein_threshold:
+                        nums_i = _extract_numeric_tokens(raw_texts[i])
+                        nums_j = _extract_numeric_tokens(raw_texts[j])
+                        cites_i = _extract_citation_keys(raw_texts[i])
+                        cites_j = _extract_citation_keys(raw_texts[j])
+                        if nums_i == nums_j and cites_i == cites_j:
+                            near_pair = (i, j)
+                            best_score = token_ratio
+                            break
+                if near_pair is not None:
+                    break
+
+            preferred_source = _SOURCE_PREFERENCE.get(block_type, "marker")
+            if near_pair is not None:
+                agreeing = [blocks[near_pair[0]], blocks[near_pair[1]]]
+                chosen_source = preferred_source
+                if not any(b.source == preferred_source for b in agreeing):
+                    chosen_source = agreeing[0].source
+                entry["details"] = {
+                    "agreeing_pair": [agreeing[0].source, agreeing[1].source],
+                    "similarity_score": round(best_score, 4),
+                    "source_preference_rule": f"{block_type} \u2192 {preferred_source}",
+                }
+            else:
+                chosen_source = blocks[0].source
+
+            entry["chosen_text"] = triple.agreed_text or ""
+            entry["chosen_source"] = chosen_source
+
+        elif triple.classification == GAP:
+            sole_source = blocks[0].source
+            deduped = not (triple.agreed_text and triple.agreed_text.strip())
+            entry["chosen_text"] = triple.agreed_text or ""
+            entry["chosen_source"] = sole_source
+            entry["details"] = {
+                "sole_source": sole_source,
+                "deduped": deduped,
+            }
+
+        elif triple.classification == CONFLICT:
+            resolved_text = resolved_conflicts.get(triple.segment_id)
+            context_before, context_after = _build_flanking_context(triples, idx)
+
+            if resolved_text is not None:
+                entry["chosen_text"] = resolved_text
+                entry["chosen_source"] = "llm"
+            elif blocks:
+                entry["chosen_text"] = clean_output_md(
+                    blocks[0].source_md or blocks[0].raw_text,
+                )
+                entry["chosen_source"] = blocks[0].source
+
+            entry["details"] = {
+                "context_before": context_before,
+                "context_after": context_after,
+                "llm_resolved": resolved_text is not None,
+            }
+
+        entries.append(entry)
+
+    return entries
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator — Top-level entry point
 # ---------------------------------------------------------------------------
 
@@ -779,7 +1555,7 @@ def merge_with_consensus(
     docling_md: str,
     marker_md: str,
     llm: "LLM",
-) -> tuple[str | None, dict]:
+) -> tuple[str | None, dict, list]:
     """
     Attempt selective LLM merge. Returns (merged_markdown, metrics).
     Returns (None, metrics) if fallback to full-LLM merge is needed.
@@ -792,7 +1568,7 @@ def merge_with_consensus(
     # Validate all 3 inputs
     if not grobid_md or not docling_md or not marker_md:
         metrics = compute_metrics([], 0.0, True, "missing_extractor")
-        return None, metrics
+        return None, metrics, []
 
     # Step 1: Parse and normalize
     logger.info("Consensus pipeline: parsing markdown outputs...")
@@ -849,6 +1625,16 @@ def merge_with_consensus(
         always_escalate_tables=Config.CONSENSUS_ALWAYS_ESCALATE_TABLES,
     )
 
+    # Step 3b: remove near-duplicate GAP blocks (local window)
+    gap_dups_removed = dedup_gap_triples(triples)
+    if gap_dups_removed > 0:
+        logger.info("Consensus pipeline: removed %d local GAP duplicates", gap_dups_removed)
+
+    # Step 3c: remove GAP blocks that duplicate ANY other block (global)
+    gap_cross_removed = dedup_gap_against_all(triples)
+    if gap_cross_removed > 0:
+        logger.info("Consensus pipeline: removed %d cross-class GAP duplicates", gap_cross_removed)
+
     classifications = {}
     for t in triples:
         classifications[t.classification] = classifications.get(t.classification, 0) + 1
@@ -865,7 +1651,7 @@ def merge_with_consensus(
     if should_fallback:
         logger.info("Consensus pipeline: fallback triggered (%s)", fallback_reason)
         metrics = compute_metrics(triples, alignment_confidence, True, fallback_reason)
-        return None, metrics
+        return None, metrics, []
 
     # Step 5: Resolve conflicts via LLM
     conflict_triples = [t for t in triples if t.classification == CONFLICT]
@@ -873,11 +1659,18 @@ def merge_with_consensus(
 
     if conflict_triples:
         logger.info("Consensus pipeline: resolving %d conflicts via LLM...", len(conflict_triples))
+        segment_id_to_index = {t.segment_id: i for i, t in enumerate(triples)}
+
         conflict_bundles = []
         for t in conflict_triples:
+            triple_index = segment_id_to_index[t.segment_id]
+            context_before, context_after = _build_flanking_context(triples, triple_index)
+            present_blocks = _get_present_blocks(t)
             bundle = {
                 "segment_id": t.segment_id,
-                "block_type": _get_present_blocks(t)[0].block_type if _get_present_blocks(t) else "paragraph",
+                "block_type": present_blocks[0].block_type if present_blocks else "paragraph",
+                "context_before": context_before,
+                "context_after": context_after,
                 "grobid": (t.grobid_block.source_md or t.grobid_block.raw_text) if t.grobid_block else "",
                 "docling": (t.docling_block.source_md or t.docling_block.raw_text) if t.docling_block else "",
                 "marker": (t.marker_block.source_md or t.marker_block.raw_text) if t.marker_block else "",
@@ -889,19 +1682,62 @@ def merge_with_consensus(
         except Exception as e:
             logger.warning("Consensus pipeline: LLM conflict resolution failed: %s", e)
             metrics = compute_metrics(triples, alignment_confidence, True, "llm_error")
-            return None, metrics
+            return None, metrics, []
+
+    # Build audit entries (after classification, dedup, and conflict resolution)
+    audit_entries = _build_audit_entries(
+        triples, resolved_conflicts,
+        near_threshold=Config.CONSENSUS_NEAR_THRESHOLD,
+        levenshtein_threshold=Config.CONSENSUS_LEVENSHTEIN_THRESHOLD,
+    )
 
     # Step 6: Assemble
     logger.info("Consensus pipeline: assembling final document...")
     merged_md = assemble(triples, resolved_conflicts)
 
+    # Step 6b: Post-assembly global paragraph dedup (safety net)
+    merged_md, assembled_dups_removed = dedup_assembled_paragraphs(merged_md)
+    if assembled_dups_removed > 0:
+        logger.info(
+            "Consensus pipeline: removed %d post-assembly duplicate paragraphs",
+            assembled_dups_removed,
+        )
+
+    # Step 6c: Header hierarchy resolution (optional)
+    if Config.CONSENSUS_HIERARCHY_ENABLED:
+        try:
+            merged_md = resolve_header_hierarchy(merged_md, llm)
+        except Exception as e:
+            logger.warning("Header hierarchy resolution failed: %s — using original headers", e)
+
+    # Step 7: QA gates (global duplicate detection)
+    qa_results = run_qa_gates(merged_md)
+
     metrics = compute_metrics(triples, alignment_confidence, False, None)
+    metrics["gap_cross_dedup_removed"] = gap_cross_removed
+    metrics["assembled_dedup_removed"] = assembled_dups_removed
+    metrics["qa"] = qa_results
+
+    # Step 8: Fail-hard on surviving global duplicates
+    surviving_dupes = qa_results.get("global_duplicate_count", 0)
+    if surviving_dupes > 0 and Config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES:
+        logger.warning(
+            "Consensus pipeline: %d global duplicates survived both dedup layers "
+            "— triggering fallback (CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES=True)",
+            surviving_dupes,
+        )
+        metrics["fallback_triggered"] = True
+        metrics["fallback_reason"] = "global_duplicates"
+        return None, metrics, audit_entries
+
     logger.info(
         "Consensus pipeline complete: %d blocks, %d conflicts resolved, "
-        "~%d tokens saved",
+        "~%d tokens saved, %d GAP cross-dedup, %d post-assembly dedup",
         metrics["total_blocks"],
         metrics["conflict"],
         metrics["tokens_saved_estimate"],
+        gap_cross_removed,
+        assembled_dups_removed,
     )
 
-    return merged_md, metrics
+    return merged_md, metrics, audit_entries

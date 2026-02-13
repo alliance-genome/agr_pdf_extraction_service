@@ -55,3 +55,9 @@ class Config:
     CONSENSUS_CONFLICT_RATIO_FALLBACK = float(os.environ.get("CONSENSUS_CONFLICT_RATIO_FALLBACK", 0.4))
     CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = float(os.environ.get("CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK", 0.5))
     CONSENSUS_ALWAYS_ESCALATE_TABLES = os.environ.get("CONSENSUS_ALWAYS_ESCALATE_TABLES", "true").lower() == "true"
+    CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = os.environ.get("CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES", "true").lower() == "true"
+
+    # ---- Header hierarchy resolution -----------------------------------------
+    CONSENSUS_HIERARCHY_ENABLED = os.environ.get("CONSENSUS_HIERARCHY_ENABLED", "true").lower() == "true"
+    HIERARCHY_LLM_MODEL = os.environ.get("HIERARCHY_LLM_MODEL", "gpt-5.2")
+    HIERARCHY_LLM_REASONING = os.environ.get("HIERARCHY_LLM_REASONING", "medium")

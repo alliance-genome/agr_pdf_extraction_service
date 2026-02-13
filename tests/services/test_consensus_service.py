@@ -13,6 +13,10 @@ from app.services.consensus_service import (
     _pick_preferred_text,
     _extract_numeric_tokens,
     _extract_citation_keys,
+    clean_output_md,
+    dedup_gap_triples,
+    dedup_gap_against_all,
+    dedup_assembled_paragraphs,
     normalize_text,
     parse_markdown,
     align_blocks,
@@ -21,6 +25,7 @@ from app.services.consensus_service import (
     assemble,
     compute_metrics,
     merge_with_consensus,
+    run_qa_gates,
 )
 
 
@@ -192,6 +197,16 @@ class TestNormalization:
 
     def test_strip_heading_markers(self):
         assert normalize_text("# Methods") == normalize_text("#### Methods")
+
+
+class TestOutputCleaning:
+    def test_clean_output_strips_span_and_comments(self):
+        text = '<span id="page-1-0">Alpha</span> <!-- image --> Beta'
+        assert clean_output_md(text) == "Alpha Beta"
+
+    def test_clean_output_preserves_markdown(self):
+        text = "# Heading\n\n**Bold** [Link](https://example.com) ![img](fig.png)"
+        assert clean_output_md(text) == text
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +583,62 @@ class TestAssembly:
         assert "Resolved A" in result
         assert "Resolved B" in result
 
+    def test_assembly_cleans_non_llm_segments(self):
+        triples = [
+            AlignedTriple(
+                segment_id="seg_000",
+                classification=AGREE_EXACT,
+                agreed_text='<span id="page-1-0">Alpha</span>',
+            ),
+            AlignedTriple(
+                segment_id="seg_001",
+                classification=CONFLICT,
+            ),
+        ]
+        result = assemble(triples, {"seg_001": "Resolved text"})
+        assert "<span" not in result
+        assert "Alpha" in result
+        assert "Resolved text" in result
+
+
+class TestGapDedup:
+    def test_dedup_gap_triples_drops_shorter_duplicate(self):
+        triples = [
+            AlignedTriple(
+                segment_id="seg_000",
+                classification=GAP,
+                agreed_text="Gill Institute for Neuroscience and Department of Biology, IU.",
+            ),
+            AlignedTriple(
+                segment_id="seg_001",
+                classification=AGREE_EXACT,
+                agreed_text="## Methods",
+            ),
+            AlignedTriple(
+                segment_id="seg_002",
+                classification=GAP,
+                agreed_text="Gill Institute for Neuroscience and Department of Biology.",
+            ),
+        ]
+
+        removed = dedup_gap_triples(triples, window=3, similarity_threshold=0.85, length_ratio_threshold=0.7)
+        assert removed == 1
+        assert sum(1 for t in triples if t.classification == GAP and t.agreed_text) == 1
+
+
+class TestQAGates:
+    def test_run_qa_gates_detects_artifacts_and_duplicates(self):
+        merged = (
+            '<span id="page-0-1"></span>Repeated paragraph content that is definitely longer than fifty chars.\n\n'
+            "Repeated paragraph content that is definitely longer than fifty chars.\n\n"
+            "<!-- image -->"
+        )
+        qa = run_qa_gates(merged)
+        assert qa["span_tag_count"] >= 1
+        assert qa["html_comment_count"] >= 1
+        assert qa["global_duplicate_count"] >= 1
+        assert qa["qa_passed"] is False
+
 
 # ---------------------------------------------------------------------------
 # Metrics tests
@@ -607,7 +678,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
 
         llm = MagicMock()
-        result, metrics = merge_with_consensus("grobid", "", "marker", llm)
+        result, metrics, _audit = merge_with_consensus("grobid", "", "marker", llm)
         assert result is None
         assert metrics["fallback_triggered"] is True
         assert metrics["fallback_reason"] == "missing_extractor"
@@ -620,7 +691,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
 
         llm = MagicMock()
-        result, metrics = merge_with_consensus("grobid", None, "marker", llm)
+        result, metrics, _audit = merge_with_consensus("grobid", None, "marker", llm)
         assert result is None
         assert metrics["fallback_reason"] == "missing_extractor"
 
@@ -636,12 +707,13 @@ class TestMergeWithConsensus:
 
         # Use identical text so everything agrees
         md = "# Title\n\nThis is the body text of the paper."
-        result, metrics = merge_with_consensus(md, md, md, llm)
+        result, metrics, _audit = merge_with_consensus(md, md, md, llm)
 
         assert result is not None
         assert "Title" in result
         assert "body text" in result
         assert metrics["fallback_triggered"] is False
+        assert metrics["qa"]["qa_passed"] is True
         # LLM should NOT have been called for conflict resolution
         llm.resolve_conflicts.assert_not_called()
 
@@ -662,10 +734,13 @@ class TestMergeWithConsensus:
 
         # Mock resolve_conflicts to return resolved text for any segment
         def mock_resolve(conflicts):
+            for c in conflicts:
+                assert "context_before" in c
+                assert "context_after" in c
             return {c["segment_id"]: "The accuracy was 95.5%." for c in conflicts}
         llm.resolve_conflicts.side_effect = mock_resolve
 
-        result, metrics = merge_with_consensus(md_a, md_b, md_c, llm)
+        result, metrics, _audit = merge_with_consensus(md_a, md_b, md_c, llm)
 
         if result is not None:
             # Pipeline succeeded with conflict resolution
@@ -690,7 +765,7 @@ class TestMergeWithConsensus:
         md_b = "# Title\n\nThe accuracy was 96%."
         md_c = "# Title\n\nThe accuracy was 97%."
 
-        result, metrics = merge_with_consensus(md_a, md_b, md_c, llm)
+        result, metrics, _audit = merge_with_consensus(md_a, md_b, md_c, llm)
 
         # Should return fallback due to LLM error
         # (only if there were conflicts that needed resolution)
@@ -708,7 +783,7 @@ class TestMergeWithConsensus:
 
         llm = MagicMock()
         md = "# Title\n\nIdentical text in all three extractors."
-        result, metrics = merge_with_consensus(md, md, md, llm)
+        result, metrics, _audit = merge_with_consensus(md, md, md, llm)
 
         if result is not None:
             assert metrics["tokens_saved_estimate"] > 0
@@ -731,7 +806,7 @@ class TestMergeWithConsensus:
         marker_md = f"# Title\n\n{shared_blocks}"
 
         with caplog.at_level("WARNING"):
-            result, metrics = merge_with_consensus(grobid_md, docling_md, marker_md, llm)
+            result, metrics, _audit = merge_with_consensus(grobid_md, docling_md, marker_md, llm)
 
         assert result is not None
         assert metrics["fallback_triggered"] is False
@@ -821,9 +896,231 @@ class TestMarkdownPreservation:
 
         llm = MagicMock()
         md = "# Title\n\n## Methods\n\nBody text of the methods section."
-        result, metrics = merge_with_consensus(md, md, md, llm)
+        result, metrics, _audit = merge_with_consensus(md, md, md, llm)
 
         assert result is not None
         assert "# Title" in result
         assert "## Methods" in result
+        assert metrics["fallback_triggered"] is False
+
+
+# ---------------------------------------------------------------------------
+# Global dedup: dedup_gap_against_all tests
+# ---------------------------------------------------------------------------
+
+class TestGlobalGapDedup:
+    def _make_triple(self, seg_id, classification, agreed_text,
+                     block_type="paragraph", source="grobid"):
+        t = AlignedTriple(segment_id=seg_id, classification=classification)
+        if agreed_text is not None:
+            t.agreed_text = agreed_text
+            block = Block(
+                block_id=f"{source}_{seg_id}",
+                block_type=block_type,
+                raw_text=agreed_text,
+                normalized_text=normalize_text(agreed_text),
+                heading_level=1 if block_type == "heading" else None,
+                order_index=0,
+                source=source,
+            )
+            setattr(t, f"{source}_block", block)
+        return t
+
+    def test_dedup_gap_against_all_drops_contained_fragment(self):
+        """GAP block whose text is a substring of an AGREE block gets blanked."""
+        long_text = (
+            "Proteomics relates the abundances of proteins to other biomolecules "
+            "such as lipids or DNA and facilitates systems biology modeling of "
+            "chemical processes underlying development and metabolism."
+        )
+        fragment = (
+            "as lipids or DNA and facilitates systems biology modeling of "
+            "chemical processes underlying development and metabolism."
+        )
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, long_text),
+            self._make_triple("seg_001", AGREE_EXACT, "## Methods", block_type="heading"),
+            self._make_triple("seg_002", AGREE_NEAR, "Some other unique paragraph content here that is different."),
+            # ... many blocks apart ...
+            self._make_triple("seg_010", GAP, fragment, source="docling"),
+        ]
+        removed = dedup_gap_against_all(triples)
+        assert removed == 1
+        assert triples[3].agreed_text == ""  # the GAP fragment is blanked
+
+    def test_dedup_gap_against_all_drops_near_equal_far_apart(self):
+        """Two blocks far apart with high similarity — GAP gets blanked."""
+        text_a = (
+            "Opsin is amongst the three most abundant proteins we have quantified "
+            "with an amount of 266 plus-minus 51 fmoles per eye in wild-type flies."
+        )
+        text_b = (
+            "Opsin is amongst the three most abundant proteins we have quantified "
+            "with an amount of 266 plus-minus 51 fmoles per eye in wild-type flies. "
+            "This represents a substantial fraction of the total retinal protein pool."
+        )
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, text_b),
+            # Many blocks in between
+            self._make_triple("seg_001", AGREE_EXACT, "Filler paragraph with unique content number one."),
+            self._make_triple("seg_002", AGREE_EXACT, "Filler paragraph with unique content number two."),
+            self._make_triple("seg_003", AGREE_EXACT, "Filler paragraph with unique content number three."),
+            self._make_triple("seg_020", GAP, text_a, source="marker"),
+        ]
+        removed = dedup_gap_against_all(triples)
+        assert removed == 1
+        assert triples[4].agreed_text == ""
+
+    def test_dedup_gap_against_all_preserves_unique_gap(self):
+        """GAP block with genuinely unique content is NOT removed."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, "The first paragraph about protein quantification methods used in this study."),
+            self._make_triple("seg_001", GAP, "This is completely unique content from only one extractor about a different topic entirely.", source="docling"),
+        ]
+        removed = dedup_gap_against_all(triples)
+        assert removed == 0
+        assert triples[1].agreed_text != ""
+
+    def test_dedup_gap_against_all_skips_headings(self):
+        """Heading-type GAP blocks are not deduplicated even if text overlaps."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, "Methods section describing the experimental approach used in great detail."),
+            self._make_triple("seg_001", GAP, "## Methods", block_type="heading", source="docling"),
+        ]
+        removed = dedup_gap_against_all(triples)
+        assert removed == 0
+        assert triples[1].agreed_text == "## Methods"
+
+
+# ---------------------------------------------------------------------------
+# Global dedup: dedup_assembled_paragraphs tests
+# ---------------------------------------------------------------------------
+
+class TestAssembledDedup:
+    def test_dedup_assembled_drops_non_adjacent_duplicate(self):
+        """Post-assembly dedup catches non-adjacent duplicates."""
+        text = (
+            "# Introduction\n\n"
+            "Proteomics relates the abundances of proteins to other biomolecules "
+            "such as lipids or DNA and facilitates systems biology modeling.\n\n"
+            "## Methods\n\n"
+            "We used mass spectrometry to analyze protein samples from Drosophila eyes.\n\n"
+            "## Results\n\n"
+            "Proteomics relates the abundances of proteins to other biomolecules "
+            "such as lipids or DNA and facilitates systems biology modeling.\n\n"
+            "## Discussion\n\n"
+            "The findings demonstrate the value of quantitative proteomics approaches."
+        )
+        cleaned, removed = dedup_assembled_paragraphs(text)
+        assert removed == 1
+        # The duplicate paragraph should appear only once
+        assert cleaned.count("Proteomics relates the abundances") == 1
+        # Headings should be preserved
+        assert "# Introduction" in cleaned
+        assert "## Methods" in cleaned
+        assert "## Results" in cleaned
+        assert "## Discussion" in cleaned
+
+    def test_dedup_assembled_preserves_headings(self):
+        """Headings are not stripped by post-assembly dedup even if similar."""
+        text = (
+            "# Methods\n\n"
+            "The methods section describes the experimental approach.\n\n"
+            "## Methods\n\n"
+            "A different paragraph about something entirely unrelated to the heading above."
+        )
+        cleaned, removed = dedup_assembled_paragraphs(text)
+        assert removed == 0
+        assert "# Methods" in cleaned
+        assert "## Methods" in cleaned
+
+
+# ---------------------------------------------------------------------------
+# Global dedup: QA gates global detection tests
+# ---------------------------------------------------------------------------
+
+class TestQAGatesGlobal:
+    def test_qa_gates_global_duplicate_detection(self):
+        """QA catches global (not just adjacent) duplicates."""
+        merged = (
+            "First unique paragraph that is definitely longer than fifty characters for testing.\n\n"
+            "## Section Header\n\n"
+            "Second unique paragraph that is also long enough to qualify for comparison.\n\n"
+            "Some middle content that separates the duplicate paragraphs significantly.\n\n"
+            "First unique paragraph that is definitely longer than fifty characters for testing."
+        )
+        qa = run_qa_gates(merged)
+        assert qa["global_duplicate_count"] >= 1
+        assert qa["qa_passed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Global dedup: fail-hard pipeline tests
+# ---------------------------------------------------------------------------
+
+class TestFailHardDedup:
+    @patch("config.Config")
+    def test_fail_hard_on_surviving_duplicates(self, mock_config):
+        """Pipeline returns None when dupes survive both layers and flag is True."""
+        mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
+        mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
+        mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1
+        mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
+        mock_config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = True
+
+        llm = MagicMock()
+
+        # Craft inputs where a near-duplicate sneaks through from two different
+        # extractors but with just enough variation in the surrounding context
+        # that dedup layers don't catch it.  We mock dedup_assembled_paragraphs
+        # to simulate duplicates surviving.
+        md = "# Title\n\nBody text of the paper for testing."
+        with patch(
+            "app.services.consensus_service.dedup_assembled_paragraphs",
+            return_value=("# Title\n\nBody text of the paper for testing.", 0),
+        ), patch(
+            "app.services.consensus_service.run_qa_gates",
+            return_value={
+                "span_tag_count": 0,
+                "html_comment_count": 0,
+                "global_duplicate_count": 2,
+                "qa_passed": False,
+            },
+        ):
+            result, metrics, _audit = merge_with_consensus(md, md, md, llm)
+
+        assert result is None
+        assert metrics["fallback_triggered"] is True
+        assert metrics["fallback_reason"] == "global_duplicates"
+
+    @patch("config.Config")
+    def test_fail_hard_disabled_returns_result(self, mock_config):
+        """Pipeline returns result when flag is False despite dupes in QA."""
+        mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
+        mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
+        mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1
+        mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
+        mock_config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = False
+
+        llm = MagicMock()
+
+        md = "# Title\n\nBody text of the paper for testing."
+        with patch(
+            "app.services.consensus_service.dedup_assembled_paragraphs",
+            return_value=("# Title\n\nBody text of the paper for testing.", 0),
+        ), patch(
+            "app.services.consensus_service.run_qa_gates",
+            return_value={
+                "span_tag_count": 0,
+                "html_comment_count": 0,
+                "global_duplicate_count": 2,
+                "qa_passed": False,
+            },
+        ):
+            result, metrics, _audit = merge_with_consensus(md, md, md, llm)
+
+        # With flag False, pipeline should return the result despite dupes
+        assert result is not None
         assert metrics["fallback_triggered"] is False

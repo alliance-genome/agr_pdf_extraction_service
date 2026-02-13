@@ -45,7 +45,7 @@ def process_pdf():
 
     VALID_METHODS = {"grobid", "docling", "marker"}
     selected_methods = request.form.getlist("methods")
-    merge_enabled = request.form.get("merge") == "on"
+    merge_enabled = request.form.get("merge", "on") in ("on", "true", "1")
 
     if not selected_methods:
         return jsonify({"error": "Please select at least one extraction method"}), 400
@@ -148,7 +148,7 @@ def process_pdf():
                 if (cfg.get("CONSENSUS_ENABLED", True)
                         and grobid_text and docling_text and marker_text):
                     try:
-                        consensus_md, metrics = merge_with_consensus(
+                        consensus_md, metrics, _audit = merge_with_consensus(
                             grobid_text, docling_text, marker_text, llm,
                         )
                         if consensus_md is not None:
