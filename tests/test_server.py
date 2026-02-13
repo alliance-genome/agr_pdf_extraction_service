@@ -91,7 +91,7 @@ def test_process_pdf_grobid(
     assert json_data["status"] == "success"
     assert "GROBID" in json_data["methods_used"]
 
-@patch('app.server.merge_with_consensus', return_value=(None, {"fallback_triggered": True}))
+@patch('app.server.merge_with_consensus', return_value=(None, {"fallback_triggered": True}, []))
 @patch('app.server.Grobid')
 @patch('app.server.Docling')
 @patch('app.server.Marker')

@@ -353,7 +353,7 @@ def submit_extraction():
         return jsonify({"error": f"Invalid methods: {', '.join(invalid)}. "
                         f"Valid: {', '.join(sorted(VALID_METHODS))}"}), 400
 
-    merge = request.form.get("merge", "false").lower() in ("true", "1", "on")
+    merge = request.form.get("merge", "true").lower() in ("true", "1", "on")
     reference_curie = request.form.get("reference_curie")
     mod_abbreviation = request.form.get("mod_abbreviation")
 
@@ -588,7 +588,7 @@ def download_result(process_id, method):
     The method can be 'grobid', 'docling', 'marker', or 'merged'.
     Tries local cache first, falls back to S3 artifact if cache is missing.
     """
-    if method not in (*VALID_METHODS, "merged"):
+    if method not in (*VALID_METHODS, "merged", "audit"):
         return jsonify({"error": f"Invalid method: {method}"}), 400
 
     from celery_app import celery
@@ -607,15 +607,23 @@ def download_result(process_id, method):
                 methods_used = data.get("methods_used", [])
                 cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(methods_used))}"
                 filepath = os.path.join(current_app.config["CACHE_FOLDER"], f"{cache_key}_merged.md")
+        elif method == "audit":
+            filepath = download_paths.get("audit")
         else:
             filepath = download_paths.get(method)
 
         if filepath and os.path.exists(filepath):
+            if method == "audit":
+                download_name = f"{file_hash}_audit.json"
+                mimetype = "application/json"
+            else:
+                download_name = f"{file_hash}_{method}.md"
+                mimetype = "text/markdown"
             return send_file(
                 filepath,
                 as_attachment=True,
-                download_name=f"{file_hash}_{method}.md",
-                mimetype="text/markdown",
+                download_name=download_name,
+                mimetype=mimetype,
             )
 
     # Fallback: look up S3 artifact from DB

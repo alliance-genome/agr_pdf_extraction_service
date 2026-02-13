@@ -1,12 +1,13 @@
 import os
 import uuid
 import time
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import setup_logging as celery_setup_logging, worker_process_init
 
 from config import Config
 from app.models import ExtractionRun, get_session
@@ -16,10 +17,19 @@ from app.logging_config import setup_logging, MergingLoggerAdapter
 logger = logging.getLogger(__name__)
 
 
+@celery_setup_logging.connect
+def _configure_celery_logging(**kwargs):
+    """Take over Celery's logging so ALL messages go through our GELF handler.
+
+    Connecting to this signal prevents Celery from setting up its own logging.
+    This ensures the GELF 'host' field is 'pdfx-worker' from the very first message.
+    """
+    setup_logging(component="worker")
+
+
 @worker_process_init.connect
 def _init_worker_process(**kwargs):
     """Configure torch threading and GPU once per forked worker process."""
-    setup_logging(component="worker")
     try:
         import torch
         num_threads = int(os.environ.get("OMP_NUM_THREADS", 8))
@@ -689,6 +699,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
 
     merged_md = None
     merged_cache_path = None
+    audit_cache_path = None
     consensus_metrics = None
     if merge and extractions:
         if not Config.OPENAI_API_KEY:
@@ -704,6 +715,9 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
             _safe_log_event(audit_logger, stage, "cache_hit", detail="Using cached merged output")
             with open(merged_cache_path, "r", encoding="utf-8") as f:
                 merged_md = f.read()
+            possible_audit = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_audit.json")
+            if os.path.exists(possible_audit):
+                audit_cache_path = possible_audit
         else:
             self.update_state(state="PROGRESS", meta={
                 "step": "llm_merge", "current": len(methods_used), "total": total_steps
@@ -728,11 +742,17 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                     from app.services.consensus_service import merge_with_consensus
                     log.info("Attempting consensus merge...")
                     try:
-                        consensus_md, consensus_metrics = merge_with_consensus(
+                        consensus_md, consensus_metrics, consensus_audit = merge_with_consensus(
                             grobid_text, docling_text, marker_text, llm,
                         )
                         if consensus_md is not None:
                             merged_md = consensus_md
+                            if consensus_audit:
+                                audit_cache_path = os.path.join(
+                                    Config.CACHE_FOLDER, f"{cache_key}_audit.json",
+                                )
+                                with open(audit_cache_path, "w", encoding="utf-8") as f:
+                                    json.dump(consensus_audit, f, indent=2, ensure_ascii=False)
                             log.info(
                                 "Consensus merge succeeded",
                                 extra={
@@ -765,6 +785,14 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                 if merged_md is None:
                     log.info("Merging outputs with full-LLM merge...")
                     merged_md = llm.extract(grobid_text, docling_text, marker_text)
+
+                    # Apply header hierarchy resolution to full-LLM output too
+                    if Config.CONSENSUS_HIERARCHY_ENABLED and merged_md:
+                        try:
+                            from app.services.consensus_service import resolve_header_hierarchy
+                            merged_md = resolve_header_hierarchy(merged_md, llm)
+                        except Exception as e:
+                            log.warning("Header hierarchy resolution failed on fallback path: %s", e)
 
                 with open(merged_cache_path, "w", encoding="utf-8") as f:
                     f.write(merged_md)
@@ -812,5 +840,8 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
 
     if consensus_metrics is not None:
         result["consensus_metrics"] = consensus_metrics
+
+    if audit_cache_path:
+        result["download_paths"]["audit"] = audit_cache_path
 
     return result

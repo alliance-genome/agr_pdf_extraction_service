@@ -8,6 +8,7 @@ marker-pdf
 
 # LLM
 openai
+pydantic>=2.0
 
 # Consensus pipeline
 mistune
