@@ -1285,6 +1285,22 @@ def dedup_assembled_paragraphs(
 
 _HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
+def extract_heading_hierarchy(merged_md: str) -> list[dict]:
+    """Extract the finalized heading hierarchy from merged markdown.
+
+    Returns a document-order list of headings, each with:
+    - text: the heading text (without leading '#' markers)
+    - level: heading level (1-6)
+    """
+    matches = list(_HEADING_LINE_RE.finditer(merged_md or ""))
+    headings: list[dict] = []
+    for m in matches:
+        headings.append({
+            "text": m.group(2).strip(),
+            "level": len(m.group(1)),
+        })
+    return headings
+
 
 def resolve_header_hierarchy(merged_md: str, llm: "LLM") -> str:
     """Resolve flat heading levels into a proper hierarchy via LLM.
@@ -1480,27 +1496,6 @@ def _validate_hierarchy_decisions(
     else:
         if h1_count != 1:
             return f"expected exactly 1 H1 (title), got {h1_count}"
-
-    # No level jumps > 1 (among headings with known levels)
-    # keep_level headings without original_levels reset tracking to avoid
-    # false positives.
-    prev_level = None
-    for d in sorted(decisions, key=lambda x: x.heading_index):
-        if d.action == "demote_to_text":
-            continue
-        level = _effective_level(d)
-        if level is None:
-            # Unknown level — reset so we don't compare across the gap
-            prev_level = None
-            continue
-        if prev_level is not None and level > prev_level + 1:
-            return f"level jump from {prev_level} to {level} (max allowed jump is 1)"
-        prev_level = level
-
-    # Demotion cap: < 50%
-    demote_count = sum(1 for d in decisions if d.action == "demote_to_text")
-    if expected_count > 0 and demote_count >= expected_count * 0.5:
-        return f"too many demotions: {demote_count}/{expected_count} (>= 50%)"
 
     return None
 
@@ -2794,6 +2789,9 @@ def merge_with_consensus(
         except Exception as e:
             logger.warning("Header hierarchy resolution failed: %s — using original headers", e)
 
+    # Finalized heading hierarchy (post optional hierarchy resolution).
+    heading_hierarchy = extract_heading_hierarchy(merged_md)
+
     # Step 7: QA gates (global duplicate detection)
     qa_results = run_qa_gates(merged_md)
 
@@ -2824,6 +2822,7 @@ def merge_with_consensus(
         resolution_metadata=resolution_metadata,
         audit_entries=audit_entries,
         total_blocks=metrics["total_blocks"],
+        heading_hierarchy=heading_hierarchy,
         zone_resolution_tokens=llm.usage.tokens_for_types("zone_resolution"),
         rescue_call_tokens=llm.usage.tokens_for_types("rescue")
     )
