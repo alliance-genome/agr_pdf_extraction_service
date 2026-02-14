@@ -1033,125 +1033,6 @@ def dedup_gap_triples(
     return removed
 
 
-def dedup_gap_against_all(
-    triples: list[AlignedTriple],
-    similarity_threshold: float = 0.85,
-    partial_threshold: float = 0.90,
-    length_ratio_cap: float = 0.7,
-    min_text_len: int = 50,
-) -> int:
-    """Remove GAP blocks that duplicate content from ANY other block.
-
-    Unlike ``dedup_gap_triples`` (which only checks GAP-vs-GAP within a
-    local window), this function compares every GAP block against ALL other
-    blocks regardless of classification or distance.  Two checks:
-
-    1. **Near-equal**: ``token_set_ratio > similarity_threshold``
-    2. **Containment**: ``partial_ratio > partial_threshold`` AND the shorter
-       normalised text is less than ``length_ratio_cap`` × the longer one.
-
-    Headings (``block_type == "heading"``) and very short texts are skipped
-    to avoid false positives.
-    """
-    removed = 0
-
-    # Pre-build candidate texts from all non-empty triples.
-    # Each entry: (index, normalised_text, is_gap, raw_text)
-    # NOTE: CONFLICT triples are excluded — their text is provisional
-    # (not yet LLM-resolved) and comparing against it could wrongly
-    # remove valid GAP content.
-    candidates: list[tuple[int, str, bool, str]] = []
-    for idx, t in enumerate(triples):
-        if t.classification == CONFLICT:
-            continue  # skip unresolved conflicts
-        text = t.agreed_text
-        if not text or not text.strip():
-            continue
-        norm = normalize_text(text)
-        if not norm or len(norm) < min_text_len:
-            continue
-        # Skip headings
-        blocks = _get_present_blocks(t)
-        if blocks and all(b.block_type == "heading" for b in blocks):
-            continue
-        if not blocks and text.lstrip().startswith("#"):
-            continue
-        candidates.append((idx, norm, t.classification == GAP, text))
-
-    # For each GAP candidate, check against every other candidate.
-    gap_indices_to_blank: set[int] = set()
-    for c_idx, (triple_idx, gap_norm, is_gap, gap_raw) in enumerate(candidates):
-        if not is_gap:
-            continue
-        if triple_idx in gap_indices_to_blank:
-            continue
-
-        for o_idx, (other_triple_idx, other_norm, other_is_gap, other_raw) in enumerate(candidates):
-            if c_idx == o_idx:
-                continue
-            if other_triple_idx in gap_indices_to_blank:
-                continue
-
-            # Near-equal check
-            tsr = fuzz.token_set_ratio(gap_norm, other_norm) / 100.0
-            near_equal_match = False
-            if tsr >= similarity_threshold:
-                # Numeric/citation guardrail: for containment (subset),
-                # allow if shorter's values are a subset of longer's.
-                gap_nums = _extract_numeric_tokens(gap_raw)
-                other_nums = _extract_numeric_tokens(other_raw)
-                gap_cites = _extract_citation_keys(gap_raw)
-                other_cites = _extract_citation_keys(other_raw)
-                shorter_nums = gap_nums if len(gap_norm) <= len(other_norm) else other_nums
-                longer_nums = other_nums if len(gap_norm) <= len(other_norm) else gap_nums
-                shorter_cites = gap_cites if len(gap_norm) <= len(other_norm) else other_cites
-                longer_cites = other_cites if len(gap_norm) <= len(other_norm) else gap_cites
-                if shorter_nums.issubset(longer_nums) and shorter_cites.issubset(longer_cites):
-                    near_equal_match = True
-                elif gap_nums == other_nums and gap_cites == other_cites:
-                    near_equal_match = True
-
-            if near_equal_match:
-                # GAP vs non-GAP: always blank the GAP regardless of length
-                if not other_is_gap:
-                    gap_indices_to_blank.add(triple_idx)
-                    break
-                # GAP vs GAP: drop the shorter one
-                if len(gap_norm) <= len(other_norm):
-                    gap_indices_to_blank.add(triple_idx)
-                    break
-                gap_indices_to_blank.add(other_triple_idx)
-                continue
-
-            # Containment check: is the GAP a fragment of the other?
-            shorter, longer = (gap_norm, other_norm) if len(gap_norm) <= len(other_norm) else (other_norm, gap_norm)
-            if len(shorter) < len(longer) * length_ratio_cap:
-                pr = fuzz.partial_ratio(shorter, longer) / 100.0
-                if pr >= partial_threshold:
-                    # GAP vs non-GAP: always blank the GAP
-                    if not other_is_gap:
-                        gap_indices_to_blank.add(triple_idx)
-                        break
-                    # GAP vs GAP: drop the shorter side
-                    if len(gap_norm) <= len(other_norm):
-                        gap_indices_to_blank.add(triple_idx)
-                        break
-                    gap_indices_to_blank.add(other_triple_idx)
-
-    # Blank the identified duplicates
-    for idx in gap_indices_to_blank:
-        t = triples[idx]
-        logger.info(
-            "Global GAP dedup: dropping %s (text=%.60s...)",
-            t.segment_id,
-            (t.agreed_text or "")[:60],
-        )
-        t.agreed_text = ""
-        removed += 1
-
-    return removed
-
-
 # ---------------------------------------------------------------------------
 # Step 5: ASSEMBLE — Build final merged markdown
 # ---------------------------------------------------------------------------
@@ -2535,11 +2416,6 @@ def merge_with_consensus(
     gap_dups_removed = dedup_gap_triples(triples)
     if gap_dups_removed > 0:
         logger.info("Consensus pipeline: removed %d local GAP duplicates", gap_dups_removed)
-
-    # Step 3c: remove GAP blocks that duplicate ANY other block (global)
-    gap_cross_removed = dedup_gap_against_all(triples)
-    if gap_cross_removed > 0:
-        logger.info("Consensus pipeline: removed %d cross-class GAP duplicates", gap_cross_removed)
 
     classifications = {}
     classifications_by_type = {}
