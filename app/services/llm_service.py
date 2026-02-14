@@ -931,8 +931,6 @@ class LLM(PDFExtractor):
             "STRUCTURAL RULES:\n"
             "- Either exactly one heading gets level 1, OR zero headings get level 1 "
             "and detected_title is set (the title will be inserted separately).\n"
-            "- No level jumps > 1 (e.g., going from level 2 to level 4 "
-            "without a level 3 in between is invalid).\n"
             "- Return a decision for EVERY heading in the input, in the same order."
         )
 

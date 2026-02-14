@@ -8,8 +8,8 @@ the consensus pipeline already produces.
 from __future__ import annotations
 
 import math
+import re
 import statistics
-from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------------------
@@ -57,26 +57,6 @@ METHOD_QUALITY_WEIGHT: dict[str, float] = {
     "llm_conflict_fallback_best_source": 0.40,
     "llm_near_agree_fallback_best_source": 0.40,
 }
-
-# Section keywords used for heuristic section detection.
-SECTION_KEYWORDS: dict[str, list[str]] = {
-    "abstract": ["abstract", "summary"],
-    "introduction": ["introduction", "background"],
-    "methods": ["methods", "materials", "experimental", "procedures",
-                "methodology", "subjects"],
-    "results": ["results", "findings", "observations"],
-    "discussion": ["discussion", "interpretation"],
-    "conclusion": ["conclusion", "concluding"],
-    "references": ["references", "bibliography", "literature cited",
-                    "works cited"],
-    "front_matter": ["author", "affiliation", "correspondence",
-                     "keyword", "abbreviation", "funding",
-                     "acknowledgment", "acknowledgement"],
-}
-
-# Sections where degradation matters most.
-CRITICAL_SECTIONS = {"abstract", "results", "methods"}
-
 
 # ---------------------------------------------------------------------------
 # Quality score computation
@@ -137,41 +117,6 @@ def quality_grade(score: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Section detection heuristic
-# ---------------------------------------------------------------------------
-
-def _detect_section(
-    segment_id: str,
-    triples: list,
-    seg_id_to_idx: dict[str, int],
-) -> str:
-    """Guess which paper section a segment belongs to by scanning
-    preceding headings.
-
-    Walks backwards from the segment looking for the nearest heading
-    block, then matches heading text against SECTION_KEYWORDS.
-    Returns the section name or "unknown".
-    """
-    idx = seg_id_to_idx.get(segment_id)
-    if idx is None:
-        return "unknown"
-
-    for i in range(idx, -1, -1):
-        triple = triples[i]
-        for attr in ("grobid_block", "docling_block", "marker_block"):
-            block = getattr(triple, attr, None)
-            if block is not None and block.block_type == "heading":
-                heading_text = (block.raw_text or "").lower().strip().lstrip("#").strip()
-                for section, keywords in SECTION_KEYWORDS.items():
-                    for kw in keywords:
-                        if kw in heading_text:
-                            return section
-                break
-
-    return "unknown"
-
-
-# ---------------------------------------------------------------------------
 # Confidence distribution computation
 # ---------------------------------------------------------------------------
 
@@ -223,11 +168,60 @@ def _compute_confidence_distribution(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+_WS_RE = re.compile(r"\s+")
+
+def _norm_heading_text(text: str) -> str:
+    return _WS_RE.sub(" ", (text or "")).strip().lower()
+
+
+def _get_present_blocks(triple) -> list:
+    blocks = []
+    for attr in ("grobid_block", "docling_block", "marker_block"):
+        b = getattr(triple, attr, None)
+        if b is not None:
+            blocks.append(b)
+    return blocks
+
+
+def _build_heading_labels(heading_hierarchy: list[dict]) -> list[dict]:
+    """Build hierarchical labels from a resolved heading list.
+
+    Each returned entry includes:
+    - text: heading text
+    - level: heading level (1-6)
+    - label: hierarchical path label using resolved levels, e.g.
+             "Materials and Methods > RNA Extraction"
+    """
+    stack: list[tuple[str, int]] = []
+    labeled: list[dict] = []
+
+    for h in (heading_hierarchy or []):
+        text = (h.get("text") or "").strip()
+        level = int(h.get("level") or 0)
+        if not text or level < 1 or level > 6:
+            continue
+
+        while stack and stack[-1][1] >= level:
+            stack.pop()
+        stack.append((text, level))
+        label = " > ".join(t for t, _lvl in stack)
+
+        labeled.append({
+            "text": text,
+            "level": level,
+            "label": label,
+            "norm_text": _norm_heading_text(text),
+        })
+
+    return labeled
+
+
 def build_degradation_metrics(
     triples: list,
     resolution_metadata: dict[str, dict],
     audit_entries: list[dict],
     total_blocks: int,
+    heading_hierarchy: list[dict],
     zone_resolution_tokens: int = 0,
     rescue_call_tokens: int = 0,
 ) -> dict:
@@ -246,6 +240,9 @@ def build_degradation_metrics(
         audit_entries: The list of per-segment audit dicts from
             _build_audit_entries().
         total_blocks: Total number of aligned triples (including AGREE_EXACT).
+        heading_hierarchy: Finalized heading list (text + level) extracted from
+            the post-hierarchy merged markdown. Section risk is computed from
+            this resolved hierarchy, not keyword guessing.
         zone_resolution_tokens: Total tokens used by zone LLM calls.
         rescue_call_tokens: Total tokens used by rescue LLM calls.
 
@@ -255,10 +252,36 @@ def build_degradation_metrics(
     """
     metadata = resolution_metadata or {}
 
-    # --- Build index helpers ---
-    seg_id_to_idx: dict[str, int] = {}
-    for i, t in enumerate(triples):
-        seg_id_to_idx[t.segment_id] = i
+    # --- Section assignment from resolved heading hierarchy ---
+    resolved_headings = _build_heading_labels(heading_hierarchy)
+    resolved_cursor = 0
+    current_section_label: str | None = None
+    current_section_level: int | None = None
+
+    seg_to_section: dict[str, str | None] = {}
+    seg_to_section_level: dict[str, int | None] = {}
+
+    for t in triples:
+        blocks = _get_present_blocks(t)
+        heading_block = next((b for b in blocks if getattr(b, "block_type", "") == "heading"), None)
+
+        if heading_block is not None:
+            candidate = _norm_heading_text(getattr(heading_block, "raw_text", "") or "")
+            matched = False
+            for i in range(resolved_cursor, len(resolved_headings)):
+                if resolved_headings[i]["norm_text"] == candidate:
+                    current_section_label = resolved_headings[i]["label"]
+                    current_section_level = resolved_headings[i]["level"]
+                    resolved_cursor = i + 1
+                    matched = True
+                    break
+            # Heading segments themselves are not counted toward section totals.
+            if not matched:
+                continue
+            continue
+
+        seg_to_section[t.segment_id] = current_section_label
+        seg_to_section_level[t.segment_id] = current_section_level
 
     # --- Quality score ---
     q_score = compute_quality_score(total_blocks, metadata)
@@ -322,7 +345,8 @@ def build_degradation_metrics(
             {},
         )
         block_type = audit_entry.get("block_type", "unknown")
-        section_hint = _detect_section(seg_id, triples, seg_id_to_idx)
+        section_label = seg_to_section.get(seg_id)
+        section_level = seg_to_section_level.get(seg_id)
 
         chosen_text = audit_entry.get("chosen_text", "")
         text_len = len(chosen_text) if chosen_text else 0
@@ -331,7 +355,8 @@ def build_degradation_metrics(
             "segment_id": seg_id,
             "zone_id": meta.get("zone_id", ""),
             "block_type": block_type,
-            "section_hint": section_hint,
+            "section_heading": section_label,
+            "section_heading_level": section_level,
             "method": meta.get("method", ""),
             "chosen_source": meta.get("chosen_source", ""),
             "confidence": round(meta.get("confidence", 0.0), 4),
@@ -385,22 +410,23 @@ def build_degradation_metrics(
     # --- Section risk ---
     section_total: dict[str, int] = {}
     section_degraded: dict[str, int] = {}
+    section_level: dict[str, int | None] = {}
 
-    for t in triples:
-        section = _detect_section(t.segment_id, triples, seg_id_to_idx)
-        section_total[section] = section_total.get(section, 0) + 1
+    for seg_id, label in seg_to_section.items():
+        if not label:
+            continue
+        section_total[label] = section_total.get(label, 0) + 1
+        if label not in section_level:
+            section_level[label] = seg_to_section_level.get(seg_id)
 
     for d in degraded_details:
-        s = d["section_hint"]
+        s = d.get("section_heading")
+        if not s:
+            continue
         section_degraded[s] = section_degraded.get(s, 0) + 1
 
-    canonical_sections = [
-        "abstract", "front_matter", "introduction", "methods",
-        "results", "discussion", "conclusion", "references",
-    ]
     section_risk: dict[str, dict] = {}
-    for sec in canonical_sections:
-        total_sec = section_total.get(sec, 0)
+    for sec, total_sec in section_total.items():
         deg_sec = section_degraded.get(sec, 0)
         pct_deg = round(100.0 * deg_sec / total_sec, 1) if total_sec > 0 else 0.0
 
@@ -414,29 +440,14 @@ def build_degradation_metrics(
             risk = "high"
 
         section_risk[sec] = {
+            "heading_level": section_level.get(sec),
             "total_segments": total_sec,
             "degraded": deg_sec,
             "pct_degraded": pct_deg,
             "risk": risk,
         }
 
-    if "unknown" in section_total:
-        total_sec = section_total["unknown"]
-        deg_sec = section_degraded.get("unknown", 0)
-        pct_deg = round(100.0 * deg_sec / total_sec, 1) if total_sec > 0 else 0.0
-        section_risk["unknown"] = {
-            "total_segments": total_sec,
-            "degraded": deg_sec,
-            "pct_degraded": pct_deg,
-            "risk": "low" if deg_sec > 0 else "none",
-        }
-
     # --- Risk flags ---
-    abstract_degraded = section_degraded.get("abstract", 0) > 0
-    references_degraded = section_degraded.get("references", 0) > 0
-    critical_degraded = any(
-        section_degraded.get(s, 0) > 0 for s in CRITICAL_SECTIONS
-    )
     high_degradation = (
         (100.0 * degraded_count / total_blocks) > 10.0
         if total_blocks > 0 else False
@@ -466,13 +477,17 @@ def build_degradation_metrics(
         else:
             consecutive_low = 0
 
+    high_risk_top_level_heading = any(
+        (info.get("risk") == "high" and (info.get("heading_level") or 99) <= 2)
+        for info in section_risk.values()
+        if isinstance(info, dict)
+    )
+
     risk_flags = {
-        "abstract_degraded": abstract_degraded,
-        "references_degraded": references_degraded,
-        "critical_section_degraded": critical_degraded,
         "high_degradation_rate": high_degradation,
         "degradation_concentrated": concentrated,
         "low_confidence_cluster": low_conf_cluster,
+        "high_risk_top_level_heading": high_risk_top_level_heading,
     }
 
     # --- Token efficiency ---
@@ -520,7 +535,7 @@ def build_degradation_metrics(
         + method_counts.get("llm_near_agree_fallback_best_source", 0),
         "mean_confidence": round(conf_dist.get("mean", 0.0), 4),
         "min_confidence": round(conf_dist.get("min", 0.0), 4),
-        "abstract_degraded": abstract_degraded,
+        "high_risk_top_level_heading": high_risk_top_level_heading,
         "total_consensus_tokens": (zone_resolution_tokens + rescue_call_tokens) if has_token_data else None,
         "full_merge_avoided": True,
     }
