@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import torch
 from pathlib import Path
@@ -13,17 +14,29 @@ logger = logging.getLogger(__name__)
 
 # Process-level model cache — survives across Celery tasks within the same fork
 _cached_models = {}  # keyed by (device_type, dtype)
-_cached_converters = {}  # keyed by (device_type, dtype)
+_cached_converters = {}  # keyed by (device_type, dtype, extract_images, disable_links)
+
+_SPAN_REF_RE = re.compile(r"<span id=['\"][^'\"]*['\"]>(.*?)</span>", re.DOTALL)
+_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_LINK_REF_RE = re.compile(r"\[([^\]]+)\]\(https?://[^)]*\)")
+_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
 
-def _get_converter(device, dtype):
+def _get_converter(device, dtype, extract_images=False, disable_links=True):
     """Return a cached PdfConverter, creating models on first call."""
-    key = (str(device), str(dtype))
+    key = (str(device), str(dtype), bool(extract_images), bool(disable_links))
     if key not in _cached_converters:
         logger.info("Marker: loading models for %s/%s (first call in this worker process)", device, dtype)
         artifact_dict = create_model_dict(device=device, dtype=dtype)
         _cached_models[key] = artifact_dict
-        _cached_converters[key] = PdfConverter(artifact_dict=artifact_dict)
+        converter_config = {
+            "extract_images": bool(extract_images),
+            "disable_links": bool(disable_links),
+        }
+        _cached_converters[key] = PdfConverter(
+            artifact_dict=artifact_dict,
+            config=converter_config,
+        )
         logger.info("Marker: models loaded and cached")
     return _cached_converters[key]
 
@@ -43,11 +56,20 @@ class Marker(PDFExtractor):
             dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.float16 if dev.type == "cuda" else torch.float32
 
-        converter = _get_converter(dev, dtype)
+        converter = _get_converter(
+            dev,
+            dtype,
+            extract_images=self.extract_images,
+            disable_links=True,
+        )
 
         with torch.inference_mode():
             rendered = converter(pdf_path)
         text, file_ext, images = text_from_rendered(rendered)
+        text = _SPAN_REF_RE.sub(r"\1", text)
+        text = _IMAGE_REF_RE.sub("", text)
+        text = _LINK_REF_RE.sub(r"\1", text)
+        text = _MULTI_NEWLINE_RE.sub("\n\n", text).strip()
 
         metadata = rendered.metadata
         num_pages = len(metadata.get("page_stats", []))

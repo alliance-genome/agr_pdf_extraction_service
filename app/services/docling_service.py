@@ -70,6 +70,10 @@ class Docling(PDFExtractor):
         result = converter.convert(pdf_path)
         doc = result.document
 
-        markdown = doc.export_to_markdown()
+        markdown = doc.export_to_markdown(
+            image_placeholder="",
+            page_break_placeholder="",
+            text_width=-1,
+        )
         with open(output_filename, "w", encoding="utf-8") as f:
             f.write(markdown)

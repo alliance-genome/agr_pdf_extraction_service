@@ -7,7 +7,7 @@ processing).  The REST API lives in app/api.py.
 
 import logging
 import os
-from flask import Blueprint, current_app, request, jsonify, render_template, send_file
+from flask import Blueprint, current_app, request, jsonify, render_template, send_file, url_for
 from werkzeug.utils import secure_filename
 
 from app.services.grobid_service import Grobid
@@ -28,6 +28,19 @@ web = Blueprint("web", __name__)
 @web.route("/")
 def index():
     return render_template("index.html")
+
+
+@web.route("/openapi.yaml")
+def openapi_spec():
+    """Serve the OpenAPI specification for the REST API."""
+    spec_path = os.path.join(current_app.root_path, "openapi.yaml")
+    return send_file(spec_path, mimetype="application/yaml")
+
+
+@web.route("/docs")
+def swagger_docs():
+    """Serve Swagger UI backed by the local OpenAPI spec."""
+    return render_template("swagger.html", spec_url=url_for("web.openapi_spec"))
 
 
 @web.route("/process", methods=["POST"])
@@ -120,7 +133,7 @@ def process_pdf():
         response_data["images"] = images
         response_data["has_images"] = bool(images)
 
-        if merge_enabled and len(selected_methods) >= 1:
+        if merge_enabled and len(selected_methods) >= 2:
             version = cfg["EXTRACTION_CONFIG_VERSION"]
             cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(selected_methods))}"
             merged_cache_path = os.path.join(cfg["CACHE_FOLDER"], f"{cache_key}_merged.md")
@@ -135,8 +148,11 @@ def process_pdf():
 
                 llm = LLM(
                     api_key=cfg["OPENAI_API_KEY"],
-                    model=cfg["LLM_MODEL"],
+                    model=cfg.get("LLM_MODEL_FULL_MERGE", cfg["LLM_MODEL"]),
                     reasoning_effort=cfg.get("LLM_REASONING_EFFORT", "medium"),
+                    conflict_batch_size=cfg.get("LLM_CONFLICT_BATCH_SIZE", 10),
+                    conflict_max_workers=cfg.get("LLM_CONFLICT_MAX_WORKERS", 4),
+                    conflict_retry_rounds=cfg.get("LLM_CONFLICT_RETRY_ROUNDS", 2),
                 )
 
                 merged_md = None

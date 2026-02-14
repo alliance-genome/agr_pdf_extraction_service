@@ -1,0 +1,639 @@
+openapi: 3.0.3
+info:
+  title: AGR PDF Extraction Service API
+  version: 1.0.0
+  description: |
+    REST API for asynchronous PDF extraction using GROBID, Docling, and Marker,
+    with optional merge output and artifact retrieval.
+
+servers:
+  - url: /api/v1
+    description: API v1
+
+tags:
+  - name: Health
+  - name: Extractions
+  - name: Artifacts
+  - name: Downloads
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Service health check
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is available (may be degraded).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Service is unhealthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /extractions:
+    get:
+      tags: [Extractions]
+      summary: List extraction runs
+      operationId: listExtractions
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, started, complete, queued, running, succeeded, failed]
+          description: Filter by status.
+        - in: query
+          name: reference_curie
+          schema:
+            type: string
+          description: Filter by reference CURIE.
+        - in: query
+          name: mod_abbreviation
+          schema:
+            type: string
+          description: Filter by MOD abbreviation.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Max number of rows returned.
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of rows to skip.
+      responses:
+        "200":
+          description: Extraction runs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtractionListResponse"
+        "500":
+          description: Query failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Database unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /extract:
+    post:
+      tags: [Extractions]
+      summary: Submit a PDF extraction job
+      operationId: submitExtraction
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: PDF file to extract.
+                methods:
+                  type: string
+                  default: grobid,docling,marker
+                  description: Comma-separated methods (`grobid`, `docling`, `marker`).
+                merge:
+                  type: boolean
+                  default: true
+                  description: Whether to run merge output generation.
+                reference_curie:
+                  type: string
+                  nullable: true
+                mod_abbreviation:
+                  type: string
+                  nullable: true
+      responses:
+        "202":
+          description: Job queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitExtractionResponse"
+        "400":
+          description: Invalid input.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Could not enqueue extraction task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /extract/{process_id}:
+    get:
+      tags: [Extractions]
+      summary: Poll extraction status and result
+      operationId: getExtractionStatus
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+      responses:
+        "200":
+          description: Status available.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtractionStatusResponse"
+        "500":
+          description: Extraction failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtractionStatusResponse"
+
+  /extract/{process_id}/download/{method}:
+    get:
+      tags: [Downloads]
+      summary: Download extraction output
+      operationId: downloadExtractionOutput
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+        - $ref: "#/components/parameters/DownloadMethod"
+      responses:
+        "200":
+          description: File returned from local cache.
+          content:
+            text/markdown:
+              schema:
+                type: string
+                format: binary
+            application/json:
+              schema:
+                type: string
+                format: binary
+        "302":
+          description: Redirect to pre-signed S3 URL.
+        "400":
+          description: Invalid method.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Process or artifact not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Job not complete.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobNotCompleteResponse"
+
+  /extract/{process_id}/images:
+    get:
+      tags: [Downloads]
+      summary: List extracted images for a job
+      operationId: listExtractionImages
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+      responses:
+        "200":
+          description: Image metadata list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageListResponse"
+        "404":
+          description: Process not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Job not complete.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobNotCompleteResponse"
+
+  /extract/{process_id}/images/{filename}:
+    get:
+      tags: [Downloads]
+      summary: Download a single extracted image
+      operationId: downloadExtractionImage
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+        - in: path
+          name: filename
+          required: true
+          schema:
+            type: string
+          description: Image filename.
+      responses:
+        "200":
+          description: Image returned from local cache.
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        "302":
+          description: Redirect to pre-signed S3 URL.
+        "404":
+          description: Process or image not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Job not complete.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobNotCompleteResponse"
+
+  /extract/{process_id}/logs:
+    get:
+      tags: [Artifacts]
+      summary: Get pre-signed URL for NDJSON audit log
+      operationId: getExtractionLogUrl
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+      responses:
+        "200":
+          description: URL generated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogUrlResponse"
+        "404":
+          description: Process or log not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: URL generation failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: S3 client unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /extract/{process_id}/artifacts:
+    get:
+      tags: [Artifacts]
+      summary: Get raw artifacts_json for a process
+      operationId: getExtractionArtifacts
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+      responses:
+        "200":
+          description: Artifact metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactsResponse"
+        "404":
+          description: Process not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /extract/{process_id}/artifacts/urls:
+    get:
+      tags: [Artifacts]
+      summary: Get pre-signed URLs for all artifact keys
+      operationId: getExtractionArtifactUrls
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+      responses:
+        "200":
+          description: Artifact URLs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactUrlsResponse"
+        "404":
+          description: Process not found or no artifacts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: S3 client unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  parameters:
+    ProcessId:
+      in: path
+      name: process_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Extraction process ID.
+    DownloadMethod:
+      in: path
+      name: method
+      required: true
+      schema:
+        type: string
+        enum: [grobid, docling, marker, merged, audit]
+      description: Output method to download.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        status:
+          type: string
+          description: Included on some conflict responses.
+
+    JobNotCompleteResponse:
+      type: object
+      required: [error, status]
+      properties:
+        error:
+          type: string
+        status:
+          type: string
+
+    HealthResponse:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, unhealthy]
+        checks:
+          type: object
+          required: [service, grobid, redis, workers]
+          properties:
+            service:
+              type: string
+            grobid:
+              type: string
+              enum: [ok, degraded, unavailable]
+            redis:
+              type: string
+              enum: [ok, unavailable]
+            workers:
+              oneOf:
+                - type: integer
+                - type: string
+                  enum: [unknown]
+
+    ExtractionListItem:
+      type: object
+      required:
+        - process_id
+        - status
+        - has_artifacts
+        - has_log
+      properties:
+        process_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, started, complete, failed, queued, running, succeeded]
+        reference_curie:
+          type: string
+          nullable: true
+        mod_abbreviation:
+          type: string
+          nullable: true
+        source_pdf_md5:
+          type: string
+          nullable: true
+        config_version:
+          type: string
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+        error_code:
+          type: string
+          nullable: true
+        has_artifacts:
+          type: boolean
+        has_log:
+          type: boolean
+
+    ExtractionListResponse:
+      type: object
+      required: [total, limit, offset, items]
+      properties:
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionListItem"
+
+    SubmitExtractionResponse:
+      type: object
+      required: [process_id, status, methods, merge]
+      properties:
+        process_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued]
+        methods:
+          type: array
+          items:
+            type: string
+            enum: [grobid, docling, marker]
+        merge:
+          type: boolean
+        reference_curie:
+          type: string
+          nullable: true
+        mod_abbreviation:
+          type: string
+          nullable: true
+
+    ExtractionStatusResponse:
+      type: object
+      required: [process_id, status]
+      properties:
+        process_id:
+          type: string
+        status:
+          type: string
+          enum:
+            - pending
+            - started
+            - progress
+            - complete
+            - failed
+            - queued
+            - running
+            - succeeded
+        detail:
+          description: Celery PROGRESS payload.
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: string
+        result:
+          type: object
+          additionalProperties: true
+        reference_curie:
+          type: string
+          nullable: true
+        mod_abbreviation:
+          type: string
+          nullable: true
+        source_pdf_md5:
+          type: string
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+        log_s3_key:
+          type: string
+          nullable: true
+        artifacts_json:
+          type: object
+          additionalProperties: true
+          nullable: true
+        error_code:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        llm_cost_usd:
+          type: number
+          format: float
+          nullable: true
+          description: Estimated LLM cost in USD for this extraction run.
+        llm_usage_json:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Full LLM token usage breakdown (tokens, pricing, per-call-type detail).
+
+    LogUrlResponse:
+      type: object
+      required: [log_url, expires_in]
+      properties:
+        log_url:
+          type: string
+          format: uri
+        expires_in:
+          type: integer
+          example: 3600
+
+    ArtifactsResponse:
+      type: object
+      required: [process_id, artifacts_json]
+      properties:
+        process_id:
+          type: string
+        artifacts_json:
+          type: object
+          additionalProperties: true
+
+    ArtifactUrlEntry:
+      type: object
+      required: [name, s3_key]
+      properties:
+        name:
+          type: string
+          description: JSONPath-like location in artifacts_json.
+        s3_key:
+          type: string
+        url:
+          type: string
+          format: uri
+        error:
+          type: string
+
+    ArtifactUrlsResponse:
+      type: object
+      required: [process_id, expires_in, artifact_urls]
+      properties:
+        process_id:
+          type: string
+        expires_in:
+          type: integer
+        artifact_urls:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactUrlEntry"
+
+    ImageListResponse:
+      type: object
+      required: [process_id, images]
+      properties:
+        process_id:
+          type: string
+        images:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImageMetadata"
+        source:
+          type: string
+          description: Included when loaded from DB/S3-backed artifacts.
+
+    ImageMetadata:
+      type: object
+      additionalProperties: true
+      properties:
+        filename:
+          type: string
+        url:
+          type: string
+        s3_key:
+          type: string
+        size_bytes:
+          type: integer

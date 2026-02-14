@@ -81,10 +81,13 @@ def setup_logging(component="worker"):
     gelf_enabled = os.environ.get("GELF_ENABLED", "false").lower() == "true"
 
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    # Set root to DEBUG so per-publication file handlers can capture everything.
+    # Console handler filters to INFO; GELF handler filters to INFO.
+    root.setLevel(logging.DEBUG)
 
     # Console handler (keep for local dev and docker logs)
     console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
     console.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     ))

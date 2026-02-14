@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -25,6 +27,8 @@ import mistune
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein
 from scipy.optimize import linear_sum_assignment
+
+from app.services.degradation_metrics import build_degradation_metrics
 
 if TYPE_CHECKING:
     from app.services.llm_service import LLM
@@ -79,14 +83,47 @@ _CITATION_LIST_RE = re.compile(
 # Output cleaning and QA: strip extractor artifacts, keep meaningful markdown.
 _SPAN_OPEN_RE = re.compile(r"<span[^>]*>")
 _SPAN_CLOSE_RE = re.compile(r"</span>")
+_SPAN_REF_RE = re.compile(r"<span id=['\"][^'\"]*['\"]>(.*?)</span>", re.DOTALL)
 _HTML_COMMENT_OUTPUT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _MULTI_SPACE_RE = re.compile(r"  +")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(https?://[^)]*\)")
+_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 
 # Flanking context budget (~150 tokens, conservative 4 chars/token estimate).
 _CHARS_PER_TOKEN = 4
 _FLANK_TOKEN_BUDGET = 150
 _FLANK_CHAR_BUDGET = _FLANK_TOKEN_BUDGET * _CHARS_PER_TOKEN
+
+# Layered conflict resolver defaults
+_LAYERED_MEDIUM_SIM_THRESHOLD = 0.60
+
+# Regexes for comparison-only normalization (false conflict reduction)
+_EN_DASH_RE = re.compile(r'[\u2013\u2014]')            # en-dash, em-dash → hyphen
+_CITE_SPACE_OPEN_RE = re.compile(r'\[\s+')              # "[ 1" → "[1"
+_CITE_SPACE_CLOSE_RE = re.compile(r'\s+\]')             # "1 ]" → "1]"
+_CITE_COMMA_SPACE_RE = re.compile(r'(\d)\s*,\s*(\d)')   # "7, 8" → "7,8"
+_MULTI_SPACE_NORM_RE = re.compile(r' {2,}')              # collapse multiple spaces
+
+
+def _normalize_for_comparison(text: str) -> str:
+    """Normalize text for similarity comparison only (not for output).
+
+    Handles the most common false-conflict triggers found in the 16-paper
+    test batch:
+    - Citation dash variants (en-dash/em-dash → hyphen)
+    - Citation spacing variants
+    - Multiple spaces → single space
+    - Unicode NFC normalization
+    """
+    text = unicodedata.normalize("NFC", text)
+    text = _EN_DASH_RE.sub('-', text)
+    text = _CITE_SPACE_OPEN_RE.sub('[', text)
+    text = _CITE_SPACE_CLOSE_RE.sub(']', text)
+    text = _CITE_COMMA_SPACE_RE.sub(r'\1,\2', text)
+    text = _MULTI_SPACE_NORM_RE.sub(' ', text)
+    text = text.strip()
+    return text
 
 
 def _has_child_type(token: dict, child_type: str) -> bool:
@@ -284,6 +321,23 @@ def normalize_text(text: str) -> str:
     # Lowercase for comparison
     text = text.lower()
     return text
+
+
+def normalize_extractor_output(markdown_text: str) -> str:
+    """Normalize full extractor markdown before block parsing.
+
+    This removes extractor-specific formatting artifacts at the source layer
+    so alignment/classification operates on cleaner inputs.
+    """
+    text = unicodedata.normalize("NFKC", markdown_text or "")
+    text = _SPAN_REF_RE.sub(r"\1", text)
+    text = _HTML_COMMENT_OUTPUT_RE.sub("", text)
+    text = _IMAGE_REF_RE.sub("", text)
+    text = _MARKDOWN_LINK_RE.sub(r"\1", text)
+    # Common Docling ligature artifacts.
+    text = text.replace("/uniFB01", "fi").replace("/uniFB02", "fl")
+    text = _MULTI_NEWLINE_RE.sub("\n\n", text)
+    return text.strip()
 
 
 def clean_output_md(text: str) -> str:
@@ -494,7 +548,6 @@ def align_blocks(
 
 _NUMERIC_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
-_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _LINK_URL_RE = re.compile(r"\]\([^)]*\)")
 _CITATION_KEY_RE = re.compile(
     r"\["
@@ -505,6 +558,11 @@ _CITATION_KEY_RE = re.compile(
     r")"
     r"\]"
 )
+_REFERENCE_NUM_RE = re.compile(
+    r"(?:fig(?:ure)?|table|eq(?:uation)?|sec(?:tion)?|ref(?:erence)?)\.?\s*(\d+)",
+    re.IGNORECASE,
+)
+_NUMERIC_CITATION_ONLY_RE = re.compile(r"^\[\d+(?:\s*[-–,]\s*\d+)*\]$")
 
 # Per-block-type source preference for AGREE_NEAR
 _SOURCE_PREFERENCE = {
@@ -515,6 +573,8 @@ _SOURCE_PREFERENCE = {
     "paragraph": "marker",
     "equation": "docling",
 }
+_TEXTUAL_BLOCK_TYPES = {"heading", "paragraph", "figure_ref", "citation_list"}
+_STRUCTURED_BLOCK_TYPES = {"table", "equation"}
 
 
 def _extract_numeric_tokens(text: str) -> set[str]:
@@ -529,6 +589,65 @@ def _extract_citation_keys(text: str) -> set[str]:
     """Extract citation keys after removing HTML tags."""
     cleaned = _HTML_TAG_RE.sub("", text)
     return set(_CITATION_KEY_RE.findall(cleaned))
+
+
+def _extract_reference_numbers(text: str) -> set[str]:
+    """Extract numbers used in local references (Figure/Table/Section/etc.)."""
+    cleaned = _HTML_TAG_RE.sub("", text)
+    return set(_REFERENCE_NUM_RE.findall(cleaned))
+
+
+def _is_minor_numeric_citation_delta(delta: set[str], max_delta: int = 1) -> bool:
+    """Allow only tiny citation deltas with numeric bracket keys."""
+    if not delta:
+        return True
+    if len(delta) > max_delta:
+        return False
+    return all(_NUMERIC_CITATION_ONLY_RE.match(key) for key in delta)
+
+
+def _allow_reference_variance_exception(
+    block_type: str,
+    token_ratio: float,
+    lev_sim: float,
+    alignment_confidence: float,
+    raw_i: str,
+    raw_j: str,
+    nums_i: set[str],
+    nums_j: set[str],
+    cites_i: set[str],
+    cites_j: set[str],
+) -> bool:
+    """Allow AGREE_NEAR for likely alignment noise in references.
+
+    This is intentionally conservative:
+    - Applies only to textual blocks (not tables/equations/citation lists)
+    - Requires high textual confidence
+    - Allows only tiny numeric/citation deltas tied to Figure/Table/Section refs
+    """
+    if block_type not in {"heading", "paragraph", "figure_ref"}:
+        return False
+    if token_ratio < 0.97 or lev_sim < 0.95:
+        return False
+    if alignment_confidence < 0.55:
+        return False
+
+    numeric_delta = nums_i.symmetric_difference(nums_j)
+    citation_delta = cites_i.symmetric_difference(cites_j)
+
+    if len(numeric_delta) > 2 or len(citation_delta) > 1:
+        return False
+    if any("." in n for n in numeric_delta):
+        return False
+
+    if numeric_delta:
+        ref_numbers = _extract_reference_numbers(raw_i) | _extract_reference_numbers(raw_j)
+        if not numeric_delta.issubset(ref_numbers):
+            return False
+    if citation_delta and not _is_minor_numeric_citation_delta(citation_delta):
+        return False
+
+    return True
 
 
 def _get_present_blocks(triple: AlignedTriple) -> list[Block]:
@@ -593,7 +712,7 @@ def classify_triples(
         block_type = blocks[0].block_type
 
         # Check all pairs for agreement
-        normalized_texts = [b.normalized_text for b in blocks]
+        normalized_texts = [_normalize_for_comparison(b.normalized_text) for b in blocks]
         raw_texts = [b.raw_text for b in blocks]
 
         # Check for AGREE_EXACT: any pair has identical normalized text
@@ -626,13 +745,30 @@ def classify_triples(
                 lev_sim = 1.0 - (lev_dist / max_len)
 
                 if token_ratio >= near_threshold and lev_sim >= levenshtein_threshold:
-                    # Check numeric/citation guardrail
-                    nums_i = _extract_numeric_tokens(raw_texts[i])
-                    nums_j = _extract_numeric_tokens(raw_texts[j])
-                    cites_i = _extract_citation_keys(raw_texts[i])
-                    cites_j = _extract_citation_keys(raw_texts[j])
+                    # Check numeric/citation guardrail (normalized for comparison)
+                    norm_raw_i = _normalize_for_comparison(raw_texts[i])
+                    norm_raw_j = _normalize_for_comparison(raw_texts[j])
+                    nums_i = _extract_numeric_tokens(norm_raw_i)
+                    nums_j = _extract_numeric_tokens(norm_raw_j)
+                    cites_i = _extract_citation_keys(norm_raw_i)
+                    cites_j = _extract_citation_keys(norm_raw_j)
 
                     if nums_i == nums_j and cites_i == cites_j:
+                        near_pair = (i, j)
+                        break
+
+                    if _allow_reference_variance_exception(
+                        block_type=block_type,
+                        token_ratio=token_ratio,
+                        lev_sim=lev_sim,
+                        alignment_confidence=triple.confidence,
+                        raw_i=raw_texts[i],
+                        raw_j=raw_texts[j],
+                        nums_i=nums_i,
+                        nums_j=nums_j,
+                        cites_i=cites_i,
+                        cites_j=cites_j,
+                    ):
                         near_pair = (i, j)
                         break
             if near_pair is not None:
@@ -667,13 +803,15 @@ def classify_triples(
                     if lev_sim < levenshtein_threshold:
                         reasons.append(f"lev_sim={lev_sim:.3f}<{levenshtein_threshold}")
 
-                    nums_i = _extract_numeric_tokens(raw_texts[i])
-                    nums_j = _extract_numeric_tokens(raw_texts[j])
+                    diag_norm_i = _normalize_for_comparison(raw_texts[i])
+                    diag_norm_j = _normalize_for_comparison(raw_texts[j])
+                    nums_i = _extract_numeric_tokens(diag_norm_i)
+                    nums_j = _extract_numeric_tokens(diag_norm_j)
                     if nums_i != nums_j:
                         reasons.append(f"numeric_diff={nums_i.symmetric_difference(nums_j)}")
 
-                    cites_i = _extract_citation_keys(raw_texts[i])
-                    cites_j = _extract_citation_keys(raw_texts[j])
+                    cites_i = _extract_citation_keys(diag_norm_i)
+                    cites_j = _extract_citation_keys(diag_norm_j)
                     if cites_i != cites_j:
                         reasons.append(f"citation_diff={cites_i.symmetric_difference(cites_j)}")
 
@@ -690,33 +828,152 @@ def classify_triples(
 # Step 4: GUARD — Check fallback conditions
 # ---------------------------------------------------------------------------
 
+def _triple_block_family(triple: AlignedTriple) -> str:
+    """Map a triple to a coarse block family for guard calibration."""
+    blocks = _get_present_blocks(triple)
+    if not blocks:
+        return "unknown"
+
+    block_types = {b.block_type for b in blocks}
+    if block_types & _STRUCTURED_BLOCK_TYPES:
+        return "structured"
+    if block_types & _TEXTUAL_BLOCK_TYPES:
+        return "textual"
+    return "textual"
+
+
+def _triple_source_count(triple: AlignedTriple) -> int:
+    """Count how many extractors produced a block for this triple."""
+    return sum(1 for b in (triple.grobid_block, triple.docling_block, triple.marker_block) if b is not None)
+
+
+def _compute_conflict_telemetry(
+    triples: list[AlignedTriple],
+    conflict_ratio_threshold: float = 0.4,
+    localized_conflict_span_max: float = 0.35,
+    localized_conflict_relief: float = 0.15,
+    localized_conflict_max_blocks: int = 25,
+) -> dict:
+    """Compute guard telemetry for calibration and adaptive thresholding.
+
+    Two-source conflicts (where median-source is degenerate and we escalate
+    to a single LLM call) are excluded from the conflict ratios that drive
+    the nuclear full-LLM fallback.  They're still tracked for transparency.
+    """
+    total = len(triples)
+    num_gap = sum(1 for t in triples if t.classification == GAP)
+    denominator = total - num_gap
+    num_conflict_all = sum(1 for t in triples if t.classification == CONFLICT)
+    # Two-source conflicts are "handleable" — they just need one LLM call
+    # to pick the better text, so they shouldn't trip the nuclear fallback.
+    num_two_source_conflict = sum(
+        1 for t in triples
+        if t.classification == CONFLICT and _triple_source_count(t) < 3
+    )
+    num_conflict = num_conflict_all - num_two_source_conflict
+    conflict_ratio = (num_conflict / denominator) if denominator > 0 else 0.0
+
+    textual_denominator = 0
+    textual_conflict = 0
+    structured_denominator = 0
+    structured_conflict = 0
+    non_gap_triples = [t for t in triples if t.classification != GAP]
+    conflict_positions: list[int] = []
+
+    for idx, triple in enumerate(non_gap_triples):
+        is_two_source = _triple_source_count(triple) < 3
+        family = _triple_block_family(triple)
+        if family == "structured":
+            structured_denominator += 1
+            if triple.classification == CONFLICT and not is_two_source:
+                structured_conflict += 1
+                conflict_positions.append(idx)
+        elif family == "textual":
+            textual_denominator += 1
+            if triple.classification == CONFLICT and not is_two_source:
+                textual_conflict += 1
+                conflict_positions.append(idx)
+        elif triple.classification == CONFLICT and not is_two_source:
+            conflict_positions.append(idx)
+
+    textual_conflict_ratio = (
+        textual_conflict / textual_denominator if textual_denominator > 0 else 0.0
+    )
+    structured_conflict_ratio = (
+        structured_conflict / structured_denominator if structured_denominator > 0 else 0.0
+    )
+
+    conflict_span_ratio = 0.0
+    conflicts_localized = False
+    adaptive_conflict_ratio_threshold = conflict_ratio_threshold
+    if conflict_positions and denominator > 0:
+        conflict_span = (max(conflict_positions) - min(conflict_positions) + 1)
+        # Span over all triples (including GAPs) captures whether conflicts are
+        # concentrated in one region of the full document timeline.
+        conflict_span_ratio = conflict_span / max(total, 1)
+        conflicts_localized = (
+            len(conflict_positions) >= 2
+            and len(conflict_positions) <= max(1, int(localized_conflict_max_blocks))
+            and conflict_span_ratio <= max(0.0, float(localized_conflict_span_max))
+        )
+        if conflicts_localized:
+            adaptive_conflict_ratio_threshold = min(
+                0.95, conflict_ratio_threshold + max(0.0, float(localized_conflict_relief)),
+            )
+
+    return {
+        "conflict_ratio": round(conflict_ratio, 4),
+        "conflict_ratio_textual": round(textual_conflict_ratio, 4),
+        "conflict_ratio_structured": round(structured_conflict_ratio, 4),
+        "non_gap_blocks": denominator,
+        "conflict_blocks": num_conflict,
+        "conflict_blocks_two_source": num_two_source_conflict,
+        "conflict_blocks_total": num_conflict_all,
+        "textual_blocks": textual_denominator,
+        "structured_blocks": structured_denominator,
+        "conflicts_localized": conflicts_localized,
+        "conflict_span_ratio": round(conflict_span_ratio, 4),
+        "adaptive_conflict_ratio_threshold": round(adaptive_conflict_ratio_threshold, 4),
+    }
+
+
 def check_guards(
     triples: list[AlignedTriple],
     alignment_confidence: float,
     conflict_ratio_threshold: float = 0.4,
     alignment_confidence_threshold: float = 0.5,
+    textual_conflict_ratio_threshold: float = 0.4,
+    structured_conflict_ratio_threshold: float = 0.85,
+    localized_conflict_span_max: float = 0.35,
+    localized_conflict_relief: float = 0.15,
+    localized_conflict_max_blocks: int = 25,
 ) -> tuple[bool, str | None]:
     """
     Check whether the consensus pipeline should fall back to full-LLM merge.
 
     Returns (should_fallback, reason).
     """
-    total = len(triples)
-    if total == 0:
+    if not triples:
         return True, "no_blocks"
 
-    num_gap = sum(1 for t in triples if t.classification == GAP)
-    num_conflict = sum(1 for t in triples if t.classification == CONFLICT)
+    telemetry = _compute_conflict_telemetry(
+        triples,
+        conflict_ratio_threshold=conflict_ratio_threshold,
+        localized_conflict_span_max=localized_conflict_span_max,
+        localized_conflict_relief=localized_conflict_relief,
+        localized_conflict_max_blocks=localized_conflict_max_blocks,
+    )
 
-    # conflict_ratio excludes GAP blocks from denominator
-    denominator = total - num_gap
-    if denominator == 0:
-        # All blocks are GAP — no real conflicts
-        conflict_ratio = 0.0
-    else:
-        conflict_ratio = num_conflict / denominator
+    if telemetry["conflict_ratio_textual"] > textual_conflict_ratio_threshold:
+        return True, "conflict_ratio_textual"
 
-    if conflict_ratio > conflict_ratio_threshold:
+    if (
+        telemetry["structured_blocks"] > 0
+        and telemetry["conflict_ratio_structured"] > structured_conflict_ratio_threshold
+    ):
+        return True, "conflict_ratio_structured"
+
+    if telemetry["conflict_ratio"] > telemetry["adaptive_conflict_ratio_threshold"]:
         return True, "conflict_ratio"
 
     if alignment_confidence < alignment_confidence_threshold:
@@ -908,7 +1165,17 @@ def assemble(
 
     for triple in triples:
         if triple.classification in (AGREE_EXACT, AGREE_NEAR, GAP):
-            if triple.agreed_text:
+            # Check if this segment was resolved by zone-based LLM resolution
+            if triple.segment_id in resolved_conflicts:
+                resolved_text = resolved_conflicts[triple.segment_id]
+                if resolved_text:
+                    parts.append(resolved_text)
+                elif triple.classification == GAP:
+                    pass  # LLM explicitly dropped this gap — do not include
+                elif triple.agreed_text:
+                    # Non-GAP (e.g. AGREE_NEAR) with empty LLM result — keep agreed_text
+                    parts.append(clean_output_md(triple.agreed_text))
+            elif triple.agreed_text:
                 parts.append(clean_output_md(triple.agreed_text))
         elif triple.classification == CONFLICT:
             resolved = resolved_conflicts.get(triple.segment_id)
@@ -1386,6 +1653,576 @@ def _build_flanking_context(
 
 
 # ---------------------------------------------------------------------------
+# Conflict zone grouping — group adjacent conflicts for LLM resolution
+# ---------------------------------------------------------------------------
+
+
+def _build_conflict_zones(
+    triples: list[AlignedTriple],
+    flanking_count: int = 2,
+) -> list[dict]:
+    """Group non-AGREE_EXACT segments into zones bounded by AGREE_EXACT flanking context.
+
+    Starting from each CONFLICT, the zone expands outward through any segment
+    that is NOT AGREE_EXACT (i.e. CONFLICT, GAP, AGREE_NEAR all become part of
+    the zone core).  Expansion stops when it hits an AGREE_EXACT segment or the
+    document boundary.  Up to *flanking_count* AGREE_EXACT segments on each side
+    are included as read-only context.
+
+    AGREE_NEAR segments in the core are sent with all extractor versions so the
+    LLM can pick or merge the cleanest text.
+
+    Returns a list of zone dicts, each with:
+        zone_id, context_before, segments, context_after, triple_indices
+    """
+    n = len(triples)
+    if n == 0:
+        return []
+
+    is_exact = [t.classification == AGREE_EXACT for t in triples]
+
+    # 1. Find all CONFLICT indices — these seed the zones.
+    conflict_indices = [i for i in range(n) if triples[i].classification == CONFLICT]
+    if not conflict_indices:
+        return []
+
+    # 2. For each conflict index, expand outward until hitting AGREE_EXACT or
+    #    document boundary.  Record the (core_start, core_end) range.
+    #    Then merge overlapping / adjacent ranges.
+    raw_ranges: list[tuple[int, int]] = []
+    for ci in conflict_indices:
+        # Expand left: stop at first AGREE_EXACT (exclusive)
+        left = ci
+        while left > 0 and not is_exact[left - 1]:
+            left -= 1
+        # Expand right: stop at first AGREE_EXACT (exclusive)
+        right = ci
+        while right < n - 1 and not is_exact[right + 1]:
+            right += 1
+        raw_ranges.append((left, right))
+
+    # Merge overlapping/adjacent ranges
+    raw_ranges.sort()
+    merged_ranges: list[tuple[int, int]] = [raw_ranges[0]]
+    for start, end in raw_ranges[1:]:
+        prev_start, prev_end = merged_ranges[-1]
+        if start <= prev_end + 1:
+            merged_ranges[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged_ranges.append((start, end))
+
+    # 3. Build zone dicts with flanking AGREE_EXACT context.
+    result: list[dict] = []
+    for zone_num, (core_start, core_end) in enumerate(merged_ranges):
+        core_indices = list(range(core_start, core_end + 1))
+
+        # Flanking context: up to flanking_count AGREE_EXACT segments on each side
+        ctx_before_indices = []
+        probe = core_start - 1
+        while probe >= 0 and len(ctx_before_indices) < flanking_count:
+            if is_exact[probe]:
+                ctx_before_indices.insert(0, probe)
+            probe -= 1
+
+        ctx_after_indices = []
+        probe = core_end + 1
+        while probe < n and len(ctx_after_indices) < flanking_count:
+            if is_exact[probe]:
+                ctx_after_indices.append(probe)
+            probe += 1
+
+        # Build context_before entries
+        context_before = []
+        for idx in ctx_before_indices:
+            t = triples[idx]
+            context_before.append({
+                "segment_id": t.segment_id,
+                "text": t.agreed_text or "",
+                "status": "agreed",
+            })
+
+        # Build core segments — everything non-AGREE_EXACT gets its full treatment
+        segments = []
+        for idx in core_indices:
+            t = triples[idx]
+            if t.classification == CONFLICT:
+                blocks = _get_present_blocks(t)
+                seg_entry: dict = {
+                    "segment_id": t.segment_id,
+                    "status": "conflict",
+                    "block_type": blocks[0].block_type if blocks else "paragraph",
+                    "grobid": (t.grobid_block.source_md or t.grobid_block.raw_text) if t.grobid_block else "",
+                    "docling": (t.docling_block.source_md or t.docling_block.raw_text) if t.docling_block else "",
+                    "marker": (t.marker_block.source_md or t.marker_block.raw_text) if t.marker_block else "",
+                }
+                segments.append(seg_entry)
+            elif t.classification == GAP:
+                blocks = _get_present_blocks(t)
+                gap_source = blocks[0].source if blocks else "unknown"
+                segments.append({
+                    "segment_id": t.segment_id,
+                    "status": "gap",
+                    "gap_source": gap_source,
+                    "text": t.agreed_text or "",
+                })
+            elif t.classification == AGREE_NEAR:
+                # Near-agree: include all extractor versions so LLM can pick cleanest
+                blocks = _get_present_blocks(t)
+                segments.append({
+                    "segment_id": t.segment_id,
+                    "status": "near_agree",
+                    "block_type": blocks[0].block_type if blocks else "paragraph",
+                    "grobid": (t.grobid_block.source_md or t.grobid_block.raw_text) if t.grobid_block else "",
+                    "docling": (t.docling_block.source_md or t.docling_block.raw_text) if t.docling_block else "",
+                    "marker": (t.marker_block.source_md or t.marker_block.raw_text) if t.marker_block else "",
+                    "current_choice": t.agreed_text or "",
+                })
+            else:
+                # AGREE_EXACT inside the core — shouldn't happen given algorithm,
+                # but handle defensively
+                segments.append({
+                    "segment_id": t.segment_id,
+                    "status": "agreed",
+                    "text": t.agreed_text or "",
+                })
+
+        # Build context_after entries
+        context_after = []
+        for idx in ctx_after_indices:
+            t = triples[idx]
+            context_after.append({
+                "segment_id": t.segment_id,
+                "text": t.agreed_text or "",
+                "status": "agreed",
+            })
+
+        result.append({
+            "zone_id": f"zone_{zone_num}",
+            "context_before": context_before,
+            "segments": segments,
+            "context_after": context_after,
+            "triple_indices": core_indices,
+        })
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Layered conflict resolution (median-source + LLM batch)
+# ---------------------------------------------------------------------------
+
+def _bundle_source_texts(bundle: dict) -> dict[str, str]:
+    """Return non-empty extractor texts from a conflict bundle."""
+    result: dict[str, str] = {}
+    for source in ("grobid", "docling", "marker"):
+        value = (bundle.get(source) or "").strip()
+        if value:
+            result[source] = value
+    return result
+
+
+def _best_source_fallback(seg: dict) -> str:
+    """Pick the best available source text when both zone and rescue resolution fail.
+
+    Strategy:
+    1. If one source text contains another (containment), pick the longer one
+    2. Otherwise, pick the longest source text (most complete)
+
+    Returns empty string only if ALL sources are empty.
+    """
+    source_texts = _bundle_source_texts(seg)
+    if not source_texts:
+        return ""
+
+    texts = list(source_texts.items())  # [(name, text), ...]
+    texts.sort(key=lambda x: len(x[1]), reverse=True)
+
+    longest_name, longest_text = texts[0]
+
+    # Containment check — if shorter texts are substrings of longest, it's clearly best
+    for name, text in texts[1:]:
+        if text in longest_text:
+            return longest_text
+
+    # Default: return longest source text
+    return longest_text
+
+
+def _gather_rescue_context(
+    seg_id: str,
+    triples: list[AlignedTriple],
+    resolved_so_far: dict[str, str],
+    flanking_count: int = 5,
+) -> tuple[list[dict], dict[str, str]]:
+    """Gather enriched context for a rescue LLM call on a single failed segment.
+
+    Returns:
+        extra_flanking: list of dicts with segment_id + text for surrounding segments
+        neighboring_resolved: dict of seg_id -> resolved text for nearby segments
+    """
+    # Find the segment's index in the triples list
+    seg_idx = None
+    for i, t in enumerate(triples):
+        if t.segment_id == seg_id:
+            seg_idx = i
+            break
+    if seg_idx is None:
+        return [], {}
+
+    # Gather flanking segments (more than the normal 2)
+    extra_flanking = []
+    for offset in range(-flanking_count, flanking_count + 1):
+        idx = seg_idx + offset
+        if idx < 0 or idx >= len(triples) or idx == seg_idx:
+            continue
+        t = triples[idx]
+        text = t.agreed_text or ""
+        if text:
+            extra_flanking.append({
+                "segment_id": t.segment_id,
+                "text": text,
+                "classification": t.classification,
+            })
+
+    # Gather already-resolved neighbors
+    neighboring_resolved = {}
+    for offset in range(-3, 4):
+        idx = seg_idx + offset
+        if idx < 0 or idx >= len(triples) or idx == seg_idx:
+            continue
+        neighbor_id = triples[idx].segment_id
+        if neighbor_id in resolved_so_far:
+            neighboring_resolved[neighbor_id] = resolved_so_far[neighbor_id]
+
+    return extra_flanking, neighboring_resolved
+
+
+def _rescue_segment(
+    seg_id: str,
+    seg: dict,
+    zone: dict,
+    triples: list[AlignedTriple],
+    resolved: dict[str, str],
+    metadata: dict[str, dict],
+    source_texts: dict[str, str],
+    max_pair_sim: float,
+    llm: "LLM",
+    method_prefix: str = "llm_conflict",
+) -> None:
+    """Three-tier rescue strategy for a segment that zone resolution returned empty.
+
+    Tier 1: Rescue LLM call with enriched context and explanation request.
+    Tier 2: Best-source fallback (deterministic, no LLM).
+    Tier 3: Skip (all sources empty).
+
+    Mutates ``resolved`` and ``metadata`` dicts in place.
+    """
+    # TIER 1: Rescue LLM call — focused single-segment with enriched context
+    extra_flanking, neighboring_resolved = _gather_rescue_context(
+        seg_id, triples, resolved, flanking_count=5,
+    )
+    from config import Config
+    rescue_result = llm.rescue_single_segment(
+        seg=seg,
+        zone=zone,
+        neighboring_resolved=neighboring_resolved,
+        extra_flanking=extra_flanking,
+        model=Config.LLM_MODEL_RESCUE,
+    )
+
+    if rescue_result is not None:
+        if rescue_result.is_intentionally_empty:
+            # LLM says this segment SHOULD be empty — respect that with audit trail
+            resolved[seg_id] = ""
+            metadata[seg_id] = {
+                "method": f"{method_prefix}_rescue_intentional_drop",
+                "chosen_source": "llm",
+                "confidence": 0.0,
+                "sources_agreeing": sorted(source_texts.keys()),
+                "max_pair_similarity": round(max_pair_sim, 4),
+                "zone_id": zone["zone_id"],
+                "rescue_explanation": rescue_result.explanation,
+            }
+            logger.info(
+                "Rescue for %s: LLM says intentionally empty — %s",
+                seg_id, rescue_result.explanation,
+            )
+            return
+        elif rescue_result.resolved_text.strip():
+            # LLM provided text on the rescue attempt — use it
+            resolved[seg_id] = rescue_result.resolved_text.strip()
+            metadata[seg_id] = {
+                "method": f"{method_prefix}_rescue_resolved",
+                "chosen_source": "llm",
+                "confidence": round(
+                    _mean_similarity_to_sources(
+                        rescue_result.resolved_text, source_texts
+                    ), 4,
+                ),
+                "sources_agreeing": sorted(source_texts.keys()),
+                "max_pair_similarity": round(max_pair_sim, 4),
+                "zone_id": zone["zone_id"],
+                "rescue_explanation": rescue_result.explanation,
+            }
+            logger.info(
+                "Rescue for %s: LLM provided text — %s",
+                seg_id, rescue_result.explanation,
+            )
+            return
+        # else: rescue returned empty WITHOUT is_intentionally_empty — fall through to Tier 2
+
+    # TIER 2: Best-source fallback — deterministic, no LLM
+    fallback_text = _best_source_fallback(seg)
+    if fallback_text:
+        resolved[seg_id] = fallback_text
+        metadata[seg_id] = {
+            "method": f"{method_prefix}_fallback_best_source",
+            "chosen_source": "best_available",
+            "confidence": 0.0,
+            "sources_agreeing": sorted(source_texts.keys()),
+            "max_pair_similarity": round(max_pair_sim, 4),
+            "zone_id": zone["zone_id"],
+            "degraded": True,
+        }
+        logger.warning(
+            "Rescue also failed for %s; using best-source fallback", seg_id,
+        )
+        return
+
+    # TIER 3: All sources empty — skip entirely
+    logger.warning(
+        "All resolution paths exhausted for %s with no text; skipping", seg_id,
+    )
+
+
+def _pairwise_similarities(texts: list[str]) -> list[float]:
+    """Pairwise token-set similarity scores in 0..1 range."""
+    sims: list[float] = []
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            sims.append(fuzz.token_set_ratio(texts[i], texts[j]) / 100.0)
+    return sims
+
+
+def _mean_similarity_to_sources(candidate: str, source_texts: dict[str, str]) -> float:
+    """Average similarity between a candidate and source extractor texts."""
+    if not candidate or not source_texts:
+        return 0.0
+    sims = [
+        fuzz.token_set_ratio(candidate, source_text) / 100.0
+        for source_text in source_texts.values()
+        if source_text
+    ]
+    if not sims:
+        return 0.0
+    return float(sum(sims) / len(sims))
+
+
+def _resolve_conflict_median_source(bundle: dict) -> tuple[str, float, str]:
+    """Layer 2: median-source selection — pick the source most similar to all others.
+
+    Unlike token-level voting (which can produce chimeric output by mixing tokens
+    from different sources), this always returns one source's text verbatim.
+    """
+    source_texts = _bundle_source_texts(bundle)
+    if len(source_texts) < 2:
+        raise ValueError("Median-source requires at least two source texts")
+
+    sources = list(source_texts.keys())
+    texts = list(source_texts.values())
+
+    # Median-source is meaningless with exactly 2 sources: sim(A,B)==sim(B,A)
+    # so both get the same score and the "winner" is arbitrary dict order.
+    # Require 3+ sources for a meaningful median vote.
+    if len(source_texts) < 3:
+        raise ValueError("Median-source requires 3+ sources to break ties; escalate to LLM")
+
+    best_text = texts[0]
+    best_source = sources[0]
+    best_score = -1.0
+
+    for i, candidate in enumerate(texts):
+        sims = [
+            fuzz.token_set_ratio(candidate, other) / 100.0
+            for other in texts if other != candidate
+        ]
+        avg_sim = (sum(sims) / len(sims)) if sims else 0.0
+        if avg_sim > best_score:
+            best_score = avg_sim
+            best_text = candidate
+            best_source = sources[i]
+
+    chosen = best_text.strip()
+    if not chosen:
+        raise ValueError("Median-source produced empty consensus")
+
+    confidence = _mean_similarity_to_sources(chosen, source_texts)
+
+    logger.info(
+        "Median-source for %s: chose %s (avg_sim=%.3f, confidence=%.3f)",
+        bundle["segment_id"], best_source, best_score, confidence,
+    )
+
+    return chosen, confidence, best_source
+
+
+def _resolve_conflicts_layered(
+    conflict_zones: list[dict],
+    triples: list[AlignedTriple],
+    llm: "LLM",
+    medium_similarity_threshold: float = _LAYERED_MEDIUM_SIM_THRESHOLD,
+) -> tuple[dict[str, str], dict[str, dict]]:
+    """Resolve conflicts with layered meta-consensus using conflict zones.
+
+    Layer 1: Median-source selection for 3+-source conflict segments with
+             medium+ similarity (picks best whole source text verbatim).
+    Layer 2: Zone-based LLM resolution for remaining conflicts. Pre-resolved
+             segments are included as read-only context so the LLM sees the
+             full picture within each zone.
+    """
+    resolved: dict[str, str] = {}
+    metadata: dict[str, dict] = {}
+    llm_zones: list[dict] = []  # zones that still need LLM resolution
+
+    # Build a quick lookup from segment_id to triple
+    seg_id_to_triple = {t.segment_id: t for t in triples}
+
+    for zone in conflict_zones:
+        zone_needs_llm = False
+
+        for seg in zone["segments"]:
+            if seg["status"] != "conflict":
+                continue
+
+            seg_id = seg["segment_id"]
+            source_texts = _bundle_source_texts(seg)
+            source_values = list(source_texts.values())
+            pair_sims = _pairwise_similarities(source_values)
+            max_pair_sim = max(pair_sims) if pair_sims else 0.0
+            n_sources = len(source_texts)
+
+            # Layer 1: Median-source for 3+-source conflicts with medium+ similarity
+            if n_sources >= 3 and max_pair_sim >= medium_similarity_threshold:
+                try:
+                    resolved_text, confidence, chosen_extractor = _resolve_conflict_median_source(seg)
+                    resolved[seg_id] = resolved_text.strip()
+                    metadata[seg_id] = {
+                        "method": "median_source",
+                        "chosen_source": chosen_extractor,
+                        "confidence": round(float(confidence), 4),
+                        "sources_agreeing": sorted(source_texts.keys()),
+                        "max_pair_similarity": round(max_pair_sim, 4),
+                    }
+                    # Mark as pre_resolved in the segment so LLM sees it as context
+                    seg["status"] = "pre_resolved"
+                    seg["text"] = resolved_text.strip()
+                    continue
+                except Exception as exc:
+                    logger.warning("Layer 1 median-source failed for %s: %s", seg_id, exc)
+
+            # This segment needs LLM
+            zone_needs_llm = True
+            if n_sources < 3:
+                logger.info("Queuing %s for LLM zone resolution (2-source conflict)", seg_id)
+            else:
+                logger.info(
+                    "Queuing %s for LLM zone resolution (max_pair_sim=%.3f < %.3f threshold)",
+                    seg_id, max_pair_sim, medium_similarity_threshold,
+                )
+
+        # Also check for gap and near_agree segments that need resolution
+        for seg in zone["segments"]:
+            if seg["status"] in ("gap", "near_agree"):
+                zone_needs_llm = True
+
+        if zone_needs_llm:
+            llm_zones.append(zone)
+
+    # Layer 2: Resolve zones via LLM (parallel, one API call per zone)
+    if llm_zones:
+        logger.info("Resolving %d zone(s) via LLM", len(llm_zones))
+        zone_results, unresolved_ids = llm.resolve_conflict_zones(llm_zones)
+        if unresolved_ids:
+            logger.warning(
+                "Zone resolution left %d unresolved segment(s) — rescue will handle: %s",
+                len(unresolved_ids), sorted(unresolved_ids),
+            )
+
+        for zone in llm_zones:
+            for seg in zone["segments"]:
+                seg_id = seg["segment_id"]
+                if seg["status"] == "pre_resolved" or seg["status"] == "agreed":
+                    continue
+
+                resolved_text = (zone_results.get(seg_id, "") or "").strip()
+
+                if seg["status"] == "conflict":
+                    source_texts = _bundle_source_texts(seg)
+                    source_values = list(source_texts.values())
+                    pair_sims = _pairwise_similarities(source_values)
+                    max_pair_sim = max(pair_sims) if pair_sims else 0.0
+
+                    if not resolved_text:
+                        # Three-tier rescue strategy instead of raising ValueError
+                        _rescue_segment(
+                            seg_id, seg, zone, triples, resolved, metadata,
+                            source_texts, max_pair_sim, llm,
+                            method_prefix="llm_conflict",
+                        )
+                        continue
+
+                    resolved[seg_id] = resolved_text
+                    metadata[seg_id] = {
+                        "method": "llm_conflict",
+                        "chosen_source": "llm",
+                        "confidence": round(_mean_similarity_to_sources(resolved_text, source_texts), 4),
+                        "sources_agreeing": sorted(source_texts.keys()),
+                        "max_pair_similarity": round(max_pair_sim, 4),
+                        "zone_id": zone["zone_id"],
+                    }
+
+                elif seg["status"] == "near_agree":
+                    source_texts = _bundle_source_texts(seg)
+                    source_values = list(source_texts.values())
+                    pair_sims = _pairwise_similarities(source_values)
+                    max_pair_sim = max(pair_sims) if pair_sims else 0.0
+
+                    if not resolved_text:
+                        # Three-tier rescue strategy instead of raising ValueError
+                        _rescue_segment(
+                            seg_id, seg, zone, triples, resolved, metadata,
+                            source_texts, max_pair_sim, llm,
+                            method_prefix="llm_near_agree",
+                        )
+                        continue
+
+                    resolved[seg_id] = resolved_text
+                    metadata[seg_id] = {
+                        "method": "llm_near_agree",
+                        "chosen_source": "llm",
+                        "confidence": round(_mean_similarity_to_sources(resolved_text, source_texts), 4),
+                        "sources_agreeing": sorted(source_texts.keys()),
+                        "max_pair_similarity": round(max_pair_sim, 4),
+                        "zone_id": zone["zone_id"],
+                    }
+
+                elif seg["status"] == "gap":
+                    # GAP segments: LLM may return empty string to drop, or cleaned text
+                    if seg_id in zone_results:
+                        resolved[seg_id] = zone_results[seg_id]
+                        metadata[seg_id] = {
+                            "method": "llm_gap",
+                            "chosen_source": "llm",
+                            "confidence": 0.0,
+                            "sources_agreeing": [],
+                            "max_pair_similarity": 0.0,
+                            "zone_id": zone["zone_id"],
+                        }
+
+    return resolved, metadata
+
+
+# ---------------------------------------------------------------------------
 # Step 6: METRICS — Compute pipeline statistics
 # ---------------------------------------------------------------------------
 
@@ -1394,6 +2231,7 @@ def compute_metrics(
     alignment_confidence: float,
     fallback_triggered: bool,
     fallback_reason: str | None,
+    guard_telemetry: dict | None = None,
 ) -> dict:
     """Compute metrics for the consensus pipeline run."""
     total = len(triples)
@@ -1410,7 +2248,7 @@ def compute_metrics(
     # Rough estimate: 100 tokens per block on average
     tokens_saved_estimate = agreed_blocks * 100
 
-    return {
+    metrics = {
         "total_blocks": total,
         "agree_exact": num_exact,
         "agree_near": num_near,
@@ -1422,6 +2260,17 @@ def compute_metrics(
         "fallback_triggered": fallback_triggered,
         "fallback_reason": fallback_reason,
     }
+    if guard_telemetry:
+        metrics.update({
+            "conflict_ratio_textual": guard_telemetry.get("conflict_ratio_textual", 0.0),
+            "conflict_ratio_structured": guard_telemetry.get("conflict_ratio_structured", 0.0),
+            "conflicts_localized": guard_telemetry.get("conflicts_localized", False),
+            "conflict_span_ratio": guard_telemetry.get("conflict_span_ratio", 0.0),
+            "adaptive_conflict_ratio_threshold": guard_telemetry.get(
+                "adaptive_conflict_ratio_threshold", metrics["conflict_ratio"],
+            ),
+        })
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -1432,6 +2281,7 @@ def compute_metrics(
 def _build_audit_entries(
     triples: list[AlignedTriple],
     resolved_conflicts: dict[str, str],
+    resolution_metadata: dict[str, dict] | None = None,
     near_threshold: float = 0.92,
     levenshtein_threshold: float = 0.90,
 ) -> list[dict]:
@@ -1467,50 +2317,73 @@ def _build_audit_entries(
         }
 
         if triple.classification == AGREE_NEAR:
-            normalized_texts = [b.normalized_text for b in blocks]
-            raw_texts = [b.raw_text for b in blocks]
-            near_pair = None
-            best_score = 0.0
+            resolution_details = (resolution_metadata or {}).get(triple.segment_id, {})
+            resolved_text = resolved_conflicts.get(triple.segment_id)
 
-            for i in range(len(blocks)):
-                for j in range(i + 1, len(blocks)):
-                    token_ratio = fuzz.token_set_ratio(
-                        normalized_texts[i], normalized_texts[j],
-                    ) / 100.0
-                    max_len = max(len(normalized_texts[i]), len(normalized_texts[j]), 1)
-                    lev_dist = Levenshtein.distance(
-                        normalized_texts[i], normalized_texts[j],
-                    )
-                    lev_sim = 1.0 - (lev_dist / max_len)
-
-                    if token_ratio >= near_threshold and lev_sim >= levenshtein_threshold:
-                        nums_i = _extract_numeric_tokens(raw_texts[i])
-                        nums_j = _extract_numeric_tokens(raw_texts[j])
-                        cites_i = _extract_citation_keys(raw_texts[i])
-                        cites_j = _extract_citation_keys(raw_texts[j])
-                        if nums_i == nums_j and cites_i == cites_j:
-                            near_pair = (i, j)
-                            best_score = token_ratio
-                            break
-                if near_pair is not None:
-                    break
-
-            preferred_source = _SOURCE_PREFERENCE.get(block_type, "marker")
-            if near_pair is not None:
-                agreeing = [blocks[near_pair[0]], blocks[near_pair[1]]]
-                chosen_source = preferred_source
-                if not any(b.source == preferred_source for b in agreeing):
-                    chosen_source = agreeing[0].source
+            resolution_method = resolution_details.get("method", "")
+            if resolved_text is not None and resolution_method.startswith("llm_near_agree"):
+                # LLM-resolved near_agree (zone-based, rescue, or fallback)
+                entry["chosen_text"] = resolved_text
+                entry["chosen_source"] = resolution_details.get("chosen_source", "llm")
                 entry["details"] = {
-                    "agreeing_pair": [agreeing[0].source, agreeing[1].source],
-                    "similarity_score": round(best_score, 4),
-                    "source_preference_rule": f"{block_type} \u2192 {preferred_source}",
+                    "zone_id": resolution_details.get("zone_id", ""),
+                    "llm_resolved": True,
+                    "resolution_method": resolution_method,
+                    "resolution_confidence": resolution_details.get("confidence", 0.0),
+                    "sources_agreeing": resolution_details.get("sources_agreeing", []),
                 }
+                if resolution_details.get("rescue_explanation"):
+                    entry["details"]["rescue_explanation"] = resolution_details["rescue_explanation"]
+                if resolution_details.get("degraded"):
+                    entry["details"]["degraded"] = True
             else:
-                chosen_source = blocks[0].source
+                # Programmatic near-agree resolution (not in a zone)
+                normalized_texts = [_normalize_for_comparison(b.normalized_text) for b in blocks]
+                raw_texts = [b.raw_text for b in blocks]
+                near_pair = None
+                best_score = 0.0
 
-            entry["chosen_text"] = triple.agreed_text or ""
-            entry["chosen_source"] = chosen_source
+                for i in range(len(blocks)):
+                    for j in range(i + 1, len(blocks)):
+                        token_ratio = fuzz.token_set_ratio(
+                            normalized_texts[i], normalized_texts[j],
+                        ) / 100.0
+                        max_len = max(len(normalized_texts[i]), len(normalized_texts[j]), 1)
+                        lev_dist = Levenshtein.distance(
+                            normalized_texts[i], normalized_texts[j],
+                        )
+                        lev_sim = 1.0 - (lev_dist / max_len)
+
+                        if token_ratio >= near_threshold and lev_sim >= levenshtein_threshold:
+                            assem_norm_i = _normalize_for_comparison(raw_texts[i])
+                            assem_norm_j = _normalize_for_comparison(raw_texts[j])
+                            nums_i = _extract_numeric_tokens(assem_norm_i)
+                            nums_j = _extract_numeric_tokens(assem_norm_j)
+                            cites_i = _extract_citation_keys(assem_norm_i)
+                            cites_j = _extract_citation_keys(assem_norm_j)
+                            if nums_i == nums_j and cites_i == cites_j:
+                                near_pair = (i, j)
+                                best_score = token_ratio
+                                break
+                    if near_pair is not None:
+                        break
+
+                preferred_source = _SOURCE_PREFERENCE.get(block_type, "marker")
+                if near_pair is not None:
+                    agreeing = [blocks[near_pair[0]], blocks[near_pair[1]]]
+                    chosen_source = preferred_source
+                    if not any(b.source == preferred_source for b in agreeing):
+                        chosen_source = agreeing[0].source
+                    entry["details"] = {
+                        "agreeing_pair": [agreeing[0].source, agreeing[1].source],
+                        "similarity_score": round(best_score, 4),
+                        "source_preference_rule": f"{block_type} \u2192 {preferred_source}",
+                    }
+                else:
+                    chosen_source = blocks[0].source
+
+                entry["chosen_text"] = triple.agreed_text or ""
+                entry["chosen_source"] = chosen_source
 
         elif triple.classification == GAP:
             sole_source = blocks[0].source
@@ -1524,11 +2397,11 @@ def _build_audit_entries(
 
         elif triple.classification == CONFLICT:
             resolved_text = resolved_conflicts.get(triple.segment_id)
-            context_before, context_after = _build_flanking_context(triples, idx)
+            resolution_details = (resolution_metadata or {}).get(triple.segment_id, {})
 
             if resolved_text is not None:
                 entry["chosen_text"] = resolved_text
-                entry["chosen_source"] = "llm"
+                entry["chosen_source"] = resolution_details.get("chosen_source", resolution_details.get("method", "llm"))
             elif blocks:
                 entry["chosen_text"] = clean_output_md(
                     blocks[0].source_md or blocks[0].raw_text,
@@ -1536,9 +2409,11 @@ def _build_audit_entries(
                 entry["chosen_source"] = blocks[0].source
 
             entry["details"] = {
-                "context_before": context_before,
-                "context_after": context_after,
+                "zone_id": resolution_details.get("zone_id", ""),
                 "llm_resolved": resolved_text is not None,
+                "resolution_method": resolution_details.get("method", ""),
+                "resolution_confidence": resolution_details.get("confidence", 0.0),
+                "sources_agreeing": resolution_details.get("sources_agreeing", []),
             }
 
         entries.append(entry)
@@ -1565,16 +2440,49 @@ def merge_with_consensus(
     """
     from config import Config
 
+    def _is_mock_value(value) -> bool:
+        return value.__class__.__module__.startswith("unittest.mock")
+
+    def _cfg_float(value, default: float) -> float:
+        if value is None or _is_mock_value(value):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_int(value, default: int) -> int:
+        if value is None or _is_mock_value(value):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_bool(value, default: bool) -> bool:
+        if value is None or _is_mock_value(value):
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() == "true"
+
     # Validate all 3 inputs
     if not grobid_md or not docling_md or not marker_md:
         metrics = compute_metrics([], 0.0, True, "missing_extractor")
         return None, metrics, []
 
-    # Step 1: Parse and normalize
+    pipeline_start = time.monotonic()
+
+    # Step 1: Source-level normalization + parse
+    step_start = time.monotonic()
     logger.info("Consensus pipeline: parsing markdown outputs...")
-    grobid_blocks = parse_markdown(grobid_md, "grobid")
-    docling_blocks = parse_markdown(docling_md, "docling")
-    marker_blocks = parse_markdown(marker_md, "marker")
+    grobid_normalized = normalize_extractor_output(grobid_md)
+    docling_normalized = normalize_extractor_output(docling_md)
+    marker_normalized = normalize_extractor_output(marker_md)
+
+    grobid_blocks = parse_markdown(grobid_normalized, "grobid")
+    docling_blocks = parse_markdown(docling_normalized, "docling")
+    marker_blocks = parse_markdown(marker_normalized, "marker")
 
     blocks_by_source = {
         "grobid": grobid_blocks,
@@ -1583,8 +2491,9 @@ def merge_with_consensus(
     }
 
     logger.info(
-        "Parsed blocks: grobid=%d, docling=%d, marker=%d",
+        "Parsed blocks: grobid=%d, docling=%d, marker=%d (%.1fs)",
         len(grobid_blocks), len(docling_blocks), len(marker_blocks),
+        time.monotonic() - step_start,
     )
 
     # Exclude extractors with dramatically fewer blocks to avoid poisoning
@@ -1610,10 +2519,12 @@ def merge_with_consensus(
             del blocks_by_source[src]
 
     # Step 2: Align
+    step_start = time.monotonic()
     logger.info("Consensus pipeline: aligning blocks...")
     triples, alignment_confidence = align_blocks(blocks_by_source)
     logger.info(
-        "Aligned %d triples, confidence=%.3f", len(triples), alignment_confidence
+        "Aligned %d triples, confidence=%.3f (%.1fs)",
+        len(triples), alignment_confidence, time.monotonic() - step_start,
     )
 
     # Step 3: Classify
@@ -1636,57 +2547,230 @@ def merge_with_consensus(
         logger.info("Consensus pipeline: removed %d cross-class GAP duplicates", gap_cross_removed)
 
     classifications = {}
+    classifications_by_type = {}
     for t in triples:
         classifications[t.classification] = classifications.get(t.classification, 0) + 1
+        present = _get_present_blocks(t)
+        btype = present[0].block_type if present else "unknown"
+        key = (t.classification, btype)
+        classifications_by_type[key] = classifications_by_type.get(key, 0) + 1
     logger.info("Classifications: %s", classifications)
+    for (cls, btype), count in sorted(classifications_by_type.items()):
+        if cls != AGREE_EXACT:
+            logger.info("  %s / %s: %d", cls, btype, count)
+
+    base_conflict_threshold = _cfg_float(
+        getattr(Config, "CONSENSUS_CONFLICT_RATIO_FALLBACK", 0.4), 0.4,
+    )
+    guard_telemetry = _compute_conflict_telemetry(
+        triples,
+        conflict_ratio_threshold=base_conflict_threshold,
+        localized_conflict_span_max=_cfg_float(
+            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_SPAN_MAX", 0.35), 0.35,
+        ),
+        localized_conflict_relief=_cfg_float(
+            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_RELIEF", 0.15), 0.15,
+        ),
+        localized_conflict_max_blocks=_cfg_int(
+            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_MAX_BLOCKS", 25), 25,
+        ),
+    )
 
     # Step 4: Guard checks
     should_fallback, fallback_reason = check_guards(
         triples,
         alignment_confidence,
-        conflict_ratio_threshold=Config.CONSENSUS_CONFLICT_RATIO_FALLBACK,
-        alignment_confidence_threshold=Config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK,
+        conflict_ratio_threshold=base_conflict_threshold,
+        alignment_confidence_threshold=_cfg_float(
+            getattr(Config, "CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK", 0.5), 0.5,
+        ),
+        textual_conflict_ratio_threshold=_cfg_float(
+            getattr(Config, "CONSENSUS_CONFLICT_RATIO_TEXTUAL_FALLBACK", base_conflict_threshold),
+            base_conflict_threshold,
+        ),
+        structured_conflict_ratio_threshold=_cfg_float(
+            getattr(Config, "CONSENSUS_CONFLICT_RATIO_STRUCTURED_FALLBACK", 0.85), 0.85,
+        ),
+        localized_conflict_span_max=_cfg_float(
+            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_SPAN_MAX", 0.35), 0.35,
+        ),
+        localized_conflict_relief=_cfg_float(
+            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_RELIEF", 0.15), 0.15,
+        ),
+        localized_conflict_max_blocks=_cfg_int(
+            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_MAX_BLOCKS", 25), 25,
+        ),
     )
 
     if should_fallback:
         logger.info("Consensus pipeline: fallback triggered (%s)", fallback_reason)
-        metrics = compute_metrics(triples, alignment_confidence, True, fallback_reason)
-        return None, metrics, []
+        audit_entries = _build_audit_entries(
+            triples, {},
+            near_threshold=Config.CONSENSUS_NEAR_THRESHOLD,
+            levenshtein_threshold=Config.CONSENSUS_LEVENSHTEIN_THRESHOLD,
+        )
+        metrics = compute_metrics(
+            triples, alignment_confidence, True, fallback_reason,
+            guard_telemetry=guard_telemetry,
+        )
+        return None, metrics, audit_entries
 
-    # Step 5: Resolve conflicts via LLM
+    # Step 5: Resolve conflicts via zone-based layered resolver
     conflict_triples = [t for t in triples if t.classification == CONFLICT]
     resolved_conflicts: dict[str, str] = {}
+    resolution_metadata: dict[str, dict] = {}
 
     if conflict_triples:
-        logger.info("Consensus pipeline: resolving %d conflicts via LLM...", len(conflict_triples))
-        segment_id_to_index = {t.segment_id: i for i, t in enumerate(triples)}
+        step_start = time.monotonic()
+        flanking_count = _cfg_int(
+            getattr(Config, "CONSENSUS_ZONE_FLANKING_COUNT", 2), 2,
+        )
+        layered_enabled = _cfg_bool(
+            getattr(Config, "CONSENSUS_LAYERED_ENABLED", True), True,
+        )
+        logger.info(
+            "Consensus pipeline: resolving %d conflicts (layered=%s, flanking=%d)...",
+            len(conflict_triples), layered_enabled, flanking_count,
+        )
 
-        conflict_bundles = []
-        for t in conflict_triples:
-            triple_index = segment_id_to_index[t.segment_id]
-            context_before, context_after = _build_flanking_context(triples, triple_index)
-            present_blocks = _get_present_blocks(t)
-            bundle = {
-                "segment_id": t.segment_id,
-                "block_type": present_blocks[0].block_type if present_blocks else "paragraph",
-                "context_before": context_before,
-                "context_after": context_after,
-                "grobid": (t.grobid_block.source_md or t.grobid_block.raw_text) if t.grobid_block else "",
-                "docling": (t.docling_block.source_md or t.docling_block.raw_text) if t.docling_block else "",
-                "marker": (t.marker_block.source_md or t.marker_block.raw_text) if t.marker_block else "",
-            }
-            conflict_bundles.append(bundle)
+        # Build conflict zones
+        conflict_zones = _build_conflict_zones(triples, flanking_count=flanking_count)
+        logger.info(
+            "Consensus pipeline: grouped %d conflicts into %d zone(s)",
+            len(conflict_triples), len(conflict_zones),
+        )
+        for zone in conflict_zones:
+            conflict_count = sum(1 for s in zone["segments"] if s["status"] == "conflict")
+            gap_count = sum(1 for s in zone["segments"] if s["status"] == "gap")
+            near_agree_count = sum(1 for s in zone["segments"] if s["status"] == "near_agree")
+            logger.info(
+                "  %s: %d conflict(s), %d gap(s), %d near_agree(s), %d before, %d after",
+                zone["zone_id"], conflict_count, gap_count, near_agree_count,
+                len(zone["context_before"]), len(zone["context_after"]),
+            )
 
         try:
-            resolved_conflicts = llm.resolve_conflicts(conflict_bundles)
+            if layered_enabled:
+                resolved_conflicts, resolution_metadata = _resolve_conflicts_layered(
+                    conflict_zones,
+                    triples,
+                    llm,
+                    medium_similarity_threshold=_cfg_float(
+                        getattr(Config, "CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD",
+                                _LAYERED_MEDIUM_SIM_THRESHOLD),
+                        _LAYERED_MEDIUM_SIM_THRESHOLD,
+                    ),
+                )
+            else:
+                # Non-layered: send all zones directly to LLM (skip median-source)
+                zone_results, _unresolved = llm.resolve_conflict_zones(conflict_zones)
+                for zone in conflict_zones:
+                    for seg in zone["segments"]:
+                        seg_id = seg["segment_id"]
+                        if seg["status"] == "conflict":
+                            source_texts = _bundle_source_texts(seg)
+                            resolved_text = (zone_results.get(seg_id, "") or "").strip()
+                            if not resolved_text:
+                                # Three-tier rescue strategy for empty conflict
+                                max_pair_sim = max(_pairwise_similarities(list(source_texts.values()))) if source_texts else 0.0
+                                _rescue_segment(
+                                    seg_id, seg, zone, triples, resolved_conflicts,
+                                    resolution_metadata, source_texts, max_pair_sim, llm,
+                                    method_prefix="llm_conflict",
+                                )
+                                continue
+                            resolved_conflicts[seg_id] = resolved_text
+                            resolution_metadata[seg_id] = {
+                                "method": "llm_conflict",
+                                "chosen_source": "llm",
+                                "confidence": round(
+                                    _mean_similarity_to_sources(resolved_text, source_texts), 4,
+                                ),
+                                "sources_agreeing": sorted(source_texts.keys()),
+                                "max_pair_similarity": round(
+                                    max(_pairwise_similarities(list(source_texts.values()))) if source_texts else 0.0,
+                                    4,
+                                ),
+                                "zone_id": zone["zone_id"],
+                            }
+                        elif seg["status"] == "near_agree":
+                            source_texts = _bundle_source_texts(seg)
+                            resolved_text = (zone_results.get(seg_id, "") or "").strip()
+                            if not resolved_text:
+                                # Three-tier rescue strategy instead of raising ValueError
+                                max_pair_sim = max(_pairwise_similarities(list(source_texts.values()))) if source_texts else 0.0
+                                _rescue_segment(
+                                    seg_id, seg, zone, triples, resolved_conflicts,
+                                    resolution_metadata, source_texts, max_pair_sim, llm,
+                                    method_prefix="llm_near_agree",
+                                )
+                                continue
+                            resolved_conflicts[seg_id] = resolved_text
+                            resolution_metadata[seg_id] = {
+                                "method": "llm_near_agree",
+                                "chosen_source": "llm",
+                                "confidence": round(
+                                    _mean_similarity_to_sources(resolved_text, source_texts), 4,
+                                ) if resolved_text else 0.0,
+                                "sources_agreeing": sorted(source_texts.keys()),
+                                "max_pair_similarity": round(
+                                    max(_pairwise_similarities(list(source_texts.values()))) if source_texts else 0.0,
+                                    4,
+                                ),
+                                "zone_id": zone["zone_id"],
+                            }
+                        elif seg["status"] == "gap" and seg_id in zone_results:
+                            resolved_conflicts[seg_id] = zone_results[seg_id]
+                            resolution_metadata[seg_id] = {
+                                "method": "llm_gap",
+                                "chosen_source": "llm",
+                                "confidence": 0.0,
+                                "sources_agreeing": [],
+                                "max_pair_similarity": 0.0,
+                                "zone_id": zone["zone_id"],
+                            }
         except Exception as e:
-            logger.warning("Consensus pipeline: LLM conflict resolution failed: %s", e)
-            metrics = compute_metrics(triples, alignment_confidence, True, "llm_error")
-            return None, metrics, []
+            logger.warning("Consensus pipeline: conflict zone resolution failed: %s", e)
+            audit_entries = _build_audit_entries(
+                triples, {}, {},
+                near_threshold=Config.CONSENSUS_NEAR_THRESHOLD,
+                levenshtein_threshold=Config.CONSENSUS_LEVENSHTEIN_THRESHOLD,
+            )
+            metrics = compute_metrics(
+                triples, alignment_confidence, True, "llm_error",
+                guard_telemetry=guard_telemetry,
+            )
+            return None, metrics, audit_entries
+
+    # Log conflict resolution summary
+    if resolution_metadata:
+        resolve_duration = time.monotonic() - step_start
+        method_counts = Counter(
+            m.get("method", "unknown") for m in resolution_metadata.values()
+        )
+        confidences = [
+            float(m.get("confidence", 0.0)) for m in resolution_metadata.values()
+        ]
+        logger.info(
+            "Conflict resolution complete in %.1fs: %s, confidence min=%.3f max=%.3f mean=%.3f",
+            resolve_duration,
+            dict(method_counts),
+            min(confidences) if confidences else 0,
+            max(confidences) if confidences else 0,
+            (sum(confidences) / len(confidences)) if confidences else 0,
+        )
+        # Per-conflict detail at DEBUG level
+        for seg_id, meta in resolution_metadata.items():
+            logger.debug(
+                "  %s: method=%s, confidence=%.3f, pair_sim=%.3f, sources=%s",
+                seg_id, meta["method"], meta["confidence"],
+                meta.get("max_pair_similarity", 0),
+                meta.get("sources_agreeing", []),
+            )
 
     # Build audit entries (after classification, dedup, and conflict resolution)
     audit_entries = _build_audit_entries(
-        triples, resolved_conflicts,
+        triples, resolved_conflicts, resolution_metadata,
         near_threshold=Config.CONSENSUS_NEAR_THRESHOLD,
         levenshtein_threshold=Config.CONSENSUS_LEVENSHTEIN_THRESHOLD,
     )
@@ -1713,10 +2797,47 @@ def merge_with_consensus(
     # Step 7: QA gates (global duplicate detection)
     qa_results = run_qa_gates(merged_md)
 
-    metrics = compute_metrics(triples, alignment_confidence, False, None)
+    metrics = compute_metrics(
+        triples, alignment_confidence, False, None, guard_telemetry=guard_telemetry,
+    )
+    if resolution_metadata:
+        method_counts = Counter(
+            m.get("method", "unknown") for m in resolution_metadata.values()
+        )
+        metrics["resolution_methods"] = dict(method_counts)
+        confidences = [
+            float(m.get("confidence", 0.0))
+            for m in resolution_metadata.values()
+            if isinstance(m, dict)
+        ]
+        if confidences:
+            metrics["resolution_confidence_mean"] = round(
+                float(sum(confidences) / len(confidences)), 4,
+            )
     metrics["gap_cross_dedup_removed"] = gap_cross_removed
     metrics["assembled_dedup_removed"] = assembled_dups_removed
     metrics["qa"] = qa_results
+
+    # Compute degradation metrics from resolution metadata
+    degradation = build_degradation_metrics(
+        triples=triples,
+        resolution_metadata=resolution_metadata,
+        audit_entries=audit_entries,
+        total_blocks=metrics["total_blocks"],
+        zone_resolution_tokens=llm.usage.tokens_for_types("zone_resolution"),
+        rescue_call_tokens=llm.usage.tokens_for_types("rescue")
+    )
+    metrics["degradation_metrics"] = degradation
+
+    degraded_count = degradation["degraded_segments"]["count"]
+    if degraded_count > 0:
+        logger.warning(
+            "Zone resolution used best-source fallback for %d segment(s) "
+            "(quality_score=%.3f, grade=%s) — quality may be reduced",
+            degraded_count,
+            degradation["quality_score"],
+            degradation["quality_grade"],
+        )
 
     # Step 8: Fail-hard on surviving global duplicates
     surviving_dupes = qa_results.get("global_duplicate_count", 0)
@@ -1730,9 +2851,11 @@ def merge_with_consensus(
         metrics["fallback_reason"] = "global_duplicates"
         return None, metrics, audit_entries
 
+    pipeline_duration = time.monotonic() - pipeline_start
     logger.info(
-        "Consensus pipeline complete: %d blocks, %d conflicts resolved, "
+        "Consensus pipeline complete in %.1fs: %d blocks, %d conflicts resolved, "
         "~%d tokens saved, %d GAP cross-dedup, %d post-assembly dedup",
+        pipeline_duration,
         metrics["total_blocks"],
         metrics["conflict"],
         metrics["tokens_saved_estimate"],

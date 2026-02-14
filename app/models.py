@@ -2,7 +2,7 @@ import os
 import threading
 import logging
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, Index, create_engine, JSON
+from sqlalchemy import Column, DateTime, Integer, Numeric, String, Text, Index, create_engine, JSON
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, scoped_session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -30,6 +30,8 @@ class ExtractionRun(Base):
     error_message = Column(Text)
     artifacts_json = Column(JSON().with_variant(JSONB, "postgresql"))
     log_s3_key = Column(String)
+    llm_usage_json = Column(JSON().with_variant(JSONB, "postgresql"))
+    llm_cost_usd = Column(Numeric(precision=10, scale=6))
 
 
 Index("idx_extraction_run_curie", ExtractionRun.reference_curie)
