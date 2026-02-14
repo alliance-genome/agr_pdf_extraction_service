@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+from app.services.llm_service import TokenAccumulator
 from app.services.consensus_service import (
     Block,
     AlignedTriple,
@@ -13,17 +14,20 @@ from app.services.consensus_service import (
     _pick_preferred_text,
     _extract_numeric_tokens,
     _extract_citation_keys,
+    _build_conflict_zones,
     clean_output_md,
     dedup_gap_triples,
     dedup_gap_against_all,
     dedup_assembled_paragraphs,
     normalize_text,
+    normalize_extractor_output,
     parse_markdown,
     align_blocks,
     classify_triples,
     check_guards,
     assemble,
     compute_metrics,
+    _build_audit_entries,
     merge_with_consensus,
     run_qa_gates,
 )
@@ -197,6 +201,22 @@ class TestNormalization:
 
     def test_strip_heading_markers(self):
         assert normalize_text("# Methods") == normalize_text("#### Methods")
+
+    def test_normalize_extractor_output_strips_artifacts(self):
+        text = (
+            "<span id='page-1-0'>Alpha</span>\n\n"
+            "<!-- image -->\n\n"
+            "![Figure 1](image.png)\n\n"
+            "[DOI](https://doi.org/10.1234/x)\n\n"
+            "/uniFB01 /uniFB02"
+        )
+        result = normalize_extractor_output(text)
+        assert "Alpha" in result
+        assert "<span" not in result
+        assert "<!--" not in result
+        assert "![" not in result
+        assert "https://doi.org" not in result
+        assert "fi fl" in result
 
 
 class TestOutputCleaning:
@@ -389,6 +409,45 @@ class TestClassification:
         classify_triples([t])
         assert t.classification == CONFLICT
 
+    def test_agree_near_allows_reference_number_variance_when_confident(self):
+        """Figure/table reference-number drift should not force CONFLICT."""
+        # Use realistic-length text so the fig/citation differences are a small
+        # fraction of the total, producing high similarity scores (>0.97).
+        # Only vary the figure number (not citations) to stay within the
+        # exception's max-2-numeric-delta / max-1-citation-delta limits.
+        base_a = (
+            "The calcium signaling pathway was analyzed using fluorescence "
+            "microscopy as shown in Fig. 1 and confirmed by western blot "
+            "analysis [8]."
+        )
+        base_b = (
+            "The calcium signaling pathway was analyzed using fluorescence "
+            "microscopy as shown in Fig. 2 and confirmed by western blot "
+            "analysis [8]."
+        )
+        t = self._make_triple(
+            "seg_001",
+            base_a,
+            base_b,
+            "A completely different paragraph that does not match.",
+        )
+        t.confidence = 0.8
+        classify_triples([t], near_threshold=0.85, levenshtein_threshold=0.85)
+        assert t.classification == AGREE_NEAR
+
+    def test_reference_variance_exception_not_applied_to_citation_list_blocks(self):
+        """Citation lists remain strict even when text similarity is high."""
+        t = self._make_triple(
+            "seg_001",
+            "[8] Author A et al. 2020",
+            "[9] Author A et al. 2020",
+            "Different citation record text",
+            block_type="citation_list",
+        )
+        t.confidence = 0.9
+        classify_triples([t], near_threshold=0.85, levenshtein_threshold=0.85)
+        assert t.classification == CONFLICT
+
     def test_gap_single_source(self):
         t = self._make_triple("seg_001", "Only in grobid", None, None)
         classify_triples([t])
@@ -483,14 +542,55 @@ class TestClassification:
 
 class TestGuards:
     def _make_classified_triples(self, classifications):
-        """Helper to create triples with given classifications."""
+        """Helper to create triples with given classifications.
+
+        All triples get 3 extractor blocks so block-family ratios are
+        realistic and CONFLICT triples count as 3-source (not excluded
+        from guard ratios).
+        """
         triples = []
         for i, cls in enumerate(classifications):
             t = AlignedTriple(segment_id=f"seg_{i:03d}")
             t.classification = cls
             t.confidence = 0.8
+            t.grobid_block = Block(block_id=f"g_{i}", raw_text="x", normalized_text="x", block_type="paragraph", heading_level=None, order_index=i, source="grobid")
+            t.docling_block = Block(block_id=f"d_{i}", raw_text="y", normalized_text="y", block_type="paragraph", heading_level=None, order_index=i, source="docling")
+            t.marker_block = Block(block_id=f"m_{i}", raw_text="z", normalized_text="z", block_type="paragraph", heading_level=None, order_index=i, source="marker")
             triples.append(t)
         return triples
+
+    def _make_block_triple(self, seg_id, classification, block_type):
+        t = AlignedTriple(segment_id=seg_id)
+        t.classification = classification
+        if classification != GAP:
+            t.grobid_block = Block(
+                block_id=f"g_{seg_id}",
+                block_type=block_type,
+                raw_text="Sample text",
+                normalized_text=normalize_text("Sample text"),
+                heading_level=None,
+                order_index=0,
+                source="grobid",
+            )
+            t.docling_block = Block(
+                block_id=f"d_{seg_id}",
+                block_type=block_type,
+                raw_text="Sample text",
+                normalized_text=normalize_text("Sample text"),
+                heading_level=None,
+                order_index=0,
+                source="docling",
+            )
+            t.marker_block = Block(
+                block_id=f"m_{seg_id}",
+                block_type=block_type,
+                raw_text="Sample text",
+                normalized_text=normalize_text("Sample text"),
+                heading_level=None,
+                order_index=0,
+                source="marker",
+            )
+        return t
 
     def test_no_fallback_when_healthy(self):
         triples = self._make_classified_triples([
@@ -504,10 +604,10 @@ class TestGuards:
         triples = self._make_classified_triples([
             CONFLICT, CONFLICT, CONFLICT, AGREE_EXACT, AGREE_EXACT,
         ])
-        # 3/5 = 0.6 > 0.4
+        # 3/5 = 0.6 > 0.4 — textual check fires first since all blocks are paragraphs
         should_fallback, reason = check_guards(triples, alignment_confidence=0.7)
         assert should_fallback
-        assert reason == "conflict_ratio"
+        assert reason in ("conflict_ratio", "conflict_ratio_textual")
 
     def test_fallback_on_low_alignment_confidence(self):
         triples = self._make_classified_triples([AGREE_EXACT, AGREE_EXACT])
@@ -523,7 +623,7 @@ class TestGuards:
         # denominator = 5 - 3 = 2, conflict = 1/2 = 0.5 > 0.4
         should_fallback, reason = check_guards(triples, alignment_confidence=0.7)
         assert should_fallback
-        assert reason == "conflict_ratio"
+        assert reason in ("conflict_ratio", "conflict_ratio_textual")
 
     def test_all_gap_no_fallback(self):
         """All-GAP should have conflict_ratio = 0.0 (no fallback from ratio)."""
@@ -535,6 +635,58 @@ class TestGuards:
         should_fallback, reason = check_guards([], alignment_confidence=0.7)
         assert should_fallback
         assert reason == "no_blocks"
+
+    def test_structured_conflicts_use_structured_threshold(self):
+        triples = [
+            self._make_block_triple("seg_000", CONFLICT, "table"),
+            self._make_block_triple("seg_001", CONFLICT, "table"),
+            self._make_block_triple("seg_002", AGREE_EXACT, "table"),
+            self._make_block_triple("seg_003", AGREE_EXACT, "table"),
+        ]
+
+        should_fallback, reason = check_guards(
+            triples,
+            alignment_confidence=0.8,
+            conflict_ratio_threshold=0.9,  # disable global ratio fallback
+            structured_conflict_ratio_threshold=0.75,
+        )
+        assert not should_fallback
+        assert reason is None
+
+        should_fallback, reason = check_guards(
+            triples,
+            alignment_confidence=0.8,
+            conflict_ratio_threshold=0.9,
+            structured_conflict_ratio_threshold=0.45,
+        )
+        assert should_fallback
+        assert reason == "conflict_ratio_structured"
+
+    def test_localized_conflict_relief_for_gap_heavy_runs(self):
+        triples = []
+        # Conflicts localized near the start.
+        for i in range(20):
+            triples.append(self._make_block_triple(f"seg_c_{i:03d}", CONFLICT, "paragraph"))
+        # Large GAP region inflates non-gap ratio in current denominator logic.
+        for i in range(20):
+            t = AlignedTriple(segment_id=f"seg_g_{i:03d}")
+            t.classification = GAP
+            triples.append(t)
+        # Healthy region later in the document.
+        for i in range(20):
+            triples.append(self._make_block_triple(f"seg_a_{i:03d}", AGREE_EXACT, "paragraph"))
+
+        should_fallback, reason = check_guards(
+            triples,
+            alignment_confidence=0.8,
+            conflict_ratio_threshold=0.4,
+            textual_conflict_ratio_threshold=0.6,
+            localized_conflict_span_max=0.35,
+            localized_conflict_relief=0.15,
+            localized_conflict_max_blocks=25,
+        )
+        assert not should_fallback
+        assert reason is None
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +816,73 @@ class TestMetrics:
         assert metrics["fallback_triggered"] is False
         assert metrics["tokens_saved_estimate"] == 400  # (2+1+1)*100
 
+    def test_metrics_include_guard_telemetry(self):
+        triples = []
+        for cls in [AGREE_EXACT, CONFLICT]:
+            t = AlignedTriple(segment_id=f"seg_{len(triples):03d}")
+            t.classification = cls
+            triples.append(t)
+
+        metrics = compute_metrics(
+            triples,
+            0.8,
+            True,
+            "conflict_ratio",
+            guard_telemetry={
+                "conflict_ratio_textual": 0.5,
+                "conflict_ratio_structured": 0.0,
+                "conflicts_localized": True,
+                "conflict_span_ratio": 0.2,
+                "adaptive_conflict_ratio_threshold": 0.55,
+            },
+        )
+        assert metrics["conflict_ratio_textual"] == 0.5
+        assert metrics["conflict_ratio_structured"] == 0.0
+        assert metrics["conflicts_localized"] is True
+        assert metrics["adaptive_conflict_ratio_threshold"] == 0.55
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 metadata tests
+# ---------------------------------------------------------------------------
+
+class TestPhase2Metadata:
+    def test_audit_includes_resolution_method_metadata(self):
+        triple = AlignedTriple(segment_id="seg_001", classification=CONFLICT)
+        triple.grobid_block = Block(
+            block_id="g_001",
+            block_type="paragraph",
+            raw_text="Alpha text.",
+            normalized_text=normalize_text("Alpha text."),
+            heading_level=None,
+            order_index=0,
+            source="grobid",
+        )
+        triple.docling_block = Block(
+            block_id="d_001",
+            block_type="paragraph",
+            raw_text="Alpha text updated.",
+            normalized_text=normalize_text("Alpha text updated."),
+            heading_level=None,
+            order_index=0,
+            source="docling",
+        )
+
+        audit = _build_audit_entries(
+            [triple],
+            {"seg_001": "Resolved text"},
+            {"seg_001": {
+                "method": "median_source",
+                "confidence": 0.91,
+                "sources_agreeing": ["docling", "grobid"],
+            }},
+        )
+
+        assert len(audit) == 1
+        assert audit[0]["chosen_source"] == "median_source"
+        assert audit[0]["details"]["resolution_method"] == "median_source"
+        assert audit[0]["details"]["resolution_confidence"] == 0.91
+
 
 # ---------------------------------------------------------------------------
 # End-to-end / orchestrator tests
@@ -678,6 +897,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
 
         llm = MagicMock()
+        llm.usage = TokenAccumulator()
         result, metrics, _audit = merge_with_consensus("grobid", "", "marker", llm)
         assert result is None
         assert metrics["fallback_triggered"] is True
@@ -691,6 +911,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
 
         llm = MagicMock()
+        llm.usage = TokenAccumulator()
         result, metrics, _audit = merge_with_consensus("grobid", None, "marker", llm)
         assert result is None
         assert metrics["fallback_reason"] == "missing_extractor"
@@ -704,6 +925,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
 
         llm = MagicMock()
+        llm.usage = TokenAccumulator()
 
         # Use identical text so everything agrees
         md = "# Title\n\nThis is the body text of the paper."
@@ -719,36 +941,77 @@ class TestMergeWithConsensus:
 
     @patch("config.Config")
     def test_full_pipeline_with_conflicts(self, mock_config):
-        """When extractors disagree, LLM should be called for conflicts."""
+        """When extractors disagree, LLM should be called for zone resolution."""
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8  # high threshold to avoid fallback
         mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1  # low threshold
+        mock_config.CONSENSUS_LAYERED_ENABLED = False
 
         llm = MagicMock()
-        llm.resolve_conflicts.return_value = {}  # will be filled dynamically
+        llm.usage = TokenAccumulator()
 
         md_a = "# Title\n\nThe accuracy was 95%."
         md_b = "# Title\n\nThe accuracy was 96%."
         md_c = "# Title\n\nThe accuracy was 97%."
 
-        # Mock resolve_conflicts to return resolved text for any segment
-        def mock_resolve(conflicts):
-            for c in conflicts:
-                assert "context_before" in c
-                assert "context_after" in c
-            return {c["segment_id"]: "The accuracy was 95.5%." for c in conflicts}
-        llm.resolve_conflicts.side_effect = mock_resolve
+        # Mock resolve_conflict_zones to return resolved text for any conflict/gap/near_agree segments
+        def mock_resolve_zones(zones):
+            result = {}
+            for zone in zones:
+                for seg in zone["segments"]:
+                    if seg["status"] in ("conflict", "gap", "near_agree"):
+                        result[seg["segment_id"]] = "The accuracy was 95.5%."
+            return result
+        llm.resolve_conflict_zones.side_effect = mock_resolve_zones
 
         result, metrics, _audit = merge_with_consensus(md_a, md_b, md_c, llm)
 
         if result is not None:
-            # Pipeline succeeded with conflict resolution
+            # Pipeline succeeded with zone-based conflict resolution
             assert metrics["conflict"] >= 1
-            llm.resolve_conflicts.assert_called()
+            llm.resolve_conflict_zones.assert_called()
         else:
             # Fallback triggered (acceptable if confidence too low)
             assert metrics["fallback_triggered"] is True
+
+    @patch("config.Config")
+    @patch("app.services.consensus_service._resolve_conflicts_layered")
+    def test_layered_resolution_methods_are_reported(self, mock_layered, mock_config):
+        mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
+        mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
+        mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1
+        mock_config.CONSENSUS_LAYERED_ENABLED = True
+        mock_config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = False
+        mock_config.CONSENSUS_HIERARCHY_ENABLED = False
+
+        llm = MagicMock()
+        llm.usage = TokenAccumulator()
+        mock_layered.return_value = (
+            {"seg_001": "Resolved by layered resolver."},
+            {
+                "seg_001": {
+                    "method": "median_source",
+                    "confidence": 0.87,
+                    "sources_agreeing": ["docling", "grobid", "marker"],
+                },
+            },
+        )
+
+        md_a = "# Title\n\nThe accuracy was 95%."
+        md_b = "# Title\n\nThe accuracy was 96%."
+        md_c = "# Title\n\nThe accuracy was 97%."
+
+        result, metrics, audit = merge_with_consensus(md_a, md_b, md_c, llm)
+        assert result is not None
+        assert metrics["fallback_triggered"] is False
+        assert metrics["resolution_methods"]["median_source"] == 1
+        assert metrics["resolution_confidence_mean"] == 0.87
+        assert any(
+            entry.get("details", {}).get("resolution_method") == "median_source"
+            for entry in audit
+        )
 
     @patch("config.Config")
     def test_llm_error_triggers_fallback(self, mock_config):
@@ -757,9 +1020,11 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8
         mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1
+        mock_config.CONSENSUS_LAYERED_ENABLED = False
 
         llm = MagicMock()
-        llm.resolve_conflicts.side_effect = Exception("LLM is down")
+        llm.usage = TokenAccumulator()
+        llm.resolve_conflict_zones.side_effect = Exception("LLM is down")
 
         md_a = "# Title\n\nThe accuracy was 95%."
         md_b = "# Title\n\nThe accuracy was 96%."
@@ -782,6 +1047,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
 
         llm = MagicMock()
+        llm.usage = TokenAccumulator()
         md = "# Title\n\nIdentical text in all three extractors."
         result, metrics, _audit = merge_with_consensus(md, md, md, llm)
 
@@ -797,6 +1063,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
 
         llm = MagicMock()
+        llm.usage = TokenAccumulator()
         grobid_md = "# Tiny\n\nOnly one paragraph."
 
         shared_blocks = "\n\n".join([
@@ -895,6 +1162,7 @@ class TestMarkdownPreservation:
         mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
 
         llm = MagicMock()
+        llm.usage = TokenAccumulator()
         md = "# Title\n\n## Methods\n\nBody text of the methods section."
         result, metrics, _audit = merge_with_consensus(md, md, md, llm)
 
@@ -1070,6 +1338,7 @@ class TestFailHardDedup:
         mock_config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = True
 
         llm = MagicMock()
+        llm.usage = TokenAccumulator()
 
         # Craft inputs where a near-duplicate sneaks through from two different
         # extractors but with just enough variation in the surrounding context
@@ -1105,6 +1374,7 @@ class TestFailHardDedup:
         mock_config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = False
 
         llm = MagicMock()
+        llm.usage = TokenAccumulator()
 
         md = "# Title\n\nBody text of the paper for testing."
         with patch(
@@ -1124,3 +1394,263 @@ class TestFailHardDedup:
         # With flag False, pipeline should return the result despite dupes
         assert result is not None
         assert metrics["fallback_triggered"] is False
+
+
+# ---------------------------------------------------------------------------
+# Conflict zone grouping tests
+# ---------------------------------------------------------------------------
+
+class TestBuildConflictZones:
+    """Tests for _build_conflict_zones()."""
+
+    def _make_triple(self, seg_id, classification, agreed_text=None,
+                     grobid_text=None, docling_text=None, marker_text=None,
+                     block_type="paragraph"):
+        """Helper to create a classified triple."""
+        t = AlignedTriple(segment_id=seg_id, classification=classification)
+        t.agreed_text = agreed_text
+        if grobid_text is not None:
+            t.grobid_block = Block(
+                block_id=f"g_{seg_id}", block_type=block_type, raw_text=grobid_text,
+                normalized_text=normalize_text(grobid_text),
+                heading_level=None, order_index=0, source="grobid",
+                source_md=grobid_text,
+            )
+        if docling_text is not None:
+            t.docling_block = Block(
+                block_id=f"d_{seg_id}", block_type=block_type, raw_text=docling_text,
+                normalized_text=normalize_text(docling_text),
+                heading_level=None, order_index=0, source="docling",
+                source_md=docling_text,
+            )
+        if marker_text is not None:
+            t.marker_block = Block(
+                block_id=f"m_{seg_id}", block_type=block_type, raw_text=marker_text,
+                normalized_text=normalize_text(marker_text),
+                heading_level=None, order_index=0, source="marker",
+                source_md=marker_text,
+            )
+        return t
+
+    def test_adjacent_conflicts_grouped(self):
+        """Two adjacent CONFLICT triples should be in one zone."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="Before text A"),
+            self._make_triple("seg_001", AGREE_EXACT, agreed_text="Before text B"),
+            self._make_triple("seg_002", CONFLICT, grobid_text="gA", docling_text="dA", marker_text="mA"),
+            self._make_triple("seg_003", CONFLICT, grobid_text="gB", docling_text="dB", marker_text="mB"),
+            self._make_triple("seg_004", AGREE_EXACT, agreed_text="After text A"),
+            self._make_triple("seg_005", AGREE_EXACT, agreed_text="After text B"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 1
+        zone = zones[0]
+        conflict_ids = [s["segment_id"] for s in zone["segments"] if s["status"] == "conflict"]
+        assert conflict_ids == ["seg_002", "seg_003"]
+        assert len(zone["context_before"]) == 2
+        assert len(zone["context_after"]) == 2
+
+    def test_gap_between_conflicts_absorbed(self):
+        """A GAP between two CONFLICTs should be absorbed into the zone."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="Before"),
+            self._make_triple("seg_001", AGREE_EXACT, agreed_text="Before 2"),
+            self._make_triple("seg_002", CONFLICT, grobid_text="g1", docling_text="d1", marker_text="m1"),
+            self._make_triple("seg_003", GAP, agreed_text="Gap text"),
+            self._make_triple("seg_004", CONFLICT, grobid_text="g2", docling_text="d2", marker_text="m2"),
+            self._make_triple("seg_005", AGREE_EXACT, agreed_text="After"),
+            self._make_triple("seg_006", AGREE_EXACT, agreed_text="After 2"),
+        ]
+        # GAP between conflicts within flanking_count should be absorbed
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 1
+        seg_ids = [s["segment_id"] for s in zones[0]["segments"]]
+        assert "seg_003" in seg_ids  # GAP absorbed into zone
+
+    def test_isolated_conflict_gets_flanking(self):
+        """A single isolated CONFLICT gets a zone of size 1 with flanking."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_001", AGREE_EXACT, agreed_text="B"),
+            self._make_triple("seg_002", CONFLICT, grobid_text="g", docling_text="d", marker_text="m"),
+            self._make_triple("seg_003", AGREE_EXACT, agreed_text="C"),
+            self._make_triple("seg_004", AGREE_EXACT, agreed_text="D"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 1
+        zone = zones[0]
+        conflict_segs = [s for s in zone["segments"] if s["status"] == "conflict"]
+        assert len(conflict_segs) == 1
+        assert conflict_segs[0]["segment_id"] == "seg_002"
+        assert len(zone["context_before"]) == 2
+        assert len(zone["context_after"]) == 2
+
+    def test_agree_exact_between_conflicts_creates_separate_zones(self):
+        """An AGREE_EXACT between two conflicts keeps them in separate zones."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_001", AGREE_EXACT, agreed_text="B"),
+            self._make_triple("seg_002", CONFLICT, grobid_text="g1", docling_text="d1", marker_text="m1"),
+            self._make_triple("seg_003", AGREE_EXACT, agreed_text="Middle"),  # AGREE_EXACT boundary
+            self._make_triple("seg_004", CONFLICT, grobid_text="g2", docling_text="d2", marker_text="m2"),
+            self._make_triple("seg_005", AGREE_EXACT, agreed_text="C"),
+            self._make_triple("seg_006", AGREE_EXACT, agreed_text="D"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        # AGREE_EXACT at seg_003 is a trusted boundary — zones stay separate
+        assert len(zones) == 2
+        assert zones[0]["segments"][0]["segment_id"] == "seg_002"
+        assert zones[1]["segments"][0]["segment_id"] == "seg_004"
+
+    def test_non_exact_between_conflicts_merges_zones(self):
+        """Non-AGREE_EXACT segments between conflicts cause zones to merge."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_001", AGREE_EXACT, agreed_text="B"),
+            self._make_triple("seg_002", CONFLICT, grobid_text="g1", docling_text="d1", marker_text="m1"),
+            self._make_triple("seg_003", AGREE_NEAR, agreed_text="Middle",
+                             grobid_text="Middle", docling_text="Middle.", marker_text="Middle"),
+            self._make_triple("seg_004", CONFLICT, grobid_text="g2", docling_text="d2", marker_text="m2"),
+            self._make_triple("seg_005", AGREE_EXACT, agreed_text="C"),
+            self._make_triple("seg_006", AGREE_EXACT, agreed_text="D"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        # AGREE_NEAR is not a boundary — both conflicts merge into one zone
+        assert len(zones) == 1
+        seg_ids = [s["segment_id"] for s in zones[0]["segments"]]
+        assert "seg_002" in seg_ids
+        assert "seg_003" in seg_ids  # near_agree absorbed
+        assert "seg_004" in seg_ids
+        # Verify the absorbed AGREE_NEAR has near_agree status with extractor versions
+        near_seg = [s for s in zones[0]["segments"] if s["segment_id"] == "seg_003"][0]
+        assert near_seg["status"] == "near_agree"
+        assert "grobid" in near_seg
+        assert "docling" in near_seg
+        assert "marker" in near_seg
+
+    def test_document_boundary_partial_flanking(self):
+        """Zone at document start should have fewer flanking segments."""
+        triples = [
+            self._make_triple("seg_000", CONFLICT, grobid_text="g", docling_text="d", marker_text="m"),
+            self._make_triple("seg_001", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_002", AGREE_EXACT, agreed_text="B"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 1
+        assert len(zones[0]["context_before"]) == 0  # no segments before
+        assert len(zones[0]["context_after"]) == 2
+
+    def test_document_end_boundary(self):
+        """Zone at document end should have fewer flanking segments."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_001", AGREE_EXACT, agreed_text="B"),
+            self._make_triple("seg_002", CONFLICT, grobid_text="g", docling_text="d", marker_text="m"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 1
+        assert len(zones[0]["context_before"]) == 2
+        assert len(zones[0]["context_after"]) == 0
+
+    def test_multiple_disjoint_zones(self):
+        """Well-separated conflicts produce separate zones.
+
+        Need at least 2*flanking_count+1 agreed segments between conflicts
+        so the flanking windows don't overlap or become adjacent.
+        """
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_001", AGREE_EXACT, agreed_text="B"),
+            self._make_triple("seg_002", CONFLICT, grobid_text="g1", docling_text="d1", marker_text="m1"),
+            self._make_triple("seg_003", AGREE_EXACT, agreed_text="C"),
+            self._make_triple("seg_004", AGREE_EXACT, agreed_text="D"),
+            self._make_triple("seg_005", AGREE_EXACT, agreed_text="E"),  # buffer
+            self._make_triple("seg_006", AGREE_EXACT, agreed_text="F"),
+            self._make_triple("seg_007", AGREE_EXACT, agreed_text="G"),
+            self._make_triple("seg_008", CONFLICT, grobid_text="g2", docling_text="d2", marker_text="m2"),
+            self._make_triple("seg_009", AGREE_EXACT, agreed_text="H"),
+            self._make_triple("seg_010", AGREE_EXACT, agreed_text="I"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 2
+        conflict_ids_0 = [s["segment_id"] for s in zones[0]["segments"] if s["status"] == "conflict"]
+        conflict_ids_1 = [s["segment_id"] for s in zones[1]["segments"] if s["status"] == "conflict"]
+        assert "seg_002" in conflict_ids_0
+        assert "seg_008" in conflict_ids_1
+
+    def test_no_conflicts_returns_empty(self):
+        """When there are no CONFLICT triples, returns empty list."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_001", GAP, agreed_text="B"),
+            self._make_triple("seg_002", AGREE_NEAR, agreed_text="C"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 0
+
+    def test_near_agree_in_zone_has_extractor_versions(self):
+        """AGREE_NEAR segments in zones should have all extractor versions and near_agree status."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="Before"),
+            self._make_triple("seg_001", AGREE_NEAR, agreed_text="Near text",
+                             grobid_text="Near text", docling_text="Near text.", marker_text="Near text"),
+            self._make_triple("seg_002", CONFLICT, grobid_text="g", docling_text="d", marker_text="m"),
+            self._make_triple("seg_003", AGREE_EXACT, agreed_text="After"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 1
+        # Near agree segment should be in the core with status "near_agree"
+        near_segs = [s for s in zones[0]["segments"] if s["status"] == "near_agree"]
+        assert len(near_segs) == 1
+        assert near_segs[0]["segment_id"] == "seg_001"
+        assert "grobid" in near_segs[0]
+        assert "docling" in near_segs[0]
+        assert "marker" in near_segs[0]
+        assert "current_choice" in near_segs[0]
+
+    def test_gap_between_conflicts_no_exact_boundary(self):
+        """GAP between conflicts should NOT create a boundary (GAP is not AGREE_EXACT)."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_001", CONFLICT, grobid_text="g1", docling_text="d1", marker_text="m1"),
+            self._make_triple("seg_002", GAP, agreed_text="Gap"),
+            self._make_triple("seg_003", CONFLICT, grobid_text="g2", docling_text="d2", marker_text="m2"),
+            self._make_triple("seg_004", AGREE_EXACT, agreed_text="B"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 1
+        seg_ids = [s["segment_id"] for s in zones[0]["segments"]]
+        assert seg_ids == ["seg_001", "seg_002", "seg_003"]
+
+    def test_zone_segment_structure(self):
+        """Verify zone segment dicts have the expected keys."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="Before"),
+            self._make_triple("seg_001", CONFLICT, grobid_text="g", docling_text="d", marker_text="m"),
+            self._make_triple("seg_002", AGREE_EXACT, agreed_text="After"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=1)
+        assert len(zones) == 1
+        seg = zones[0]["segments"][0]
+        assert seg["status"] == "conflict"
+        assert "grobid" in seg
+        assert "docling" in seg
+        assert "marker" in seg
+        assert "segment_id" in seg
+
+    def test_isolated_near_agree_not_in_zones(self):
+        """An AGREE_NEAR separated from conflicts by AGREE_EXACT should NOT be in any zone."""
+        triples = [
+            self._make_triple("seg_000", AGREE_EXACT, agreed_text="A"),
+            self._make_triple("seg_001", AGREE_NEAR, agreed_text="Near",
+                             grobid_text="Near", docling_text="Near.", marker_text="Near"),
+            self._make_triple("seg_002", AGREE_EXACT, agreed_text="B"),
+            self._make_triple("seg_003", CONFLICT, grobid_text="g", docling_text="d", marker_text="m"),
+            self._make_triple("seg_004", AGREE_EXACT, agreed_text="C"),
+        ]
+        zones = _build_conflict_zones(triples, flanking_count=2)
+        assert len(zones) == 1
+        # Only the conflict should be in the zone, not the isolated near_agree
+        all_seg_ids = [s["segment_id"] for s in zones[0]["segments"]]
+        assert "seg_001" not in all_seg_ids
+        assert "seg_003" in all_seg_ids

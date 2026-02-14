@@ -23,7 +23,6 @@ def client(monkeypatch):
     app.config["CACHE_FOLDER"] = tempfile.mkdtemp()
     app.config["OPENAI_API_KEY"] = "dummy"
     app.config["LLM_MODEL"] = "dummy"
-    app.config["LLM_MAX_TOKENS"] = 16000
     app.config["EXTRACTION_CONFIG_VERSION"] = "1"
     app.config["GROBID_REQUEST_TIMEOUT"] = 120
     app.config["GROBID_INCLUDE_COORDINATES"] = False

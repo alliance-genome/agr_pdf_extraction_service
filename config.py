@@ -12,7 +12,7 @@ class Config:
 
     # ---- Cache versioning ----------------------------------------------------
     # Bump this when extractor config changes to invalidate old cached outputs.
-    EXTRACTION_CONFIG_VERSION = os.environ.get("EXTRACTION_CONFIG_VERSION", "3")
+    EXTRACTION_CONFIG_VERSION = os.environ.get("EXTRACTION_CONFIG_VERSION", "4")
 
     # ---- Celery / Redis ------------------------------------------------------
     CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
@@ -47,15 +47,58 @@ class Config:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
     LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.2")
     LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "medium")
+    LLM_CONFLICT_BATCH_SIZE = int(os.environ.get("LLM_CONFLICT_BATCH_SIZE", 10))
+    LLM_CONFLICT_MAX_WORKERS = int(os.environ.get("LLM_CONFLICT_MAX_WORKERS", 4))
+    LLM_CONFLICT_RETRY_ROUNDS = int(os.environ.get("LLM_CONFLICT_RETRY_ROUNDS", 2))
+
+    # ---- Per-call-type model defaults ----------------------------------------
+    LLM_MODEL_ZONE_RESOLUTION = os.environ.get("LLM_MODEL_ZONE_RESOLUTION", "gpt-5-mini")
+    LLM_MODEL_FULL_MERGE = os.environ.get("LLM_MODEL_FULL_MERGE", "gpt-5.2")
+    LLM_MODEL_RESCUE = os.environ.get("LLM_MODEL_RESCUE", "gpt-5-mini")
+    LLM_MODEL_CONFLICT_BATCH = os.environ.get("LLM_MODEL_CONFLICT_BATCH", "gpt-5.2")
+
+    # ---- Zone resolution escalation threshold --------------------------------
+    ZONE_ESCALATION_THRESHOLD = int(os.environ.get("ZONE_ESCALATION_THRESHOLD", 20000))
+    ZONE_ESCALATION_MODEL = os.environ.get("ZONE_ESCALATION_MODEL", "gpt-5.2")
+
+    # ---- LLM pricing (USD per 1M tokens) ------------------------------------
+    LLM_PRICING = {
+        "gpt-5.2": {"input": 1.75, "output": 14.00, "cached_input": 0.175},
+        "gpt-5-mini": {"input": 0.25, "output": 2.00, "cached_input": 0.025},
+        "gpt-4.1": {"input": 2.00, "output": 8.00, "cached_input": 0.50},
+        "gpt-4.1-mini": {"input": 0.40, "output": 1.60, "cached_input": 0.10},
+    }
 
     # ---- Consensus pipeline --------------------------------------------------
     CONSENSUS_ENABLED = os.environ.get("CONSENSUS_ENABLED", "true").lower() == "true"
     CONSENSUS_NEAR_THRESHOLD = float(os.environ.get("CONSENSUS_NEAR_THRESHOLD", 0.92))
     CONSENSUS_LEVENSHTEIN_THRESHOLD = float(os.environ.get("CONSENSUS_LEVENSHTEIN_THRESHOLD", 0.90))
     CONSENSUS_CONFLICT_RATIO_FALLBACK = float(os.environ.get("CONSENSUS_CONFLICT_RATIO_FALLBACK", 0.4))
+    CONSENSUS_CONFLICT_RATIO_TEXTUAL_FALLBACK = float(
+        os.environ.get("CONSENSUS_CONFLICT_RATIO_TEXTUAL_FALLBACK", 0.4),
+    )
+    CONSENSUS_CONFLICT_RATIO_STRUCTURED_FALLBACK = float(
+        os.environ.get("CONSENSUS_CONFLICT_RATIO_STRUCTURED_FALLBACK", 0.85),
+    )
+    CONSENSUS_LOCALIZED_CONFLICT_SPAN_MAX = float(
+        os.environ.get("CONSENSUS_LOCALIZED_CONFLICT_SPAN_MAX", 0.35),
+    )
+    CONSENSUS_LOCALIZED_CONFLICT_RELIEF = float(
+        os.environ.get("CONSENSUS_LOCALIZED_CONFLICT_RELIEF", 0.15),
+    )
+    CONSENSUS_LOCALIZED_CONFLICT_MAX_BLOCKS = int(
+        os.environ.get("CONSENSUS_LOCALIZED_CONFLICT_MAX_BLOCKS", 25),
+    )
+    CONSENSUS_LAYERED_ENABLED = os.environ.get("CONSENSUS_LAYERED_ENABLED", "true").lower() == "true"
+    CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD = float(
+        os.environ.get("CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD", 0.60),
+    )
     CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = float(os.environ.get("CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK", 0.5))
     CONSENSUS_ALWAYS_ESCALATE_TABLES = os.environ.get("CONSENSUS_ALWAYS_ESCALATE_TABLES", "true").lower() == "true"
     CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = os.environ.get("CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES", "true").lower() == "true"
+
+    # ---- Conflict zone grouping -----------------------------------------------
+    CONSENSUS_ZONE_FLANKING_COUNT = int(os.environ.get("CONSENSUS_ZONE_FLANKING_COUNT", 2))
 
     # ---- Header hierarchy resolution -----------------------------------------
     CONSENSUS_HIERARCHY_ENABLED = os.environ.get("CONSENSUS_HIERARCHY_ENABLED", "true").lower() == "true"

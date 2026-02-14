@@ -15,6 +15,12 @@ class Grobid(PDFExtractor):
         self.include_raw_citations = include_raw_citations
         self.tei_ns = {"tei": "http://www.tei-c.org/ns/1.0"}
 
+    @staticmethod
+    def _normalized_xml_text(elem):
+        if elem is None:
+            return ""
+        return " ".join("".join(elem.itertext()).split()).strip()
+
     def is_alive(self):
         try:
             response = requests.get(f"{self.base_url}/api/isalive", timeout=5)
@@ -48,10 +54,48 @@ class Grobid(PDFExtractor):
     def extract_plain_text(self, tei_xml):
         try:
             tree = ET.fromstring(tei_xml)
+            text_parts = []
+
+            # Parse front matter from teiHeader.
+            title_elem = tree.find(
+                ".//tei:teiHeader/tei:fileDesc/tei:titleStmt/tei:title[@type='main']",
+                self.tei_ns,
+            )
+            if title_elem is None:
+                title_elem = tree.find(
+                    ".//tei:teiHeader/tei:fileDesc/tei:titleStmt/tei:title",
+                    self.tei_ns,
+                )
+            title_text = self._normalized_xml_text(title_elem)
+            if title_text:
+                text_parts.append(f"# {title_text}")
+
+            author_names = []
+            for author in tree.findall(".//tei:teiHeader/tei:fileDesc/tei:sourceDesc//tei:author", self.tei_ns):
+                pers_name = author.find(".//tei:persName", self.tei_ns)
+                name_source = pers_name if pers_name is not None else author
+                name_text = self._normalized_xml_text(name_source)
+                if name_text and name_text not in author_names:
+                    author_names.append(name_text)
+            if author_names:
+                text_parts.append(", ".join(author_names))
+
+            abstract_parts = []
+            for paragraph in tree.findall(".//tei:teiHeader/tei:profileDesc/tei:abstract//tei:p", self.tei_ns):
+                paragraph_text = self._normalized_xml_text(paragraph)
+                if paragraph_text:
+                    abstract_parts.append(paragraph_text)
+            if not abstract_parts:
+                abstract_elem = tree.find(".//tei:teiHeader/tei:profileDesc/tei:abstract", self.tei_ns)
+                abstract_text = self._normalized_xml_text(abstract_elem)
+                if abstract_text:
+                    abstract_parts.append(abstract_text)
+            if abstract_parts:
+                text_parts.append("## Abstract")
+                text_parts.extend(abstract_parts)
 
             body_elem = tree.find(".//tei:text/tei:body", self.tei_ns)
             if body_elem is not None:
-                text_parts = []
                 for div in body_elem.findall(".//tei:div", self.tei_ns):
                     # Emit section heading once.
                     head = div.find("tei:head", self.tei_ns)
@@ -79,8 +123,8 @@ class Grobid(PDFExtractor):
                         if parts:
                             text_parts.append("\n\n".join(parts))
 
-                return "\n\n".join(text_parts)
-            return None
+            result = "\n\n".join(part for part in text_parts if part and part.strip())
+            return result or None
 
         except ET.ParseError as e:
             raise RuntimeError(f"Error parsing TEI XML: {e}")

@@ -115,6 +115,8 @@ def _get_run_by_process_id(process_id):
             "error_message": run.error_message,
             "artifacts_json": run.artifacts_json,
             "log_s3_key": run.log_s3_key,
+            "llm_usage_json": run.llm_usage_json,
+            "llm_cost_usd": float(run.llm_cost_usd) if run.llm_cost_usd is not None else None,
         }
     except Exception as exc:
         logger.warning("Failed to query extraction_run for %s: %s", process_id, exc)
@@ -435,6 +437,8 @@ def get_extraction_status(process_id):
             "ended_at": run["ended_at"],
             "log_s3_key": run["log_s3_key"],
             "artifacts_json": run["artifacts_json"],
+            "llm_cost_usd": run["llm_cost_usd"],
+            "llm_usage_json": run["llm_usage_json"],
         }
         if run["error_code"] or run["error_message"]:
             response["error_code"] = run["error_code"]

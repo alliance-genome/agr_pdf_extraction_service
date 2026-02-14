@@ -194,6 +194,8 @@ def _upsert_extraction_run(
     error_message=None,
     artifacts_json=None,
     log_s3_key=None,
+    llm_usage_json=None,
+    llm_cost_usd=None,
 ):
     if not db_session:
         return None
@@ -227,6 +229,10 @@ def _upsert_extraction_run(
         run.artifacts_json = artifacts_json
     if log_s3_key is not None:
         run.log_s3_key = log_s3_key
+    if llm_usage_json is not None:
+        run.llm_usage_json = llm_usage_json
+    if llm_cost_usd is not None:
+        run.llm_cost_usd = llm_cost_usd
 
     db_session.commit()
     return run
@@ -388,6 +394,24 @@ def extract_pdf(
     except Exception as exc:
         adapter.warning("Failed to initialize audit logger: %s", exc)
 
+    # Per-publication file log — captures all log output for this run to a .txt file.
+    # Attaches a FileHandler to the root logger; removed in the finally block.
+    run_log_handler = None
+    version = Config.EXTRACTION_CONFIG_VERSION
+    cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(methods))}"
+    run_log_path = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_run.log")
+    try:
+        run_log_handler = logging.FileHandler(run_log_path, mode="w", encoding="utf-8")
+        run_log_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        ))
+        run_log_handler.setLevel(logging.DEBUG)
+        logging.getLogger().addHandler(run_log_handler)
+        adapter.info("Per-publication log: %s", run_log_path)
+    except Exception as exc:
+        adapter.warning("Failed to set up per-publication file log: %s", exc)
+        run_log_handler = None
+
     _safe_log_event(audit_logger, "run", "queued", detail="Task accepted")
 
     adapter.info(
@@ -422,6 +446,9 @@ def extract_pdf(
 
     _safe_log_event(audit_logger, "run", "running")
 
+    # Shared container so failure path can access LLM usage even if _run_extraction raises
+    _shared = {"llm": None}
+
     try:
         result = _run_extraction(
             self,
@@ -431,6 +458,8 @@ def extract_pdf(
             file_hash=file_hash,
             audit_logger=audit_logger,
             adapter=adapter,
+            run_log_path=run_log_path if run_log_handler else None,
+            _shared=_shared,
         )
 
         artifacts_json = _upload_artifacts(audit_logger, result, merge, pdf_path=pdf_path)
@@ -454,6 +483,8 @@ def extract_pdf(
                 ended_at=ended_at,
                 artifacts_json=artifacts_json,
                 log_s3_key=log_s3_key,
+                llm_usage_json=result.get("llm_usage_json"),
+                llm_cost_usd=result.get("llm_cost_usd"),
             )
 
         result["process_id"] = process_id
@@ -487,6 +518,18 @@ def extract_pdf(
             },
         )
 
+        # Persist any LLM cost data even on failure (tokens were still spent)
+        fail_llm_usage = None
+        fail_llm_cost = None
+        if _shared.get("llm") is not None:
+            try:
+                from app.services.llm_service import compute_cost
+                fail_summary = _shared["llm"].usage.summary()
+                if fail_summary["total_tokens"] > 0:
+                    fail_llm_cost, fail_llm_usage = compute_cost(fail_summary, Config.LLM_PRICING)
+            except Exception:
+                pass
+
         if db_session:
             _safe_upsert_extraction_run(
                 db_session,
@@ -496,6 +539,8 @@ def extract_pdf(
                 error_code=exc.__class__.__name__,
                 error_message=str(exc),
                 log_s3_key=audit_logger.get_log_s3_key() if audit_logger else None,
+                llm_usage_json=fail_llm_usage,
+                llm_cost_usd=fail_llm_cost,
             )
 
         raise
@@ -512,6 +557,14 @@ def extract_pdf(
                     )
         except Exception as exc:
             logger.warning("Failed during audit flush for process_id=%s: %s", process_id, exc)
+
+        # Remove per-publication file handler
+        if run_log_handler:
+            try:
+                logging.getLogger().removeHandler(run_log_handler)
+                run_log_handler.close()
+            except Exception:
+                pass
 
         _safe_close_session(db_session)
 
@@ -610,7 +663,7 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
         return method, f.read(), False
 
 
-def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger=None, adapter=None):
+def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger=None, adapter=None, run_log_path=None, _shared=None):
     """Inner extraction logic, separated so caller can wrap with finally."""
 
     from app.services.llm_service import LLM
@@ -701,6 +754,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
     merged_cache_path = None
     audit_cache_path = None
     consensus_metrics = None
+    llm = None
     if merge and extractions:
         if not Config.OPENAI_API_KEY:
             raise ValueError("merge=true but OPENAI_API_KEY is not set")
@@ -725,9 +779,14 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
 
             llm = LLM(
                 api_key=Config.OPENAI_API_KEY,
-                model=Config.LLM_MODEL,
+                model=Config.LLM_MODEL_FULL_MERGE,
                 reasoning_effort=Config.LLM_REASONING_EFFORT,
+                conflict_batch_size=Config.LLM_CONFLICT_BATCH_SIZE,
+                conflict_max_workers=Config.LLM_CONFLICT_MAX_WORKERS,
+                conflict_retry_rounds=Config.LLM_CONFLICT_RETRY_ROUNDS,
             )
+            if _shared is not None:
+                _shared["llm"] = llm
 
             grobid_text = extractions.get("grobid", "")
             docling_text = extractions.get("docling", "")
@@ -745,14 +804,15 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                         consensus_md, consensus_metrics, consensus_audit = merge_with_consensus(
                             grobid_text, docling_text, marker_text, llm,
                         )
+                        if consensus_metrics is not None:
+                            audit_cache_path = os.path.join(
+                                Config.CACHE_FOLDER, f"{cache_key}_audit.json",
+                            )
+                            with open(audit_cache_path, "w", encoding="utf-8") as f:
+                                json.dump(consensus_audit or [], f, indent=2, ensure_ascii=False)
+
                         if consensus_md is not None:
                             merged_md = consensus_md
-                            if consensus_audit:
-                                audit_cache_path = os.path.join(
-                                    Config.CACHE_FOLDER, f"{cache_key}_audit.json",
-                                )
-                                with open(audit_cache_path, "w", encoding="utf-8") as f:
-                                    json.dump(consensus_audit, f, indent=2, ensure_ascii=False)
                             log.info(
                                 "Consensus merge succeeded",
                                 extra={
@@ -780,6 +840,11 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                     except Exception as e:
                         log.warning("Consensus pipeline error, falling back to full-LLM merge: %s", e)
                         consensus_metrics = {"fallback_triggered": True, "fallback_reason": "pipeline_error"}
+                        audit_cache_path = os.path.join(
+                            Config.CACHE_FOLDER, f"{cache_key}_audit.json",
+                        )
+                        with open(audit_cache_path, "w", encoding="utf-8") as f:
+                            json.dump([], f, indent=2, ensure_ascii=False)
 
                 # Fallback to full-LLM merge
                 if merged_md is None:
@@ -799,11 +864,12 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                 with open(_cached_path(file_hash, "merged"), "w", encoding="utf-8") as f:
                     f.write(merged_md)
 
+                merge_duration = round(time.monotonic() - started, 3)
                 _safe_log_event(
                     audit_logger,
                     stage,
                     "completed",
-                    duration_s=round(time.monotonic() - started, 3),
+                    duration_s=merge_duration,
                 )
             except Exception as exc:
                 _safe_log_event(
@@ -814,6 +880,27 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                     duration_s=round(time.monotonic() - started, 3),
                 )
                 raise
+
+    # --- Compute LLM cost tracking -------------------------------------------
+    llm_cost_usd = None
+    llm_usage_json = None
+    if llm is not None:
+        try:
+            from app.services.llm_service import compute_cost
+            usage_summary = llm.usage.summary()
+            if usage_summary["total_tokens"] > 0:
+                llm_cost_usd, llm_usage_json = compute_cost(usage_summary, Config.LLM_PRICING)
+                log.info(
+                    "LLM cost tracking: $%.4f (%d tokens)",
+                    llm_cost_usd, usage_summary["total_tokens"],
+                    extra={
+                        "_event": "llm_cost_computed",
+                        "_llm_cost_usd": llm_cost_usd,
+                        "_llm_total_tokens": usage_summary["total_tokens"],
+                    },
+                )
+        except Exception as exc:
+            log.warning("Failed to compute LLM cost: %s", exc)
 
     # Rewrite image paths in merged output preview at response time
     merged_preview = merged_md
@@ -834,12 +921,18 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
         "merged_output": merged_preview,
         "merged_cache_path": merged_cache_path,
         "download_paths": {m: _cached_path(file_hash, m) for m in methods_used},
+        "run_log_path": run_log_path,
         "images": images,
         "has_images": bool(images),
     }
 
     if consensus_metrics is not None:
         result["consensus_metrics"] = consensus_metrics
+
+    if llm_usage_json is not None:
+        result["llm_usage_json"] = llm_usage_json
+    if llm_cost_usd is not None:
+        result["llm_cost_usd"] = llm_cost_usd
 
     if audit_cache_path:
         result["download_paths"]["audit"] = audit_cache_path
