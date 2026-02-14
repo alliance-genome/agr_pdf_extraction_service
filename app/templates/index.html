@@ -60,7 +60,7 @@
                     <input type="checkbox" name="merge" id="mergeCheckbox" checked>
                     <strong>Merge extractions with LLM</strong>
                 </label>
-                <div class="method-info">Uses Claude to intelligently combine selected methods into a structured output</div>
+                <div class="method-info">Uses GPT to intelligently combine selected methods into a structured output</div>
             </div>
             
             <button type="submit" id="submitBtn">Process PDF</button>
@@ -161,6 +161,19 @@
                         }
                     }
                     
+                    // Build extracted figures section
+                    if (data.images && data.images.length > 0) {
+                        outputHTML += '<h3>Extracted Figures:</h3>';
+                        outputHTML += '<div style="display: flex; flex-wrap: wrap; gap: 15px;">';
+                        data.images.forEach(img => {
+                            outputHTML += `<div style="border: 1px solid #ddd; padding: 10px; border-radius: 4px;">`;
+                            outputHTML += `<img src="/download/${data.file_hash}/images/${encodeURIComponent(img.filename)}" style="max-width: 400px; max-height: 300px; display: block; margin-bottom: 8px;">`;
+                            outputHTML += `<a href="/download/${data.file_hash}/images/${encodeURIComponent(img.filename)}" class="download-btn" style="font-size: 0.85em; padding: 5px 10px;">Download ${escapeHtml(img.filename)}</a>`;
+                            outputHTML += `</div>`;
+                        });
+                        outputHTML += '</div>';
+                    }
+
                     outputSection.innerHTML = outputHTML;
                 } else {
                     messageDiv.innerHTML = `<p class="error">✗ Error: ${data.error}</p>`;
