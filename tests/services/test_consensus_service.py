@@ -17,7 +17,6 @@ from app.services.consensus_service import (
     _build_conflict_zones,
     clean_output_md,
     dedup_gap_triples,
-    dedup_gap_against_all,
     dedup_assembled_paragraphs,
     normalize_text,
     normalize_extractor_output,
@@ -1170,94 +1169,6 @@ class TestMarkdownPreservation:
         assert "# Title" in result
         assert "## Methods" in result
         assert metrics["fallback_triggered"] is False
-
-
-# ---------------------------------------------------------------------------
-# Global dedup: dedup_gap_against_all tests
-# ---------------------------------------------------------------------------
-
-class TestGlobalGapDedup:
-    def _make_triple(self, seg_id, classification, agreed_text,
-                     block_type="paragraph", source="grobid"):
-        t = AlignedTriple(segment_id=seg_id, classification=classification)
-        if agreed_text is not None:
-            t.agreed_text = agreed_text
-            block = Block(
-                block_id=f"{source}_{seg_id}",
-                block_type=block_type,
-                raw_text=agreed_text,
-                normalized_text=normalize_text(agreed_text),
-                heading_level=1 if block_type == "heading" else None,
-                order_index=0,
-                source=source,
-            )
-            setattr(t, f"{source}_block", block)
-        return t
-
-    def test_dedup_gap_against_all_drops_contained_fragment(self):
-        """GAP block whose text is a substring of an AGREE block gets blanked."""
-        long_text = (
-            "Proteomics relates the abundances of proteins to other biomolecules "
-            "such as lipids or DNA and facilitates systems biology modeling of "
-            "chemical processes underlying development and metabolism."
-        )
-        fragment = (
-            "as lipids or DNA and facilitates systems biology modeling of "
-            "chemical processes underlying development and metabolism."
-        )
-        triples = [
-            self._make_triple("seg_000", AGREE_EXACT, long_text),
-            self._make_triple("seg_001", AGREE_EXACT, "## Methods", block_type="heading"),
-            self._make_triple("seg_002", AGREE_NEAR, "Some other unique paragraph content here that is different."),
-            # ... many blocks apart ...
-            self._make_triple("seg_010", GAP, fragment, source="docling"),
-        ]
-        removed = dedup_gap_against_all(triples)
-        assert removed == 1
-        assert triples[3].agreed_text == ""  # the GAP fragment is blanked
-
-    def test_dedup_gap_against_all_drops_near_equal_far_apart(self):
-        """Two blocks far apart with high similarity — GAP gets blanked."""
-        text_a = (
-            "Opsin is amongst the three most abundant proteins we have quantified "
-            "with an amount of 266 plus-minus 51 fmoles per eye in wild-type flies."
-        )
-        text_b = (
-            "Opsin is amongst the three most abundant proteins we have quantified "
-            "with an amount of 266 plus-minus 51 fmoles per eye in wild-type flies. "
-            "This represents a substantial fraction of the total retinal protein pool."
-        )
-        triples = [
-            self._make_triple("seg_000", AGREE_EXACT, text_b),
-            # Many blocks in between
-            self._make_triple("seg_001", AGREE_EXACT, "Filler paragraph with unique content number one."),
-            self._make_triple("seg_002", AGREE_EXACT, "Filler paragraph with unique content number two."),
-            self._make_triple("seg_003", AGREE_EXACT, "Filler paragraph with unique content number three."),
-            self._make_triple("seg_020", GAP, text_a, source="marker"),
-        ]
-        removed = dedup_gap_against_all(triples)
-        assert removed == 1
-        assert triples[4].agreed_text == ""
-
-    def test_dedup_gap_against_all_preserves_unique_gap(self):
-        """GAP block with genuinely unique content is NOT removed."""
-        triples = [
-            self._make_triple("seg_000", AGREE_EXACT, "The first paragraph about protein quantification methods used in this study."),
-            self._make_triple("seg_001", GAP, "This is completely unique content from only one extractor about a different topic entirely.", source="docling"),
-        ]
-        removed = dedup_gap_against_all(triples)
-        assert removed == 0
-        assert triples[1].agreed_text != ""
-
-    def test_dedup_gap_against_all_skips_headings(self):
-        """Heading-type GAP blocks are not deduplicated even if text overlaps."""
-        triples = [
-            self._make_triple("seg_000", AGREE_EXACT, "Methods section describing the experimental approach used in great detail."),
-            self._make_triple("seg_001", GAP, "## Methods", block_type="heading", source="docling"),
-        ]
-        removed = dedup_gap_against_all(triples)
-        assert removed == 0
-        assert triples[1].agreed_text == "## Methods"
 
 
 # ---------------------------------------------------------------------------

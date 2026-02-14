@@ -197,12 +197,9 @@ There is one narrow exception: if the blocks are extremely similar (>97% token o
 
 ### Step 3b: GAP Deduplication
 
-Before evaluating guard gates, the pipeline removes duplicate GAP blocks in two passes:
+Before evaluating guard gates, the pipeline removes duplicate GAP blocks using a local window comparison. Each GAP block is compared against nearby GAP blocks (within a 3-block window). If two GAPs are ≥85% similar, the shorter duplicate is removed.
 
-1. **Local dedup** — Compares each GAP block against nearby GAP blocks (within a 3-block window). If two GAPs are ≥85% similar, the duplicate is removed.
-2. **Global dedup** — Compares each remaining GAP block against ALL other blocks (regardless of classification or distance). If a GAP's text is ≥85% similar to another block, or if one fully contains the other (≥90% containment), the GAP is removed.
-
-This prevents the same content from appearing twice in the final output when multiple extractors captured it at slightly different positions.
+This catches the common case where the same content is captured twice at adjacent positions by a single extractor, without risking removal of legitimately repeated content that appears in different sections of the paper.
 
 ### Step 4: Guard Gates — Decide How to Resolve Conflicts
 
