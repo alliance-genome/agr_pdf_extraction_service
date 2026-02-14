@@ -1,0 +1,87 @@
+# Dockerfile.gpu for agr_pdf_extraction_service
+# GPU-accelerated deployment on NVIDIA A10G (g5.2xlarge)
+#
+# Uses CUDA 12.8 runtime + Python 3.11 for PyTorch GPU inference.
+# Marker/Surya and Docling both benefit from GPU acceleration.
+
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python 3.11 and system dependencies
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3-pip \
+    gcc \
+    g++ \
+    make \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libgl1-mesa-glx \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.11 the default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+# Ensure pip is available for python3.11
+RUN python3.11 -m ensurepip --upgrade \
+    && python3.11 -m pip install --upgrade pip
+
+WORKDIR /app
+
+# Install PyTorch with CUDA 12.8 support
+RUN python3.11 -m pip install --no-cache-dir \
+    torch \
+    torchvision \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# Install onnxruntime-gpu (Docling needs this for GPU layout detection)
+RUN python3.11 -m pip install --no-cache-dir onnxruntime-gpu
+
+# Install production server and task queue
+RUN python3.11 -m pip install --no-cache-dir \
+    gunicorn \
+    celery[redis] \
+    redis
+
+# Install application dependencies
+COPY requirements.txt .
+RUN python3.11 -m pip install --no-cache-dir --ignore-installed -r requirements.txt
+
+# Force onnxruntime-gpu over any CPU version pulled in by dependencies
+RUN python3.11 -m pip uninstall -y onnxruntime 2>/dev/null; \
+    python3.11 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu || true
+
+# Copy application code
+COPY . .
+
+# Create data directories
+RUN mkdir -p data/cache data/uploads data/models logs
+
+EXPOSE 5000
+
+# GPU environment defaults
+ENV CUDA_VISIBLE_DEVICES="0"
+ENV NVIDIA_VISIBLE_DEVICES="all"
+ENV NVIDIA_DRIVER_CAPABILITIES="compute,utility"
+ENV TORCH_DEVICE="auto"
+ENV DOCLING_DEVICE="cuda"
+ENV MARKER_DEVICE="auto"
+ENV OMP_NUM_THREADS="8"
+ENV MKL_NUM_THREADS="8"
+ENV DOCLING_NUM_THREADS="8"
+ENV PYTHONUNBUFFERED=1
+
+# Default: run the web app (override in docker-compose for worker)
+CMD ["python3.11", "-m", "gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "--timeout", "600", "app:create_app()"]

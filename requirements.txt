@@ -1,8 +1,33 @@
+# Web framework
+flask
+
+# PDF extraction tools
 requests
 docling[vlm]
 marker-pdf
-uvicorn
-fastapi
+
+# LLM
+openai
+pydantic>=2.0
+
+# Consensus pipeline
+mistune
+rapidfuzz
+scipy
+
+# Background task queue
+celery[redis]
+redis
+
+# Production WSGI server
+gunicorn
+
+# Structured GELF logging
+pygelf~=0.4.2
+
+# Utilities
 boto3
 python-multipart
-flask
+sqlalchemy
+psycopg2-binary
+alembic
