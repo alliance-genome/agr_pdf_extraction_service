@@ -787,7 +787,16 @@ All extraction outputs are stored in S3 via the audit trail, and tracked in the 
 | Extracted images | S3 | Permanent |
 | Local cache (fast access) | Docker volume | Cleared on cleanup |
 
-**Prerequisites for durable storage:** AWS credentials must be configured in `.env` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). Without them, extraction still works but outputs are only in local cache.
+**Prerequisites for durable storage:**
+
+1. **IAM role** — The EC2 instance needs an IAM instance profile with:
+   - `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` on the audit bucket
+   - `ssm:GetParameter` on `/pdfx/*`
+2. **IMDSv2 hop limit** — Set to 2 so Docker containers can reach the EC2 metadata service for IAM credentials (`aws ec2 modify-instance-metadata-options --instance-id <id> --http-put-response-hop-limit 2`)
+3. **SSM parameter** — Store the bucket name at `/pdfx/audit-s3-bucket` in Parameter Store
+4. **No AWS keys needed** — The service uses the default boto3 credential chain (instance profile on EC2, env vars or config for local dev)
+
+Without S3 access, extraction still works but outputs are only in local cache.
 
 ---
 
@@ -817,7 +826,8 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 |----------|---------|-------------|
 | `LLM_MODEL` | `gpt-5.2` | Base model |
 | `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5-mini` | Model for zone-based conflict resolution |
-| `LLM_MODEL_RESCUE` | `gpt-5-mini` | Model for rescue resolution attempts |
+| `LLM_MODEL_GENERAL_RESCUE` | `gpt-5.2` | Model for general (non-numeric) rescue resolution |
+| `LLM_MODEL_NUMERIC_RESCUE` | `gpt-5.2` | Model for numeric integrity rescue — uses stronger model for complex numbers |
 | `LLM_MODEL_CONFLICT_BATCH` | `gpt-5.2` | Model for batched conflict resolution |
 | `HIERARCHY_LLM_MODEL` | `gpt-5.2` | Model for heading hierarchy resolution |
 | `HIERARCHY_LLM_REASONING` | `medium` | Reasoning effort for heading hierarchy calls |
@@ -858,7 +868,9 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 | `CELERY_BROKER_URL` | `redis://localhost:6379/0` | Redis broker URL |
 | `CELERY_RESULT_BACKEND` | `redis://localhost:6379/1` | Redis result backend |
 | `CACHE_FOLDER` | `./extraction_cache` | Local cache directory |
-| `AUDIT_S3_BUCKET` | `agr-pdf-extraction-benchmark` | S3 bucket for durable artifact storage |
+| `AUDIT_S3_BUCKET` | _(empty)_ | S3 bucket for durable artifact storage; resolved from SSM if unset |
+| `AUDIT_S3_BUCKET_SSM_PARAM` | `/pdfx/audit-s3-bucket` | SSM parameter name for bucket resolution |
+| `AWS_DEFAULT_REGION` | `us-east-1` | AWS region for SSM and S3 clients |
 | `EXTRACTION_CONFIG_VERSION` | `4` | Bump to invalidate cached outputs |
 
 ---

@@ -8,15 +8,14 @@ from app.services.audit_logger import AuditLogger
 class DummyConfig:
     AUDIT_S3_BUCKET = "test-bucket"
     AUDIT_S3_PREFIX = "pdfx/audit"
-    AWS_ACCESS_KEY_ID = "test-key"
-    AWS_SECRET_ACCESS_KEY = "test-secret"
+    AUDIT_S3_BUCKET_SSM_PARAM = ""
     AWS_DEFAULT_REGION = "us-east-1"
 
 
-@patch("app.services.audit_logger.boto3.client")
-def test_flush_writes_ndjson(mock_boto_client):
+@patch("app.services.audit_logger.build_s3_client")
+def test_flush_writes_ndjson(mock_build_s3):
     mock_s3 = MagicMock()
-    mock_boto_client.return_value = mock_s3
+    mock_build_s3.return_value = mock_s3
 
     audit = AuditLogger("process-123", DummyConfig)
     audit.log("extract_grobid", "started")
@@ -45,10 +44,10 @@ def test_flush_writes_ndjson(mock_boto_client):
     assert second["duration_s"] == 1.23
 
 
-@patch("app.services.audit_logger.boto3.client")
-def test_upload_artifact_uses_process_prefix(mock_boto_client):
+@patch("app.services.audit_logger.build_s3_client")
+def test_upload_artifact_uses_process_prefix(mock_build_s3):
     mock_s3 = MagicMock()
-    mock_boto_client.return_value = mock_s3
+    mock_build_s3.return_value = mock_s3
 
     audit = AuditLogger("process-456", DummyConfig)
     key = audit.upload_artifact("grobid.md", "hello")
@@ -62,10 +61,10 @@ def test_upload_artifact_uses_process_prefix(mock_boto_client):
     assert kwargs["Body"] == b"hello"
 
 
-@patch("app.services.audit_logger.boto3.client")
-def test_upload_artifact_supports_subdir(mock_boto_client):
+@patch("app.services.audit_logger.build_s3_client")
+def test_upload_artifact_supports_subdir(mock_build_s3):
     mock_s3 = MagicMock()
-    mock_boto_client.return_value = mock_s3
+    mock_build_s3.return_value = mock_s3
 
     audit = AuditLogger("process-654", DummyConfig)
     key = audit.upload_artifact("figure1.png", b"img-bytes", subdir="images/raw")
@@ -79,10 +78,10 @@ def test_upload_artifact_supports_subdir(mock_boto_client):
     assert kwargs["Body"] == b"img-bytes"
 
 
-@patch("app.services.audit_logger.boto3.client")
-def test_context_manager_flushes_on_exit(mock_boto_client):
+@patch("app.services.audit_logger.build_s3_client")
+def test_context_manager_flushes_on_exit(mock_build_s3):
     mock_s3 = MagicMock()
-    mock_boto_client.return_value = mock_s3
+    mock_build_s3.return_value = mock_s3
 
     with AuditLogger("process-789", DummyConfig) as audit:
         audit.log("finalize", "succeeded")

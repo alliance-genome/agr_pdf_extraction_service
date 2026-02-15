@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 
 import boto3
+from botocore.exceptions import BotoCoreError, NoCredentialsError
 
 logger = logging.getLogger(__name__)
 
@@ -20,22 +21,49 @@ def utc_now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _resolve_bucket_name(config):
+    """Resolve the S3 bucket name: env var first, then SSM Parameter Store."""
+    bucket = _cfg(config, "AUDIT_S3_BUCKET", "")
+    if bucket:
+        return bucket
 
-def build_s3_client(config):
-    aws_access_key_id = _cfg(config, "AWS_ACCESS_KEY_ID", "")
-    aws_secret_access_key = _cfg(config, "AWS_SECRET_ACCESS_KEY", "")
+    ssm_param = _cfg(config, "AUDIT_S3_BUCKET_SSM_PARAM", "/pdfx/audit-s3-bucket")
+    if not ssm_param:
+        return ""
+
     region = _cfg(config, "AWS_DEFAULT_REGION", "us-east-1")
+    try:
+        ssm = boto3.client("ssm", region_name=region)
+        resp = ssm.get_parameter(Name=ssm_param)
+        bucket = resp["Parameter"]["Value"]
+        logger.info("Resolved AUDIT_S3_BUCKET from SSM %s: %s", ssm_param, bucket)
+        return bucket
+    except Exception as exc:
+        logger.warning("Failed to read SSM parameter %s: %s", ssm_param, exc)
+        return ""
 
-    if not aws_access_key_id or not aws_secret_access_key:
-        logger.warning("Audit logging disabled: missing AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY")
+
+def build_s3_client(config=None):
+    """Build an S3 client using the default boto3 credential chain.
+
+    On EC2 with an IAM instance profile, credentials are provided
+    automatically.  Returns None if no credentials are available
+    (local dev without AWS config).
+    """
+    region = "us-east-1"
+    if config is not None:
+        region = _cfg(config, "AWS_DEFAULT_REGION", "us-east-1")
+
+    try:
+        session = boto3.Session(region_name=region)
+        credentials = session.get_credentials()
+        if credentials is None:
+            logger.warning("Audit S3 client unavailable: no AWS credentials found")
+            return None
+        return session.client("s3")
+    except (BotoCoreError, NoCredentialsError) as exc:
+        logger.warning("Audit S3 client unavailable: %s", exc)
         return None
-
-    return boto3.client(
-        "s3",
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        region_name=region,
-    )
 
 
 
@@ -43,7 +71,7 @@ class AuditLogger:
     def __init__(self, process_id, config):
         self.process_id = str(process_id)
         self.config = config
-        self.bucket = _cfg(config, "AUDIT_S3_BUCKET")
+        self.bucket = _resolve_bucket_name(config)
         self.prefix = (_cfg(config, "AUDIT_S3_PREFIX", "pdfx/audit") or "pdfx/audit").strip("/")
 
         now = datetime.now(timezone.utc)
@@ -67,7 +95,7 @@ class AuditLogger:
         self.enabled = bool(self.s3_client and self.bucket)
 
         if not self.bucket:
-            logger.warning("Audit logging disabled: AUDIT_S3_BUCKET is empty")
+            logger.warning("Audit logging disabled: no AUDIT_S3_BUCKET (env or SSM)")
             self.enabled = False
 
     def log(self, stage, status, **kwargs):

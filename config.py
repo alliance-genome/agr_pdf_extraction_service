@@ -22,12 +22,11 @@ class Config:
     DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://pdfx:pdfx@localhost:5432/pdfx")
 
     # ---- Audit Trail (S3) -----------------------------------------------
-    AUDIT_S3_BUCKET = os.environ.get("AUDIT_S3_BUCKET", "agr-pdf-extraction-benchmark")
+    # Bucket name: read from SSM Parameter Store (/pdfx/audit-s3-bucket),
+    # with AUDIT_S3_BUCKET env var as fallback for local dev.
+    AUDIT_S3_BUCKET = os.environ.get("AUDIT_S3_BUCKET", "")
     AUDIT_S3_PREFIX = os.environ.get("AUDIT_S3_PREFIX", "pdfx/audit")
-
-    # ---- AWS (for S3 access from off-AWS deployment) --------------------
-    AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    AUDIT_S3_BUCKET_SSM_PARAM = os.environ.get("AUDIT_S3_BUCKET_SSM_PARAM", "/pdfx/audit-s3-bucket")
     AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
     # ---- GROBID --------------------------------------------------------------
@@ -53,7 +52,8 @@ class Config:
 
     # ---- Per-call-type model defaults ----------------------------------------
     LLM_MODEL_ZONE_RESOLUTION = os.environ.get("LLM_MODEL_ZONE_RESOLUTION", "gpt-5-mini")
-    LLM_MODEL_RESCUE = os.environ.get("LLM_MODEL_RESCUE", "gpt-5-mini")
+    LLM_MODEL_GENERAL_RESCUE = os.environ.get("LLM_MODEL_GENERAL_RESCUE", "gpt-5.2")
+    LLM_MODEL_NUMERIC_RESCUE = os.environ.get("LLM_MODEL_NUMERIC_RESCUE", "gpt-5.2")
     LLM_MODEL_CONFLICT_BATCH = os.environ.get("LLM_MODEL_CONFLICT_BATCH", "gpt-5.2")
 
     # ---- Zone resolution escalation threshold --------------------------------
