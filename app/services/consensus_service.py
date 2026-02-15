@@ -1774,7 +1774,7 @@ def _rescue_segment(
         zone=zone,
         neighboring_resolved=neighboring_resolved,
         extra_flanking=extra_flanking,
-        model=Config.LLM_MODEL_RESCUE,
+        model=Config.LLM_MODEL_GENERAL_RESCUE,
     )
 
     if rescue_result is not None:
@@ -1859,8 +1859,9 @@ def _apply_numeric_integrity_guard(
     """Ensure resolved text does not introduce numeric tokens not present in sources.
 
     If novel numbers are detected, retries via single-segment rescue with an
-    explicit numeric-integrity constraint and required justification. If the
-    retry still introduces novel numbers, falls back to deterministic best-source.
+    explicit numeric-integrity constraint and required justification. The rescue
+    LLM's output is trusted (novel numbers after rescue are logged but accepted).
+    Falls back to deterministic best-source only if rescue returns no text.
     """
     current = (resolved.get(seg_id, "") or "").strip()
     if not current:
@@ -1885,7 +1886,7 @@ def _apply_numeric_integrity_guard(
         zone=zone,
         neighboring_resolved=neighboring_resolved,
         extra_flanking=extra_flanking,
-        model=Config.LLM_MODEL_RESCUE,
+        model=Config.LLM_MODEL_NUMERIC_RESCUE,
         reason="numeric_integrity",
         previous_text=current,
         novel_numbers=novel,
@@ -1909,38 +1910,38 @@ def _apply_numeric_integrity_guard(
     if seg_status in ("conflict", "near_agree") and not candidate:
         candidate = None
 
-    novel2: list[str] = []
+    # Trust the rescue LLM's output — it was explicitly told about the
+    # numeric issue and given context to fix it.  Still log any remaining
+    # novel numbers for telemetry, but accept the text.
     if candidate is not None:
         novel2 = _numeric_integrity_novel_numbers(candidate, allowed_numbers)
-        if not novel2:
-            resolved[seg_id] = candidate
-            metadata[seg_id] = {
-                "method": f"{method_prefix}_numeric_guard_rescue_resolved",
-                "chosen_source": "llm",
-                "confidence": round(_mean_similarity_to_sources(candidate, source_texts), 4),
-                "sources_agreeing": sorted(source_texts.keys()),
-                "max_pair_similarity": round(max_pair_sim, 4),
-                "zone_id": zone.get("zone_id", ""),
-                "degraded": True,
-                "numeric_integrity": {
-                    "severity": "critical",
-                    "action": "rescue_resolved",
-                    "novel_numbers_initial": novel,
-                    "novel_numbers_retry": [],
-                    "novel_numbers_final": [],
-                    "initial_text": current,
-                    "rescued_text": candidate,
-                    "explanation": explanation,
-                },
-            }
-            return
+        if novel2:
+            logger.info(
+                "Numeric integrity guard: %s rescue still has novel number(s) %s — trusting rescue LLM",
+                seg_id, ", ".join(novel2),
+            )
+        resolved[seg_id] = candidate
+        metadata[seg_id] = {
+            "method": f"{method_prefix}_numeric_guard_rescue_resolved",
+            "chosen_source": "llm",
+            "confidence": round(_mean_similarity_to_sources(candidate, source_texts), 4),
+            "sources_agreeing": sorted(source_texts.keys()),
+            "max_pair_similarity": round(max_pair_sim, 4),
+            "zone_id": zone.get("zone_id", ""),
+            "degraded": bool(novel2),
+            "numeric_integrity": {
+                "severity": "critical" if novel2 else "resolved",
+                "action": "rescue_resolved",
+                "novel_numbers_initial": novel,
+                "novel_numbers_after_rescue": novel2,
+                "initial_text": current,
+                "rescued_text": candidate,
+                "explanation": explanation,
+            },
+        }
+        return
 
-        logger.error(
-            "Numeric integrity guard: %s retry still introduced novel number(s): %s",
-            seg_id, ", ".join(novel2),
-        )
-
-    # Deterministic fallback: use best-source (or original GAP text) to guarantee provenance.
+    # Rescue returned nothing — deterministic fallback to best source.
     if seg_status == "gap":
         fallback_text = (seg.get("text") or "").strip()
     else:
@@ -1958,14 +1959,11 @@ def _apply_numeric_integrity_guard(
         "degraded": True,
         "numeric_integrity": {
             "severity": "critical",
-            "action": "fallback_best_source",
+            "action": "fallback_no_rescue_text",
             "novel_numbers_initial": novel,
-            "novel_numbers_retry": novel2,
             "novel_numbers_final": final_novel,
             "initial_text": current,
-            "rescue_text": (candidate or "") if candidate is not None else "",
             "fallback_text": fallback_text,
-            "explanation": explanation,
         },
     }
 

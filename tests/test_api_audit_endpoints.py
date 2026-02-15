@@ -14,6 +14,7 @@ from app.models import Base, ExtractionRun, get_engine, get_session, reset_db_en
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+    monkeypatch.setenv("AUDIT_S3_BUCKET", "test-bucket")
     reset_db_engine()
     Base.metadata.create_all(bind=get_engine())
 
@@ -38,8 +39,7 @@ def client(monkeypatch):
     app.config["CONSENSUS_ALWAYS_ESCALATE_TABLES"] = True
     app.config["AUDIT_S3_BUCKET"] = "test-bucket"
     app.config["AUDIT_S3_PREFIX"] = "pdfx/audit"
-    app.config["AWS_ACCESS_KEY_ID"] = "test-key"
-    app.config["AWS_SECRET_ACCESS_KEY"] = "test-secret"
+    app.config["AUDIT_S3_BUCKET_SSM_PARAM"] = ""
     app.config["AWS_DEFAULT_REGION"] = "us-east-1"
 
     with app.test_client() as test_client:
