@@ -408,8 +408,8 @@ class TestClassification:
         classify_triples([t])
         assert t.classification == CONFLICT
 
-    def test_agree_near_allows_reference_number_variance_when_confident(self):
-        """Figure/table reference-number drift should not force CONFLICT."""
+    def test_reference_number_variance_escalates_to_conflict(self):
+        """Reference-number drift is treated as CONFLICT (no exceptions)."""
         # Use realistic-length text so the fig/citation differences are a small
         # fraction of the total, producing high similarity scores (>0.97).
         # Only vary the figure number (not citations) to stay within the
@@ -432,7 +432,7 @@ class TestClassification:
         )
         t.confidence = 0.8
         classify_triples([t], near_threshold=0.85, levenshtein_threshold=0.85)
-        assert t.classification == AGREE_NEAR
+        assert t.classification == CONFLICT
 
     def test_reference_variance_exception_not_applied_to_citation_list_blocks(self):
         """Citation lists remain strict even when text similarity is high."""
@@ -445,6 +445,19 @@ class TestClassification:
         )
         t.confidence = 0.9
         classify_triples([t], near_threshold=0.85, levenshtein_threshold=0.85)
+        assert t.classification == CONFLICT
+
+    def test_strict_numeric_near_escalates_even_when_numbers_match(self):
+        """When strict_numeric_near is enabled, any numeric-bearing near-match becomes CONFLICT."""
+        t = self._make_triple(
+            "seg_001",
+            "We measured 10 samples in total.",
+            "We measured ten (10) samples in total.",
+            "Completely different outlier text here",
+        )
+        # Lower thresholds so the first two are near-similar; strict_numeric_near
+        # should still prevent AGREE_NEAR due to numeric tokens.
+        classify_triples([t], near_threshold=0.70, levenshtein_threshold=0.70, strict_numeric_near=True)
         assert t.classification == CONFLICT
 
     def test_gap_single_source(self):

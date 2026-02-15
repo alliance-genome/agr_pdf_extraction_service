@@ -20,6 +20,7 @@ import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -549,6 +550,11 @@ def align_blocks(
 _NUMERIC_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _LINK_URL_RE = re.compile(r"\]\([^)]*\)")
+_INTEGRITY_NUM_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?"
+    r"(?![A-Za-z0-9_])"
+)
 _CITATION_KEY_RE = re.compile(
     r"\["
     r"(?:"
@@ -558,11 +564,6 @@ _CITATION_KEY_RE = re.compile(
     r")"
     r"\]"
 )
-_REFERENCE_NUM_RE = re.compile(
-    r"(?:fig(?:ure)?|table|eq(?:uation)?|sec(?:tion)?|ref(?:erence)?)\.?\s*(\d+)",
-    re.IGNORECASE,
-)
-_NUMERIC_CITATION_ONLY_RE = re.compile(r"^\[\d+(?:\s*[-–,]\s*\d+)*\]$")
 
 # Per-block-type source preference for AGREE_NEAR
 _SOURCE_PREFERENCE = {
@@ -591,63 +592,67 @@ def _extract_citation_keys(text: str) -> set[str]:
     return set(_CITATION_KEY_RE.findall(cleaned))
 
 
-def _extract_reference_numbers(text: str) -> set[str]:
-    """Extract numbers used in local references (Figure/Table/Section/etc.)."""
-    cleaned = _HTML_TAG_RE.sub("", text)
-    return set(_REFERENCE_NUM_RE.findall(cleaned))
+def _extract_numeric_tokens_integrity(text: str) -> set[str]:
+    """Extract numeric tokens for integrity checks (more permissive + normalization).
 
-
-def _is_minor_numeric_citation_delta(delta: set[str], max_delta: int = 1) -> bool:
-    """Allow only tiny citation deltas with numeric bracket keys."""
-    if not delta:
-        return True
-    if len(delta) > max_delta:
-        return False
-    return all(_NUMERIC_CITATION_ONLY_RE.match(key) for key in delta)
-
-
-def _allow_reference_variance_exception(
-    block_type: str,
-    token_ratio: float,
-    lev_sim: float,
-    alignment_confidence: float,
-    raw_i: str,
-    raw_j: str,
-    nums_i: set[str],
-    nums_j: set[str],
-    cites_i: set[str],
-    cites_j: set[str],
-) -> bool:
-    """Allow AGREE_NEAR for likely alignment noise in references.
-
-    This is intentionally conservative:
-    - Applies only to textual blocks (not tables/equations/citation lists)
-    - Requires high textual confidence
-    - Allows only tiny numeric/citation deltas tied to Figure/Table/Section refs
+    Goal: detect novel numbers introduced by the LLM even when formatting varies
+    (e.g., `.001` vs `0.001`, `1e-3` vs `0.001`).
     """
-    if block_type not in {"heading", "paragraph", "figure_ref"}:
-        return False
-    if token_ratio < 0.97 or lev_sim < 0.95:
-        return False
-    if alignment_confidence < 0.55:
-        return False
+    cleaned = _HTML_TAG_RE.sub("", text or "")
+    cleaned = _IMAGE_REF_RE.sub("", cleaned)
+    cleaned = _LINK_URL_RE.sub("]", cleaned)
+    cleaned = unicodedata.normalize("NFKC", cleaned)
+    cleaned = cleaned.replace("\u2212", "-")  # Unicode minus
 
-    numeric_delta = nums_i.symmetric_difference(nums_j)
-    citation_delta = cites_i.symmetric_difference(cites_j)
+    out: set[str] = set()
+    for m in _INTEGRITY_NUM_RE.finditer(cleaned):
+        raw = (m.group(0) or "").strip()
+        if not raw:
+            continue
+        s = raw
+        if s.startswith("+"):
+            s = s[1:]
+        if s.startswith("."):
+            s = "0" + s
+        if s.startswith("-."):
+            s = s.replace("-.", "-0.", 1)
+        try:
+            d = Decimal(s)
+        except (InvalidOperation, ValueError):
+            continue
 
-    if len(numeric_delta) > 2 or len(citation_delta) > 1:
-        return False
-    if any("." in n for n in numeric_delta):
-        return False
+        txt = format(d, "f")
+        if "." in txt:
+            txt = txt.rstrip("0").rstrip(".")
+        if txt == "-0":
+            txt = "0"
+        out.add(txt)
+    return out
 
-    if numeric_delta:
-        ref_numbers = _extract_reference_numbers(raw_i) | _extract_reference_numbers(raw_j)
-        if not numeric_delta.issubset(ref_numbers):
-            return False
-    if citation_delta and not _is_minor_numeric_citation_delta(citation_delta):
-        return False
 
-    return True
+def _zone_allowed_numeric_tokens(zone: dict) -> set[str]:
+    """Union of numeric tokens visible to the LLM within a zone prompt."""
+    texts: list[str] = []
+    for ctx in (zone.get("context_before") or []):
+        texts.append(ctx.get("text", "") or "")
+    for seg in (zone.get("segments") or []):
+        for key in ("grobid", "docling", "marker", "text", "current_choice"):
+            if seg.get(key):
+                texts.append(seg.get(key) or "")
+    for ctx in (zone.get("context_after") or []):
+        texts.append(ctx.get("text", "") or "")
+
+    allowed: set[str] = set()
+    for t in texts:
+        allowed |= _extract_numeric_tokens_integrity(t)
+    return allowed
+
+
+def _numeric_integrity_novel_numbers(output_text: str, allowed_numbers: set[str]) -> list[str]:
+    """Return sorted list of numeric tokens present in output but not in allowed_numbers."""
+    out_nums = _extract_numeric_tokens_integrity(output_text or "")
+    novel = out_nums - (allowed_numbers or set())
+    return sorted(novel)
 
 
 def _get_present_blocks(triple: AlignedTriple) -> list[Block]:
@@ -685,6 +690,7 @@ def classify_triples(
     near_threshold: float = 0.92,
     levenshtein_threshold: float = 0.90,
     always_escalate_tables: bool = True,
+    strict_numeric_near: bool = True,
 ) -> None:
     """Classify each triple in-place. Mutates triple.classification and triple.agreed_text."""
     for triple in triples:
@@ -753,22 +759,12 @@ def classify_triples(
                     cites_i = _extract_citation_keys(norm_raw_i)
                     cites_j = _extract_citation_keys(norm_raw_j)
 
-                    if nums_i == nums_j and cites_i == cites_j:
-                        near_pair = (i, j)
-                        break
+                    # If enabled, any numeric-bearing near-match is escalated to CONFLICT
+                    # unless the segment qualifies for AGREE_EXACT earlier.
+                    if strict_numeric_near and (nums_i or nums_j):
+                        continue
 
-                    if _allow_reference_variance_exception(
-                        block_type=block_type,
-                        token_ratio=token_ratio,
-                        lev_sim=lev_sim,
-                        alignment_confidence=triple.confidence,
-                        raw_i=raw_texts[i],
-                        raw_j=raw_texts[j],
-                        nums_i=nums_i,
-                        nums_j=nums_j,
-                        cites_i=cites_i,
-                        cites_j=cites_j,
-                    ):
+                    if nums_i == nums_j and cites_i == cites_j:
                         near_pair = (i, j)
                         break
             if near_pair is not None:
@@ -1871,6 +1867,129 @@ def _rescue_segment(
     )
 
 
+def _apply_numeric_integrity_guard(
+    *,
+    seg_id: str,
+    seg: dict,
+    zone: dict,
+    triples: list[AlignedTriple],
+    resolved: dict[str, str],
+    metadata: dict[str, dict],
+    allowed_numbers: set[str],
+    source_texts: dict[str, str],
+    max_pair_sim: float,
+    llm: "LLM",
+    method_prefix: str,
+) -> None:
+    """Ensure resolved text does not introduce numeric tokens not present in sources.
+
+    If novel numbers are detected, retries via single-segment rescue with an
+    explicit numeric-integrity constraint and required justification. If the
+    retry still introduces novel numbers, falls back to deterministic best-source.
+    """
+    current = (resolved.get(seg_id, "") or "").strip()
+    if not current:
+        return
+
+    novel = _numeric_integrity_novel_numbers(current, allowed_numbers)
+    if not novel:
+        return
+
+    logger.error(
+        "Numeric integrity guard: %s introduced novel number(s): %s",
+        seg_id, ", ".join(novel),
+    )
+
+    # Retry once with a focused rescue call that explicitly enforces numeric integrity.
+    from config import Config
+    extra_flanking, neighboring_resolved = _gather_rescue_context(
+        seg_id, triples, resolved, flanking_count=5,
+    )
+    rescue_result = llm.rescue_single_segment(
+        seg=seg,
+        zone=zone,
+        neighboring_resolved=neighboring_resolved,
+        extra_flanking=extra_flanking,
+        model=Config.LLM_MODEL_RESCUE,
+        reason="numeric_integrity",
+        previous_text=current,
+        novel_numbers=novel,
+    )
+
+    seg_status = seg.get("status", "conflict")
+    candidate: str | None = None
+    explanation: str = ""
+    if rescue_result is not None:
+        explanation = rescue_result.explanation or ""
+        if rescue_result.is_intentionally_empty:
+            # Only GAP segments may be dropped intentionally.
+            if seg_status == "gap":
+                candidate = ""
+            else:
+                candidate = None
+        else:
+            candidate = (rescue_result.resolved_text or "").strip()
+
+    # Conflict/near_agree segments must not become empty.
+    if seg_status in ("conflict", "near_agree") and not candidate:
+        candidate = None
+
+    novel2: list[str] = []
+    if candidate is not None:
+        novel2 = _numeric_integrity_novel_numbers(candidate, allowed_numbers)
+        if not novel2:
+            resolved[seg_id] = candidate
+            metadata[seg_id] = {
+                "method": f"{method_prefix}_numeric_guard_rescue_resolved",
+                "chosen_source": "llm",
+                "confidence": round(_mean_similarity_to_sources(candidate, source_texts), 4),
+                "sources_agreeing": sorted(source_texts.keys()),
+                "max_pair_similarity": round(max_pair_sim, 4),
+                "zone_id": zone.get("zone_id", ""),
+                "degraded": True,
+                "numeric_integrity": {
+                    "severity": "critical",
+                    "action": "rescue_resolved",
+                    "novel_numbers_initial": novel,
+                    "novel_numbers_retry": [],
+                    "novel_numbers_final": [],
+                    "explanation": explanation,
+                },
+            }
+            return
+
+        logger.error(
+            "Numeric integrity guard: %s retry still introduced novel number(s): %s",
+            seg_id, ", ".join(novel2),
+        )
+
+    # Deterministic fallback: use best-source (or original GAP text) to guarantee provenance.
+    if seg_status == "gap":
+        fallback_text = (seg.get("text") or "").strip()
+    else:
+        fallback_text = _best_source_fallback(seg).strip()
+
+    final_novel = _numeric_integrity_novel_numbers(fallback_text, allowed_numbers)
+    resolved[seg_id] = fallback_text
+    metadata[seg_id] = {
+        "method": f"{method_prefix}_numeric_guard_fallback_best_source",
+        "chosen_source": "best_available",
+        "confidence": 0.0,
+        "sources_agreeing": sorted(source_texts.keys()),
+        "max_pair_similarity": round(max_pair_sim, 4),
+        "zone_id": zone.get("zone_id", ""),
+        "degraded": True,
+        "numeric_integrity": {
+            "severity": "critical",
+            "action": "fallback_best_source",
+            "novel_numbers_initial": novel,
+            "novel_numbers_retry": novel2,
+            "novel_numbers_final": final_novel,
+            "explanation": explanation,
+        },
+    }
+
+
 def _pairwise_similarities(texts: list[str]) -> list[float]:
     """Pairwise token-set similarity scores in 0..1 range."""
     sims: list[float] = []
@@ -2025,6 +2144,7 @@ def _resolve_conflicts_layered(
             )
 
         for zone in llm_zones:
+            allowed_numbers = _zone_allowed_numeric_tokens(zone)
             for seg in zone["segments"]:
                 seg_id = seg["segment_id"]
                 if seg["status"] == "pre_resolved" or seg["status"] == "agreed":
@@ -2045,6 +2165,20 @@ def _resolve_conflicts_layered(
                             source_texts, max_pair_sim, llm,
                             method_prefix="llm_conflict",
                         )
+                        # Numeric integrity guard applies to any LLM-provided rescue output.
+                        _apply_numeric_integrity_guard(
+                            seg_id=seg_id,
+                            seg=seg,
+                            zone=zone,
+                            triples=triples,
+                            resolved=resolved,
+                            metadata=metadata,
+                            allowed_numbers=allowed_numbers,
+                            source_texts=source_texts,
+                            max_pair_sim=max_pair_sim,
+                            llm=llm,
+                            method_prefix="llm_conflict",
+                        )
                         continue
 
                     resolved[seg_id] = resolved_text
@@ -2056,6 +2190,19 @@ def _resolve_conflicts_layered(
                         "max_pair_similarity": round(max_pair_sim, 4),
                         "zone_id": zone["zone_id"],
                     }
+                    _apply_numeric_integrity_guard(
+                        seg_id=seg_id,
+                        seg=seg,
+                        zone=zone,
+                        triples=triples,
+                        resolved=resolved,
+                        metadata=metadata,
+                        allowed_numbers=allowed_numbers,
+                        source_texts=source_texts,
+                        max_pair_sim=max_pair_sim,
+                        llm=llm,
+                        method_prefix="llm_conflict",
+                    )
 
                 elif seg["status"] == "near_agree":
                     source_texts = _bundle_source_texts(seg)
@@ -2070,6 +2217,19 @@ def _resolve_conflicts_layered(
                             source_texts, max_pair_sim, llm,
                             method_prefix="llm_near_agree",
                         )
+                        _apply_numeric_integrity_guard(
+                            seg_id=seg_id,
+                            seg=seg,
+                            zone=zone,
+                            triples=triples,
+                            resolved=resolved,
+                            metadata=metadata,
+                            allowed_numbers=allowed_numbers,
+                            source_texts=source_texts,
+                            max_pair_sim=max_pair_sim,
+                            llm=llm,
+                            method_prefix="llm_near_agree",
+                        )
                         continue
 
                     resolved[seg_id] = resolved_text
@@ -2081,6 +2241,19 @@ def _resolve_conflicts_layered(
                         "max_pair_similarity": round(max_pair_sim, 4),
                         "zone_id": zone["zone_id"],
                     }
+                    _apply_numeric_integrity_guard(
+                        seg_id=seg_id,
+                        seg=seg,
+                        zone=zone,
+                        triples=triples,
+                        resolved=resolved,
+                        metadata=metadata,
+                        allowed_numbers=allowed_numbers,
+                        source_texts=source_texts,
+                        max_pair_sim=max_pair_sim,
+                        llm=llm,
+                        method_prefix="llm_near_agree",
+                    )
 
                 elif seg["status"] == "gap":
                     # GAP segments: LLM may return empty string to drop, or cleaned text
@@ -2094,6 +2267,19 @@ def _resolve_conflicts_layered(
                             "max_pair_similarity": 0.0,
                             "zone_id": zone["zone_id"],
                         }
+                        _apply_numeric_integrity_guard(
+                            seg_id=seg_id,
+                            seg=seg,
+                            zone=zone,
+                            triples=triples,
+                            resolved=resolved,
+                            metadata=metadata,
+                            allowed_numbers=allowed_numbers,
+                            source_texts={},
+                            max_pair_sim=0.0,
+                            llm=llm,
+                            method_prefix="llm_gap",
+                        )
 
     return resolved, metadata
 
@@ -2208,6 +2394,8 @@ def _build_audit_entries(
                     "resolution_confidence": resolution_details.get("confidence", 0.0),
                     "sources_agreeing": resolution_details.get("sources_agreeing", []),
                 }
+                if resolution_details.get("numeric_integrity"):
+                    entry["details"]["numeric_integrity"] = resolution_details["numeric_integrity"]
                 if resolution_details.get("rescue_explanation"):
                     entry["details"]["rescue_explanation"] = resolution_details["rescue_explanation"]
                 if resolution_details.get("degraded"):
@@ -2291,6 +2479,8 @@ def _build_audit_entries(
                 "resolution_confidence": resolution_details.get("confidence", 0.0),
                 "sources_agreeing": resolution_details.get("sources_agreeing", []),
             }
+            if resolution_details.get("numeric_integrity"):
+                entry["details"]["numeric_integrity"] = resolution_details["numeric_integrity"]
 
         entries.append(entry)
 
@@ -2410,6 +2600,7 @@ def merge_with_consensus(
         near_threshold=Config.CONSENSUS_NEAR_THRESHOLD,
         levenshtein_threshold=Config.CONSENSUS_LEVENSHTEIN_THRESHOLD,
         always_escalate_tables=Config.CONSENSUS_ALWAYS_ESCALATE_TABLES,
+        strict_numeric_near=getattr(Config, "CONSENSUS_STRICT_NUMERIC_NEAR", True),
     )
 
     # Step 3b: remove near-duplicate GAP blocks (local window)

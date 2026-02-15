@@ -95,6 +95,10 @@ class Config:
     )
     CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = float(os.environ.get("CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK", 0.5))
     CONSENSUS_ALWAYS_ESCALATE_TABLES = os.environ.get("CONSENSUS_ALWAYS_ESCALATE_TABLES", "true").lower() == "true"
+    # If true, AGREE_NEAR is disabled for any block containing numbers; such blocks
+    # become CONFLICT unless they qualify for AGREE_EXACT. This is the safest option
+    # for scientific PDFs but can increase LLM usage.
+    CONSENSUS_STRICT_NUMERIC_NEAR = os.environ.get("CONSENSUS_STRICT_NUMERIC_NEAR", "true").lower() == "true"
     CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = os.environ.get("CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES", "true").lower() == "true"
 
     # ---- Conflict zone grouping -----------------------------------------------

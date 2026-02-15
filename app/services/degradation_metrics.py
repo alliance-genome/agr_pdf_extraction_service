@@ -36,6 +36,12 @@ METHOD_QUALITY_TIER: dict[str, str] = {
     "zone_fallback_best_source": "medium",
     "llm_conflict_fallback_best_source": "medium",
     "llm_near_agree_fallback_best_source": "medium",
+    "llm_conflict_numeric_guard_rescue_resolved": "medium",
+    "llm_near_agree_numeric_guard_rescue_resolved": "medium",
+    "llm_gap_numeric_guard_rescue_resolved": "medium",
+    "llm_conflict_numeric_guard_fallback_best_source": "medium",
+    "llm_near_agree_numeric_guard_fallback_best_source": "medium",
+    "llm_gap_numeric_guard_fallback_best_source": "medium",
 }
 
 # Weights used in the quality score formula.  Each resolved segment
@@ -56,6 +62,15 @@ METHOD_QUALITY_WEIGHT: dict[str, float] = {
     "zone_fallback_best_source": 0.40,
     "llm_conflict_fallback_best_source": 0.40,
     "llm_near_agree_fallback_best_source": 0.40,
+    # Numeric integrity guard is a critical scientific-accuracy event.
+    # Even if the retry succeeds, we down-weight heavily to make it visible.
+    "llm_conflict_numeric_guard_rescue_resolved": 0.25,
+    "llm_near_agree_numeric_guard_rescue_resolved": 0.25,
+    "llm_gap_numeric_guard_rescue_resolved": 0.25,
+    # If we had to fall back due to numeric invention, treat as near-fail.
+    "llm_conflict_numeric_guard_fallback_best_source": 0.05,
+    "llm_near_agree_numeric_guard_fallback_best_source": 0.05,
+    "llm_gap_numeric_guard_fallback_best_source": 0.05,
 }
 
 # ---------------------------------------------------------------------------
@@ -93,7 +108,24 @@ def compute_quality_score(
         weight = METHOD_QUALITY_WEIGHT.get(method, 0.5)
         weighted_sum += weight
 
-    return min(weighted_sum / total_blocks, 1.0)
+    base = min(weighted_sum / total_blocks, 1.0)
+
+    # Severe paper-level penalty for numeric invention (even if corrected).
+    # Rationale: numeric integrity issues are high-stakes for scientific PDFs.
+    metas = list((resolution_metadata or {}).values())
+    numeric_guard_triggered = any(
+        isinstance(m.get("numeric_integrity"), dict) and m["numeric_integrity"].get("novel_numbers_initial")
+        for m in metas
+    )
+    numeric_guard_fallback = any(
+        str(m.get("method", "")).endswith("numeric_guard_fallback_best_source")
+        for m in metas
+    )
+    if numeric_guard_fallback:
+        return round(base * 0.25, 6)
+    if numeric_guard_triggered:
+        return round(base * 0.50, 6)
+    return base
 
 
 def quality_grade(score: float) -> str:
@@ -490,6 +522,23 @@ def build_degradation_metrics(
         "high_risk_top_level_heading": high_risk_top_level_heading,
     }
 
+    # --- Numeric integrity (critical scientific accuracy) ---
+    numeric_guard_ids = [
+        seg_id for seg_id, meta in metadata.items()
+        if isinstance(meta.get("numeric_integrity"), dict) and meta["numeric_integrity"].get("novel_numbers_initial")
+    ]
+    numeric_guard_fallback_ids = [
+        seg_id for seg_id, meta in metadata.items()
+        if str(meta.get("method", "")).endswith("numeric_guard_fallback_best_source")
+    ]
+    numeric_integrity = {
+        "count": len(numeric_guard_ids),
+        "fallback_count": len(numeric_guard_fallback_ids),
+        "segment_ids": numeric_guard_ids,
+    }
+    risk_flags["numeric_integrity_violation"] = len(numeric_guard_ids) > 0
+    risk_flags["numeric_integrity_fallback"] = len(numeric_guard_fallback_ids) > 0
+
     # --- Token efficiency ---
     # Only compute token efficiency when actual token data is available.
     # When both inputs are zero, token tracking is not yet wired in and
@@ -536,6 +585,8 @@ def build_degradation_metrics(
         "mean_confidence": round(conf_dist.get("mean", 0.0), 4),
         "min_confidence": round(conf_dist.get("min", 0.0), 4),
         "high_risk_top_level_heading": high_risk_top_level_heading,
+        "numeric_integrity_violation": len(numeric_guard_ids) > 0,
+        "numeric_integrity_violation_count": len(numeric_guard_ids),
         "total_consensus_tokens": (zone_resolution_tokens + rescue_call_tokens) if has_token_data else None,
         "full_merge_avoided": True,
     }
@@ -547,6 +598,7 @@ def build_degradation_metrics(
         "resolution_summary": resolution_summary,
         "degraded_segments": degraded_segments,
         "rescue_segments": rescue_segments,
+        "numeric_integrity": numeric_integrity,
         "confidence_distribution": conf_dist,
         "section_risk": section_risk,
         "risk_flags": risk_flags,

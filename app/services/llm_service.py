@@ -602,6 +602,9 @@ class LLM(PDFExtractor):
         neighboring_resolved: dict[str, str],
         extra_flanking: list[dict],
         model: str | None = None,
+        reason: str | None = None,
+        previous_text: str | None = None,
+        novel_numbers: list[str] | None = None,
     ) -> RescueSegmentResponse | None:
         """Focused rescue call for a single segment that zone resolution returned empty.
 
@@ -623,12 +626,19 @@ class LLM(PDFExtractor):
 
         # Build the source texts display
         source_lines = []
+        has_any_extractor_text = False
         for source_name in ("grobid", "docling", "marker"):
             text = (seg.get(source_name) or "").strip()
             if text:
+                has_any_extractor_text = True
                 source_lines.append(f"### {source_name.upper()}\n{text}")
             else:
                 source_lines.append(f"### {source_name.upper()}\n(no output from this extractor)")
+        if not has_any_extractor_text and seg_status == "gap":
+            gap_text = (seg.get("text") or "").strip()
+            gap_source = (seg.get("gap_source") or "unknown").strip()
+            if gap_text:
+                source_lines.append(f"### GAP ({gap_source})\n{gap_text}")
         sources_display = "\n\n".join(source_lines)
 
         # Build neighboring context display
@@ -646,25 +656,59 @@ class LLM(PDFExtractor):
             else "(no surrounding context available)"
         )
 
-        system_msg = (
-            "You are resolving a SINGLE segment from a scientific paper where three PDF extraction "
-            "tools (GROBID, Docling, Marker) produced different text.\n\n"
-            "IMPORTANT CONTEXT: This segment was previously sent to you as part of a larger conflict "
-            "zone, and you returned EMPTY text for it. We need you to look at it again carefully.\n\n"
-            "You have two valid options:\n"
-            "1. PROVIDE RESOLVED TEXT: Pick the best version from the sources below, merge them, "
-            "   or clean one up. Set is_intentionally_empty=false and put the text in resolved_text.\n"
-            "2. EXPLAIN WHY IT SHOULD BE EMPTY: If this segment genuinely should not appear in the "
-            "   final document (it's a duplicate of nearby text, a page artifact, metadata noise, "
-            "   a figure label that doesn't belong inline, etc.), set is_intentionally_empty=true, "
-            "   leave resolved_text as empty string, and explain your reasoning in the explanation field.\n\n"
-            "You MUST provide an explanation in ALL cases — even when providing resolved text, briefly "
-            "explain what you did (e.g., 'Chose Docling version as it was most complete').\n\n"
-            "SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):\n"
-            f"{context_display}\n\n"
-            f"SEGMENT TO RESOLVE ({seg_id}, status: {seg_status}):\n\n"
-            f"{sources_display}"
-        )
+        reason = (reason or "empty").strip().lower()
+        if reason == "numeric_integrity":
+            numeric_note = ""
+            if novel_numbers:
+                numeric_note = (
+                    "\n\nNUMERIC INTEGRITY ISSUE:\n"
+                    "A previous resolution for this segment introduced number(s) not present in any input source.\n"
+                    f"Novel numbers detected: {', '.join(novel_numbers)}\n"
+                )
+            prev_note = ""
+            if previous_text and previous_text.strip():
+                prev_note = f"\n\nPREVIOUS OUTPUT (do not trust blindly):\n{previous_text.strip()}\n"
+
+            system_msg = (
+                "You are resolving a SINGLE segment from a scientific paper where PDF extraction "
+                "tools (GROBID, Docling, Marker) produced different text.\n\n"
+                "IMPORTANT CONTEXT: This segment was previously resolved, but the output triggered a "
+                "numeric-integrity guard (it contained numbers not present in any source).\n"
+                "This is a CRITICAL scientific-accuracy issue.\n"
+                f"{numeric_note}"
+                f"{prev_note}\n"
+                "RULES:\n"
+                "1. Do NOT introduce any new numbers. Every number in your output must appear in at least one source.\n"
+                "2. You MAY delete numbers that appear to be extractor artifacts (but explain why).\n"
+                "3. If sources disagree on a number, choose one that appears in a source and explain which source you followed.\n"
+                "4. If status is conflict/near_agree, you must provide non-empty resolved_text.\n"
+                "5. If status is gap, you may set is_intentionally_empty=true ONLY if you justify why it should be dropped.\n"
+                "You MUST provide an explanation in ALL cases.\n\n"
+                "SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):\n"
+                f"{context_display}\n\n"
+                f"SEGMENT TO RESOLVE ({seg_id}, status: {seg_status}):\n\n"
+                f"{sources_display}"
+            )
+        else:
+            system_msg = (
+                "You are resolving a SINGLE segment from a scientific paper where three PDF extraction "
+                "tools (GROBID, Docling, Marker) produced different text.\n\n"
+                "IMPORTANT CONTEXT: This segment was previously sent to you as part of a larger conflict "
+                "zone, and you returned EMPTY text for it. We need you to look at it again carefully.\n\n"
+                "You have two valid options:\n"
+                "1. PROVIDE RESOLVED TEXT: Pick the best version from the sources below, merge them, "
+                "   or clean one up. Set is_intentionally_empty=false and put the text in resolved_text.\n"
+                "2. EXPLAIN WHY IT SHOULD BE EMPTY: If this segment genuinely should not appear in the "
+                "   final document (it's a duplicate of nearby text, a page artifact, metadata noise, "
+                "   a figure label that doesn't belong inline, etc.), set is_intentionally_empty=true, "
+                "   leave resolved_text as empty string, and explain your reasoning in the explanation field.\n\n"
+                "You MUST provide an explanation in ALL cases — even when providing resolved text, briefly "
+                "explain what you did (e.g., 'Chose Docling version as it was most complete').\n\n"
+                "SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):\n"
+                f"{context_display}\n\n"
+                f"SEGMENT TO RESOLVE ({seg_id}, status: {seg_status}):\n\n"
+                f"{sources_display}"
+            )
 
         try:
             completion = self.client.chat.completions.parse(

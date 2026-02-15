@@ -191,7 +191,11 @@ Only the agreeing extractors are considered — the outlier (if any) is excluded
 
 **Numeric and citation guardrails:** AGREE_NEAR has strict protections — if two blocks are textually similar but differ in numbers (e.g., "p < 0.05" vs "p < 0.5") or citation references (e.g., "[1,2]" vs "[1,3]"), the block is escalated to CONFLICT. This prevents silently accepting corrupted data values.
 
-There is one narrow exception: if the blocks are extremely similar (>97% token overlap AND >95% character match), the numeric difference is tiny (≤2 numbers, ≤1 citation), and the differing numbers are tied to Figure/Table/Section references (not data values), the block can still qualify as AGREE_NEAR. This prevents spurious conflicts from extractors formatting "Figure 1" vs "Fig. 1" differently while still catching real data discrepancies.
+No exceptions are applied: any numeric or citation-key disagreement forces CONFLICT, even if the rest of the text is highly similar. This avoids silently accepting drift in reference labels or dropped citations.
+
+By default, AGREE_NEAR is also disabled for any block that contains numbers at all (`CONSENSUS_STRICT_NUMERIC_NEAR=true`). With this enabled, numeric-bearing blocks only qualify for automatic acceptance when they are AGREE_EXACT; otherwise they are escalated to CONFLICT. If you want fewer conflicts (and lower LLM usage), set `CONSENSUS_STRICT_NUMERIC_NEAR=false`.
+
+After the LLM resolves a conflict/near-agree/gap segment, the pipeline also runs a **numeric integrity check**: if the LLM output contains any number that did not appear anywhere in the zone inputs, the segment is retried with a stricter instruction (and required justification). If it still invents numbers, the segment falls back to best-source and the paper's quality score is heavily penalized.
 
 **Table and equation escalation:** Tables and equations are optionally always escalated to CONFLICT regardless of similarity, since even minor formatting differences in these structured elements can change their meaning.
 
@@ -847,6 +851,7 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 | `CONSENSUS_LAYERED_ENABLED` | `true` | Enable layered conflict resolver (median-source + LLM) |
 | `CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD` | `0.60` | Minimum pairwise similarity for median-source selection |
 | `CONSENSUS_ALWAYS_ESCALATE_TABLES` | `true` | Always send tables/equations to AI, even if extractors agree |
+| `CONSENSUS_STRICT_NUMERIC_NEAR` | `true` | If true, any numeric-bearing near-match is escalated to CONFLICT unless it is AGREE_EXACT |
 | `CONSENSUS_LOCALIZED_CONFLICT_SPAN_MAX` | `0.35` | Max document span ratio for localized conflict relief |
 | `CONSENSUS_LOCALIZED_CONFLICT_RELIEF` | `0.15` | How much to relax conflict ratio when conflicts are localized |
 | `CONSENSUS_LOCALIZED_CONFLICT_MAX_BLOCKS` | `25` | Max conflict blocks for localized relief to apply |
