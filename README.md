@@ -12,7 +12,7 @@ The service runs three independent extraction engines on each PDF, then intellig
   - [Step 1: Parse](#step-1-parse--break-each-output-into-blocks)
   - [Step 2: Align](#step-2-align--match-blocks-across-extractors)
   - [Step 3: Classify](#step-3-classify--determine-agreement-or-disagreement)
-  - [Step 4: Guard Gates](#step-4-guard-gates--decide-how-to-resolve-conflicts)
+  - [Step 4: Guard Gates](#step-4-guard-gates--document-health-assessment)
   - [Step 5: Resolve Conflicts](#step-5-resolve-conflicts--four-layers-of-resolution)
   - [Step 6: Assemble and Clean](#step-6-assemble-and-clean--build-the-final-document)
   - [Step 7: Heading Hierarchy](#step-7-heading-hierarchy--fix-section-structure)
@@ -205,9 +205,9 @@ Before evaluating guard gates, the pipeline removes duplicate GAP blocks using a
 
 This catches the common case where the same content is captured twice at adjacent positions by a single extractor, without risking removal of legitimately repeated content that appears in different sections of the paper.
 
-### Step 4: Guard Gates — Decide How to Resolve Conflicts
+### Step 4: Guard Gates — Document Health Assessment
 
-Before resolving conflicts, the pipeline evaluates the overall difficulty of the document through several **guard gates**. These decide whether conflicts can be resolved zone-by-zone (efficient) or whether the entire document needs to be sent to the AI (expensive but thorough).
+Before resolving conflicts, the pipeline evaluates the overall difficulty of the document through several **guard gates**. These are used for monitoring and to catch fundamentally broken alignments.
 
 | Guard Gate | Threshold | What Triggers It |
 |------------|-----------|-----------------|
@@ -224,7 +224,7 @@ The only guard gate that causes a hard failure is **alignment confidence** — i
 
 ### Step 5: Resolve Conflicts — Four Layers of Resolution
 
-Conflicts that pass the guard gates are resolved through a **layered approach**, starting with the cheapest method and escalating only when needed:
+All conflicts are resolved through a **layered approach**, starting with the cheapest method and escalating only when needed:
 
 #### Layer 1: Median-Source Selection
 

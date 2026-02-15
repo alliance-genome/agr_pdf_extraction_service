@@ -88,6 +88,24 @@ def test_submit_extraction_returns_process_id_and_creates_db_row(mock_apply_asyn
 
 
 @patch("celery_app.extract_pdf.apply_async")
+def test_submit_extraction_passes_clear_cache_to_celery(mock_apply_async, client):
+    mock_apply_async.return_value = SimpleNamespace(id="process-id-placeholder")
+
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "clear_cache": "true",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 202
+    call_kwargs = mock_apply_async.call_args.kwargs
+    assert call_kwargs["kwargs"]["clear_cache"] is True
+
+
+@patch("celery_app.extract_pdf.apply_async")
 def test_submit_extraction_returns_503_when_enqueue_fails(mock_apply_async, client):
     mock_apply_async.side_effect = ConnectionError("Redis unavailable")
 
@@ -119,6 +137,11 @@ def test_get_extraction_status_prefers_db(client):
         ended_at=datetime.now(timezone.utc),
         log_s3_key="pdfx/audit/2026/02/11/test.ndjson",
         artifacts_json={"grobid": "pdfx/audit/2026/02/11/x/grobid.md"},
+        consensus_metrics_json={
+            "total_blocks": 100,
+            "agree_exact": 90,
+            "degradation_metrics": {"quality_score": 0.995, "quality_grade": "A"},
+        },
     ))
     session.commit()
     session.close()
@@ -134,6 +157,8 @@ def test_get_extraction_status_prefers_db(client):
     assert payload["reference_curie"] == "PMID:99999"
     assert payload["log_s3_key"] == "pdfx/audit/2026/02/11/test.ndjson"
     assert "grobid" in payload["artifacts_json"]
+    assert payload["consensus_metrics_json"]["total_blocks"] == 100
+    assert payload["consensus_metrics_json"]["degradation_metrics"]["quality_score"] == 0.995
     assert mock_async.called is False
 
 
