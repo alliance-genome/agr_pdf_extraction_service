@@ -36,9 +36,9 @@ METHOD_QUALITY_TIER: dict[str, str] = {
     "zone_fallback_best_source": "medium",
     "llm_conflict_fallback_best_source": "medium",
     "llm_near_agree_fallback_best_source": "medium",
-    "llm_conflict_numeric_guard_rescue_resolved": "medium",
-    "llm_near_agree_numeric_guard_rescue_resolved": "medium",
-    "llm_gap_numeric_guard_rescue_resolved": "medium",
+    "llm_conflict_numeric_guard_rescue_resolved": "medium_high",
+    "llm_near_agree_numeric_guard_rescue_resolved": "medium_high",
+    "llm_gap_numeric_guard_rescue_resolved": "medium_high",
     "llm_conflict_numeric_guard_fallback_best_source": "medium",
     "llm_near_agree_numeric_guard_fallback_best_source": "medium",
     "llm_gap_numeric_guard_fallback_best_source": "medium",
@@ -62,15 +62,17 @@ METHOD_QUALITY_WEIGHT: dict[str, float] = {
     "zone_fallback_best_source": 0.40,
     "llm_conflict_fallback_best_source": 0.40,
     "llm_near_agree_fallback_best_source": 0.40,
-    # Numeric integrity guard is a critical scientific-accuracy event.
-    # Even if the retry succeeds, we down-weight heavily to make it visible.
-    "llm_conflict_numeric_guard_rescue_resolved": 0.25,
-    "llm_near_agree_numeric_guard_rescue_resolved": 0.25,
-    "llm_gap_numeric_guard_rescue_resolved": 0.25,
-    # If we had to fall back due to numeric invention, treat as near-fail.
-    "llm_conflict_numeric_guard_fallback_best_source": 0.05,
-    "llm_near_agree_numeric_guard_fallback_best_source": 0.05,
-    "llm_gap_numeric_guard_fallback_best_source": 0.05,
+    # Numeric integrity guard: rescue succeeded — the guard caught a problem
+    # and the retry LLM fixed it. Output is correct. Mild penalty to signal
+    # the initial LLM was unreliable on this segment.
+    "llm_conflict_numeric_guard_rescue_resolved": 0.85,
+    "llm_near_agree_numeric_guard_rescue_resolved": 0.85,
+    "llm_gap_numeric_guard_rescue_resolved": 0.85,
+    # Numeric integrity guard: rescue also failed, fell back to picking the
+    # best single extractor's text. Output is correct but not merged.
+    "llm_conflict_numeric_guard_fallback_best_source": 0.30,
+    "llm_near_agree_numeric_guard_fallback_best_source": 0.30,
+    "llm_gap_numeric_guard_fallback_best_source": 0.30,
 }
 
 # ---------------------------------------------------------------------------
@@ -110,21 +112,17 @@ def compute_quality_score(
 
     base = min(weighted_sum / total_blocks, 1.0)
 
-    # Severe paper-level penalty for numeric invention (even if corrected).
-    # Rationale: numeric integrity issues are high-stakes for scientific PDFs.
+    # Paper-level penalty only when numeric integrity rescue FAILED and we
+    # had to fall back to best-source (the output has unmerged text).
+    # Successful rescues are handled by per-segment weights alone — a working
+    # safety system should not catastrophically penalize the score.
     metas = list((resolution_metadata or {}).values())
-    numeric_guard_triggered = any(
-        isinstance(m.get("numeric_integrity"), dict) and m["numeric_integrity"].get("novel_numbers_initial")
-        for m in metas
-    )
     numeric_guard_fallback = any(
         str(m.get("method", "")).endswith("numeric_guard_fallback_best_source")
         for m in metas
     )
     if numeric_guard_fallback:
-        return round(base * 0.25, 6)
-    if numeric_guard_triggered:
-        return round(base * 0.50, 6)
+        return round(base * 0.80, 6)
     return base
 
 

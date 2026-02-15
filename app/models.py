@@ -30,6 +30,7 @@ class ExtractionRun(Base):
     error_message = Column(Text)
     artifacts_json = Column(JSON().with_variant(JSONB, "postgresql"))
     log_s3_key = Column(String)
+    consensus_metrics_json = Column(JSON().with_variant(JSONB, "postgresql"))
     llm_usage_json = Column(JSON().with_variant(JSONB, "postgresql"))
     llm_cost_usd = Column(Numeric(precision=10, scale=6))
 

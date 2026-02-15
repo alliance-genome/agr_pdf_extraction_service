@@ -5,6 +5,7 @@ These serve the original browser-based interface (upload form + synchronous
 processing).  The REST API lives in app/api.py.
 """
 
+import json
 import logging
 import os
 from flask import Blueprint, current_app, request, jsonify, render_template, send_file, url_for
@@ -138,10 +139,16 @@ def process_pdf():
             cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(selected_methods))}"
             merged_cache_path = os.path.join(cfg["CACHE_FOLDER"], f"{cache_key}_merged.md")
 
+            metrics_cache_path = os.path.join(cfg["CACHE_FOLDER"], f"{cache_key}_consensus_metrics.json")
+            metrics = None
+
             if os.path.exists(merged_cache_path):
                 with open(merged_cache_path, "r", encoding="utf-8") as f:
                     merged_md = f.read()
                 cached_methods.append("Merged")
+                if os.path.exists(metrics_cache_path):
+                    with open(metrics_cache_path, "r", encoding="utf-8") as f:
+                        metrics = json.load(f)
             else:
                 if not cfg.get("OPENAI_API_KEY"):
                     return jsonify({"error": "merge=true but OPENAI_API_KEY is not set"}), 400
@@ -164,7 +171,7 @@ def process_pdf():
                         and grobid_text and docling_text and marker_text):
                     return jsonify({
                         "error": "Merge requires consensus pipeline with all 3 extractors"
-                    }), 500
+                    }), 400
 
                 consensus_md, metrics, _audit = merge_with_consensus(
                     grobid_text, docling_text, marker_text, llm,
@@ -183,8 +190,13 @@ def process_pdf():
                 merged_output_path = get_cached_path(file_hash, "merged")
                 with open(merged_output_path, "w", encoding="utf-8") as f:
                     f.write(merged_md)
+                if metrics is not None:
+                    with open(metrics_cache_path, "w", encoding="utf-8") as f:
+                        json.dump(metrics, f, ensure_ascii=False)
 
             response_data["merged_output"] = rewrite_image_paths(merged_md, file_hash)
+            if metrics is not None:
+                response_data["consensus_metrics"] = metrics
         else:
             response_data["individual_outputs"] = {
                 method.upper(): content for method, content in extractions.items()

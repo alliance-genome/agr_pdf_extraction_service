@@ -114,6 +114,7 @@ def _get_run_by_process_id(process_id):
             "error_code": run.error_code,
             "error_message": run.error_message,
             "artifacts_json": run.artifacts_json,
+            "consensus_metrics_json": run.consensus_metrics_json,
             "log_s3_key": run.log_s3_key,
             "llm_usage_json": run.llm_usage_json,
             "llm_cost_usd": float(run.llm_cost_usd) if run.llm_cost_usd is not None else None,
@@ -331,6 +332,8 @@ def submit_extraction():
         methods:          Comma-separated extractor names, e.g. "grobid,docling,marker"
                           (default: all three)
         merge:            "true" to run LLM merge (default: false)
+        clear_cache:      "true" to clear any existing cached results for this PDF
+                          before processing (default: false)
         reference_curie:  Optional curie from upstream system
         mod_abbreviation: Optional MOD abbreviation from upstream system
 
@@ -356,6 +359,7 @@ def submit_extraction():
                         f"Valid: {', '.join(sorted(VALID_METHODS))}"}), 400
 
     merge = request.form.get("merge", "true").lower() in ("true", "1", "on")
+    clear_cache = request.form.get("clear_cache", "false").lower() in ("true", "1", "on")
     reference_curie = request.form.get("reference_curie")
     mod_abbreviation = request.form.get("mod_abbreviation")
 
@@ -377,6 +381,7 @@ def submit_extraction():
             args=[pdf_path, methods],
             kwargs={
                 "merge": merge,
+                "clear_cache": clear_cache,
                 "process_id": process_id,
                 "reference_curie": reference_curie,
                 "mod_abbreviation": mod_abbreviation,

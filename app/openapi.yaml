@@ -124,6 +124,13 @@ paths:
                 mod_abbreviation:
                   type: string
                   nullable: true
+                clear_cache:
+                  type: boolean
+                  default: false
+                  description: >-
+                    When true, deletes any cached extraction outputs for this
+                    PDF (keyed by file hash) before processing. Useful to
+                    force a fresh extraction after config or model changes.
       responses:
         "202":
           description: Job queued.
@@ -561,6 +568,13 @@ components:
           additionalProperties: true
           nullable: true
           description: Full LLM token usage breakdown (tokens, pricing, per-call-type detail).
+        consensus_metrics_json:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: >-
+            Consensus pipeline metrics including quality score,
+            agreement/conflict counts, and degradation analysis.
 
     LogUrlResponse:
       type: object

@@ -193,6 +193,7 @@ def _upsert_extraction_run(
     error_code=None,
     error_message=None,
     artifacts_json=None,
+    consensus_metrics_json=None,
     log_s3_key=None,
     llm_usage_json=None,
     llm_cost_usd=None,
@@ -227,6 +228,8 @@ def _upsert_extraction_run(
         run.error_message = error_message
     if artifacts_json is not None:
         run.artifacts_json = artifacts_json
+    if consensus_metrics_json is not None:
+        run.consensus_metrics_json = consensus_metrics_json
     if log_s3_key is not None:
         run.log_s3_key = log_s3_key
     if llm_usage_json is not None:
@@ -344,6 +347,7 @@ def extract_pdf(
     pdf_path,
     methods,
     merge=False,
+    clear_cache=False,
     process_id=None,
     reference_curie=None,
     mod_abbreviation=None,
@@ -388,6 +392,31 @@ def extract_pdf(
                                         status="failed", error_message=f"PDF file not found: {pdf_path}")
             _safe_close_session(db_session)
         return {"status": "failed", "error": f"PDF file not found: {pdf_path}", "process_id": process_id}
+
+    # Clear cached outputs for this PDF if requested
+    if clear_cache:
+        import glob as _glob
+        import shutil
+        version = Config.EXTRACTION_CONFIG_VERSION
+        pattern = os.path.join(Config.CACHE_FOLDER, f"v{version}_{file_hash}_*")
+        removed = 0
+        for cached_file in _glob.glob(pattern):
+            try:
+                os.remove(cached_file)
+                removed += 1
+            except OSError:
+                pass
+        # Also clear extracted images directory
+        images_dir = _get_images_dir(file_hash)
+        if os.path.isdir(images_dir):
+            shutil.rmtree(images_dir, ignore_errors=True)
+            removed += 1
+        if removed:
+            adapter.info(
+                "Cleared %d cached file(s) for hash %s",
+                removed, file_hash,
+                extra={"_event": "cache_cleared", "_files_removed": removed},
+            )
 
     try:
         audit_logger = AuditLogger(process_id, Config)
@@ -482,6 +511,7 @@ def extract_pdf(
                 status="succeeded",
                 ended_at=ended_at,
                 artifacts_json=artifacts_json,
+                consensus_metrics_json=result.get("consensus_metrics"),
                 log_s3_key=log_s3_key,
                 llm_usage_json=result.get("llm_usage_json"),
                 llm_cost_usd=result.get("llm_cost_usd"),
@@ -763,6 +793,8 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
         cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(methods))}"
         merged_cache_path = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_merged.md")
 
+        metrics_cache_path = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_consensus_metrics.json")
+
         stage = "llm_merge"
         if os.path.exists(merged_cache_path):
             cached_methods.append("merged")
@@ -772,6 +804,9 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
             possible_audit = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_audit.json")
             if os.path.exists(possible_audit):
                 audit_cache_path = possible_audit
+            if os.path.exists(metrics_cache_path):
+                with open(metrics_cache_path, "r", encoding="utf-8") as f:
+                    consensus_metrics = json.load(f)
         else:
             self.update_state(state="PROGRESS", meta={
                 "step": "llm_merge", "current": len(methods_used), "total": total_steps
@@ -836,6 +871,8 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                     f.write(merged_md)
                 with open(_cached_path(file_hash, "merged"), "w", encoding="utf-8") as f:
                     f.write(merged_md)
+                with open(metrics_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(consensus_metrics, f, ensure_ascii=False)
 
                 merge_duration = round(time.monotonic() - started, 3)
                 _safe_log_event(

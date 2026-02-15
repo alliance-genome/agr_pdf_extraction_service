@@ -1928,6 +1928,8 @@ def _apply_numeric_integrity_guard(
                     "novel_numbers_initial": novel,
                     "novel_numbers_retry": [],
                     "novel_numbers_final": [],
+                    "initial_text": current,
+                    "rescued_text": candidate,
                     "explanation": explanation,
                 },
             }
@@ -1960,6 +1962,9 @@ def _apply_numeric_integrity_guard(
             "novel_numbers_initial": novel,
             "novel_numbers_retry": novel2,
             "novel_numbers_final": final_novel,
+            "initial_text": current,
+            "rescue_text": (candidate or "") if candidate is not None else "",
+            "fallback_text": fallback_text,
             "explanation": explanation,
         },
     }
@@ -2421,12 +2426,29 @@ def _build_audit_entries(
         elif triple.classification == GAP:
             sole_source = blocks[0].source
             deduped = not (triple.agreed_text and triple.agreed_text.strip())
-            entry["chosen_text"] = triple.agreed_text or ""
-            entry["chosen_source"] = sole_source
-            entry["details"] = {
-                "sole_source": sole_source,
-                "deduped": deduped,
-            }
+            # GAPs pulled into zones may have been resolved by LLM
+            resolved_text = resolved_conflicts.get(triple.segment_id)
+            resolution_details = (resolution_metadata or {}).get(triple.segment_id, {})
+            if resolved_text is not None:
+                entry["chosen_text"] = resolved_text
+                entry["chosen_source"] = resolution_details.get("chosen_source", sole_source)
+                entry["details"] = {
+                    "sole_source": sole_source,
+                    "deduped": deduped,
+                    "zone_id": resolution_details.get("zone_id", ""),
+                    "llm_resolved": True,
+                    "resolution_method": resolution_details.get("method", ""),
+                    "resolution_confidence": resolution_details.get("confidence", 0.0),
+                }
+                if resolution_details.get("numeric_integrity"):
+                    entry["details"]["numeric_integrity"] = resolution_details["numeric_integrity"]
+            else:
+                entry["chosen_text"] = triple.agreed_text or ""
+                entry["chosen_source"] = sole_source
+                entry["details"] = {
+                    "sole_source": sole_source,
+                    "deduped": deduped,
+                }
 
         elif triple.classification == CONFLICT:
             resolved_text = resolved_conflicts.get(triple.segment_id)
@@ -2468,8 +2490,9 @@ def merge_with_consensus(
 ) -> tuple[str | None, dict, list]:
     """
     Attempt selective LLM merge. Returns (merged_markdown, metrics, audit_entries).
-    Returns (None, metrics, []) if the pipeline fails (missing extractors,
-    alignment too low, or LLM error).
+    Returns (None, metrics, audit_entries) if the pipeline fails (missing extractors,
+    alignment too low, or LLM error). Audit entries may be non-empty on failure
+    if some pipeline stages ran before the failure point.
     """
     from config import Config
 
@@ -2844,7 +2867,7 @@ def merge_with_consensus(
             metrics["resolution_confidence_mean"] = round(
                 float(sum(confidences) / len(confidences)), 4,
             )
-    metrics["gap_cross_dedup_removed"] = gap_dups_removed
+    metrics["gap_dedup_removed"] = gap_dups_removed
     metrics["assembled_dedup_removed"] = assembled_dups_removed
     metrics["qa"] = qa_results
 
@@ -2863,8 +2886,8 @@ def merge_with_consensus(
     degraded_count = degradation["degraded_segments"]["count"]
     if degraded_count > 0:
         logger.warning(
-            "Zone resolution used best-source fallback for %d segment(s) "
-            "(quality_score=%.3f, grade=%s) — quality may be reduced",
+            "Zone resolution: %d segment(s) required numeric integrity intervention "
+            "(quality_score=%.3f, grade=%s)",
             degraded_count,
             degradation["quality_score"],
             degradation["quality_grade"],
@@ -2882,7 +2905,7 @@ def merge_with_consensus(
     pipeline_duration = time.monotonic() - pipeline_start
     logger.info(
         "Consensus pipeline complete in %.1fs: %d blocks, %d conflicts resolved, "
-        "%d GAP cross-dedup, %d post-assembly dedup",
+        "%d GAP dedup, %d post-assembly dedup",
         pipeline_duration,
         metrics["total_blocks"],
         metrics["conflict"],
