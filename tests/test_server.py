@@ -25,7 +25,7 @@ def client():
     app.config['CONSENSUS_NEAR_THRESHOLD'] = 0.92
     app.config['CONSENSUS_LEVENSHTEIN_THRESHOLD'] = 0.90
     app.config['CONSENSUS_CONFLICT_RATIO_FALLBACK'] = 0.4
-    app.config['CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK'] = 0.5
+    app.config['CONSENSUS_ALIGNMENT_CONFIDENCE_MIN'] = 0.5
     app.config['CONSENSUS_ALWAYS_ESCALATE_TABLES'] = True
     with app.test_client() as client:
         yield client
@@ -90,7 +90,7 @@ def test_process_pdf_grobid(
     assert json_data["status"] == "success"
     assert "GROBID" in json_data["methods_used"]
 
-@patch('app.server.merge_with_consensus', return_value=(None, {"fallback_triggered": True}, []))
+@patch('app.server.merge_with_consensus', return_value=("merged output", {"failed": False}, []))
 @patch('app.server.Grobid')
 @patch('app.server.Docling')
 @patch('app.server.Marker')
@@ -119,7 +119,6 @@ def test_process_pdf_merge(
     mock_marker.return_value = marker_instance
 
     llm_instance = MagicMock()
-    llm_instance.extract.return_value = "merged output"
     mock_llm.return_value = llm_instance
 
     data = {

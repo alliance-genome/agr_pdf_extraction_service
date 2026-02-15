@@ -933,51 +933,6 @@ def _compute_conflict_telemetry(
     }
 
 
-def check_guards(
-    triples: list[AlignedTriple],
-    alignment_confidence: float,
-    conflict_ratio_threshold: float = 0.4,
-    alignment_confidence_threshold: float = 0.5,
-    textual_conflict_ratio_threshold: float = 0.4,
-    structured_conflict_ratio_threshold: float = 0.85,
-    localized_conflict_span_max: float = 0.35,
-    localized_conflict_relief: float = 0.15,
-    localized_conflict_max_blocks: int = 25,
-) -> tuple[bool, str | None]:
-    """
-    Check whether the consensus pipeline should fall back to full-LLM merge.
-
-    Returns (should_fallback, reason).
-    """
-    if not triples:
-        return True, "no_blocks"
-
-    telemetry = _compute_conflict_telemetry(
-        triples,
-        conflict_ratio_threshold=conflict_ratio_threshold,
-        localized_conflict_span_max=localized_conflict_span_max,
-        localized_conflict_relief=localized_conflict_relief,
-        localized_conflict_max_blocks=localized_conflict_max_blocks,
-    )
-
-    if telemetry["conflict_ratio_textual"] > textual_conflict_ratio_threshold:
-        return True, "conflict_ratio_textual"
-
-    if (
-        telemetry["structured_blocks"] > 0
-        and telemetry["conflict_ratio_structured"] > structured_conflict_ratio_threshold
-    ):
-        return True, "conflict_ratio_structured"
-
-    if telemetry["conflict_ratio"] > telemetry["adaptive_conflict_ratio_threshold"]:
-        return True, "conflict_ratio"
-
-    if alignment_confidence < alignment_confidence_threshold:
-        return True, "alignment_confidence"
-
-    return False, None
-
-
 def dedup_gap_triples(
     triples: list[AlignedTriple],
     window: int = 3,
@@ -1373,6 +1328,26 @@ def _validate_hierarchy_decisions(
     else:
         if h1_count != 1:
             return f"expected exactly 1 H1 (title), got {h1_count}"
+
+    # Level jump check: consecutive headings should not skip levels (e.g. 1→3)
+    sorted_decisions = sorted(decisions, key=lambda d: d.heading_index)
+    prev_level = None
+    for d in sorted_decisions:
+        if d.action == "demote_to_text":
+            continue
+        eff = _effective_level(d)
+        if eff is None:
+            # Unknown level (keep_level without original_levels) — reset tracking
+            prev_level = None
+            continue
+        if prev_level is not None and eff > prev_level + 1:
+            return f"level jump from {prev_level} to {eff}"
+        prev_level = eff
+
+    # Too many demotions: more than half the headings demoted is suspicious
+    demote_count = sum(1 for d in decisions if d.action == "demote_to_text")
+    if demote_count > len(decisions) // 2:
+        return f"too many demotions: {demote_count} of {len(decisions)} headings demoted"
 
     return None
 
@@ -2291,8 +2266,8 @@ def _resolve_conflicts_layered(
 def compute_metrics(
     triples: list[AlignedTriple],
     alignment_confidence: float,
-    fallback_triggered: bool,
-    fallback_reason: str | None,
+    failed: bool,
+    failure_reason: str | None,
     guard_telemetry: dict | None = None,
 ) -> dict:
     """Compute metrics for the consensus pipeline run."""
@@ -2305,11 +2280,6 @@ def compute_metrics(
     denominator = total - num_gap
     conflict_ratio = num_conflict / denominator if denominator > 0 else 0.0
 
-    # Estimate tokens saved: agreed + gap blocks not sent to LLM
-    agreed_blocks = num_exact + num_near + num_gap
-    # Rough estimate: 100 tokens per block on average
-    tokens_saved_estimate = agreed_blocks * 100
-
     metrics = {
         "total_blocks": total,
         "agree_exact": num_exact,
@@ -2318,9 +2288,8 @@ def compute_metrics(
         "conflict": num_conflict,
         "conflict_ratio": round(conflict_ratio, 4),
         "alignment_confidence": round(alignment_confidence, 4),
-        "tokens_saved_estimate": tokens_saved_estimate,
-        "fallback_triggered": fallback_triggered,
-        "fallback_reason": fallback_reason,
+        "failed": failed,
+        "failure_reason": failure_reason,
     }
     if guard_telemetry:
         metrics.update({
@@ -2498,11 +2467,9 @@ def merge_with_consensus(
     llm: "LLM",
 ) -> tuple[str | None, dict, list]:
     """
-    Attempt selective LLM merge. Returns (merged_markdown, metrics).
-    Returns (None, metrics) if fallback to full-LLM merge is needed.
-
-    Requires all 3 extractor outputs. If any are empty/None, returns (None, metrics)
-    immediately with fallback_reason="missing_extractor".
+    Attempt selective LLM merge. Returns (merged_markdown, metrics, audit_entries).
+    Returns (None, metrics, []) if the pipeline fails (missing extractors,
+    alignment too low, or LLM error).
     """
     from config import Config
 
@@ -2638,44 +2605,42 @@ def merge_with_consensus(
         ),
     )
 
-    # Step 4: Guard checks
-    should_fallback, fallback_reason = check_guards(
-        triples,
-        alignment_confidence,
-        conflict_ratio_threshold=base_conflict_threshold,
-        alignment_confidence_threshold=_cfg_float(
-            getattr(Config, "CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK", 0.5), 0.5,
-        ),
-        textual_conflict_ratio_threshold=_cfg_float(
-            getattr(Config, "CONSENSUS_CONFLICT_RATIO_TEXTUAL_FALLBACK", base_conflict_threshold),
-            base_conflict_threshold,
-        ),
-        structured_conflict_ratio_threshold=_cfg_float(
-            getattr(Config, "CONSENSUS_CONFLICT_RATIO_STRUCTURED_FALLBACK", 0.85), 0.85,
-        ),
-        localized_conflict_span_max=_cfg_float(
-            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_SPAN_MAX", 0.35), 0.35,
-        ),
-        localized_conflict_relief=_cfg_float(
-            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_RELIEF", 0.15), 0.15,
-        ),
-        localized_conflict_max_blocks=_cfg_int(
-            getattr(Config, "CONSENSUS_LOCALIZED_CONFLICT_MAX_BLOCKS", 25), 25,
-        ),
+    # Step 4: Guard checks — alignment confidence hard-fail + telemetry logging
+    alignment_confidence_min = _cfg_float(
+        getattr(Config, "CONSENSUS_ALIGNMENT_CONFIDENCE_MIN", 0.5), 0.5,
     )
 
-    if should_fallback:
-        logger.info("Consensus pipeline: fallback triggered (%s)", fallback_reason)
+    if not triples:
+        logger.info("Consensus pipeline: no blocks after alignment — failing")
+        metrics = compute_metrics([], 0.0, True, "no_blocks", guard_telemetry=guard_telemetry)
+        return None, metrics, []
+
+    if alignment_confidence < alignment_confidence_min:
+        logger.info(
+            "Consensus pipeline: alignment confidence %.3f < %.3f — failing",
+            alignment_confidence, alignment_confidence_min,
+        )
         audit_entries = _build_audit_entries(
             triples, {},
             near_threshold=Config.CONSENSUS_NEAR_THRESHOLD,
             levenshtein_threshold=Config.CONSENSUS_LEVENSHTEIN_THRESHOLD,
         )
         metrics = compute_metrics(
-            triples, alignment_confidence, True, fallback_reason,
+            triples, alignment_confidence, True, "alignment_too_low",
             guard_telemetry=guard_telemetry,
         )
         return None, metrics, audit_entries
+
+    # Log guard telemetry for monitoring (no longer used for branching decisions)
+    logger.info(
+        "Consensus pipeline guard telemetry: conflict_ratio=%.3f, "
+        "conflict_ratio_textual=%.3f, conflict_ratio_structured=%.3f, "
+        "conflicts_localized=%s",
+        guard_telemetry.get("conflict_ratio", 0.0),
+        guard_telemetry.get("conflict_ratio_textual", 0.0),
+        guard_telemetry.get("conflict_ratio_structured", 0.0),
+        guard_telemetry.get("conflicts_localized", False),
+    )
 
     # Step 5: Resolve conflicts via zone-based layered resolver
     conflict_triples = [t for t in triples if t.classification == CONFLICT]
@@ -2879,7 +2844,7 @@ def merge_with_consensus(
             metrics["resolution_confidence_mean"] = round(
                 float(sum(confidences) / len(confidences)), 4,
             )
-    metrics["gap_cross_dedup_removed"] = gap_cross_removed
+    metrics["gap_cross_dedup_removed"] = gap_dups_removed
     metrics["assembled_dedup_removed"] = assembled_dups_removed
     metrics["qa"] = qa_results
 
@@ -2905,27 +2870,23 @@ def merge_with_consensus(
             degradation["quality_grade"],
         )
 
-    # Step 8: Fail-hard on surviving global duplicates
+    # Step 8: Log surviving global duplicates (monitoring only)
     surviving_dupes = qa_results.get("global_duplicate_count", 0)
-    if surviving_dupes > 0 and Config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES:
+    if surviving_dupes > 0:
         logger.warning(
             "Consensus pipeline: %d global duplicates survived both dedup layers "
-            "— triggering fallback (CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES=True)",
+            "— continuing with zone-resolved output",
             surviving_dupes,
         )
-        metrics["fallback_triggered"] = True
-        metrics["fallback_reason"] = "global_duplicates"
-        return None, metrics, audit_entries
 
     pipeline_duration = time.monotonic() - pipeline_start
     logger.info(
         "Consensus pipeline complete in %.1fs: %d blocks, %d conflicts resolved, "
-        "~%d tokens saved, %d GAP cross-dedup, %d post-assembly dedup",
+        "%d GAP cross-dedup, %d post-assembly dedup",
         pipeline_duration,
         metrics["total_blocks"],
         metrics["conflict"],
-        metrics["tokens_saved_estimate"],
-        gap_cross_removed,
+        gap_dups_removed,
         assembled_dups_removed,
     )
 

@@ -779,7 +779,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
 
             llm = LLM(
                 api_key=Config.OPENAI_API_KEY,
-                model=Config.LLM_MODEL_FULL_MERGE,
+                model=Config.LLM_MODEL_ZONE_RESOLUTION,
                 reasoning_effort=Config.LLM_REASONING_EFFORT,
                 conflict_batch_size=Config.LLM_CONFLICT_BATCH_SIZE,
                 conflict_max_workers=Config.LLM_CONFLICT_MAX_WORKERS,
@@ -795,69 +795,42 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
             started = time.monotonic()
             _safe_log_event(audit_logger, stage, "started")
             try:
-                # Try consensus pipeline if enabled and all 3 extractors present
-                if (Config.CONSENSUS_ENABLED
+                if not (Config.CONSENSUS_ENABLED
                         and grobid_text and docling_text and marker_text):
-                    from app.services.consensus_service import merge_with_consensus
-                    log.info("Attempting consensus merge...")
-                    try:
-                        consensus_md, consensus_metrics, consensus_audit = merge_with_consensus(
-                            grobid_text, docling_text, marker_text, llm,
-                        )
-                        if consensus_metrics is not None:
-                            audit_cache_path = os.path.join(
-                                Config.CACHE_FOLDER, f"{cache_key}_audit.json",
-                            )
-                            with open(audit_cache_path, "w", encoding="utf-8") as f:
-                                json.dump(consensus_audit or [], f, indent=2, ensure_ascii=False)
+                    raise ValueError(
+                        "Merge requires consensus pipeline with all 3 extractors "
+                        "(CONSENSUS_ENABLED=true, grobid, docling, marker)"
+                    )
 
-                        if consensus_md is not None:
-                            merged_md = consensus_md
-                            log.info(
-                                "Consensus merge succeeded",
-                                extra={
-                                    "_event": "consensus_classify_summary",
-                                    "_conflict_count": consensus_metrics.get("conflict", 0),
-                                    "_agree_exact": consensus_metrics.get("agree_exact", 0),
-                                    "_agree_near": consensus_metrics.get("agree_near", 0),
-                                    "_gap": consensus_metrics.get("gap", 0),
-                                    "_conflict_ratio": consensus_metrics.get("conflict_ratio", 0.0),
-                                    "_alignment_confidence": consensus_metrics.get("alignment_confidence", 0.0),
-                                    "_tokens_saved": consensus_metrics.get("tokens_saved_estimate", 0),
-                                },
-                            )
-                        else:
-                            log.info(
-                                "Consensus fallback triggered: %s",
-                                consensus_metrics.get("fallback_reason"),
-                                extra={
-                                    "_event": "consensus_fallback",
-                                    "_fallback_reason": consensus_metrics.get("fallback_reason", ""),
-                                    "_conflict_ratio": consensus_metrics.get("conflict_ratio", 0.0),
-                                    "_alignment_confidence": consensus_metrics.get("alignment_confidence", 0.0),
-                                },
-                            )
-                    except Exception as e:
-                        log.warning("Consensus pipeline error, falling back to full-LLM merge: %s", e)
-                        consensus_metrics = {"fallback_triggered": True, "fallback_reason": "pipeline_error"}
-                        audit_cache_path = os.path.join(
-                            Config.CACHE_FOLDER, f"{cache_key}_audit.json",
-                        )
-                        with open(audit_cache_path, "w", encoding="utf-8") as f:
-                            json.dump([], f, indent=2, ensure_ascii=False)
+                from app.services.consensus_service import merge_with_consensus
+                log.info("Attempting consensus merge...")
+                consensus_md, consensus_metrics, consensus_audit = merge_with_consensus(
+                    grobid_text, docling_text, marker_text, llm,
+                )
+                if consensus_metrics is not None:
+                    audit_cache_path = os.path.join(
+                        Config.CACHE_FOLDER, f"{cache_key}_audit.json",
+                    )
+                    with open(audit_cache_path, "w", encoding="utf-8") as f:
+                        json.dump(consensus_audit or [], f, indent=2, ensure_ascii=False)
 
-                # Fallback to full-LLM merge
-                if merged_md is None:
-                    log.info("Merging outputs with full-LLM merge...")
-                    merged_md = llm.extract(grobid_text, docling_text, marker_text)
-
-                    # Apply header hierarchy resolution to full-LLM output too
-                    if Config.CONSENSUS_HIERARCHY_ENABLED and merged_md:
-                        try:
-                            from app.services.consensus_service import resolve_header_hierarchy
-                            merged_md = resolve_header_hierarchy(merged_md, llm)
-                        except Exception as e:
-                            log.warning("Header hierarchy resolution failed on fallback path: %s", e)
+                if consensus_md is not None:
+                    merged_md = consensus_md
+                    log.info(
+                        "Consensus merge succeeded",
+                        extra={
+                            "_event": "consensus_classify_summary",
+                            "_conflict_count": consensus_metrics.get("conflict", 0),
+                            "_agree_exact": consensus_metrics.get("agree_exact", 0),
+                            "_agree_near": consensus_metrics.get("agree_near", 0),
+                            "_gap": consensus_metrics.get("gap", 0),
+                            "_conflict_ratio": consensus_metrics.get("conflict_ratio", 0.0),
+                            "_alignment_confidence": consensus_metrics.get("alignment_confidence", 0.0),
+                        },
+                    )
+                else:
+                    reason = (consensus_metrics or {}).get("failure_reason", "unknown")
+                    raise ValueError(f"Consensus pipeline failed: {reason}")
 
                 with open(merged_cache_path, "w", encoding="utf-8") as f:
                     f.write(merged_md)
