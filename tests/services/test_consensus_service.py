@@ -23,7 +23,6 @@ from app.services.consensus_service import (
     parse_markdown,
     align_blocks,
     classify_triples,
-    check_guards,
     assemble,
     compute_metrics,
     _build_audit_entries,
@@ -552,16 +551,13 @@ class TestClassification:
 # Guard tests
 # ---------------------------------------------------------------------------
 
-class TestGuards:
-    def _make_classified_triples(self, classifications):
-        """Helper to create triples with given classifications.
+class TestGuardTelemetry:
+    """Guard checks are now telemetry-only. Only alignment confidence causes failure."""
 
-        All triples get 3 extractor blocks so block-family ratios are
-        realistic and CONFLICT triples count as 3-source (not excluded
-        from guard ratios).
-        """
+    def test_healthy_document_passes(self):
+        """Healthy document should produce metrics with failed=False."""
         triples = []
-        for i, cls in enumerate(classifications):
+        for i, cls in enumerate([AGREE_EXACT, AGREE_EXACT, AGREE_NEAR, CONFLICT, GAP]):
             t = AlignedTriple(segment_id=f"seg_{i:03d}")
             t.classification = cls
             t.confidence = 0.8
@@ -569,136 +565,52 @@ class TestGuards:
             t.docling_block = Block(block_id=f"d_{i}", raw_text="y", normalized_text="y", block_type="paragraph", heading_level=None, order_index=i, source="docling")
             t.marker_block = Block(block_id=f"m_{i}", raw_text="z", normalized_text="z", block_type="paragraph", heading_level=None, order_index=i, source="marker")
             triples.append(t)
-        return triples
+        metrics = compute_metrics(triples, 0.7, False, None)
+        assert metrics["failed"] is False
+        assert metrics["failure_reason"] is None
 
-    def _make_block_triple(self, seg_id, classification, block_type):
-        t = AlignedTriple(segment_id=seg_id)
-        t.classification = classification
-        if classification != GAP:
-            t.grobid_block = Block(
-                block_id=f"g_{seg_id}",
-                block_type=block_type,
-                raw_text="Sample text",
-                normalized_text=normalize_text("Sample text"),
-                heading_level=None,
-                order_index=0,
-                source="grobid",
-            )
-            t.docling_block = Block(
-                block_id=f"d_{seg_id}",
-                block_type=block_type,
-                raw_text="Sample text",
-                normalized_text=normalize_text("Sample text"),
-                heading_level=None,
-                order_index=0,
-                source="docling",
-            )
-            t.marker_block = Block(
-                block_id=f"m_{seg_id}",
-                block_type=block_type,
-                raw_text="Sample text",
-                normalized_text=normalize_text("Sample text"),
-                heading_level=None,
-                order_index=0,
-                source="marker",
-            )
-        return t
-
-    def test_no_fallback_when_healthy(self):
-        triples = self._make_classified_triples([
-            AGREE_EXACT, AGREE_EXACT, AGREE_NEAR, CONFLICT, GAP,
-        ])
-        should_fallback, reason = check_guards(triples, alignment_confidence=0.7)
-        assert not should_fallback
-        assert reason is None
-
-    def test_fallback_on_high_conflict_ratio(self):
-        triples = self._make_classified_triples([
-            CONFLICT, CONFLICT, CONFLICT, AGREE_EXACT, AGREE_EXACT,
-        ])
-        # 3/5 = 0.6 > 0.4 — textual check fires first since all blocks are paragraphs
-        should_fallback, reason = check_guards(triples, alignment_confidence=0.7)
-        assert should_fallback
-        assert reason in ("conflict_ratio", "conflict_ratio_textual")
-
-    def test_fallback_on_low_alignment_confidence(self):
-        triples = self._make_classified_triples([AGREE_EXACT, AGREE_EXACT])
-        should_fallback, reason = check_guards(triples, alignment_confidence=0.3)
-        assert should_fallback
-        assert reason == "alignment_confidence"
-
-    def test_gap_excluded_from_conflict_ratio(self):
-        """GAP blocks should NOT inflate the conflict ratio."""
-        triples = self._make_classified_triples([
-            AGREE_EXACT, CONFLICT, GAP, GAP, GAP,
-        ])
-        # denominator = 5 - 3 = 2, conflict = 1/2 = 0.5 > 0.4
-        should_fallback, reason = check_guards(triples, alignment_confidence=0.7)
-        assert should_fallback
-        assert reason in ("conflict_ratio", "conflict_ratio_textual")
-
-    def test_all_gap_no_fallback(self):
-        """All-GAP should have conflict_ratio = 0.0 (no fallback from ratio)."""
-        triples = self._make_classified_triples([GAP, GAP, GAP])
-        should_fallback, reason = check_guards(triples, alignment_confidence=0.7)
-        assert not should_fallback
-
-    def test_empty_triples_triggers_fallback(self):
-        should_fallback, reason = check_guards([], alignment_confidence=0.7)
-        assert should_fallback
-        assert reason == "no_blocks"
-
-    def test_structured_conflicts_use_structured_threshold(self):
-        triples = [
-            self._make_block_triple("seg_000", CONFLICT, "table"),
-            self._make_block_triple("seg_001", CONFLICT, "table"),
-            self._make_block_triple("seg_002", AGREE_EXACT, "table"),
-            self._make_block_triple("seg_003", AGREE_EXACT, "table"),
-        ]
-
-        should_fallback, reason = check_guards(
-            triples,
-            alignment_confidence=0.8,
-            conflict_ratio_threshold=0.9,  # disable global ratio fallback
-            structured_conflict_ratio_threshold=0.75,
-        )
-        assert not should_fallback
-        assert reason is None
-
-        should_fallback, reason = check_guards(
-            triples,
-            alignment_confidence=0.8,
-            conflict_ratio_threshold=0.9,
-            structured_conflict_ratio_threshold=0.45,
-        )
-        assert should_fallback
-        assert reason == "conflict_ratio_structured"
-
-    def test_localized_conflict_relief_for_gap_heavy_runs(self):
+    def test_fail_on_low_alignment_confidence(self):
+        """Low alignment confidence should produce metrics with failed=True."""
         triples = []
-        # Conflicts localized near the start.
-        for i in range(20):
-            triples.append(self._make_block_triple(f"seg_c_{i:03d}", CONFLICT, "paragraph"))
-        # Large GAP region inflates non-gap ratio in current denominator logic.
-        for i in range(20):
-            t = AlignedTriple(segment_id=f"seg_g_{i:03d}")
+        for i, cls in enumerate([AGREE_EXACT, AGREE_EXACT]):
+            t = AlignedTriple(segment_id=f"seg_{i:03d}")
+            t.classification = cls
+            triples.append(t)
+        metrics = compute_metrics(triples, 0.3, True, "alignment_too_low")
+        assert metrics["failed"] is True
+        assert metrics["failure_reason"] == "alignment_too_low"
+
+    def test_empty_triples_triggers_failure(self):
+        metrics = compute_metrics([], 0.7, True, "no_blocks")
+        assert metrics["failed"] is True
+        assert metrics["failure_reason"] == "no_blocks"
+
+    def test_all_gap_does_not_fail(self):
+        """All-GAP should have conflict_ratio = 0.0 and not fail."""
+        triples = []
+        for i in range(3):
+            t = AlignedTriple(segment_id=f"seg_{i:03d}")
             t.classification = GAP
             triples.append(t)
-        # Healthy region later in the document.
-        for i in range(20):
-            triples.append(self._make_block_triple(f"seg_a_{i:03d}", AGREE_EXACT, "paragraph"))
+        metrics = compute_metrics(triples, 0.7, False, None)
+        assert metrics["failed"] is False
+        assert metrics["conflict_ratio"] == 0.0
 
-        should_fallback, reason = check_guards(
-            triples,
-            alignment_confidence=0.8,
-            conflict_ratio_threshold=0.4,
-            textual_conflict_ratio_threshold=0.6,
-            localized_conflict_span_max=0.35,
-            localized_conflict_relief=0.15,
-            localized_conflict_max_blocks=25,
-        )
-        assert not should_fallback
-        assert reason is None
+    def test_high_conflict_ratio_does_not_fail(self):
+        """High conflict ratio documents go through zone resolution, not failure."""
+        triples = []
+        for i, cls in enumerate([CONFLICT, CONFLICT, CONFLICT, AGREE_EXACT, AGREE_EXACT]):
+            t = AlignedTriple(segment_id=f"seg_{i:03d}")
+            t.classification = cls
+            t.confidence = 0.8
+            t.grobid_block = Block(block_id=f"g_{i}", raw_text="x", normalized_text="x", block_type="paragraph", heading_level=None, order_index=i, source="grobid")
+            t.docling_block = Block(block_id=f"d_{i}", raw_text="y", normalized_text="y", block_type="paragraph", heading_level=None, order_index=i, source="docling")
+            t.marker_block = Block(block_id=f"m_{i}", raw_text="z", normalized_text="z", block_type="paragraph", heading_level=None, order_index=i, source="marker")
+            triples.append(t)
+        # conflict_ratio = 3/5 = 0.6 > 0.4, but this no longer triggers failure
+        metrics = compute_metrics(triples, 0.7, False, None)
+        assert metrics["failed"] is False
+        assert metrics["conflict_ratio"] == 0.6
 
 
 # ---------------------------------------------------------------------------
@@ -825,8 +737,7 @@ class TestMetrics:
         # conflict_ratio = 1/(5-1) = 0.25
         assert metrics["conflict_ratio"] == 0.25
         assert metrics["alignment_confidence"] == 0.75
-        assert metrics["fallback_triggered"] is False
-        assert metrics["tokens_saved_estimate"] == 400  # (2+1+1)*100
+        assert metrics["failed"] is False
 
     def test_metrics_include_guard_telemetry(self):
         triples = []
@@ -902,31 +813,31 @@ class TestPhase2Metadata:
 
 class TestMergeWithConsensus:
     @patch("config.Config")
-    def test_missing_extractor_returns_fallback(self, mock_config):
+    def test_missing_extractor_returns_failure(self, mock_config):
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.4
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.5
 
         llm = MagicMock()
         llm.usage = TokenAccumulator()
         result, metrics, _audit = merge_with_consensus("grobid", "", "marker", llm)
         assert result is None
-        assert metrics["fallback_triggered"] is True
-        assert metrics["fallback_reason"] == "missing_extractor"
+        assert metrics["failed"] is True
+        assert metrics["failure_reason"] == "missing_extractor"
 
     @patch("config.Config")
-    def test_none_input_returns_fallback(self, mock_config):
+    def test_none_input_returns_failure(self, mock_config):
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.4
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.5
 
         llm = MagicMock()
         llm.usage = TokenAccumulator()
         result, metrics, _audit = merge_with_consensus("grobid", None, "marker", llm)
         assert result is None
-        assert metrics["fallback_reason"] == "missing_extractor"
+        assert metrics["failure_reason"] == "missing_extractor"
 
     @patch("config.Config")
     def test_full_pipeline_with_agreement(self, mock_config):
@@ -934,7 +845,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.4
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.5
 
         llm = MagicMock()
         llm.usage = TokenAccumulator()
@@ -946,7 +857,7 @@ class TestMergeWithConsensus:
         assert result is not None
         assert "Title" in result
         assert "body text" in result
-        assert metrics["fallback_triggered"] is False
+        assert metrics["failed"] is False
         assert metrics["qa"]["qa_passed"] is True
         # LLM should NOT have been called for conflict resolution
         llm.resolve_conflicts.assert_not_called()
@@ -957,7 +868,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8  # high threshold to avoid fallback
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1  # low threshold
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.1  # low threshold
         mock_config.CONSENSUS_LAYERED_ENABLED = False
 
         llm = MagicMock()
@@ -985,7 +896,7 @@ class TestMergeWithConsensus:
             llm.resolve_conflict_zones.assert_called()
         else:
             # Fallback triggered (acceptable if confidence too low)
-            assert metrics["fallback_triggered"] is True
+            assert metrics["failed"] is True
 
     @patch("config.Config")
     @patch("app.services.consensus_service._resolve_conflicts_layered")
@@ -993,7 +904,7 @@ class TestMergeWithConsensus:
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.1
         mock_config.CONSENSUS_LAYERED_ENABLED = True
         mock_config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = False
         mock_config.CONSENSUS_HIERARCHY_ENABLED = False
@@ -1017,7 +928,7 @@ class TestMergeWithConsensus:
 
         result, metrics, audit = merge_with_consensus(md_a, md_b, md_c, llm)
         assert result is not None
-        assert metrics["fallback_triggered"] is False
+        assert metrics["failed"] is False
         assert metrics["resolution_methods"]["median_source"] == 1
         assert metrics["resolution_confidence_mean"] == 0.87
         assert any(
@@ -1026,12 +937,12 @@ class TestMergeWithConsensus:
         )
 
     @patch("config.Config")
-    def test_llm_error_triggers_fallback(self, mock_config):
-        """LLM failure during conflict resolution should trigger fallback."""
+    def test_llm_error_triggers_failure(self, mock_config):
+        """LLM failure during conflict resolution should trigger failure."""
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.1
         mock_config.CONSENSUS_LAYERED_ENABLED = False
 
         llm = MagicMock()
@@ -1048,30 +959,14 @@ class TestMergeWithConsensus:
         # (only if there were conflicts that needed resolution)
         if metrics.get("conflict", 0) > 0:
             assert result is None
-            assert metrics["fallback_reason"] == "llm_error"
-
-    @patch("config.Config")
-    def test_token_savings_estimate(self, mock_config):
-        """Verify token savings are reported when blocks agree."""
-        mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
-        mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
-        mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.4
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
-
-        llm = MagicMock()
-        llm.usage = TokenAccumulator()
-        md = "# Title\n\nIdentical text in all three extractors."
-        result, metrics, _audit = merge_with_consensus(md, md, md, llm)
-
-        if result is not None:
-            assert metrics["tokens_saved_estimate"] > 0
+            assert metrics["failure_reason"] == "llm_error"
 
     @patch("config.Config")
     def test_sparse_extractor_is_excluded_from_alignment(self, mock_config, caplog):
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.4
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.5
         mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
 
         llm = MagicMock()
@@ -1088,7 +983,7 @@ class TestMergeWithConsensus:
             result, metrics, _audit = merge_with_consensus(grobid_md, docling_md, marker_md, llm)
 
         assert result is not None
-        assert metrics["fallback_triggered"] is False
+        assert metrics["failed"] is False
         assert "excluding grobid from alignment" in caplog.text
 
 
@@ -1170,7 +1065,7 @@ class TestMarkdownPreservation:
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.4
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.5
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.5
         mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
 
         llm = MagicMock()
@@ -1181,7 +1076,7 @@ class TestMarkdownPreservation:
         assert result is not None
         assert "# Title" in result
         assert "## Methods" in result
-        assert metrics["fallback_triggered"] is False
+        assert metrics["failed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1250,52 +1145,15 @@ class TestQAGatesGlobal:
 # Global dedup: fail-hard pipeline tests
 # ---------------------------------------------------------------------------
 
-class TestFailHardDedup:
+class TestGlobalDedupMonitoring:
     @patch("config.Config")
-    def test_fail_hard_on_surviving_duplicates(self, mock_config):
-        """Pipeline returns None when dupes survive both layers and flag is True."""
+    def test_surviving_duplicates_logged_but_result_returned(self, mock_config):
+        """Pipeline returns result even when global duplicates survive (monitoring only)."""
         mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
         mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
         mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1
+        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = 0.1
         mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
-        mock_config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = True
-
-        llm = MagicMock()
-        llm.usage = TokenAccumulator()
-
-        # Craft inputs where a near-duplicate sneaks through from two different
-        # extractors but with just enough variation in the surrounding context
-        # that dedup layers don't catch it.  We mock dedup_assembled_paragraphs
-        # to simulate duplicates surviving.
-        md = "# Title\n\nBody text of the paper for testing."
-        with patch(
-            "app.services.consensus_service.dedup_assembled_paragraphs",
-            return_value=("# Title\n\nBody text of the paper for testing.", 0),
-        ), patch(
-            "app.services.consensus_service.run_qa_gates",
-            return_value={
-                "span_tag_count": 0,
-                "html_comment_count": 0,
-                "global_duplicate_count": 2,
-                "qa_passed": False,
-            },
-        ):
-            result, metrics, _audit = merge_with_consensus(md, md, md, llm)
-
-        assert result is None
-        assert metrics["fallback_triggered"] is True
-        assert metrics["fallback_reason"] == "global_duplicates"
-
-    @patch("config.Config")
-    def test_fail_hard_disabled_returns_result(self, mock_config):
-        """Pipeline returns result when flag is False despite dupes in QA."""
-        mock_config.CONSENSUS_NEAR_THRESHOLD = 0.92
-        mock_config.CONSENSUS_LEVENSHTEIN_THRESHOLD = 0.90
-        mock_config.CONSENSUS_CONFLICT_RATIO_FALLBACK = 0.8
-        mock_config.CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = 0.1
-        mock_config.CONSENSUS_ALWAYS_ESCALATE_TABLES = True
-        mock_config.CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = False
 
         llm = MagicMock()
         llm.usage = TokenAccumulator()
@@ -1315,9 +1173,9 @@ class TestFailHardDedup:
         ):
             result, metrics, _audit = merge_with_consensus(md, md, md, llm)
 
-        # With flag False, pipeline should return the result despite dupes
+        # Duplicates no longer trigger failure — zone-resolved output is kept
         assert result is not None
-        assert metrics["fallback_triggered"] is False
+        assert metrics["failed"] is False
 
 
 # ---------------------------------------------------------------------------

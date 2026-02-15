@@ -34,7 +34,7 @@ def client(monkeypatch):
     app.config["CONSENSUS_NEAR_THRESHOLD"] = 0.92
     app.config["CONSENSUS_LEVENSHTEIN_THRESHOLD"] = 0.90
     app.config["CONSENSUS_CONFLICT_RATIO_FALLBACK"] = 0.4
-    app.config["CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK"] = 0.5
+    app.config["CONSENSUS_ALIGNMENT_CONFIDENCE_MIN"] = 0.5
     app.config["CONSENSUS_ALWAYS_ESCALATE_TABLES"] = True
     app.config["AUDIT_S3_BUCKET"] = "test-bucket"
     app.config["AUDIT_S3_PREFIX"] = "pdfx/audit"

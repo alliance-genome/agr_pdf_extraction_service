@@ -216,11 +216,11 @@ Before resolving conflicts, the pipeline evaluates the overall difficulty of the
 | **Structured conflict ratio** | > 85% of tables/equations are CONFLICT | Extractors fundamentally disagree on structured content |
 | **Alignment confidence** | < 0.50 | The block-matching step had very low confidence, suggesting the extractors produced very different document structures |
 
-If any guard gate triggers, the pipeline falls back to sending the **entire document** to the AI for a full-document merge. This is the safety net — it costs more but gives the AI the most context to work with.
+The only guard gate that causes a hard failure is **alignment confidence** — if the block-matching step had very low confidence, the extraction fails with a clear error rather than producing unreliable output. All other guard metrics (conflict ratios, localization) are logged as telemetry for monitoring but do not block the pipeline. Every document goes through zone-based resolution regardless of conflict ratio.
 
-**Two-source conflict exclusion:** When computing conflict ratios for guard gate decisions, the pipeline excludes conflicts where only two extractors produced output (the third had nothing at that position). These "two-source conflicts" are simpler to resolve (just pick the better of two versions) and shouldn't trigger the full-document fallback.
+**Two-source conflict exclusion:** When computing conflict ratios for telemetry, the pipeline excludes conflicts where only two extractors produced output (the third had nothing at that position). These "two-source conflicts" are simpler to resolve (just pick the better of two versions).
 
-**Localized conflict relief:** If conflicts are clustered in one part of the document (e.g., a difficult table section) rather than spread throughout, the overall conflict ratio threshold is relaxed by up to +0.15 (capped at 0.95). For this relief to apply, conflicts must span ≤35% of the document and involve no more than 25 conflict blocks. This prevents a single tricky section from forcing a full-document merge when the rest of the paper merged cleanly.
+**Localized conflict relief:** Conflict localization is tracked in telemetry. If conflicts are clustered in one part of the document (e.g., a difficult table section) rather than spread throughout, this is noted in the guard telemetry metrics.
 
 ### Step 5: Resolve Conflicts — Four Layers of Resolution
 
@@ -360,10 +360,6 @@ Containment check: GROBID's text is contained within Docling's text ✓
 
 If all extractor sources are empty for this segment (all three produced nothing), the segment is dropped entirely. This is rare and typically means the segment was an artifact of the alignment step rather than real content.
 
-#### Layer 4: Full-Document LLM Fallback
-
-If guard gates triggered earlier, or if rescue still fails for critical content, the entire document is sent to the strongest AI model (GPT-5.2) for a complete merge. This is the most expensive path but gives the AI maximum context to work with.
-
 ### Step 6: Assemble and Clean — Build the Final Document
 
 The resolved blocks are reassembled into a single markdown document in the correct order. The output goes through several cleaning passes:
@@ -453,8 +449,6 @@ The service uses two AI models to balance cost and quality:
 | **Zone resolution** (resolving individual conflict sections) | GPT-5-mini | Handles most conflicts well at lower cost |
 | **Large zone resolution** (zones with >20,000 estimated tokens) | GPT-5.2 | Complex/large zones need the stronger model |
 | **Heading hierarchy** | GPT-5.2 | Needs holistic document understanding |
-| **Full-document merge** (fallback) | GPT-5.2 | Always uses the strongest model for full-document passes |
-
 If GPT-5-mini fails to resolve a zone, it is automatically retried with GPT-5.2.
 
 ---
@@ -472,7 +466,7 @@ Every extraction produces a **consensus metrics** report that tells you how the 
 | `conflict` | Blocks where extractors disagreed (resolved by the pipeline) |
 | `conflict_ratio` | Fraction of blocks that were conflicts (lower is better; typical range 0.10-0.35) |
 | `alignment_confidence` | How well the blocks matched across extractors (0.0-1.0; higher is better) |
-| `fallback_triggered` | Whether the full-document AI merge was needed (false is better — means zone-based resolution handled everything) |
+| `failed` | Whether the consensus pipeline failed (true means extraction did not produce output) |
 
 **Example metrics from a typical paper:**
 
@@ -485,8 +479,8 @@ Every extraction produces a **consensus metrics** report that tells you how the 
   "conflict": 18,
   "conflict_ratio": 0.11,
   "alignment_confidence": 0.82,
-  "fallback_triggered": false,
-  "fallback_reason": null,
+  "failed": false,
+  "failure_reason": null,
 
   "degradation_metrics": {
     "quality_score": 0.943,
@@ -566,15 +560,13 @@ Every extraction produces a **consensus metrics** report that tells you how the 
       "zone_resolution_tokens": 12400,
       "rescue_call_tokens": 1800,
       "total_consensus_tokens": 14200,
-      "estimated_full_merge_tokens": 54200,
-      "tokens_saved": 40000,
-      "savings_pct": 73.8
+      "total_consensus_tokens": 14200
     }
   }
 }
 ```
 
-This paper had 174 content blocks. 141 (81%) were resolved automatically without AI. Only 18 conflicts (11%) needed AI resolution, and zone-based resolution handled them all (no full-document fallback needed).
+This paper had 174 content blocks. 141 (81%) were resolved automatically without AI. Only 18 conflicts (11%) needed AI resolution, and zone-based resolution handled them all.
 
 The nested `degradation_metrics` object provides deeper insight into how the merge went:
 
@@ -587,7 +579,7 @@ The nested `degradation_metrics` object provides deeper insight into how the mer
 | `confidence_distribution` | Statistical spread of resolution confidence scores — includes mean, median, percentiles (p10/p25/p75/p90), std_dev, and percentage below 50%/25% confidence |
 | `section_risk` | Per-section degradation summary keyed by the paper's **actual resolved headings** (post heading-hierarchy fix). Keys are hierarchical paths like `Materials and Methods > RNA Extraction`, and each entry reports degraded counts and a risk level (none/low/medium/high) based on `% degraded` in that section. |
 | `risk_flags` | Boolean alerts — `high_degradation_rate` (>10% of blocks degraded), `low_confidence_cluster` (3+ consecutive low-confidence segments), `degradation_concentrated` (>50% of degraded segments in a single zone), `high_risk_top_level_heading` (any H1/H2 section has `risk=high`) |
-| `token_efficiency` | Token usage breakdown — zone resolution tokens, rescue tokens, total, estimated full-merge tokens, tokens saved, and savings percentage |
+| `token_efficiency` | Token usage breakdown — zone resolution tokens, rescue tokens, and total consensus tokens |
 
 **Resolution method vocabulary:** Each resolved segment is tagged with a `method` string that describes exactly how it was resolved. These appear in `resolution_summary.by_method` and in per-segment audit entries.
 
@@ -613,9 +605,9 @@ The weight column shows each method's contribution to the `quality_score` calcul
 **Interpreting the numbers:**
 - **conflict_ratio < 0.20**: Excellent — extractors mostly agree. High confidence in output.
 - **conflict_ratio 0.20-0.40**: Normal — some complex content needed AI resolution. Still reliable.
-- **conflict_ratio > 0.40**: High — may trigger full-document merge. The paper likely has complex layout, many tables, or unusual formatting.
+- **conflict_ratio > 0.40**: High — the paper likely has complex layout, many tables, or unusual formatting. Zone resolution still handles it.
 - **alignment_confidence > 0.70**: Good structural agreement between extractors.
-- **alignment_confidence < 0.50**: Extractors produced very different structures — the merge may be less reliable.
+- **alignment_confidence < 0.50**: Extractors produced very different structures — the extraction will fail with a clear error.
 
 ---
 
@@ -628,7 +620,7 @@ Each extraction run tracks AI usage and estimated cost:
 | `llm_cost_usd` | Total estimated cost in US dollars for this extraction |
 | `llm_usage_json` | Detailed breakdown by call type and model, including token counts |
 
-The cost breakdown shows token usage per call type (zone_resolution, header_hierarchy, full_merge, rescue, conflict_batch) and per model (gpt-5-mini, gpt-5.2), so you can see exactly where the AI budget was spent.
+The cost breakdown shows token usage per call type (zone_resolution, header_hierarchy, rescue, conflict_batch) and per model (gpt-5-mini, gpt-5.2), so you can see exactly where the AI budget was spent.
 
 **Typical costs per paper:** $0.02-$0.20 depending on paper length and complexity.
 
@@ -823,9 +815,8 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_MODEL` | `gpt-5.2` | Base model (used for full-document merge) |
+| `LLM_MODEL` | `gpt-5.2` | Base model |
 | `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5-mini` | Model for zone-based conflict resolution |
-| `LLM_MODEL_FULL_MERGE` | `gpt-5.2` | Model for full-document merge fallback |
 | `LLM_MODEL_RESCUE` | `gpt-5-mini` | Model for rescue resolution attempts |
 | `LLM_MODEL_CONFLICT_BATCH` | `gpt-5.2` | Model for batched conflict resolution |
 | `HIERARCHY_LLM_MODEL` | `gpt-5.2` | Model for heading hierarchy resolution |
@@ -844,10 +835,10 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 | `CONSENSUS_ENABLED` | `true` | Enable the consensus merge pipeline |
 | `CONSENSUS_NEAR_THRESHOLD` | `0.92` | Token similarity threshold for AGREE_NEAR classification |
 | `CONSENSUS_LEVENSHTEIN_THRESHOLD` | `0.90` | Character-level similarity threshold for AGREE_NEAR |
-| `CONSENSUS_CONFLICT_RATIO_FALLBACK` | `0.4` | Overall conflict ratio that triggers full-LLM fallback |
-| `CONSENSUS_CONFLICT_RATIO_TEXTUAL_FALLBACK` | `0.4` | Text-block conflict ratio for fallback |
-| `CONSENSUS_CONFLICT_RATIO_STRUCTURED_FALLBACK` | `0.85` | Table/equation conflict ratio for fallback |
-| `CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK` | `0.5` | Alignment confidence below this triggers fallback |
+| `CONSENSUS_CONFLICT_RATIO_FALLBACK` | `0.4` | Overall conflict ratio threshold (telemetry only) |
+| `CONSENSUS_CONFLICT_RATIO_TEXTUAL_FALLBACK` | `0.4` | Text-block conflict ratio (telemetry only) |
+| `CONSENSUS_CONFLICT_RATIO_STRUCTURED_FALLBACK` | `0.85` | Table/equation conflict ratio (telemetry only) |
+| `CONSENSUS_ALIGNMENT_CONFIDENCE_MIN` | `0.5` | Alignment confidence below this fails the extraction |
 | `CONSENSUS_LAYERED_ENABLED` | `true` | Enable layered conflict resolver (median-source + LLM) |
 | `CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD` | `0.60` | Minimum pairwise similarity for median-source selection |
 | `CONSENSUS_ALWAYS_ESCALATE_TABLES` | `true` | Always send tables/equations to AI, even if extractors agree |

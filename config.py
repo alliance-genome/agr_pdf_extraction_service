@@ -53,7 +53,6 @@ class Config:
 
     # ---- Per-call-type model defaults ----------------------------------------
     LLM_MODEL_ZONE_RESOLUTION = os.environ.get("LLM_MODEL_ZONE_RESOLUTION", "gpt-5-mini")
-    LLM_MODEL_FULL_MERGE = os.environ.get("LLM_MODEL_FULL_MERGE", "gpt-5.2")
     LLM_MODEL_RESCUE = os.environ.get("LLM_MODEL_RESCUE", "gpt-5-mini")
     LLM_MODEL_CONFLICT_BATCH = os.environ.get("LLM_MODEL_CONFLICT_BATCH", "gpt-5.2")
 
@@ -93,7 +92,7 @@ class Config:
     CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD = float(
         os.environ.get("CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD", 0.60),
     )
-    CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK = float(os.environ.get("CONSENSUS_ALIGNMENT_CONFIDENCE_FALLBACK", 0.5))
+    CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = float(os.environ.get("CONSENSUS_ALIGNMENT_CONFIDENCE_MIN", 0.5))
     CONSENSUS_ALWAYS_ESCALATE_TABLES = os.environ.get("CONSENSUS_ALWAYS_ESCALATE_TABLES", "true").lower() == "true"
     # If true, AGREE_NEAR is disabled for any block containing numbers; such blocks
     # become CONFLICT unless they qualify for AGREE_EXACT. This is the safest option

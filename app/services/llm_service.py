@@ -269,32 +269,6 @@ class LLM(PDFExtractor):
             pass
         return None
 
-    def extract(self, grobid_md, docling_md, marker_md):
-        """Full-document LLM merge (fallback path)."""
-        prompt = self.create_prompt(grobid_md, docling_md, marker_md)
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                reasoning_effort=self.reasoning_effort,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            usage = response.usage
-            self.usage.record(usage, "full_merge", self.model)
-            if usage:
-                logger.info(
-                    "LLM full merge complete: model=%s, tokens=%d (prompt=%d, completion=%d)",
-                    self.model, usage.total_tokens, usage.prompt_tokens, usage.completion_tokens,
-                    extra={
-                        "_event": "llm_resolve_complete",
-                        "_llm_model": self.model,
-                        "_llm_tokens_used": usage.total_tokens,
-                    },
-                )
-            return response.choices[0].message.content
-        except Exception as e:
-            raise Exception(f"Error in LLM processing: {str(e)}")
-
     def _resolve_conflict_batch(self, batch: list[dict]) -> tuple[dict[str, str], set[str]]:
         """Resolve one conflict batch, returning (resolved_map, unresolved_ids)."""
         use_model = Config.LLM_MODEL_CONFLICT_BATCH
@@ -1034,42 +1008,3 @@ class LLM(PDFExtractor):
 
         raise Exception(f"resolve_header_hierarchy failed after 2 attempts: {last_error}")
 
-    def create_prompt(self, grobid_md, docling_md, marker_md):
-        return f"""You are processing a scientific article that has been extracted using three different tools: GROBID, Docling, and Marker.
-Each tool produces different quality outputs with varying levels of detail.
-
-Your task is to:
-1. Merge the three markdown extractions into a single, well-structured document
-2. Identify and clearly mark the following sections:
-   - Title
-   - Authors (with affiliations if available)
-   - Abstract
-   - Keywords (if present)
-   - Introduction
-   - Methodology/Methods
-   - Results
-   - Discussion
-   - Conclusion
-   - References
-   - Any other relevant sections
-
-3. Extract and list:
-   - All tables (preserve structure)
-   - All figures/images (note their captions and references)
-   - All equations (preserve formatting)
-
-4. Resolve conflicts between the three extractions by choosing the most complete and accurate version
-5. Maintain academic formatting and citation styles
-
-Here are the three extractions:
-
-## GROBID Extraction:
-{grobid_md}
-
-## Docling Extraction:
-{docling_md}
-
-## Marker Extraction:
-{marker_md}
-
-Please provide a single, well-structured markdown document with clear section headers and all elements properly organized."""

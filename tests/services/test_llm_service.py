@@ -18,28 +18,6 @@ class DummyLLM(LLM):
         self.conflict_retry_rounds = 2
         self.usage = TokenAccumulator()
 
-    def create_prompt(self, g, d, m):
-        return "prompt"
-
-
-def test_llm_extract_success():
-    llm = DummyLLM()
-    mock_response = MagicMock()
-    mock_response.choices = [MagicMock()]
-    mock_response.choices[0].message.content = "merged output"
-    llm.client.chat.completions.create.return_value = mock_response
-
-    result = llm.extract("grobid", "docling", "marker")
-    assert result == "merged output"
-
-
-def test_llm_extract_error():
-    llm = DummyLLM()
-    llm.client.chat.completions.create.side_effect = Exception("fail")
-    with pytest.raises(Exception) as excinfo:
-        llm.extract("grobid", "docling", "marker")
-    assert "Error in LLM processing" in str(excinfo.value)
-
 
 def test_resolve_conflicts_success():
     llm = DummyLLM()

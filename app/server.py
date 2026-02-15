@@ -148,7 +148,7 @@ def process_pdf():
 
                 llm = LLM(
                     api_key=cfg["OPENAI_API_KEY"],
-                    model=cfg.get("LLM_MODEL_FULL_MERGE", cfg["LLM_MODEL"]),
+                    model=cfg.get("LLM_MODEL_ZONE_RESOLUTION", cfg["LLM_MODEL"]),
                     reasoning_effort=cfg.get("LLM_REASONING_EFFORT", "medium"),
                     conflict_batch_size=cfg.get("LLM_CONFLICT_BATCH_SIZE", 10),
                     conflict_max_workers=cfg.get("LLM_CONFLICT_MAX_WORKERS", 4),
@@ -160,24 +160,23 @@ def process_pdf():
                 docling_text = extractions.get("docling", "")
                 marker_text = extractions.get("marker", "")
 
-                # Try consensus pipeline if enabled and all 3 extractors present
-                if (cfg.get("CONSENSUS_ENABLED", True)
+                if not (cfg.get("CONSENSUS_ENABLED", True)
                         and grobid_text and docling_text and marker_text):
-                    try:
-                        consensus_md, metrics, _audit = merge_with_consensus(
-                            grobid_text, docling_text, marker_text, llm,
-                        )
-                        if consensus_md is not None:
-                            merged_md = consensus_md
-                            logger.info("Consensus merge succeeded: %s", metrics)
-                        else:
-                            logger.info("Consensus fallback triggered: %s", metrics)
-                    except Exception as e:
-                        logger.warning("Consensus pipeline error, falling back to full-LLM merge: %s", e)
+                    return jsonify({
+                        "error": "Merge requires consensus pipeline with all 3 extractors"
+                    }), 500
 
-                # Fallback to full-LLM merge
-                if merged_md is None:
-                    merged_md = llm.extract(grobid_text, docling_text, marker_text)
+                consensus_md, metrics, _audit = merge_with_consensus(
+                    grobid_text, docling_text, marker_text, llm,
+                )
+                if consensus_md is not None:
+                    merged_md = consensus_md
+                    logger.info("Consensus merge succeeded: %s", metrics)
+                else:
+                    reason = (metrics or {}).get("failure_reason", "unknown")
+                    return jsonify({
+                        "error": f"Consensus pipeline failed: {reason}"
+                    }), 500
 
                 with open(merged_cache_path, "w", encoding="utf-8") as f:
                     f.write(merged_md)

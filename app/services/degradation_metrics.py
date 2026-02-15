@@ -546,19 +546,11 @@ def build_degradation_metrics(
     has_token_data = zone_resolution_tokens > 0 or rescue_call_tokens > 0
     if has_token_data:
         total_consensus_tokens = zone_resolution_tokens + rescue_call_tokens
-        estimated_full_merge = total_blocks * 300 + 2000
-        tokens_saved = max(0, estimated_full_merge - total_consensus_tokens)
-        savings_pct = round(
-            100.0 * tokens_saved / estimated_full_merge, 1,
-        ) if estimated_full_merge > 0 else 0.0
 
         token_efficiency = {
             "zone_resolution_tokens": zone_resolution_tokens,
             "rescue_call_tokens": rescue_call_tokens,
             "total_consensus_tokens": total_consensus_tokens,
-            "estimated_full_merge_tokens": estimated_full_merge,
-            "tokens_saved": tokens_saved,
-            "savings_pct": savings_pct,
         }
     else:
         token_efficiency = {"status": "not_tracked"}
@@ -588,7 +580,6 @@ def build_degradation_metrics(
         "numeric_integrity_violation": len(numeric_guard_ids) > 0,
         "numeric_integrity_violation_count": len(numeric_guard_ids),
         "total_consensus_tokens": (zone_resolution_tokens + rescue_call_tokens) if has_token_data else None,
-        "full_merge_avoided": True,
     }
 
     # --- Assemble final dict ---

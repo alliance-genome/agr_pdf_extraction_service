@@ -111,7 +111,7 @@ def run_benchmark(file_hash: str) -> dict:
     # Create LLM instance (uses current Config defaults: mini for zones, 5.2 for large/hierarchy)
     llm = LLM(
         api_key=Config.OPENAI_API_KEY,
-        model=Config.LLM_MODEL_FULL_MERGE,
+        model=Config.LLM_MODEL_ZONE_RESOLUTION,
         reasoning_effort=Config.LLM_REASONING_EFFORT,
         conflict_batch_size=Config.LLM_CONFLICT_BATCH_SIZE,
         conflict_max_workers=Config.LLM_CONFLICT_MAX_WORKERS,
@@ -151,7 +151,7 @@ def run_benchmark(file_hash: str) -> dict:
         "usage_json": usage_json,
         "metrics": {k: v for k, v in (metrics or {}).items()
                     if k in ("conflict", "agree_exact", "agree_near", "gap",
-                             "fallback_triggered", "conflict_ratio", "total_blocks",
+                             "failed", "conflict_ratio", "total_blocks",
                              "quality_grade", "quality_score", "degraded_segments",
                              "error")},
         "audit_count": len(audit) if audit else 0,
