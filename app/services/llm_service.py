@@ -1,3 +1,5 @@
+"""OpenAI-backed LLM service used by consensus and hierarchy resolution flows."""
+
 import json
 import logging
 import threading
@@ -205,6 +207,20 @@ class ConflictResolutionResponse(BaseModel):
     resolved: list[ResolvedSegment]
 
 
+class ResolvedMicroConflict(BaseModel):
+    """A single resolved micro-conflict span."""
+
+    conflict_id: str
+    text: str = ""
+    action: Literal["keep", "drop"] = "keep"
+
+
+class MicroConflictResolutionResponse(BaseModel):
+    """Structured output for micro-conflict resolution."""
+
+    resolved: list[ResolvedMicroConflict]
+
+
 class RescueSegmentResponse(BaseModel):
     """Response from a rescue resolution call for a single failed segment."""
 
@@ -246,17 +262,6 @@ class LLM(PDFExtractor):
         self.conflict_max_workers = max(1, int(conflict_max_workers))
         self.conflict_retry_rounds = max(1, int(conflict_retry_rounds))
         self.usage = TokenAccumulator()
-
-    def _estimate_zone_tokens(self, zone: dict) -> int:
-        """Estimate token count for a zone payload (~4 chars per token + system message overhead)."""
-        return len(json.dumps(zone)) // 4 + 500
-
-    def _select_zone_model(self, zone: dict) -> str:
-        """Select the appropriate model for a conflict zone based on size."""
-        est_tokens = self._estimate_zone_tokens(zone)
-        if est_tokens > Config.ZONE_ESCALATION_THRESHOLD:
-            return Config.ZONE_ESCALATION_MODEL
-        return Config.LLM_MODEL_ZONE_RESOLUTION
 
     @staticmethod
     def _next_tier_model(current_model: str) -> str | None:
@@ -423,151 +428,125 @@ class LLM(PDFExtractor):
 
         return {c["segment_id"]: resolved_all[c["segment_id"]] for c in conflicts}
 
-    def _resolve_single_zone(self, zone: dict, model: str | None = None) -> tuple[dict[str, str], set[str]]:
-        """Resolve one conflict zone, returning (resolved_map, unresolved_ids).
+    def resolve_micro_conflicts(
+        self,
+        payload: dict,
+        model: str | None = None,
+    ) -> MicroConflictResolutionResponse:
+        """Resolve one segment's micro-conflicts with targeted retries/escalation."""
+        micro_conflicts = payload.get("micro_conflicts") or []
+        if not micro_conflicts:
+            return MicroConflictResolutionResponse(resolved=[])
 
-        Args:
-            zone: The conflict zone dict to resolve.
-            model: Override model for this call (defaults to self.model).
-        """
-        use_model = model or self.model
-
-        # Collect expected segment_ids (conflict, gap, and near_agree — not pre_resolved or agreed)
-        expected_ids = {
-            seg["segment_id"]
-            for seg in zone["segments"]
-            if seg["status"] in ("conflict", "gap", "near_agree")
-        }
+        expected_ids = [mc.get("conflict_id", "") for mc in micro_conflicts if mc.get("conflict_id")]
         if not expected_ids:
-            return {}, set()
+            return MicroConflictResolutionResponse(resolved=[])
 
+        resolved_map: dict[str, str] = {}
+        pending_ids = list(expected_ids)
+        current_model = model or Config.LLM_MODEL_ZONE_RESOLUTION
         system_msg = (
-            "You are resolving conflicts between PDF extraction tools (GROBID, Docling, Marker) "
-            "that processed the same scientific paper.\n\n"
-            "You will receive a \"conflict zone\" — consecutive segments where extractors disagreed "
-            "or produced slightly different text, surrounded by agreed-upon context that is already settled.\n\n"
-            "ZONE STRUCTURE:\n"
-            "- context_before: agreed segments BEFORE the zone (read-only, do NOT repeat)\n"
-            "- segments: the zone's segments in document order. Each has a status:\n"
-            "    \"conflict\" — extractors disagree significantly. Pick the best version or merge.\n"
-            "    \"near_agree\" — extractors mostly agree but text differs slightly (formatting, "
-            "accents, punctuation, whitespace). All extractor versions are provided. Pick the "
-            "cleanest, most complete version or merge the best parts. The \"current_choice\" "
-            "field shows what the programmatic pipeline chose — you may keep it or improve it.\n"
-            "    \"gap\" — only one extractor has text. Keep it, drop it (empty string), "
-            "or clean it up.\n"
-            "    \"pre_resolved\" — already resolved, included for context only. Do NOT "
-            "return text for these.\n"
-            "    \"agreed\" — already agreed, included for context only. Do NOT "
-            "return text for these.\n"
-            "- context_after: agreed segments AFTER the zone (read-only, do NOT repeat)\n\n"
+            "You are resolving small disagreements between three PDF extraction tools "
+            "(GROBID, Docling, Marker) that processed the same scientific paper.\n\n"
+            "You will receive one or more MICRO-CONFLICTS. Each shows a small region "
+            "where the tools disagree, surrounded by context where they agree.\n\n"
+            "FORMAT:\n"
+            "- conflict_id: unique identifier\n"
+            "- context_before: agreed text before the disagreement (read-only)\n"
+            "- disagreement: what each extractor has (some may be empty)\n"
+            "- context_after: agreed text after the disagreement (read-only)\n\n"
             "RULES:\n"
-            "1. Return a resolution for every \"conflict\", \"near_agree\", and \"gap\" segment.\n"
-            "2. Do NOT return entries for \"pre_resolved\", \"agreed\", or context segments.\n"
-            "3. Your resolved segments must flow naturally in document order between "
-            "context_before and context_after.\n"
-            "4. Preserve markdown formatting (bold, headers, italics) where appropriate.\n"
-            "5. For \"near_agree\" segments, prefer the version with correct accented characters, "
-            "complete text, and proper formatting.\n\n"
-            "ACTION FIELD (required for every segment):\n"
-            "- Set action=\"keep\" and provide the resolved text for segments that belong in "
-            "the final document. This applies to ALL conflict and near_agree segments — you "
-            "must ALWAYS resolve these with action=\"keep\".\n"
-            "- Set action=\"drop\" with empty text ONLY for \"gap\" segments that are artifacts, "
-            "duplicates, or page noise that should be excluded. NEVER drop a conflict or "
-            "near_agree segment.\n\n"
-            "Return JSON: {\"resolved\": [{\"segment_id\": \"...\", \"action\": \"keep\"|\"drop\", \"text\": \"...\"}, ...]}"
+            "1. Pick the most accurate version or merge the best parts.\n"
+            "2. Return ONLY the resolved text for the disagreement span.\n"
+            "3. Do NOT repeat context_before or context_after.\n"
+            "4. Preserve ALL numbers exactly as they appear in sources.\n"
+            "5. Preserve Greek letters, subscripts, superscripts, math symbols exactly.\n"
+            "6. When sources disagree on a number, pick one verbatim — do NOT invent.\n"
+            "7. Prefer selecting from source text over rewriting.\n"
+            "8. For table cell disagreements, preserve markdown table formatting.\n"
+            "9. For equation disagreements, preserve LaTeX/mathematical notation.\n\n"
+            "Return JSON: {\"resolved\": [{\"conflict_id\": \"...\", \"text\": \"...\", \"action\": \"keep\"}, ...]}\n"
+            "Set action=\"keep\" (default) with resolved text for normal spans.\n"
+            "Set action=\"drop\" with empty text to intentionally delete a span."
         )
 
-        prompt_payload = json.dumps(zone)
+        for attempt in range(self.conflict_retry_rounds + 1):
+            if not pending_ids:
+                break
 
-        completion = self.client.chat.completions.parse(
-            model=use_model,
-            reasoning_effort=self.reasoning_effort,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt_payload},
-            ],
-            response_format=ConflictResolutionResponse,
-        )
+            attempt_payload = dict(payload)
+            attempt_payload["micro_conflicts"] = [
+                mc for mc in micro_conflicts if mc.get("conflict_id") in set(pending_ids)
+            ]
+            try:
+                completion = self.client.chat.completions.parse(
+                    model=current_model,
+                    reasoning_effort=self.reasoning_effort,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": json.dumps(attempt_payload)},
+                    ],
+                    response_format=MicroConflictResolutionResponse,
+                )
 
-        usage = completion.usage
-        self.usage.record(usage, "zone_resolution", use_model)
-        if usage:
-            logger.info(
-                "LLM zone resolution: zone=%s, model=%s, tokens=%d (prompt=%d, completion=%d)",
-                zone.get("zone_id", "?"),
-                use_model, usage.total_tokens, usage.prompt_tokens, usage.completion_tokens,
-                extra={
-                    "_event": "llm_zone_resolve_complete",
-                    "_llm_model": use_model,
-                    "_llm_tokens_used": usage.total_tokens,
-                },
+                usage = completion.usage
+                self.usage.record(usage, "micro_conflict", current_model)
+                if usage:
+                    logger.info(
+                        "LLM micro-conflict resolution: model=%s, tokens=%d (prompt=%d, completion=%d)",
+                        current_model,
+                        usage.total_tokens,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                    )
+
+                message = completion.choices[0].message
+                refusal = getattr(message, "refusal", None)
+                if refusal:
+                    raise ValueError(f"Model refused: {refusal}")
+                if not message.parsed:
+                    raise ValueError("No parsed response from model")
+
+                for item in message.parsed.resolved:
+                    conflict_id = (item.conflict_id or "").strip()
+                    text = (item.text or "").strip()
+                    if conflict_id in pending_ids and (text or item.action == "drop"):
+                        resolved_map[conflict_id] = text  # empty string for drops
+
+            except Exception as exc:
+                logger.warning(
+                    "Micro-conflict call failed (attempt=%d, model=%s): %s",
+                    attempt + 1, current_model, exc,
+                )
+                if attempt < self.conflict_retry_rounds:
+                    next_model = self._next_tier_model(current_model)
+                    if next_model:
+                        current_model = next_model
+                    continue
+                break
+
+            pending_ids = [cid for cid in pending_ids if cid not in resolved_map]
+            if pending_ids and attempt < self.conflict_retry_rounds:
+                next_model = self._next_tier_model(current_model)
+                if next_model:
+                    logger.info(
+                        "Escalating micro-conflict resolution model: %s -> %s",
+                        current_model, next_model,
+                    )
+                    current_model = next_model
+
+        if pending_ids:
+            logger.warning(
+                "Unresolved micro_conflicts after %d retries: %s",
+                self.conflict_retry_rounds + 1, sorted(pending_ids),
             )
 
-        message = completion.choices[0].message
-        refusal = getattr(message, "refusal", None)
-        if refusal:
-            raise ValueError(f"Model refused: {refusal}")
-
-        if not message.parsed:
-            raise ValueError("No parsed response from model")
-
-        # Build lookup preserving the full ResolvedSegment (with action field)
-        raw_map = {seg.segment_id: seg for seg in message.parsed.resolved}
-        # Map segment_id → original status for drop validation
-        seg_status_map = {
-            seg["segment_id"]: seg["status"]
-            for seg in zone["segments"]
-            if seg["status"] in ("conflict", "gap", "near_agree")
-        }
-        resolved: dict[str, str] = {}
-        unresolved = set(expected_ids)
-
-        for seg_id in expected_ids:
-            seg_result = raw_map.get(seg_id)
-
-            if seg_result is None:
-                # Segment missing entirely — LLM omitted it
-                logger.warning("LLM omitted segment %s from zone response — unresolved", seg_id)
-                continue  # stays in unresolved set
-
-            if seg_result.action == "keep":
-                if seg_result.text.strip():
-                    # Normal resolution — text provided
-                    resolved[seg_id] = seg_result.text.strip()
-                    unresolved.discard(seg_id)
-                else:
-                    # Error: said "keep" but gave empty text — treat as unresolved
-                    logger.warning(
-                        "LLM returned action='keep' but empty text for %s — treating as unresolved",
-                        seg_id,
-                    )
-                    # stays in unresolved set — will trigger retry
-
-            elif seg_result.action == "drop":
-                orig_status = seg_status_map.get(seg_id, "conflict")
-                if seg_result.text.strip():
-                    # Suspicious: said "drop" but provided text — use the text
-                    logger.warning(
-                        "LLM returned action='drop' but provided text for %s — using text as 'keep'",
-                        seg_id,
-                    )
-                    resolved[seg_id] = seg_result.text.strip()
-                    unresolved.discard(seg_id)
-                elif orig_status == "gap":
-                    # Intentional drop of gap segment — legitimate empty
-                    resolved[seg_id] = ""
-                    unresolved.discard(seg_id)
-                else:
-                    # Invalid: tried to drop a conflict/near_agree segment — treat as unresolved
-                    logger.warning(
-                        "LLM tried to drop %s segment %s — treating as unresolved for retry/escalation",
-                        orig_status, seg_id,
-                    )
-                    # stays in unresolved set — will trigger retry with escalated model
-
-        return resolved, unresolved
+        resolved_items = [
+            ResolvedMicroConflict(conflict_id=cid, text=resolved_map.get(cid, ""), action="keep" if resolved_map.get(cid) else "drop")
+            for cid in expected_ids
+            if cid in resolved_map
+        ]
+        return MicroConflictResolutionResponse(resolved=resolved_items)
 
     def rescue_single_segment(
         self,
@@ -717,157 +696,6 @@ class LLM(PDFExtractor):
             logger.warning("Rescue call for %s failed: %s", seg_id, exc)
             return None
 
-    def resolve_conflict_zones(
-        self, zones: list[dict],
-    ) -> tuple[dict[str, str], set[str]]:
-        """Resolve conflict zones in parallel with per-zone model selection and retry escalation.
-
-        Each zone gets a model selected by _select_zone_model() based on its
-        estimated token count. On failure or unresolved segments, the model is
-        escalated to the next tier (mini→5.2) before retrying.
-
-        Returns:
-            (resolved_all, unresolved_ids) — resolved_all maps segment_id to
-            resolved text for every segment the LLM handled; unresolved_ids
-            contains segment IDs from zones that still had failures after all
-            retry rounds.  The caller is responsible for deciding how to handle
-            unresolved segments (rescue, fallback, skip).
-        """
-        if not zones:
-            return {}, set()
-
-        resolved_all: dict[str, str] = {}
-        pending_zones = list(zones)
-
-        def _zkey(z: dict) -> str:
-            """Consistent zone key for model tracking."""
-            return z.get("zone_id") or str(id(z))
-
-        # Track per-zone model selection for escalation across rounds
-        zone_models: dict[str, str] = {}
-        for zone in zones:
-            zid = _zkey(zone)
-            selected = self._select_zone_model(zone)
-            zone_models[zid] = selected
-            est_tokens = self._estimate_zone_tokens(zone)
-            logger.info(
-                "Zone %s: est_tokens=%d, selected_model=%s",
-                zid, est_tokens, selected,
-                extra={
-                    "_event": "zone_model_selected",
-                    "_zone_id": zid,
-                    "_est_tokens": est_tokens,
-                    "_selected_model": selected,
-                },
-            )
-
-        for round_idx in range(self.conflict_retry_rounds + 1):
-            if not pending_zones:
-                break
-
-            logger.info(
-                "resolve_conflict_zones round %d: %d zone(s)",
-                round_idx + 1, len(pending_zones),
-            )
-
-            round_resolved: dict[str, str] = {}
-            failed_zones: list[dict] = []
-
-            max_workers = min(self.conflict_max_workers, len(pending_zones))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {}
-                for zone in pending_zones:
-                    zid = _zkey(zone)
-                    use_model = zone_models.get(zid, self.model)
-                    futures[executor.submit(self._resolve_single_zone, zone, model=use_model)] = zone
-
-                for future in as_completed(futures):
-                    zone = futures[future]
-                    zid = _zkey(zone)
-                    current_model = zone_models.get(zid, self.model)
-                    try:
-                        zone_resolved, zone_unresolved = future.result()
-                        round_resolved.update(zone_resolved)
-                        if zone_unresolved:
-                            logger.warning(
-                                "Zone %s left %d unresolved segments (model=%s, attempt=%d)",
-                                zid, len(zone_unresolved), current_model, round_idx + 1,
-                                extra={
-                                    "_event": "zone_resolve_partial",
-                                    "_zone_id": zid,
-                                    "_model": current_model,
-                                    "_attempt": round_idx + 1,
-                                    "_unresolved_count": len(zone_unresolved),
-                                },
-                            )
-                            # Escalate model for next round
-                            next_model = self._next_tier_model(current_model)
-                            if next_model and round_idx < self.conflict_retry_rounds:
-                                logger.info(
-                                    "Escalating zone %s: %s → %s",
-                                    zid, current_model, next_model,
-                                    extra={
-                                        "_event": "zone_model_escalated",
-                                        "_zone_id": zid,
-                                        "_escalated_from": current_model,
-                                        "_escalated_to": next_model,
-                                    },
-                                )
-                                zone_models[zid] = next_model
-                            failed_zones.append(zone)
-                    except Exception as exc:
-                        logger.warning(
-                            "resolve_conflict_zones zone %s failed (model=%s, attempt=%d): %s",
-                            zid, current_model, round_idx + 1, exc,
-                            extra={
-                                "_event": "zone_resolve_failed",
-                                "_zone_id": zid,
-                                "_model": current_model,
-                                "_attempt": round_idx + 1,
-                            },
-                        )
-                        # Escalate model for next round
-                        next_model = self._next_tier_model(current_model)
-                        if next_model and round_idx < self.conflict_retry_rounds:
-                            logger.info(
-                                "Escalating zone %s: %s → %s",
-                                zid, current_model, next_model,
-                                extra={
-                                    "_event": "zone_model_escalated",
-                                    "_zone_id": zid,
-                                    "_escalated_from": current_model,
-                                    "_escalated_to": next_model,
-                                },
-                            )
-                            zone_models[zid] = next_model
-                        failed_zones.append(zone)
-
-            resolved_all.update(round_resolved)
-            pending_zones = failed_zones
-
-            if pending_zones and round_idx < self.conflict_retry_rounds:
-                logger.warning(
-                    "resolve_conflict_zones round %d: %d zone(s) need retry",
-                    round_idx + 1, len(pending_zones),
-                )
-                continue
-
-        # Collect only the truly unresolved segment IDs (not already in resolved_all)
-        unresolved_ids: set[str] = set()
-        if pending_zones:
-            for z in pending_zones:
-                for seg in z["segments"]:
-                    sid = seg["segment_id"]
-                    if seg["status"] in ("conflict", "near_agree", "gap") and sid not in resolved_all:
-                        unresolved_ids.add(sid)
-            failed_zone_ids = [z.get("zone_id", "?") for z in pending_zones]
-            logger.warning(
-                "resolve_conflict_zones: %d zone(s) unresolved after retries: %s (%d segments)",
-                len(pending_zones), failed_zone_ids, len(unresolved_ids),
-            )
-
-        return resolved_all, unresolved_ids
-
     def resolve_header_hierarchy(
         self, headers: list[dict], model: str | None = None,
         reasoning_effort: str | None = None, opening_text: str | None = None,
@@ -1007,4 +835,3 @@ class LLM(PDFExtractor):
                 break
 
         raise Exception(f"resolve_header_hierarchy failed after 2 attempts: {last_error}")
-

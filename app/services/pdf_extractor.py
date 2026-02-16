@@ -1,3 +1,5 @@
+"""Abstract interface for extractor backends used by the pipeline."""
+
 class PDFExtractor:
     def extract(self, pdf_path, output_filename):
         """

@@ -1,3 +1,5 @@
+"""Marker-based PDF extraction service with cached model/converter instances."""
+
 import os
 import re
 import logging

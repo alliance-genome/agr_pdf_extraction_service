@@ -383,7 +383,7 @@ def build_degradation_metrics(
 
         degraded_details.append({
             "segment_id": seg_id,
-            "zone_id": meta.get("zone_id", ""),
+            "context_id": meta.get("context_id", meta.get("zone_id", "")),
             "block_type": block_type,
             "section_heading": section_label,
             "section_heading_level": section_level,
@@ -418,7 +418,7 @@ def build_degradation_metrics(
             )
             rescue_details.append({
                 "segment_id": seg_id,
-                "zone_id": meta.get("zone_id", ""),
+                "context_id": meta.get("context_id", meta.get("zone_id", "")),
                 "block_type": audit_entry.get("block_type", "unknown"),
                 "method": method,
                 "rescue_explanation": meta.get("rescue_explanation", ""),
@@ -483,16 +483,16 @@ def build_degradation_metrics(
         if total_blocks > 0 else False
     )
 
-    # Concentration check: are >50% of degraded segments in a single zone?
-    zone_counts: dict[str, int] = {}
+    # Concentration check: are >50% of degraded segments in a single context?
+    context_counts: dict[str, int] = {}
     for d in degraded_details:
-        z = d.get("zone_id", "")
-        if z:
-            zone_counts[z] = zone_counts.get(z, 0) + 1
+        ctx = d.get("context_id", "")
+        if ctx:
+            context_counts[ctx] = context_counts.get(ctx, 0) + 1
     concentrated = False
-    if degraded_count >= 2 and zone_counts:
-        max_in_zone = max(zone_counts.values())
-        concentrated = max_in_zone > (degraded_count * 0.5)
+    if degraded_count >= 2 and context_counts:
+        max_in_context = max(context_counts.values())
+        concentrated = max_in_context > (degraded_count * 0.5)
 
     # Low-confidence cluster: 3+ consecutive segments with confidence < 0.50
     low_conf_cluster = False

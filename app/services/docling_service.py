@@ -1,3 +1,5 @@
+"""Docling-based PDF extraction service with process-local converter caching."""
+
 import os
 import logging
 from app.services.pdf_extractor import PDFExtractor

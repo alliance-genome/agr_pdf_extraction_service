@@ -1,3 +1,8 @@
+"""Audit logging helpers for merge runs.
+
+Persists structured audit artifacts locally and optionally mirrors them to S3.
+"""
+
 import os
 import json
 import logging
