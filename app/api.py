@@ -442,6 +442,7 @@ def get_extraction_status(process_id):
             "ended_at": run["ended_at"],
             "log_s3_key": run["log_s3_key"],
             "artifacts_json": run["artifacts_json"],
+            "consensus_metrics_json": run["consensus_metrics_json"],
             "llm_cost_usd": run["llm_cost_usd"],
             "llm_usage_json": run["llm_usage_json"],
         }

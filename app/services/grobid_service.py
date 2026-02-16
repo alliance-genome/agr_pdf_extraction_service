@@ -1,3 +1,5 @@
+"""GROBID TEI-to-markdown extraction service."""
+
 import logging
 import requests
 from xml.etree import ElementTree as ET

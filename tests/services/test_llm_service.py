@@ -2,7 +2,9 @@ import pytest
 from unittest.mock import MagicMock
 from app.services.llm_service import (
     ConflictResolutionResponse,
+    MicroConflictResolutionResponse,
     ResolvedSegment,
+    ResolvedMicroConflict,
     LLM,
     TokenAccumulator,
 )
@@ -148,132 +150,231 @@ def test_resolve_conflicts_retry_on_refusal():
 
 
 # ---------------------------------------------------------------------------
-# Zone resolution tests
+# Micro-conflict resolution tests
 # ---------------------------------------------------------------------------
 
-def test_resolve_conflict_zones_single_zone():
-    """Single zone with one conflict should resolve successfully."""
+def test_resolve_micro_conflicts_single_payload():
+    """Single payload should resolve all micro-conflict IDs."""
     llm = DummyLLM()
 
-    zone = {
-        "zone_id": "zone_0",
-        "context_before": [{"segment_id": "seg_000", "text": "Before", "status": "agreed"}],
-        "segments": [
-            {"segment_id": "seg_001", "status": "conflict", "block_type": "paragraph",
-             "grobid": "text a", "docling": "text b", "marker": "text c"},
+    payload = {
+        "segment_id": "seg_001",
+        "block_type": "paragraph",
+        "micro_conflicts": [
+            {
+                "conflict_id": "seg_001_mc_0",
+                "context_before": "The result was",
+                "disagreement": {"grobid": "95%", "docling": "96%", "marker": "97%"},
+                "context_after": "in all runs.",
+            },
         ],
-        "context_after": [{"segment_id": "seg_002", "text": "After", "status": "agreed"}],
-        "triple_indices": [1],
     }
 
     message = MagicMock()
-    message.parsed = ConflictResolutionResponse(
-        resolved=[ResolvedSegment(segment_id="seg_001", action="keep", text="resolved zone text")]
+    message.parsed = MicroConflictResolutionResponse(
+        resolved=[ResolvedMicroConflict(conflict_id="seg_001_mc_0", text="95.5%")]
     )
     message.refusal = None
     completion = MagicMock()
     completion.choices = [MagicMock(message=message)]
     llm.client.chat.completions.parse.return_value = completion
 
-    result, unresolved = llm.resolve_conflict_zones([zone])
-    assert result == {"seg_001": "resolved zone text"}
-    assert unresolved == set()
+    result = llm.resolve_micro_conflicts(payload)
+    assert result.resolved[0].conflict_id == "seg_001_mc_0"
+    assert result.resolved[0].text == "95.5%"
 
 
-def test_resolve_conflict_zones_multiple_zones():
-    """Multiple zones should all be resolved."""
+def test_resolve_micro_conflicts_retry_on_partial():
+    """Missing IDs in first response should trigger retry."""
     llm = DummyLLM()
 
-    zones = [
-        {
-            "zone_id": "zone_0",
-            "context_before": [],
-            "segments": [
-                {"segment_id": "seg_001", "status": "conflict", "block_type": "paragraph",
-                 "grobid": "a", "docling": "b", "marker": "c"},
-            ],
-            "context_after": [],
-            "triple_indices": [1],
-        },
-        {
-            "zone_id": "zone_1",
-            "context_before": [],
-            "segments": [
-                {"segment_id": "seg_005", "status": "conflict", "block_type": "paragraph",
-                 "grobid": "x", "docling": "y", "marker": "z"},
-            ],
-            "context_after": [],
-            "triple_indices": [5],
-        },
-    ]
+    payload = {
+        "segment_id": "seg_001",
+        "block_type": "paragraph",
+        "micro_conflicts": [
+            {
+                "conflict_id": "seg_001_mc_0",
+                "context_before": "",
+                "disagreement": {"grobid": "a", "docling": "b", "marker": "c"},
+                "context_after": "",
+            },
+            {
+                "conflict_id": "seg_001_mc_1",
+                "context_before": "",
+                "disagreement": {"grobid": "x", "docling": "y", "marker": "z"},
+                "context_after": "",
+            },
+        ],
+    }
 
-    # Each call resolves one zone
     msg1 = MagicMock()
-    msg1.parsed = ConflictResolutionResponse(resolved=[ResolvedSegment(segment_id="seg_001", action="keep", text="r1")])
+    msg1.parsed = MicroConflictResolutionResponse(
+        resolved=[ResolvedMicroConflict(conflict_id="seg_001_mc_0", text="r1")]
+    )
     msg1.refusal = None
     comp1 = MagicMock()
     comp1.choices = [MagicMock(message=msg1)]
 
     msg2 = MagicMock()
-    msg2.parsed = ConflictResolutionResponse(resolved=[ResolvedSegment(segment_id="seg_005", action="keep", text="r2")])
+    msg2.parsed = MicroConflictResolutionResponse(
+        resolved=[ResolvedMicroConflict(conflict_id="seg_001_mc_1", text="r2")]
+    )
     msg2.refusal = None
     comp2 = MagicMock()
     comp2.choices = [MagicMock(message=msg2)]
 
     llm.client.chat.completions.parse.side_effect = [comp1, comp2]
 
-    result, unresolved = llm.resolve_conflict_zones(zones)
-    assert result["seg_001"] == "r1"
-    assert result["seg_005"] == "r2"
-    assert unresolved == set()
+    result = llm.resolve_micro_conflicts(payload)
+    resolved = {item.conflict_id: item.text for item in result.resolved}
+    assert resolved["seg_001_mc_0"] == "r1"
+    assert resolved["seg_001_mc_1"] == "r2"
 
 
-def test_resolve_conflict_zones_retry_on_failure():
-    """Zone that fails once should be retried."""
+def test_resolve_micro_conflicts_all_fail():
+    """All retries fail should return empty (graceful degradation, no raise)."""
     llm = DummyLLM()
-
-    zone = {
-        "zone_id": "zone_0",
-        "context_before": [],
-        "segments": [
-            {"segment_id": "seg_001", "status": "conflict", "block_type": "paragraph",
-             "grobid": "a", "docling": "b", "marker": "c"},
+    payload = {
+        "segment_id": "seg_001",
+        "block_type": "paragraph",
+        "micro_conflicts": [
+            {
+                "conflict_id": "seg_001_mc_0",
+                "context_before": "",
+                "disagreement": {"grobid": "a", "docling": "b", "marker": "c"},
+                "context_after": "",
+            },
         ],
-        "context_after": [],
-        "triple_indices": [1],
-    }
-
-    msg = MagicMock()
-    msg.parsed = ConflictResolutionResponse(resolved=[ResolvedSegment(segment_id="seg_001", action="keep", text="ok")])
-    msg.refusal = None
-    good_comp = MagicMock()
-    good_comp.choices = [MagicMock(message=msg)]
-
-    llm.client.chat.completions.parse.side_effect = [Exception("boom"), good_comp]
-
-    result, unresolved = llm.resolve_conflict_zones([zone])
-    assert result == {"seg_001": "ok"}
-    assert unresolved == set()
-    assert llm.client.chat.completions.parse.call_count == 2
-
-
-def test_resolve_conflict_zones_all_fail():
-    """All retries fail — returns empty resolved + unresolved IDs (no raise)."""
-    llm = DummyLLM()
-
-    zone = {
-        "zone_id": "zone_0",
-        "context_before": [],
-        "segments": [
-            {"segment_id": "seg_001", "status": "conflict", "block_type": "paragraph",
-             "grobid": "a", "docling": "b", "marker": "c"},
-        ],
-        "context_after": [],
-        "triple_indices": [1],
     }
 
     llm.client.chat.completions.parse.side_effect = Exception("down")
 
-    result, unresolved = llm.resolve_conflict_zones([zone])
-    assert result == {}
-    assert "seg_001" in unresolved
+    result = llm.resolve_micro_conflicts(payload)
+    assert len(result.resolved) == 0
+
+
+# ---------------------------------------------------------------------------
+# Refusal triggers retry + escalation (C-3)
+# ---------------------------------------------------------------------------
+
+def test_resolve_micro_conflicts_refusal_triggers_retry():
+    """Refusal inside resolve_micro_conflicts should trigger retry/escalation."""
+    llm = DummyLLM()
+    payload = {
+        "segment_id": "seg_001",
+        "block_type": "paragraph",
+        "micro_conflicts": [
+            {
+                "conflict_id": "seg_001_mc_0",
+                "context_before": "",
+                "disagreement": {"grobid": "a", "docling": "b", "marker": "c"},
+                "context_after": "",
+            },
+        ],
+    }
+
+    # First call: model refuses
+    refusal_message = MagicMock()
+    refusal_message.refusal = "I cannot help with that."
+    refusal_message.parsed = None
+    refusal_completion = MagicMock()
+    refusal_completion.choices = [MagicMock(message=refusal_message)]
+    refusal_completion.usage = None
+
+    # Second call: succeeds
+    good_message = MagicMock()
+    good_message.refusal = None
+    good_message.parsed = MicroConflictResolutionResponse(
+        resolved=[ResolvedMicroConflict(conflict_id="seg_001_mc_0", text="resolved")]
+    )
+    good_completion = MagicMock()
+    good_completion.choices = [MagicMock(message=good_message)]
+    good_completion.usage = None
+
+    llm.client.chat.completions.parse.side_effect = [refusal_completion, good_completion]
+
+    result = llm.resolve_micro_conflicts(payload)
+    resolved = {item.conflict_id: item.text for item in result.resolved}
+    assert resolved["seg_001_mc_0"] == "resolved"
+    assert llm.client.chat.completions.parse.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Empty text with action=drop is accepted (C-4)
+# ---------------------------------------------------------------------------
+
+def test_resolve_micro_conflicts_action_drop_accepted():
+    """action=drop with empty text should resolve the conflict (intentional deletion)."""
+    llm = DummyLLM()
+    payload = {
+        "segment_id": "seg_001",
+        "block_type": "paragraph",
+        "micro_conflicts": [
+            {
+                "conflict_id": "seg_001_mc_0",
+                "context_before": "before",
+                "disagreement": {"grobid": "noise", "docling": "", "marker": ""},
+                "context_after": "after",
+            },
+        ],
+    }
+
+    message = MagicMock()
+    message.refusal = None
+    message.parsed = MicroConflictResolutionResponse(
+        resolved=[ResolvedMicroConflict(conflict_id="seg_001_mc_0", text="", action="drop")]
+    )
+    completion = MagicMock()
+    completion.choices = [MagicMock(message=message)]
+    completion.usage = None
+    llm.client.chat.completions.parse.return_value = completion
+
+    result = llm.resolve_micro_conflicts(payload)
+    resolved = {item.conflict_id: item.text for item in result.resolved}
+    assert "seg_001_mc_0" in resolved
+    assert resolved["seg_001_mc_0"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Partial resolution returns on retry exhaustion (O-3)
+# ---------------------------------------------------------------------------
+
+def test_resolve_micro_conflicts_partial_on_exhaustion():
+    """When retries exhaust, return partial results instead of raising."""
+    llm = DummyLLM()
+    payload = {
+        "segment_id": "seg_001",
+        "block_type": "paragraph",
+        "micro_conflicts": [
+            {
+                "conflict_id": "seg_001_mc_0",
+                "context_before": "",
+                "disagreement": {"grobid": "a", "docling": "b", "marker": "c"},
+                "context_after": "",
+            },
+            {
+                "conflict_id": "seg_001_mc_1",
+                "context_before": "",
+                "disagreement": {"grobid": "x", "docling": "y", "marker": "z"},
+                "context_after": "",
+            },
+        ],
+    }
+
+    # Every call only resolves mc_0, never mc_1
+    msg = MagicMock()
+    msg.refusal = None
+    msg.parsed = MicroConflictResolutionResponse(
+        resolved=[ResolvedMicroConflict(conflict_id="seg_001_mc_0", text="resolved_a")]
+    )
+    comp = MagicMock()
+    comp.choices = [MagicMock(message=msg)]
+    comp.usage = None
+    llm.client.chat.completions.parse.return_value = comp
+
+    # Should NOT raise — returns partial
+    result = llm.resolve_micro_conflicts(payload)
+    resolved = {item.conflict_id: item.text for item in result.resolved}
+    assert "seg_001_mc_0" in resolved
+    assert resolved["seg_001_mc_0"] == "resolved_a"
+    # mc_1 is unresolved but no exception raised

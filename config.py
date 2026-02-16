@@ -56,10 +56,6 @@ class Config:
     LLM_MODEL_NUMERIC_RESCUE = os.environ.get("LLM_MODEL_NUMERIC_RESCUE", "gpt-5.2")
     LLM_MODEL_CONFLICT_BATCH = os.environ.get("LLM_MODEL_CONFLICT_BATCH", "gpt-5.2")
 
-    # ---- Zone resolution escalation threshold --------------------------------
-    ZONE_ESCALATION_THRESHOLD = int(os.environ.get("ZONE_ESCALATION_THRESHOLD", 20000))
-    ZONE_ESCALATION_MODEL = os.environ.get("ZONE_ESCALATION_MODEL", "gpt-5.2")
-
     # ---- LLM pricing (USD per 1M tokens) ------------------------------------
     LLM_PRICING = {
         "gpt-5.2": {"input": 1.75, "output": 14.00, "cached_input": 0.175},
@@ -100,8 +96,18 @@ class Config:
     CONSENSUS_STRICT_NUMERIC_NEAR = os.environ.get("CONSENSUS_STRICT_NUMERIC_NEAR", "true").lower() == "true"
     CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = os.environ.get("CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES", "true").lower() == "true"
 
-    # ---- Conflict zone grouping -----------------------------------------------
-    CONSENSUS_ZONE_FLANKING_COUNT = int(os.environ.get("CONSENSUS_ZONE_FLANKING_COUNT", 2))
+    # ---- Micro-conflict extraction --------------------------------------------
+    MICRO_CONFLICT_CONTEXT_CAP = int(os.environ.get("MICRO_CONFLICT_CONTEXT_CAP", 30))
+    MICRO_CONFLICT_HIGH_DIVERGENCE_RATIO_THRESHOLD = float(
+        os.environ.get("MICRO_CONFLICT_HIGH_DIVERGENCE_RATIO_THRESHOLD", 0.40),
+    )
+    MICRO_CONFLICT_HIGH_DIVERGENCE_SPAN_THRESHOLD = int(
+        os.environ.get("MICRO_CONFLICT_HIGH_DIVERGENCE_SPAN_THRESHOLD", 12),
+    )
+    MICRO_CONFLICT_COALESCE_GAP = int(os.environ.get("MICRO_CONFLICT_COALESCE_GAP", 8))
+    MICRO_CONFLICT_HIGH_DIVERGENCE_MIN_TOKENS = int(
+        os.environ.get("MICRO_CONFLICT_HIGH_DIVERGENCE_MIN_TOKENS", 10),
+    )
 
     # ---- Header hierarchy resolution -----------------------------------------
     CONSENSUS_HIERARCHY_ENABLED = os.environ.get("CONSENSUS_HIERARCHY_ENABLED", "true").lower() == "true"
