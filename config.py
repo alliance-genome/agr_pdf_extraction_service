@@ -45,16 +45,22 @@ class Config:
     # ---- LLM (merge) ---------------------------------------------------------
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
     LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.2")
-    LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "medium")
-    LLM_CONFLICT_BATCH_SIZE = int(os.environ.get("LLM_CONFLICT_BATCH_SIZE", 10))
-    LLM_CONFLICT_MAX_WORKERS = int(os.environ.get("LLM_CONFLICT_MAX_WORKERS", 4))
+    LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
+    LLM_CONFLICT_BATCH_SIZE = int(os.environ.get("LLM_CONFLICT_BATCH_SIZE", 500))
+    LLM_CONFLICT_MAX_WORKERS = int(os.environ.get("LLM_CONFLICT_MAX_WORKERS", 100))
     LLM_CONFLICT_RETRY_ROUNDS = int(os.environ.get("LLM_CONFLICT_RETRY_ROUNDS", 2))
 
-    # ---- Per-call-type model defaults ----------------------------------------
-    LLM_MODEL_ZONE_RESOLUTION = os.environ.get("LLM_MODEL_ZONE_RESOLUTION", "gpt-5-mini")
+    # ---- Per-call-type model + reasoning defaults ----------------------------
+    # Each call type can override both model and reasoning effort individually.
+    # Falls back to LLM_MODEL / LLM_REASONING_EFFORT when not set.
+    LLM_MODEL_ZONE_RESOLUTION = os.environ.get("LLM_MODEL_ZONE_RESOLUTION", "gpt-5.2")
+    LLM_REASONING_ZONE_RESOLUTION = os.environ.get("LLM_REASONING_ZONE_RESOLUTION", "")
     LLM_MODEL_GENERAL_RESCUE = os.environ.get("LLM_MODEL_GENERAL_RESCUE", "gpt-5.2")
+    LLM_REASONING_GENERAL_RESCUE = os.environ.get("LLM_REASONING_GENERAL_RESCUE", "")
     LLM_MODEL_NUMERIC_RESCUE = os.environ.get("LLM_MODEL_NUMERIC_RESCUE", "gpt-5.2")
+    LLM_REASONING_NUMERIC_RESCUE = os.environ.get("LLM_REASONING_NUMERIC_RESCUE", "")
     LLM_MODEL_CONFLICT_BATCH = os.environ.get("LLM_MODEL_CONFLICT_BATCH", "gpt-5.2")
+    LLM_REASONING_CONFLICT_BATCH = os.environ.get("LLM_REASONING_CONFLICT_BATCH", "")
 
     # ---- LLM pricing (USD per 1M tokens) ------------------------------------
     LLM_PRICING = {
@@ -88,6 +94,9 @@ class Config:
     CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD = float(
         os.environ.get("CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD", 0.60),
     )
+    CONSENSUS_MEDIAN_SOURCE_MAX_MICRO_CONFLICTS = int(
+        os.environ.get("CONSENSUS_MEDIAN_SOURCE_MAX_MICRO_CONFLICTS", 20),
+    )
     CONSENSUS_ALIGNMENT_CONFIDENCE_MIN = float(os.environ.get("CONSENSUS_ALIGNMENT_CONFIDENCE_MIN", 0.5))
     CONSENSUS_ALWAYS_ESCALATE_TABLES = os.environ.get("CONSENSUS_ALWAYS_ESCALATE_TABLES", "true").lower() == "true"
     # If true, AGREE_NEAR is disabled for any block containing numbers; such blocks
@@ -95,6 +104,30 @@ class Config:
     # for scientific PDFs but can increase LLM usage.
     CONSENSUS_STRICT_NUMERIC_NEAR = os.environ.get("CONSENSUS_STRICT_NUMERIC_NEAR", "true").lower() == "true"
     CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES = os.environ.get("CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES", "true").lower() == "true"
+    CONSENSUS_ALIGNMENT_ANCHOR_PARTITIONING_ENABLED = (
+        os.environ.get("CONSENSUS_ALIGNMENT_ANCHOR_PARTITIONING_ENABLED", "true").lower() == "true"
+    )
+    CONSENSUS_ALIGNMENT_ANCHOR_MIN_SCORE = float(
+        os.environ.get("CONSENSUS_ALIGNMENT_ANCHOR_MIN_SCORE", 0.72),
+    )
+    CONSENSUS_ALIGNMENT_ANCHOR_INCLUDE_STRUCTURAL = (
+        os.environ.get("CONSENSUS_ALIGNMENT_ANCHOR_INCLUDE_STRUCTURAL", "false").lower() == "true"
+    )
+    CONSENSUS_ALIGNMENT_ANCHOR_MAX_HEADING_LEVEL = int(
+        os.environ.get("CONSENSUS_ALIGNMENT_ANCHOR_MAX_HEADING_LEVEL", 2),
+    )
+    CONSENSUS_ALIGNMENT_AMBIGUITY_DELTA = float(
+        os.environ.get("CONSENSUS_ALIGNMENT_AMBIGUITY_DELTA", 0.03),
+    )
+    CONSENSUS_ALIGNMENT_SEMANTIC_RERANK_ENABLED = (
+        os.environ.get("CONSENSUS_ALIGNMENT_SEMANTIC_RERANK_ENABLED", "true").lower() == "true"
+    )
+    CONSENSUS_ALIGNMENT_SEMANTIC_MARGIN = float(
+        os.environ.get("CONSENSUS_ALIGNMENT_SEMANTIC_MARGIN", 0.02),
+    )
+    CONSENSUS_ALIGNMENT_LLM_TIEBREAK_ENABLED = (
+        os.environ.get("CONSENSUS_ALIGNMENT_LLM_TIEBREAK_ENABLED", "true").lower() == "true"
+    )
 
     # ---- Micro-conflict extraction --------------------------------------------
     MICRO_CONFLICT_CONTEXT_CAP = int(os.environ.get("MICRO_CONFLICT_CONTEXT_CAP", 30))
@@ -112,4 +145,4 @@ class Config:
     # ---- Header hierarchy resolution -----------------------------------------
     CONSENSUS_HIERARCHY_ENABLED = os.environ.get("CONSENSUS_HIERARCHY_ENABLED", "true").lower() == "true"
     HIERARCHY_LLM_MODEL = os.environ.get("HIERARCHY_LLM_MODEL", "gpt-5.2")
-    HIERARCHY_LLM_REASONING = os.environ.get("HIERARCHY_LLM_REASONING", "medium")
+    HIERARCHY_LLM_REASONING = os.environ.get("HIERARCHY_LLM_REASONING", "low")

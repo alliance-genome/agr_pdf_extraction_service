@@ -14,8 +14,8 @@ from app.services.pdf_extractor import PDFExtractor
 
 logger = logging.getLogger(__name__)
 
-# Model tier ordering for retry escalation (cheapest → strongest)
-MODEL_TIER_ORDER = ["gpt-5-mini", "gpt-5.2"]
+# Reasoning effort escalation order for retries (lightest → heaviest)
+REASONING_ESCALATION_ORDER = ["low", "medium", "high"]
 
 
 class TokenAccumulator:
@@ -245,14 +245,22 @@ class HeaderHierarchyResponse(BaseModel):
     detected_title: str | None = None  # paper title found in opening text but not in headings
 
 
+class AlignmentTieBreakResponse(BaseModel):
+    """Structured output for alignment tie-break selection."""
+
+    choice: Literal["candidate_a", "candidate_b"]
+    confidence: float = 0.0
+    explanation: str = ""
+
+
 class LLM(PDFExtractor):
     def __init__(
         self,
         api_key,
         model="gpt-5.2",
-        reasoning_effort="medium",
-        conflict_batch_size: int = 10,
-        conflict_max_workers: int = 4,
+        reasoning_effort="low",
+        conflict_batch_size: int = 500,
+        conflict_max_workers: int = 100,
         conflict_retry_rounds: int = 2,
     ):
         self.client = OpenAI(api_key=api_key)
@@ -264,12 +272,12 @@ class LLM(PDFExtractor):
         self.usage = TokenAccumulator()
 
     @staticmethod
-    def _next_tier_model(current_model: str) -> str | None:
-        """Return the next stronger model in the tier order, or None if already at strongest."""
+    def _next_reasoning_effort(current_effort: str) -> str | None:
+        """Return the next higher reasoning effort, or None if already at highest."""
         try:
-            idx = MODEL_TIER_ORDER.index(current_model)
-            if idx + 1 < len(MODEL_TIER_ORDER):
-                return MODEL_TIER_ORDER[idx + 1]
+            idx = REASONING_ESCALATION_ORDER.index(current_effort)
+            if idx + 1 < len(REASONING_ESCALATION_ORDER):
+                return REASONING_ESCALATION_ORDER[idx + 1]
         except ValueError:
             pass
         return None
@@ -277,6 +285,7 @@ class LLM(PDFExtractor):
     def _resolve_conflict_batch(self, batch: list[dict]) -> tuple[dict[str, str], set[str]]:
         """Resolve one conflict batch, returning (resolved_map, unresolved_ids)."""
         use_model = Config.LLM_MODEL_CONFLICT_BATCH
+        use_reasoning = Config.LLM_REASONING_CONFLICT_BATCH or self.reasoning_effort
         expected_ids = {c["segment_id"] for c in batch}
         prompt_payload = json.dumps({"conflicts": batch})
         system_msg = (
@@ -290,6 +299,15 @@ class LLM(PDFExtractor):
             "include this context in your output. Your resolved text must flow "
             "naturally between context_before and context_after, but you must only "
             "return the text for the conflict segment itself.\n\n"
+            "SPECIAL CHARACTERS:\n"
+            "- Use actual Unicode Greek letters (α, β, γ, δ, ε, ζ, η, θ, ι, κ, λ, μ, "
+            "ν, ξ, π, ρ, σ, τ, υ, φ, χ, ψ, ω and uppercase equivalents), NOT LaTeX "
+            "notation ($\\alpha$, $\\beta$, etc.).\n"
+            "- Example: write β-ENaC, not $\\beta$-ENaC. Write Aβ42, not A$\\beta$42.\n"
+            "- Exception: preserve LaTeX only inside actual math expressions "
+            "(e.g. $E = mc^2$ or $$\\sum_{i=1}^n x_i$$).\n"
+            "- Use Unicode superscripts/subscripts where appropriate (e.g. Ca²⁺, Na⁺, "
+            "μm, °C) rather than LaTeX equivalents.\n\n"
             "Return a JSON object with a 'resolved' key containing a list of "
             "objects, each with 'segment_id', 'action', and 'text' keys.\n"
             "- Set action=\"keep\" and provide the resolved text for segments "
@@ -301,7 +319,7 @@ class LLM(PDFExtractor):
 
         completion = self.client.chat.completions.parse(
             model=use_model,
-            reasoning_effort=self.reasoning_effort,
+            reasoning_effort=use_reasoning,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt_payload},
@@ -445,6 +463,7 @@ class LLM(PDFExtractor):
         resolved_map: dict[str, str] = {}
         pending_ids = list(expected_ids)
         current_model = model or Config.LLM_MODEL_ZONE_RESOLUTION
+        use_reasoning = Config.LLM_REASONING_ZONE_RESOLUTION or self.reasoning_effort
         system_msg = (
             "You are resolving small disagreements between three PDF extraction tools "
             "(GROBID, Docling, Marker) that processed the same scientific paper.\n\n"
@@ -460,11 +479,13 @@ class LLM(PDFExtractor):
             "2. Return ONLY the resolved text for the disagreement span.\n"
             "3. Do NOT repeat context_before or context_after.\n"
             "4. Preserve ALL numbers exactly as they appear in sources.\n"
-            "5. Preserve Greek letters, subscripts, superscripts, math symbols exactly.\n"
+            "5. Use actual Unicode Greek letters (α, β, γ, δ, ε, μ, etc.), NOT LaTeX "
+            "notation ($\\alpha$, $\\beta$, etc.). Example: β-ENaC not $\\beta$-ENaC.\n"
             "6. When sources disagree on a number, pick one verbatim — do NOT invent.\n"
             "7. Prefer selecting from source text over rewriting.\n"
             "8. For table cell disagreements, preserve markdown table formatting.\n"
-            "9. For equation disagreements, preserve LaTeX/mathematical notation.\n\n"
+            "9. For equation disagreements, preserve LaTeX/mathematical notation.\n"
+            "10. Use Unicode superscripts/subscripts where appropriate (Ca²⁺, Na⁺, μm, °C).\n\n"
             "Return JSON: {\"resolved\": [{\"conflict_id\": \"...\", \"text\": \"...\", \"action\": \"keep\"}, ...]}\n"
             "Set action=\"keep\" (default) with resolved text for normal spans.\n"
             "Set action=\"drop\" with empty text to intentionally delete a span."
@@ -481,7 +502,7 @@ class LLM(PDFExtractor):
             try:
                 completion = self.client.chat.completions.parse(
                     model=current_model,
-                    reasoning_effort=self.reasoning_effort,
+                    reasoning_effort=use_reasoning,
                     messages=[
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": json.dumps(attempt_payload)},
@@ -515,25 +536,25 @@ class LLM(PDFExtractor):
 
             except Exception as exc:
                 logger.warning(
-                    "Micro-conflict call failed (attempt=%d, model=%s): %s",
-                    attempt + 1, current_model, exc,
+                    "Micro-conflict call failed (attempt=%d, model=%s, reasoning=%s): %s",
+                    attempt + 1, current_model, use_reasoning, exc,
                 )
                 if attempt < self.conflict_retry_rounds:
-                    next_model = self._next_tier_model(current_model)
-                    if next_model:
-                        current_model = next_model
+                    next_reasoning = self._next_reasoning_effort(use_reasoning)
+                    if next_reasoning:
+                        use_reasoning = next_reasoning
                     continue
                 break
 
             pending_ids = [cid for cid in pending_ids if cid not in resolved_map]
             if pending_ids and attempt < self.conflict_retry_rounds:
-                next_model = self._next_tier_model(current_model)
-                if next_model:
+                next_reasoning = self._next_reasoning_effort(use_reasoning)
+                if next_reasoning:
                     logger.info(
-                        "Escalating micro-conflict resolution model: %s -> %s",
-                        current_model, next_model,
+                        "Escalating micro-conflict reasoning: %s -> %s (model=%s)",
+                        use_reasoning, next_reasoning, current_model,
                     )
-                    current_model = next_model
+                    use_reasoning = next_reasoning
 
         if pending_ids:
             logger.warning(
@@ -555,6 +576,7 @@ class LLM(PDFExtractor):
         neighboring_resolved: dict[str, str],
         extra_flanking: list[dict],
         model: str | None = None,
+        reasoning_effort: str | None = None,
         reason: str | None = None,
         previous_text: str | None = None,
         novel_numbers: list[str] | None = None,
@@ -570,10 +592,12 @@ class LLM(PDFExtractor):
 
         Args:
             model: Override model for this call (defaults to self.model).
+            reasoning_effort: Override reasoning effort for this call.
 
         Returns a RescueSegmentResponse, or None if the API call itself fails.
         """
         use_model = model or self.model
+        use_reasoning = reasoning_effort or self.reasoning_effort
         seg_id = seg["segment_id"]
         seg_status = seg["status"]
 
@@ -636,6 +660,9 @@ class LLM(PDFExtractor):
                 "3. If sources disagree on a number, choose one that appears in a source and explain which source you followed.\n"
                 "4. If status is conflict/near_agree, you must provide non-empty resolved_text.\n"
                 "5. If status is gap, you may set is_intentionally_empty=true ONLY if you justify why it should be dropped.\n"
+                "6. Use actual Unicode Greek letters (α, β, γ, δ, ε, μ, etc.), NOT LaTeX "
+                "notation ($\\alpha$, $\\beta$, etc.). Example: β-ENaC not $\\beta$-ENaC. "
+                "Only preserve LaTeX inside actual math expressions.\n"
                 "You MUST provide an explanation in ALL cases.\n\n"
                 "SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):\n"
                 f"{context_display}\n\n"
@@ -655,6 +682,11 @@ class LLM(PDFExtractor):
                 "   final document (it's a duplicate of nearby text, a page artifact, metadata noise, "
                 "   a figure label that doesn't belong inline, etc.), set is_intentionally_empty=true, "
                 "   leave resolved_text as empty string, and explain your reasoning in the explanation field.\n\n"
+                "SPECIAL CHARACTERS:\n"
+                "- Use actual Unicode Greek letters (α, β, γ, δ, ε, μ, etc.), NOT LaTeX "
+                "notation ($\\alpha$, $\\beta$, etc.). Example: β-ENaC not $\\beta$-ENaC.\n"
+                "- Use Unicode superscripts/subscripts where appropriate (Ca²⁺, Na⁺, μm, °C).\n"
+                "- Only preserve LaTeX inside actual math expressions.\n\n"
                 "You MUST provide an explanation in ALL cases — even when providing resolved text, briefly "
                 "explain what you did (e.g., 'Chose Docling version as it was most complete').\n\n"
                 "SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):\n"
@@ -666,7 +698,7 @@ class LLM(PDFExtractor):
         try:
             completion = self.client.chat.completions.parse(
                 model=use_model,
-                reasoning_effort=self.reasoning_effort,
+                reasoning_effort=use_reasoning,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": (
@@ -695,6 +727,67 @@ class LLM(PDFExtractor):
         except Exception as exc:
             logger.warning("Rescue call for %s failed: %s", seg_id, exc)
             return None
+
+    def resolve_alignment_tiebreak(
+        self,
+        payload: dict,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict:
+        """Choose between two candidate alignments for ambiguous close-score cases."""
+        use_model = model or Config.LLM_MODEL_ZONE_RESOLUTION
+        use_reasoning = reasoning_effort or Config.LLM_REASONING_ZONE_RESOLUTION or self.reasoning_effort
+        system_msg = (
+            "You are selecting between two candidate alignments for the same local document region.\n"
+            "Choose only the better candidate ID. Do not rewrite any text.\n"
+            "Return JSON with keys: choice, confidence, explanation.\n"
+            "- choice must be exactly 'candidate_a' or 'candidate_b'.\n"
+            "- Prefer semantic coherence and scientific fidelity."
+        )
+
+        last_error = None
+        for attempt in range(self.conflict_retry_rounds + 1):
+            try:
+                completion = self.client.chat.completions.parse(
+                    model=use_model,
+                    reasoning_effort=use_reasoning,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": json.dumps(payload)},
+                    ],
+                    response_format=AlignmentTieBreakResponse,
+                )
+
+                usage = completion.usage
+                self.usage.record(usage, "alignment_tiebreak", use_model)
+                message = completion.choices[0].message
+                refusal = getattr(message, "refusal", None)
+                if refusal:
+                    raise ValueError(f"Model refused alignment tie-break: {refusal}")
+                if not message.parsed:
+                    raise ValueError("No parsed alignment tie-break response")
+
+                return {
+                    "choice": message.parsed.choice,
+                    "confidence": float(message.parsed.confidence),
+                    "explanation": message.parsed.explanation,
+                }
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "resolve_alignment_tiebreak attempt %d failed (model=%s, reasoning=%s): %s",
+                    attempt + 1, use_model, use_reasoning, exc,
+                )
+                if attempt < self.conflict_retry_rounds:
+                    next_reasoning = self._next_reasoning_effort(use_reasoning)
+                    if next_reasoning:
+                        use_reasoning = next_reasoning
+                    continue
+                break
+
+        raise Exception(
+            f"resolve_alignment_tiebreak failed after {self.conflict_retry_rounds + 1} attempts: {last_error}"
+        )
 
     def resolve_header_hierarchy(
         self, headers: list[dict], model: str | None = None,
@@ -727,6 +820,8 @@ class LLM(PDFExtractor):
             "- You are ONLY assigning heading levels (1-6) or demoting to plain text.\n"
             "- You must NEVER rename, rephrase, reword, or invent headings.\n"
             "- The original_text you return MUST be the EXACT text from the input.\n"
+            "- Do NOT convert Unicode characters to LaTeX. If the input has β, return β — "
+            "NOT $\\beta$. If it has α, return α — NOT $\\alpha$. Copy characters exactly.\n"
             "- Every paper is different. Section names vary widely across journals "
             "and disciplines. Work with what the paper actually contains.\n\n"
 
