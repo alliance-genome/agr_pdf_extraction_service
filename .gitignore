@@ -1,4 +1,5 @@
 venv/
+.venv/
 uploaded_pdfs/
 extraction_cache/
 __pycache__/

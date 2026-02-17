@@ -63,6 +63,9 @@ RUN python3.11 -m pip install --no-cache-dir --ignore-installed -r requirements.
 RUN python3.11 -m pip uninstall -y onnxruntime 2>/dev/null; \
     python3.11 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu || true
 
+# Force numpy <2.4 for numba compatibility (numba 0.61.x doesn't support numpy 2.4+)
+RUN python3.11 -m pip install --no-cache-dir 'numpy<2.4'
+
 # Copy application code
 COPY . .
 

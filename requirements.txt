@@ -14,6 +14,8 @@ pydantic>=2.0
 mistune
 rapidfuzz
 scipy
+numba
+numpy<2.4  # numba 0.61.x requires numpy <2.4; remove pin when numba adds 2.4 support
 
 # Background task queue
 celery[redis]
