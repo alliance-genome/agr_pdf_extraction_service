@@ -2,7 +2,7 @@
 
 A production service for extracting structured text from scientific PDFs. Built for the [Alliance of Genome Resources](https://www.alliancegenome.org/).
 
-The service runs three independent extraction engines on each PDF, then intelligently merges their outputs to produce a single, high-quality markdown document. The merging process identifies where the extractors agree and disagree, resolves disagreements automatically, and uses an AI language model only when necessary — reducing cost by 65-72% compared to sending everything to the AI.
+The service runs three independent extraction engines on each PDF, then intelligently merges their outputs to produce a single, high-quality markdown document. The merging process identifies where the extractors agree and disagree, extracts word-level micro-conflicts from the disagreement spans, and uses an AI language model only to resolve those narrow spans — reducing cost by 65-72% compared to sending everything to the AI.
 
 ## Table of Contents
 
@@ -13,9 +13,10 @@ The service runs three independent extraction engines on each PDF, then intellig
   - [Step 2: Align](#step-2-align--match-blocks-across-extractors)
   - [Step 3: Classify](#step-3-classify--determine-agreement-or-disagreement)
   - [Step 4: Guard Gates](#step-4-guard-gates--document-health-assessment)
-  - [Step 5: Resolve Conflicts](#step-5-resolve-conflicts--four-layers-of-resolution)
-  - [Step 6: Assemble and Clean](#step-6-assemble-and-clean--build-the-final-document)
-  - [Step 7: Heading Hierarchy](#step-7-heading-hierarchy--fix-section-structure)
+  - [Step 5: Extract Micro-Conflicts](#step-5-extract-micro-conflicts--find-word-level-disagreements)
+  - [Step 6: Resolve Conflicts](#step-6-resolve-conflicts--layered-resolution)
+  - [Step 7: Assemble and Clean](#step-7-assemble-and-clean--build-the-final-document)
+  - [Step 8: Heading Hierarchy](#step-8-heading-hierarchy--fix-section-structure)
 - [Two-Tier Model Selection](#two-tier-model-selection)
 - [Quality Metrics](#quality-metrics)
 - [Cost Tracking](#cost-tracking)
@@ -39,8 +40,9 @@ When you submit a PDF, the service:
 1. **Extracts** the document with three independent engines (GROBID, Docling, Marker), each producing a markdown version of the paper
 2. **Compares** the three outputs block by block, looking for agreement and disagreement
 3. **Keeps** the parts where extractors agree (no AI needed — this is typically 60-85% of the document)
-4. **Resolves** the parts where extractors disagree, using a layered approach that starts with simple heuristics and escalates to an AI language model only when needed
-5. **Assembles** the final merged document with proper heading structure
+4. **Extracts micro-conflicts** — word-level disagreement spans within each conflicting segment, preserving the surrounding tokens where extractors agree
+5. **Resolves** only the narrow disagreement spans, using a layered approach that starts with simple heuristics and escalates to an AI language model only when needed
+6. **Assembles** the final merged document with proper heading structure
 
 The result is a single markdown file that is more accurate than any individual extractor could produce alone.
 
@@ -52,16 +54,17 @@ The result is a single markdown file that is more accurate than any individual e
                             └──────────┘
                                   │
                                   ▼
-                     ┌────────────────────────┐
-                     │   Consensus Pipeline    │
-                     │                         │
-                     │  1. Parse into blocks    │
-                     │  2. Align across sources │
-                     │  3. Classify agreement   │
-                     │  4. Resolve conflicts    │
-                     │  5. Assemble output      │
-                     │  6. Fix heading levels   │
-                     └────────────────────────┘
+                     ┌─────────────────────────────┐
+                     │     Consensus Pipeline       │
+                     │                              │
+                     │  1. Parse into blocks         │
+                     │  2. Align across sources      │
+                     │  3. Classify agreement        │
+                     │  4. Extract micro-conflicts   │
+                     │  5. Resolve disagreement spans│
+                     │  6. Assemble output           │
+                     │  7. Fix heading levels        │
+                     └─────────────────────────────┘
                                   │
                                   ▼
                          Final Merged Markdown
@@ -85,7 +88,7 @@ All three engines run in parallel to minimize extraction time.
 
 ## The Consensus Pipeline
 
-The consensus pipeline is the core algorithm that merges three independent extractions into one accurate output. It works in seven steps.
+The consensus pipeline is the core algorithm that merges three independent extractions into one accurate output. It works in eight steps.
 
 ### Step 1: Parse — Break Each Output into Blocks
 
@@ -195,7 +198,7 @@ No exceptions are applied: any numeric or citation-key disagreement forces CONFL
 
 By default, AGREE_NEAR is also disabled for any block that contains numbers at all (`CONSENSUS_STRICT_NUMERIC_NEAR=true`). With this enabled, numeric-bearing blocks only qualify for automatic acceptance when they are AGREE_EXACT; otherwise they are escalated to CONFLICT. If you want fewer conflicts (and lower LLM usage), set `CONSENSUS_STRICT_NUMERIC_NEAR=false`.
 
-After the LLM resolves a conflict/near-agree/gap segment, the pipeline also runs a **numeric integrity check**: if the LLM output contains any number that did not appear anywhere in the zone inputs, the segment is retried with a stricter instruction (and required justification). If it still invents numbers, the segment falls back to best-source and the paper's quality score is heavily penalized.
+After the LLM resolves a conflict segment, the pipeline also runs a **numeric integrity check**: if the LLM output contains any number that did not appear anywhere in the source extractor texts, the segment is retried with a stricter instruction (and required justification). If it still invents numbers, the segment falls back to best-source and the paper's quality score is heavily penalized.
 
 **Table and equation escalation:** Tables and equations are optionally always escalated to CONFLICT regardless of similarity, since even minor formatting differences in these structured elements can change their meaning.
 
@@ -212,17 +215,59 @@ Before resolving conflicts, the pipeline evaluates the overall difficulty of the
 | Guard Gate | Threshold | What Triggers It |
 |------------|-----------|-----------------|
 | **Overall conflict ratio** | > adaptive threshold (default 40%) | Too many total disagreements across all block types |
-| **Textual conflict ratio** | > 40% of text blocks are CONFLICT | Too many disagreements in body text for zone-based resolution |
+| **Textual conflict ratio** | > 40% of text blocks are CONFLICT | Too many disagreements in body text |
 | **Structured conflict ratio** | > 85% of tables/equations are CONFLICT | Extractors fundamentally disagree on structured content |
 | **Alignment confidence** | < 0.50 | The block-matching step had very low confidence, suggesting the extractors produced very different document structures |
 
-The only guard gate that causes a hard failure is **alignment confidence** — if the block-matching step had very low confidence, the extraction fails with a clear error rather than producing unreliable output. All other guard metrics (conflict ratios, localization) are logged as telemetry for monitoring but do not block the pipeline. Every document goes through zone-based resolution regardless of conflict ratio.
+The only guard gate that causes a hard failure is **alignment confidence** — if the block-matching step had very low confidence, the extraction fails with a clear error rather than producing unreliable output. All other guard metrics (conflict ratios, localization) are logged as telemetry for monitoring but do not block the pipeline. Every document goes through micro-conflict resolution regardless of conflict ratio.
 
 **Two-source conflict exclusion:** When computing conflict ratios for telemetry, the pipeline excludes conflicts where only two extractors produced output (the third had nothing at that position). These "two-source conflicts" are simpler to resolve (just pick the better of two versions).
 
 **Localized conflict relief:** Conflict localization is tracked in telemetry. If conflicts are clustered in one part of the document (e.g., a difficult table section) rather than spread throughout, this is noted in the guard telemetry metrics.
 
-### Step 5: Resolve Conflicts — Four Layers of Resolution
+### Step 5: Extract Micro-Conflicts — Find Word-Level Disagreements
+
+Before sending anything to the AI, the pipeline performs word-level diff analysis on each CONFLICT segment to isolate exactly where the extractors disagree. This produces **micro-conflicts** — small contiguous spans of disagreement surrounded by tokens where all extractors agree.
+
+The extraction works by:
+
+1. **Tokenizing** all extractor texts for the segment (word-level split with sentence-end punctuation separated)
+2. **Aligning** tokens across all present extractors using `SequenceMatcher` to build a position map
+3. **Majority voting** at each position — if 2+ extractors agree on a token, it is accepted as agreed
+4. **Extracting conflict spans** — contiguous runs of positions where no majority exists become individual micro-conflicts
+5. **Coalescing** nearby micro-conflicts (within a configurable gap, default 8 tokens) to avoid excessive fragmentation
+6. **Adding context** — each micro-conflict carries a few surrounding agreed tokens as context for the AI
+
+**Example:** Given a segment where the three extractors differ only in a few words:
+
+```
+GROBID:  "Expression was detected in a broad stripe along the A/P boundary (Fig. 2A, B)"
+Docling: "Expression was detected in a broad stripe along the anterior-posterior boundary (Figure 2A, B)"
+Marker:  "Expression was detected in a broad stripe along the A/P boundary (Fig. 2A,B)"
+
+Majority-agreed tokens (no AI needed):
+  "Expression was detected in a broad stripe along the ... boundary ... 2A, B)"
+
+Micro-conflict #1 (the disagreement span):
+  context_before: ["along", "the"]
+  GROBID:  ["A/P"]
+  Docling: ["anterior-posterior"]
+  Marker:  ["A/P"]
+  context_after: ["boundary"]
+
+Micro-conflict #2:
+  context_before: ["boundary"]
+  GROBID:  ["(Fig."]
+  Docling: ["(Figure"]
+  Marker:  ["(Fig."]
+  context_after: ["2A,"]
+```
+
+Only these narrow disagreement spans are sent to the AI — the rest of the segment is kept as-is from the majority vote. This drastically reduces the amount of text the AI needs to process.
+
+**High-divergence fallback:** If the majority-agree ratio for a segment is below a threshold (default 40%) or the conflict spans are very large (>12 tokens), the segment is treated as fully divergent and the entire text is sent through the resolution pipeline rather than individual micro-conflicts. This handles cases like tables or equations where extractors produce structurally different output.
+
+### Step 6: Resolve Conflicts — Layered Resolution
 
 All conflicts are resolved through a **layered approach**, starting with the cheapest method and escalating only when needed:
 
@@ -244,53 +289,51 @@ Median-source picks GROBID or Docling (they're most similar to each other).
 No AI call needed — resolved programmatically.
 ```
 
-#### Layer 2: Zone-Based LLM Resolution
+#### Layer 2: Per-Segment Micro-Conflict LLM Resolution
 
-Remaining conflicts are grouped into **conflict zones** — contiguous stretches of the document where disagreements occur, along with a few surrounding "context" blocks so the AI understands what comes before and after.
+For remaining conflicts, the pipeline sends only the micro-conflict spans (extracted in Step 5) to the AI, rather than entire document zones. The AI sees each disagreement span with its surrounding agreed context and must resolve just that narrow region.
 
-Each zone is sent to the AI language model, which sees all extractor versions side by side and attempts to select the best text for each conflicting segment. The AI is instructed to:
-- Attempt to choose the most complete and accurate version
-- Never fabricate content that doesn't appear in any extractor
-- Preserve all data values, citations, and scientific terminology exactly
+The AI is instructed to:
+- Pick the most accurate version or merge the best parts of the disagreement span
+- Return ONLY the resolved text for the disagreement span (not the surrounding context)
+- Preserve all numbers, Greek letters, subscripts, and math symbols exactly as they appear in sources
+- Never fabricate content that does not appear in any extractor
 
-The AI does not have access to the original PDF — it can only compare what the three extractors produced and use its judgment to pick the version that appears most complete and internally consistent.
+**Example of what the AI sees:**
 
-**Example of what the AI sees for a conflict zone:**
-
+```json
+{
+  "segment_id": "seg_012",
+  "block_type": "paragraph",
+  "micro_conflicts": [
+    {
+      "conflict_id": "seg_012_mc_0",
+      "context_before": ["along", "the"],
+      "disagreement": {
+        "grobid": ["A/P"],
+        "docling": ["anterior-posterior"],
+        "marker": ["A/P"]
+      },
+      "context_after": ["boundary"]
+    }
+  ]
+}
 ```
-── Context (agreed, for reference) ──────────────────────
-seg_010 [AGREE_EXACT]: "## Results"
-seg_011 [AGREE_NEAR]:  "We first examined the expression pattern of dpp in wing discs."
 
-── Conflict (AI must resolve) ──────────────────────────
-seg_012 [CONFLICT]:
-  GROBID:  "dpp-lacZ expression was detected in a broad stripe along the
-            A/P boundary (Fig. 2A, B; Table 1)"
-  Docling: "dpp-lacZ expression was detected in a broad stripe along the
-            anterior-posterior boundary (Figure 2A, B; Table 1)"
-  Marker:  "dpp-lacZ expression was detected in a broad stripe along the
-            A/P boundary (Fig. 2A,B, Table 1)"
-
-── Context (agreed) ────────────────────────────────────
-seg_013 [AGREE_NEAR]:  "This pattern was consistent across all genotypes tested."
-```
-
-**How the AI responds — structured keep/drop decisions:**
-
-For every segment in the zone, the AI must return a structured decision with an explicit `action` field:
+The AI responds with a structured `action` per conflict:
 
 | Action | Meaning | When It's Used |
 |--------|---------|---------------|
-| **keep** | Include this text in the final document | ALL conflict and near_agree segments — the AI must always provide resolved text for these |
-| **drop** | Exclude this segment entirely | ONLY for gap segments that are artifacts, duplicates, or page noise (e.g., a stray header repeated from a previous page) |
+| **keep** | Use this resolved text for the disagreement span | Default for all micro-conflicts |
+| **drop** | Remove this span entirely | Only for artifact/noise spans |
 
-The AI is **never allowed** to drop a conflict or near_agree segment — those always need resolved text. If the AI says "keep" but provides empty text, or tries to drop a conflict segment, the segment is treated as **unresolved** and sent to rescue resolution (see Layer 3 below).
+The resolved micro-conflict texts are then stitched back into the majority-agreed token stream to reconstruct the full segment.
 
-This structured response eliminates ambiguity: previously, an empty string could mean "I couldn't resolve this" or "this segment should genuinely be empty." The explicit action field makes the AI's intent clear.
+**Retry and escalation:** If the initial model (GPT-5-mini) fails to resolve a micro-conflict, it is retried with the stronger model (GPT-5.2).
 
 #### Layer 3: Rescue Resolution (Three Tiers)
 
-If any segments remain unresolved after zone-based resolution (the AI returned empty or failed to parse), the pipeline attempts **rescue resolution** — a series of fallback strategies for that specific segment:
+If any segments remain unresolved after micro-conflict resolution (the AI returned empty or failed to parse), the pipeline attempts **rescue resolution** — a series of fallback strategies for that specific segment:
 
 **Tier 1 — Focused AI retry with enriched context:**
 
@@ -360,7 +403,7 @@ Containment check: GROBID's text is contained within Docling's text ✓
 
 If all extractor sources are empty for this segment (all three produced nothing), the segment is dropped entirely. This is rare and typically means the segment was an artifact of the alignment step rather than real content.
 
-### Step 6: Assemble and Clean — Build the Final Document
+### Step 7: Assemble and Clean — Build the Final Document
 
 The resolved blocks are reassembled into a single markdown document in the correct order. The output goes through several cleaning passes:
 
@@ -368,7 +411,7 @@ The resolved blocks are reassembled into a single markdown document in the corre
 - **HTML cleanup** — Strips leftover HTML tags, comments, and span elements
 - **Whitespace normalization** — Ensures consistent spacing between sections
 
-### Step 7: Heading Hierarchy — Fix Section Structure
+### Step 8: Heading Hierarchy — Fix Section Structure
 
 PDF extractors often produce "flat" headings — every heading at the same level (e.g., all `##`) regardless of the actual document structure. The final step uses the AI to restore the proper heading hierarchy.
 
@@ -446,10 +489,10 @@ The service uses two AI models to balance cost and quality:
 
 | Task | Model | Why |
 |------|-------|-----|
-| **Zone resolution** (resolving individual conflict sections) | GPT-5-mini | Handles most conflicts well at lower cost |
-| **Large zone resolution** (zones with >20,000 estimated tokens) | GPT-5.2 | Complex/large zones need the stronger model |
+| **Micro-conflict resolution** (resolving word-level disagreement spans) | GPT-5-mini | Handles most narrow conflicts well at lower cost |
+| **Rescue resolution** (segments that micro-conflict resolution could not resolve) | GPT-5.2 | Needs broader context and stronger reasoning |
 | **Heading hierarchy** | GPT-5.2 | Needs holistic document understanding |
-If GPT-5-mini fails to resolve a zone, it is automatically retried with GPT-5.2.
+If GPT-5-mini fails to resolve a micro-conflict, it is automatically retried with GPT-5.2.
 
 ---
 
@@ -557,16 +600,15 @@ Every extraction produces a **consensus metrics** report that tells you how the 
     },
 
     "token_efficiency": {
-      "zone_resolution_tokens": 12400,
+      "micro_conflict_tokens": 8200,
       "rescue_call_tokens": 1800,
-      "total_consensus_tokens": 14200,
-      "total_consensus_tokens": 14200
+      "total_consensus_tokens": 10000
     }
   }
 }
 ```
 
-This paper had 174 content blocks. 141 (81%) were resolved automatically without AI. Only 18 conflicts (11%) needed AI resolution, and zone-based resolution handled them all.
+This paper had 174 content blocks. 141 (81%) were resolved automatically without AI. Only 18 conflicts (11%) needed AI resolution, and micro-conflict resolution handled them all by sending only the narrow disagreement spans to the AI.
 
 The nested `degradation_metrics` object provides deeper insight into how the merge went:
 
@@ -578,34 +620,31 @@ The nested `degradation_metrics` object provides deeper insight into how the mer
 | `rescue_segments` | Segments that needed rescue (Tier 1 retry) — includes the AI's explanation for each decision |
 | `confidence_distribution` | Statistical spread of resolution confidence scores — includes mean, median, percentiles (p10/p25/p75/p90), std_dev, and percentage below 50%/25% confidence |
 | `section_risk` | Per-section degradation summary keyed by the paper's **actual resolved headings** (post heading-hierarchy fix). Keys are hierarchical paths like `Materials and Methods > RNA Extraction`, and each entry reports degraded counts and a risk level (none/low/medium/high) based on `% degraded` in that section. |
-| `risk_flags` | Boolean alerts — `high_degradation_rate` (>10% of blocks degraded), `low_confidence_cluster` (3+ consecutive low-confidence segments), `degradation_concentrated` (>50% of degraded segments in a single zone), `high_risk_top_level_heading` (any H1/H2 section has `risk=high`) |
-| `token_efficiency` | Token usage breakdown — zone resolution tokens, rescue tokens, and total consensus tokens |
+| `risk_flags` | Boolean alerts — `high_degradation_rate` (>10% of blocks degraded), `low_confidence_cluster` (3+ consecutive low-confidence segments), `degradation_concentrated` (>50% of degraded segments in a single section), `high_risk_top_level_heading` (any H1/H2 section has `risk=high`) |
+| `token_efficiency` | Token usage breakdown — micro-conflict resolution tokens, rescue tokens, and total consensus tokens |
 
 **Resolution method vocabulary:** Each resolved segment is tagged with a `method` string that describes exactly how it was resolved. These appear in `resolution_summary.by_method` and in per-segment audit entries.
 
 | Method | Weight | What Happened |
 |--------|--------|---------------|
 | `median_source` | 1.0 | Median-source heuristic picked the consensus version (no AI) |
-| `llm_conflict` | 1.0 | AI resolved a conflict segment in zone resolution |
-| `llm_near_agree` | 1.0 | AI resolved a near-agree segment in zone resolution |
-| `llm_gap` | 1.0 | AI resolved a gap segment in zone resolution |
+| `majority_vote` | 1.0 | All micro-conflicts resolved by majority token agreement (no AI) |
+| `micro_conflict_llm` | 1.0 | AI resolved word-level micro-conflict spans |
+| `llm_conflict` | 1.0 | AI resolved a conflict segment via full-segment LLM call |
+| `llm_gap` | 1.0 | AI resolved a gap segment |
 | `llm_rescue_resolved` | 0.95 | AI provided text on rescue retry |
 | `llm_conflict_rescue_resolved` | 0.95 | AI provided text on rescue retry (conflict segment) |
-| `llm_near_agree_rescue_resolved` | 0.95 | AI provided text on rescue retry (near-agree segment) |
 | `llm_rescue_intentional_drop` | 0.95 | AI determined segment should be empty on rescue retry (with explanation) |
 | `llm_conflict_rescue_intentional_drop` | 0.95 | AI determined segment should be empty on rescue retry (with explanation) |
-| `llm_near_agree_rescue_intentional_drop` | 0.95 | AI determined segment should be empty on rescue retry (with explanation) |
 | `deterministic_two_source` | 0.85 | Only two extractors present; deterministic pick (no AI) |
 | `llm_conflict_fallback_best_source` | 0.40 | AI failed; fell back to longest/most-complete extractor version |
-| `llm_near_agree_fallback_best_source` | 0.40 | AI failed; fell back to longest/most-complete extractor version |
-| `zone_fallback_best_source` | 0.40 | Zone resolution failed entirely; deterministic fallback |
 
 The weight column shows each method's contribution to the `quality_score` calculation. Direct resolutions (AI or median-source) contribute full weight (1.0). Rescue resolutions contribute 0.95 (slightly lower since they needed a retry). Deterministic two-source picks contribute 0.85. Degraded fallbacks (where AI failed entirely) contribute only 0.40. Agreed blocks (AGREE_EXACT, AGREE_NEAR) that needed no conflict resolution contribute 1.0 each.
 
 **Interpreting the numbers:**
 - **conflict_ratio < 0.20**: Excellent — extractors mostly agree. High confidence in output.
 - **conflict_ratio 0.20-0.40**: Normal — some complex content needed AI resolution. Still reliable.
-- **conflict_ratio > 0.40**: High — the paper likely has complex layout, many tables, or unusual formatting. Zone resolution still handles it.
+- **conflict_ratio > 0.40**: High — the paper likely has complex layout, many tables, or unusual formatting. Micro-conflict resolution still handles it.
 - **alignment_confidence > 0.70**: Good structural agreement between extractors.
 - **alignment_confidence < 0.50**: Extractors produced very different structures — the extraction will fail with a clear error.
 
@@ -620,7 +659,7 @@ Each extraction run tracks AI usage and estimated cost:
 | `llm_cost_usd` | Total estimated cost in US dollars for this extraction |
 | `llm_usage_json` | Detailed breakdown by call type and model, including token counts |
 
-The cost breakdown shows token usage per call type (zone_resolution, header_hierarchy, rescue, conflict_batch) and per model (gpt-5-mini, gpt-5.2), so you can see exactly where the AI budget was spent.
+The cost breakdown shows token usage per call type (micro_conflict, header_hierarchy, rescue) and per model (gpt-5-mini, gpt-5.2), so you can see exactly where the AI budget was spent.
 
 **Typical costs per paper:** $0.02-$0.20 depending on paper length and complexity.
 
@@ -825,18 +864,16 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLM_MODEL` | `gpt-5.2` | Base model |
-| `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5-mini` | Model for zone-based conflict resolution |
+| `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5-mini` | Model for micro-conflict resolution |
 | `LLM_MODEL_GENERAL_RESCUE` | `gpt-5.2` | Model for general (non-numeric) rescue resolution |
 | `LLM_MODEL_NUMERIC_RESCUE` | `gpt-5.2` | Model for numeric integrity rescue — uses stronger model for complex numbers |
 | `LLM_MODEL_CONFLICT_BATCH` | `gpt-5.2` | Model for batched conflict resolution |
 | `HIERARCHY_LLM_MODEL` | `gpt-5.2` | Model for heading hierarchy resolution |
 | `HIERARCHY_LLM_REASONING` | `medium` | Reasoning effort for heading hierarchy calls |
 | `LLM_REASONING_EFFORT` | `medium` | Default reasoning effort for LLM calls |
-| `ZONE_ESCALATION_THRESHOLD` | `20000` | Token threshold — zones above this use the escalation model |
-| `ZONE_ESCALATION_MODEL` | `gpt-5.2` | Model used when a zone exceeds the escalation threshold |
 | `LLM_CONFLICT_BATCH_SIZE` | `10` | Number of conflicts per batch in batched resolution |
 | `LLM_CONFLICT_MAX_WORKERS` | `4` | Max parallel workers for batched conflict resolution |
-| `LLM_CONFLICT_RETRY_ROUNDS` | `2` | Number of retry rounds for unresolved conflicts |
+| `LLM_CONFLICT_RETRY_ROUNDS` | `2` | Number of retry rounds for unresolved micro-conflicts |
 
 ### Consensus Pipeline
 
@@ -856,9 +893,18 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 | `CONSENSUS_LOCALIZED_CONFLICT_SPAN_MAX` | `0.35` | Max document span ratio for localized conflict relief |
 | `CONSENSUS_LOCALIZED_CONFLICT_RELIEF` | `0.15` | How much to relax conflict ratio when conflicts are localized |
 | `CONSENSUS_LOCALIZED_CONFLICT_MAX_BLOCKS` | `25` | Max conflict blocks for localized relief to apply |
-| `CONSENSUS_ZONE_FLANKING_COUNT` | `2` | Number of context blocks on each side of a conflict zone |
 | `CONSENSUS_HIERARCHY_ENABLED` | `true` | Enable heading hierarchy resolution step |
 | `CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES` | `true` | Flag global duplicates in QA gate |
+
+### Micro-Conflict Extraction
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MICRO_CONFLICT_CONTEXT_CAP` | `30` | Max context tokens to include before/after each micro-conflict span |
+| `MICRO_CONFLICT_HIGH_DIVERGENCE_RATIO_THRESHOLD` | `0.40` | If majority-agree ratio is below this, treat segment as fully divergent |
+| `MICRO_CONFLICT_HIGH_DIVERGENCE_SPAN_THRESHOLD` | `12` | If a conflict span exceeds this many tokens, treat it as high-divergence |
+| `MICRO_CONFLICT_COALESCE_GAP` | `8` | Merge nearby micro-conflicts that are within this many tokens of each other |
+| `MICRO_CONFLICT_HIGH_DIVERGENCE_MIN_TOKENS` | `10` | Minimum token count for high-divergence detection to apply |
 
 ### Infrastructure
 
@@ -897,8 +943,16 @@ agr_pdf_extraction_service/
 │   │   ├── docling_service.py   # Docling extractor
 │   │   ├── marker_service.py    # Marker extractor
 │   │   ├── llm_service.py       # LLM service (model selection, cost tracking)
-│   │   ├── consensus_service.py # Consensus merge pipeline
-│   │   └── degradation_metrics.py # Quality scoring
+│   │   ├── consensus_service.py # Consensus pipeline orchestrator (~412 lines)
+│   │   ├── consensus_models.py  # Block, AlignedTriple, MicroConflict data classes
+│   │   ├── consensus_parsing_alignment.py    # Markdown parsing + Hungarian alignment
+│   │   ├── consensus_classification_assembly.py  # Triple classification, assembly, dedup
+│   │   ├── consensus_micro_conflicts.py      # Word-level disagreement extraction
+│   │   ├── consensus_resolution.py           # Layered conflict + rescue resolution
+│   │   ├── consensus_hierarchy_qa.py         # Heading hierarchy + QA gates
+│   │   ├── consensus_reporting.py            # Metrics computation + audit builders
+│   │   ├── consensus_pipeline_steps.py       # Backwards-compatible re-export layer
+│   │   └── degradation_metrics.py            # Quality scoring
 │   └── templates/
 │       └── index.html           # Web UI
 ├── tests/                       # Test suite
