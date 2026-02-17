@@ -145,7 +145,34 @@ def merge_with_consensus(
     # Step 2: Align
     step_start = time.monotonic()
     logger.info("Consensus pipeline: aligning blocks...")
-    triples, alignment_confidence = align_blocks(blocks_by_source)
+    triples, alignment_confidence = align_blocks(
+        blocks_by_source,
+        llm=llm,
+        anchor_partitioning_enabled=_cfg_bool(
+            getattr(Config, "CONSENSUS_ALIGNMENT_ANCHOR_PARTITIONING_ENABLED", True), True,
+        ),
+        anchor_min_score=_cfg_float(
+            getattr(Config, "CONSENSUS_ALIGNMENT_ANCHOR_MIN_SCORE", 0.72), 0.72,
+        ),
+        anchor_include_structural_secondary=_cfg_bool(
+            getattr(Config, "CONSENSUS_ALIGNMENT_ANCHOR_INCLUDE_STRUCTURAL", True), True,
+        ),
+        anchor_max_heading_level=int(
+            getattr(Config, "CONSENSUS_ALIGNMENT_ANCHOR_MAX_HEADING_LEVEL", 2),
+        ),
+        ambiguity_delta=_cfg_float(
+            getattr(Config, "CONSENSUS_ALIGNMENT_AMBIGUITY_DELTA", 0.03), 0.03,
+        ),
+        semantic_rerank_enabled=_cfg_bool(
+            getattr(Config, "CONSENSUS_ALIGNMENT_SEMANTIC_RERANK_ENABLED", True), True,
+        ),
+        semantic_margin=_cfg_float(
+            getattr(Config, "CONSENSUS_ALIGNMENT_SEMANTIC_MARGIN", 0.02), 0.02,
+        ),
+        llm_tiebreak_enabled=_cfg_bool(
+            getattr(Config, "CONSENSUS_ALIGNMENT_LLM_TIEBREAK_ENABLED", False), False,
+        ),
+    )
     logger.info(
         "Aligned %d triples, confidence=%.3f (%.1fs)",
         len(triples), alignment_confidence, time.monotonic() - step_start,
@@ -233,22 +260,26 @@ def merge_with_consensus(
         guard_telemetry.get("conflicts_localized", False),
     )
 
-    # Step 5: Resolve conflicts and gaps via per-segment micro-conflict resolver
+    # Step 5: Extract micro-conflicts and resolve via token DP + LLM
+    # The micro-conflict pipeline now handles CONFLICT, AGREE_NEAR, and
+    # multi-source GAP triples. Single-source GAPs still go directly to LLM.
     conflict_triples = [t for t in triples if t.classification == CONFLICT]
+    near_triples = [t for t in triples if t.classification == AGREE_NEAR]
     gap_triples = [t for t in triples if t.classification == GAP]
     resolved_conflicts: dict[str, str] = {}
     resolution_metadata: dict[str, dict] = {}
     micro_results: dict[str, MicroConflictResult] = {}
 
-    if conflict_triples or gap_triples:
+    if conflict_triples or gap_triples or near_triples:
         step_start = time.monotonic()
         logger.info(
-            "Consensus pipeline: resolving %d conflict(s), %d GAP segment(s) via micro-conflict...",
-            len(conflict_triples), len(gap_triples),
+            "Consensus pipeline: resolving %d conflict(s), %d near-agree, %d GAP segment(s) "
+            "via micro-conflict...",
+            len(conflict_triples), len(near_triples), len(gap_triples),
         )
 
         try:
-            # Extract per-segment micro-conflicts for all CONFLICT triples.
+            # Extract per-segment micro-conflicts for eligible triples.
             micro_results = extract_micro_conflicts(triples)
             logger.info(
                 "Consensus pipeline: extracted micro-conflicts for %d segment(s), total spans=%d",
@@ -268,9 +299,12 @@ def merge_with_consensus(
                     ),
                     _LAYERED_MEDIUM_SIM_THRESHOLD,
                 ),
+                median_source_max_micro_conflicts=int(
+                    getattr(Config, "CONSENSUS_MEDIAN_SOURCE_MAX_MICRO_CONFLICTS", 20),
+                ),
             )
         except Exception as e:
-            logger.warning("Consensus pipeline: micro-conflict resolution failed: %s", e)
+            logger.warning("Consensus pipeline: micro-conflict resolution failed: %s", e, exc_info=True)
             audit_entries = _build_audit_entries(
                 triples, {}, {},
                 near_threshold=Config.CONSENSUS_NEAR_THRESHOLD,
@@ -334,6 +368,16 @@ def merge_with_consensus(
             merged_md = resolve_header_hierarchy(merged_md, llm)
         except Exception as e:
             logger.warning("Header hierarchy resolution failed: %s — using original headers", e)
+
+    # Step 6d: Post-hierarchy dedup — heading demotion can expose duplicates
+    #          that were invisible to the first dedup pass (they were headings).
+    merged_md, post_hierarchy_dups = dedup_assembled_paragraphs(merged_md)
+    assembled_dups_removed += post_hierarchy_dups
+    if post_hierarchy_dups > 0:
+        logger.info(
+            "Consensus pipeline: removed %d post-hierarchy duplicate paragraphs",
+            post_hierarchy_dups,
+        )
 
     # Finalized heading hierarchy (post optional hierarchy resolution).
     heading_hierarchy = extract_heading_hierarchy(merged_md)
