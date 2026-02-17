@@ -8,12 +8,14 @@ resolution.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import unicodedata
 from collections import Counter
-from difflib import SequenceMatcher
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from app.services.consensus_models import AGREE_EXACT, CONFLICT, AlignedTriple, MicroConflict, MicroConflictResult
+from app.services.alignment.dp3 import align_three_way_tokens
+from app.services.consensus_models import AGREE_EXACT, AGREE_NEAR, CONFLICT, GAP, AlignedTriple, MicroConflict, MicroConflictResult
 from app.services.consensus_classification_assembly import _get_present_blocks, _pick_preferred_text
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,50 @@ logger = logging.getLogger(__name__)
 _SENTENCE_END_TOKENS = {".", "!", "?"}
 _MICRO_PLACEHOLDER_PREFIX = "__MC__"
 _DELETION = "__MICRO_DELETION__"
+
+
+def normalize_for_comparison(token: str) -> str:
+    """Normalize a token for comparison, stripping markdown formatting.
+
+    Used to prevent formatting-only differences (bold/italic markers, dashes,
+    smart quotes) from registering as content conflicts in the 3-way DP and
+    majority vote.  The original un-normalized tokens are preserved for output
+    so formatting from the preferred source is kept intact.
+    """
+    if not token or token == _DELETION:
+        return token
+
+    t = token
+
+    # Strip matched bold/italic marker pairs:  *word* -> word,  **word** -> word
+    while len(t) > 1 and t[0] == "*" and t[-1] == "*":
+        t = t[1:-1]
+    # Strip unmatched leading/trailing markers:  **Fig -> Fig,  text** -> text
+    t = t.lstrip("*").rstrip("*")
+
+    # Strip heading markers:  ## -> ""  (let fallback handle it)
+    if t.startswith("#"):
+        t = t.lstrip("#").lstrip()
+
+    # Unicode compatibility normalization (handles superscripts, ligatures, etc.)
+    t = unicodedata.normalize("NFKC", t)
+
+    # Normalize dashes/minus to ASCII hyphen
+    t = t.replace("\u2013", "-")   # en-dash
+    t = t.replace("\u2014", "-")   # em-dash
+    t = t.replace("\u2212", "-")   # unicode minus
+
+    # Normalize smart quotes to ASCII
+    t = t.replace("\u2018", "'").replace("\u2019", "'")   # single
+    t = t.replace("\u201c", '"').replace("\u201d", '"')   # double
+
+    return t or token  # fallback to original if stripping emptied it
+
+# 3-way token DP allocates O(n_a * n_b * n_c * 8) memory.  At 500 tokens per
+# stream that's ~9 GB which is safe after extractors finish and free RAM.
+# Blocks exceeding this (e.g. 1900-token reference lists) skip the DP entirely
+# and the whole segment is treated as a single conflict for LLM resolution.
+_TOKEN_DP_MAX = 500
 
 
 def tokenize_for_diff(text: str) -> list[str]:
@@ -43,90 +89,59 @@ def tokenize_for_diff(text: str) -> list[str]:
     return tokens
 
 
-def _build_position_map(
-    opcodes: list[tuple[str, int, int, int, int]],
-    ref_len: int,
-) -> tuple[list[int | None], list[tuple[int, int, int]]]:
-    """Map reference positions to another source and track insertions."""
-    ref_to_other: list[int | None] = [None] * ref_len
-    insertions: list[tuple[int, int, int]] = []
-
-    for tag, i1, i2, j1, j2 in opcodes:
-        if tag == "equal":
-            for k in range(i2 - i1):
-                ref_to_other[i1 + k] = j1 + k
-        elif tag == "replace":
-            overlap = min(i2 - i1, j2 - j1)
-            for k in range(overlap):
-                ref_to_other[i1 + k] = j1 + k
-            if (j2 - j1) > overlap:
-                insertions.append((i1 + overlap, j1 + overlap, j2))
-        elif tag == "insert":
-            insertions.append((i1, j1, j2))
-        # delete => keep None mappings
-
-    return ref_to_other, insertions
-
-
 def _build_majority_alignment(
     source_tokens: dict[str, list[str]],
 ) -> tuple[list[str], list[MicroConflict], float]:
-    """Build majority-agreed token stream with placeholders at true conflicts."""
-    present_sources = [s for s in ("grobid", "docling", "marker") if source_tokens.get(s)]
+    """Build majority-agreed token stream with placeholders at true conflicts.
+
+    Uses full 3-way DP alignment (same algorithm family as block-level alignment)
+    to simultaneously align all three token streams, then majority-votes each column.
+    """
+    _SOURCES = ("grobid", "docling", "marker")
+    present_sources = [s for s in _SOURCES if source_tokens.get(s)]
     if not present_sources:
         return [], [], 1.0
     if len(present_sources) == 1:
         only = present_sources[0]
         return list(source_tokens.get(only, [])), [], 1.0
 
-    ref_source = max(
-        present_sources,
-        key=lambda s: (len(source_tokens[s]), -("grobid", "docling", "marker").index(s)),
+    # Guard: if any token stream exceeds the cap, skip DP and treat the whole
+    # segment as one conflict so it goes straight to LLM resolution.
+    max_len = max(len(source_tokens.get(s, [])) for s in present_sources)
+    if max_len > _TOKEN_DP_MAX:
+        logger.info(
+            "Token DP skipped: max stream length %d > %d cap, treating as single conflict",
+            max_len, _TOKEN_DP_MAX,
+        )
+        placeholder = f"{_MICRO_PLACEHOLDER_PREFIX}0__"
+        conflict = MicroConflict(
+            conflict_id="",
+            segment_id="",
+            grobid_tokens=list(source_tokens.get("grobid", [])),
+            docling_tokens=list(source_tokens.get("docling", [])),
+            marker_tokens=list(source_tokens.get("marker", [])),
+            context_before=[],
+            context_after=[],
+            output_position=0,
+        )
+        return [placeholder], [conflict], 0.0
+
+    # Run 3-way DP alignment on the token streams.
+    # Pass normalize_fn so the DP scores matches on normalized forms
+    # (ignoring markdown formatting) while returning original tokens.
+    raw_columns = align_three_way_tokens(
+        source_tokens.get("grobid", []),
+        source_tokens.get("docling", []),
+        source_tokens.get("marker", []),
+        normalize_fn=normalize_for_comparison,
     )
-    ref_tokens = source_tokens[ref_source]
-    other_sources = [s for s in present_sources if s != ref_source]
 
-    maps: dict[str, list[int | None]] = {}
-    insertions_by_source: dict[str, dict[int, list[list[str]]]] = {}
-    for other in other_sources:
-        opcodes = SequenceMatcher(None, ref_tokens, source_tokens[other], autojunk=False).get_opcodes()
-        ref_map, insertions = _build_position_map(opcodes, len(ref_tokens))
-        maps[other] = ref_map
-        grouped: dict[int, list[list[str]]] = {}
-        for after_ref, j1, j2 in insertions:
-            if j2 <= j1:
-                continue
-            grouped.setdefault(after_ref, []).append(source_tokens[other][j1:j2])
-        insertions_by_source[other] = grouped
-
+    # Convert tuples to dicts keyed by source name.
     columns: list[dict[str, str | None]] = []
+    for tok_g, tok_d, tok_m in raw_columns:
+        columns.append({"grobid": tok_g, "docling": tok_d, "marker": tok_m})
 
-    def _add_column(values: dict[str, str | None]) -> None:
-        full = {"grobid": None, "docling": None, "marker": None}
-        for src, val in values.items():
-            full[src] = val
-        columns.append(full)
-
-    for ref_idx in range(len(ref_tokens) + 1):
-        insertion_values: dict[str, str | None] = {}
-        has_insertion = False
-        for src in other_sources:
-            pieces = insertions_by_source.get(src, {}).get(ref_idx, [])
-            if pieces:
-                insertion_values[src] = " ".join(" ".join(chunk) for chunk in pieces if chunk).strip()
-                has_insertion = has_insertion or bool(insertion_values[src])
-        if has_insertion:
-            _add_column(insertion_values)
-
-        if ref_idx == len(ref_tokens):
-            break
-
-        values: dict[str, str | None] = {ref_source: ref_tokens[ref_idx]}
-        for src in other_sources:
-            mapped = maps[src][ref_idx]
-            values[src] = source_tokens[src][mapped] if mapped is not None else None
-        _add_column(values)
-
+    # Majority-vote each column to build agreed stream + conflict spans.
     agreed_tokens: list[str] = []
     conflicts: list[MicroConflict] = []
     active: MicroConflict | None = None
@@ -150,28 +165,42 @@ def _build_majority_alignment(
         )
 
     for column in columns:
-        values = [column[s] if column[s] is not None else _DELETION for s in present_sources]
-        counts = Counter(values)
-        majority_token: str | None = None
-        if counts:
-            top_token, top_count = counts.most_common(1)[0]
-            if top_count >= 2:
-                majority_token = top_token
+        # Build raw and normalized value maps per source.
+        raw_values = {s: (column[s] if column[s] is not None else _DELETION) for s in present_sources}
+        norm_values = {s: normalize_for_comparison(v) for s, v in raw_values.items()}
 
-        if majority_token is not None:
+        # Majority-vote on NORMALIZED forms so formatting-only
+        # differences (e.g. *lag-1* vs lag-1) count as agreement.
+        counts = Counter(norm_values.values())
+        majority_norm: str | None = None
+        if counts:
+            top_norm, top_count = counts.most_common(1)[0]
+            if top_count >= 2:
+                majority_norm = top_norm
+
+        if majority_norm is not None:
             agree_columns += 1
             if active is not None:
                 conflicts.append(active)
                 active = None
             # Majority-agreed deletion: don't append to agreed_tokens
-            if majority_token != _DELETION:
-                agreed_tokens.append(majority_token)
+            if majority_norm != _DELETION:
+                # Pick the ORIGINAL token with the most characters among
+                # agreeing sources — this preserves markdown formatting
+                # (e.g. *lag-1* is preferred over lag-1).
+                candidates = [
+                    raw_values[s]
+                    for s in present_sources
+                    if norm_values[s] == majority_norm and raw_values[s] != _DELETION
+                ]
+                best_token = max(candidates, key=len) if candidates else majority_norm
+                agreed_tokens.append(best_token)
             continue
 
         if active is None:
             active = _start_conflict()
 
-        for src in ("grobid", "docling", "marker"):
+        for src in _SOURCES:
             tok = column[src]
             if tok is None:
                 continue
@@ -433,19 +462,59 @@ def reconstruct_segment_from_micro_conflicts(
 def extract_micro_conflicts(
     triples: list[AlignedTriple],
 ) -> dict[str, MicroConflictResult]:
-    """Extract micro-conflicts for all CONFLICT segments and auto-reclassify 0-conflict cases."""
-    results: dict[str, MicroConflictResult] = {}
+    """Extract micro-conflicts for CONFLICT, AGREE_NEAR, and multi-source GAP segments.
+
+    Runs 3-way token DP on each eligible segment to find word-level disagreements.
+    Uses ThreadPoolExecutor for parallelism (Numba JIT releases the GIL).
+    Segments with 0 conflicts get majority-agreed text directly (no LLM needed).
+    Segments with conflicts get only the disagreeing spans sent to LLM.
+    """
+    # Collect eligible triples.
+    eligible: list[AlignedTriple] = []
     for triple in triples:
-        if triple.classification != CONFLICT:
-            continue
+        if triple.classification == CONFLICT:
+            eligible.append(triple)
+        elif triple.classification == AGREE_NEAR:
+            eligible.append(triple)
+        elif triple.classification == GAP:
+            present = _get_present_blocks(triple)
+            if len(present) >= 2:
+                eligible.append(triple)
+
+    if not eligible:
+        return {}
+
+    # Process segments in parallel — Numba-JIT kernel releases the GIL
+    # so threads achieve true parallelism on the CPU-bound DP work.
+    max_workers = min(len(eligible), os.cpu_count() or 4)
+    results: dict[str, MicroConflictResult] = {}
+
+    def _process_one(triple: AlignedTriple) -> tuple[str, MicroConflictResult]:
         result = extract_micro_conflicts_for_segment(triple)
-        result = _coalesce_micro_conflicts_if_high_divergence(result)
-        results[triple.segment_id] = result
-        if not result.conflicts:
-            triple.classification = AGREE_EXACT
-            blocks = _get_present_blocks(triple)
-            triple.agreed_text = _pick_preferred_text(
-                blocks,
-                triple.grobid_block.block_type if triple.grobid_block else "paragraph",
-            )
+        if triple.classification == CONFLICT:
+            result = _coalesce_micro_conflicts_if_high_divergence(result)
+        return triple.segment_id, result
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process_one, t): t for t in eligible}
+        for future in as_completed(futures):
+            triple = futures[future]
+            segment_id, result = future.result()
+            results[segment_id] = result
+
+            # If 0 conflicts found, all sources agree at the word level — no LLM
+            # needed. Use the original source text (preserves formatting like
+            # newlines in tables) rather than reconstructing from tokens.
+            if not result.conflicts:
+                triple.classification = AGREE_EXACT
+                blocks = _get_present_blocks(triple)
+                triple.agreed_text = _pick_preferred_text(
+                    blocks,
+                    triple.grobid_block.block_type if triple.grobid_block else "paragraph",
+                )
+
+    logger.info(
+        "Micro-conflict extraction: %d segments processed in parallel (workers=%d)",
+        len(eligible), max_workers,
+    )
     return results

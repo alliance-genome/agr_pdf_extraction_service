@@ -24,7 +24,6 @@ from app.services.consensus_service import (
     MicroConflict,
     MicroConflictResult,
     tokenize_for_diff,
-    _build_position_map,
     _build_majority_alignment,
     _expand_to_sentence_boundary,
     extract_micro_conflicts_for_segment,

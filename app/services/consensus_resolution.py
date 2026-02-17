@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
@@ -151,6 +152,7 @@ def _rescue_segment(
         neighboring_resolved=neighboring_resolved,
         extra_flanking=extra_flanking,
         model=Config.LLM_MODEL_GENERAL_RESCUE,
+        reasoning_effort=Config.LLM_REASONING_GENERAL_RESCUE or None,
     )
 
     if rescue_result is not None:
@@ -263,6 +265,7 @@ def _apply_numeric_integrity_guard(
         neighboring_resolved=neighboring_resolved,
         extra_flanking=extra_flanking,
         model=Config.LLM_MODEL_NUMERIC_RESCUE,
+        reasoning_effort=Config.LLM_REASONING_NUMERIC_RESCUE or None,
         reason="numeric_integrity",
         previous_text=current,
         novel_numbers=novel,
@@ -465,6 +468,7 @@ def _route_to_rescue(
         neighboring_resolved=neighboring_resolved,
         extra_flanking=extra_flanking,
         model=Config.LLM_MODEL_NUMERIC_RESCUE,
+        reasoning_effort=Config.LLM_REASONING_NUMERIC_RESCUE or None,
         reason="numeric_integrity",
         previous_text=current,
         novel_numbers=[],
@@ -646,113 +650,67 @@ def _build_micro_conflict_payload(
     }
 
 
-def _resolve_conflicts_micro(
-    triples: list[AlignedTriple],
+def _resolve_single_conflict(
+    triple: AlignedTriple,
     micro_results: dict[str, MicroConflictResult],
+    triples: list[AlignedTriple],
     llm: "LLM",
-    medium_similarity_threshold: float = _LAYERED_MEDIUM_SIM_THRESHOLD,
-) -> tuple[dict[str, str], dict[str, dict]]:
-    """Resolve CONFLICT and GAP segments with per-segment micro-conflict extraction."""
-    resolved: dict[str, str] = {}
-    metadata: dict[str, dict] = {}
-
-    gap_triples: list[AlignedTriple] = []
-    triple_index = {tr.segment_id: idx for idx, tr in enumerate(triples)}
-
-    for triple in triples:
-        if triple.classification == GAP:
-            gap_triples.append(triple)
-            continue
-        if triple.classification != CONFLICT:
-            continue
-
-        result = micro_results.get(triple.segment_id)
-        if result is None:
-            logger.warning("Missing micro-conflict result for %s; routing to rescue", triple.segment_id)
-            seg = _triple_to_segment_dict(triple, status="conflict")
-            resolution_ctx = {"context_id": f"micro_{triple.segment_id}", "segments": [seg], "context_before": [], "context_after": []}
-            source_texts = _bundle_source_texts(seg)
-            source_values = list(source_texts.values())
-            pair_sims = _pairwise_similarities(source_values)
-            max_pair_sim = max(pair_sims) if pair_sims else 0.0
-            _rescue_segment(
-                triple.segment_id, seg, resolution_ctx, triples, resolved, metadata,
-                source_texts, max_pair_sim, llm, method_prefix="rescue_missing_micro",
-            )
-            continue
-
+    resolved: dict[str, str],
+    metadata: dict[str, dict],
+    medium_similarity_threshold: float,
+    median_source_max_micro_conflicts: int = 20,
+) -> None:
+    """Resolve a single CONFLICT triple. Mutates resolved/metadata for this segment's key."""
+    result = micro_results.get(triple.segment_id)
+    if result is None:
+        logger.warning("Missing micro-conflict result for %s; routing to rescue", triple.segment_id)
         seg = _triple_to_segment_dict(triple, status="conflict")
-        resolution_ctx = {
-            "context_id": f"micro_{triple.segment_id}",
-            "segments": [seg],
-            "context_before": [],
-            "context_after": [],
-        }
+        resolution_ctx = {"context_id": f"micro_{triple.segment_id}", "segments": [seg], "context_before": [], "context_after": []}
         source_texts = _bundle_source_texts(seg)
         source_values = list(source_texts.values())
         pair_sims = _pairwise_similarities(source_values)
         max_pair_sim = max(pair_sims) if pair_sims else 0.0
-        allowed_numbers = _segment_allowed_numeric_tokens(seg)
+        _rescue_segment(
+            triple.segment_id, seg, resolution_ctx, triples, resolved, metadata,
+            source_texts, max_pair_sim, llm, method_prefix="rescue_missing_micro",
+        )
+        return
 
-        # Optional pre-LLM deterministic median-source resolution.
-        if len(source_texts) >= 3 and max_pair_sim >= medium_similarity_threshold:
-            try:
-                median_text, confidence, chosen_extractor = _resolve_conflict_median_source(seg)
-                resolved[triple.segment_id] = median_text.strip()
-                metadata[triple.segment_id] = {
-                    "method": "median_source",
-                    "chosen_source": chosen_extractor,
-                    "confidence": round(float(confidence), 4),
-                    "sources_agreeing": sorted(source_texts.keys()),
-                    "max_pair_similarity": round(max_pair_sim, 4),
-                    "context_id": resolution_ctx["context_id"],
-                    "micro_conflicts": len(result.conflicts),
-                    "majority_agree_ratio": round(result.majority_agree_ratio, 4),
-                }
-                _apply_numeric_integrity_guard(
-                    seg_id=triple.segment_id,
-                    seg=seg,
-                    resolution_ctx=resolution_ctx,
-                    triples=triples,
-                    resolved=resolved,
-                    metadata=metadata,
-                    allowed_numbers=allowed_numbers,
-                    source_texts=source_texts,
-                    max_pair_sim=max_pair_sim,
-                    llm=llm,
-                    method_prefix="llm_conflict",
-                )
-                _apply_post_resolution_validation(
-                    seg_id=triple.segment_id,
-                    seg=seg,
-                    resolution_ctx=resolution_ctx,
-                    triples=triples,
-                    resolved=resolved,
-                    metadata=metadata,
-                    source_texts=source_texts,
-                    max_pair_sim=max_pair_sim,
-                    llm=llm,
-                    method_prefix="llm_conflict",
-                )
-                continue
-            except Exception as exc:
-                logger.info("Median-source skipped for %s: %s", triple.segment_id, exc)
+    seg = _triple_to_segment_dict(triple, status="conflict")
+    resolution_ctx = {
+        "context_id": f"micro_{triple.segment_id}",
+        "segments": [seg],
+        "context_before": [],
+        "context_after": [],
+    }
+    source_texts = _bundle_source_texts(seg)
+    source_values = list(source_texts.values())
+    pair_sims = _pairwise_similarities(source_values)
+    max_pair_sim = max(pair_sims) if pair_sims else 0.0
+    allowed_numbers = _segment_allowed_numeric_tokens(seg)
 
-        if not result.conflicts:
-            blocks = _get_present_blocks(triple)
-            resolved_text = _pick_preferred_text(
-                blocks,
-                triple.grobid_block.block_type if triple.grobid_block else "paragraph",
-            )
-            resolved[triple.segment_id] = resolved_text
+    # Optional pre-LLM deterministic median-source resolution.
+    # Skip when micro-conflict count is high — indicates structural divergence
+    # (e.g. references blocks) where picking one source verbatim is inadequate.
+    micro_conflict_count = len(result.conflicts)
+    median_eligible = micro_conflict_count <= median_source_max_micro_conflicts
+    if not median_eligible:
+        logger.info(
+            "Median-source skipped for %s: %d micro-conflicts > %d threshold",
+            triple.segment_id, micro_conflict_count, median_source_max_micro_conflicts,
+        )
+    if median_eligible and len(source_texts) >= 3 and max_pair_sim >= medium_similarity_threshold:
+        try:
+            median_text, confidence, chosen_extractor = _resolve_conflict_median_source(seg)
+            resolved[triple.segment_id] = median_text.strip()
             metadata[triple.segment_id] = {
-                "method": "majority_vote",
-                "chosen_source": "majority_vote",
-                "confidence": round(_mean_similarity_to_sources(resolved_text, source_texts), 4),
+                "method": "median_source",
+                "chosen_source": chosen_extractor,
+                "confidence": round(float(confidence), 4),
                 "sources_agreeing": sorted(source_texts.keys()),
                 "max_pair_similarity": round(max_pair_sim, 4),
                 "context_id": resolution_ctx["context_id"],
-                "micro_conflicts": 0,
+                "micro_conflicts": len(result.conflicts),
                 "majority_agree_ratio": round(result.majority_agree_ratio, 4),
             }
             _apply_numeric_integrity_guard(
@@ -780,138 +738,26 @@ def _resolve_conflicts_micro(
                 llm=llm,
                 method_prefix="llm_conflict",
             )
-            continue
-
-        payload = _build_micro_conflict_payload(triple, result)
-        try:
-            llm_response = llm.resolve_micro_conflicts(payload)
-            resolved_map = {}
-            for item in llm_response.resolved:
-                if item.action == "drop":
-                    resolved_map[item.conflict_id] = ""
-                elif (item.text or "").strip():
-                    resolved_map[item.conflict_id] = item.text
-
-            # Fall back to longest source tokens for any unresolved spans
-            for conflict in result.conflicts:
-                if conflict.conflict_id not in resolved_map:
-                    candidates = [
-                        conflict.grobid_tokens,
-                        conflict.docling_tokens,
-                        conflict.marker_tokens,
-                    ]
-                    best = max(candidates, key=len) if candidates else []
-                    fallback = _tokens_to_text(best)
-                    if fallback:
-                        resolved_map[conflict.conflict_id] = fallback
-                        logger.warning(
-                            "Micro-conflict %s unresolved; using longest source tokens as fallback",
-                            conflict.conflict_id,
-                        )
-
-            resolved_text = reconstruct_segment_from_micro_conflicts(
-                result.agreed_tokens,
-                result.conflicts,
-                resolved_map,
-            )
+            return
         except Exception as exc:
-            logger.warning("Micro-conflict LLM resolution failed for %s: %s", triple.segment_id, exc)
-            resolved_text = ""
+            logger.info("Median-source skipped for %s: %s", triple.segment_id, exc)
 
-        if not resolved_text:
-            _rescue_segment(
-                triple.segment_id,
-                seg,
-                resolution_ctx,
-                triples,
-                resolved,
-                metadata,
-                source_texts,
-                max_pair_sim,
-                llm,
-                method_prefix="llm_conflict",
-            )
-        else:
-            resolved[triple.segment_id] = resolved_text
-            metadata[triple.segment_id] = {
-                "method": "llm_conflict",
-                "chosen_source": "llm",
-                "confidence": round(_mean_similarity_to_sources(resolved_text, source_texts), 4),
-                "sources_agreeing": sorted(source_texts.keys()),
-                "max_pair_similarity": round(max_pair_sim, 4),
-                "context_id": resolution_ctx["context_id"],
-                "micro_conflicts": len(result.conflicts),
-                "majority_agree_ratio": round(result.majority_agree_ratio, 4),
-                "resolution_strategy": "micro_conflict",
-            }
-
-        _apply_numeric_integrity_guard(
-            seg_id=triple.segment_id,
-            seg=seg,
-            resolution_ctx=resolution_ctx,
-            triples=triples,
-            resolved=resolved,
-            metadata=metadata,
-            allowed_numbers=allowed_numbers,
-            source_texts=source_texts,
-            max_pair_sim=max_pair_sim,
-            llm=llm,
-            method_prefix="llm_conflict",
+    if not result.conflicts:
+        blocks = _get_present_blocks(triple)
+        resolved_text = _pick_preferred_text(
+            blocks,
+            triple.grobid_block.block_type if triple.grobid_block else "paragraph",
         )
-        _apply_post_resolution_validation(
-            seg_id=triple.segment_id,
-            seg=seg,
-            resolution_ctx=resolution_ctx,
-            triples=triples,
-            resolved=resolved,
-            metadata=metadata,
-            source_texts=source_texts,
-            max_pair_sim=max_pair_sim,
-            llm=llm,
-            method_prefix="llm_conflict",
-        )
-
-    # GAP segments are handled individually.
-    for triple in gap_triples:
-        seg = _triple_to_segment_dict(triple, status="gap")
-        resolution_ctx = {
-            "context_id": f"micro_{triple.segment_id}",
-            "segments": [seg],
-            "context_before": [],
-            "context_after": [],
-        }
-        gap_text = (seg.get("text") or "").strip()
-        gap_source = seg.get("gap_source", "unknown")
-        source_texts = {gap_source: gap_text} if gap_text else {}
-        allowed_numbers = _segment_allowed_numeric_tokens(seg)
-
-        idx = triple_index.get(triple.segment_id, 0)
-        context_before, context_after = _build_flanking_context(triples, idx)
-        payload = {
-            "segment_id": triple.segment_id,
-            "block_type": seg.get("block_type", "paragraph"),
-            "context_before": context_before,
-            "context_after": context_after,
-            "grobid": seg.get("grobid", ""),
-            "docling": seg.get("docling", ""),
-            "marker": seg.get("marker", ""),
-        }
-
-        try:
-            gap_resolved = llm.resolve_conflicts([payload])
-            resolved_text = gap_resolved.get(triple.segment_id, "")
-        except Exception as exc:
-            logger.warning("GAP resolution failed for %s: %s", triple.segment_id, exc)
-            resolved_text = gap_text
-
         resolved[triple.segment_id] = resolved_text
         metadata[triple.segment_id] = {
-            "method": "llm_gap",
-            "chosen_source": "llm" if resolved_text != gap_text else gap_source,
-            "confidence": 0.0,
+            "method": "majority_vote",
+            "chosen_source": "majority_vote",
+            "confidence": round(_mean_similarity_to_sources(resolved_text, source_texts), 4),
             "sources_agreeing": sorted(source_texts.keys()),
-            "max_pair_similarity": 0.0,
+            "max_pair_similarity": round(max_pair_sim, 4),
             "context_id": resolution_ctx["context_id"],
+            "micro_conflicts": 0,
+            "majority_agree_ratio": round(result.majority_agree_ratio, 4),
         }
         _apply_numeric_integrity_guard(
             seg_id=triple.segment_id,
@@ -922,9 +768,9 @@ def _resolve_conflicts_micro(
             metadata=metadata,
             allowed_numbers=allowed_numbers,
             source_texts=source_texts,
-            max_pair_sim=0.0,
+            max_pair_sim=max_pair_sim,
             llm=llm,
-            method_prefix="llm_gap",
+            method_prefix="llm_conflict",
         )
         _apply_post_resolution_validation(
             seg_id=triple.segment_id,
@@ -934,9 +780,293 @@ def _resolve_conflicts_micro(
             resolved=resolved,
             metadata=metadata,
             source_texts=source_texts,
-            max_pair_sim=0.0,
+            max_pair_sim=max_pair_sim,
             llm=llm,
-            method_prefix="llm_gap",
+            method_prefix="llm_conflict",
         )
+        return
 
+    payload = _build_micro_conflict_payload(triple, result)
+    try:
+        llm_response = llm.resolve_micro_conflicts(payload)
+        resolved_map = {}
+        for item in llm_response.resolved:
+            if item.action == "drop":
+                resolved_map[item.conflict_id] = ""
+            elif (item.text or "").strip():
+                resolved_map[item.conflict_id] = item.text
+
+        # Fall back to longest source tokens for any unresolved spans
+        for conflict in result.conflicts:
+            if conflict.conflict_id not in resolved_map:
+                candidates = [
+                    conflict.grobid_tokens,
+                    conflict.docling_tokens,
+                    conflict.marker_tokens,
+                ]
+                best = max(candidates, key=len) if candidates else []
+                fallback = _tokens_to_text(best)
+                if fallback:
+                    resolved_map[conflict.conflict_id] = fallback
+                    logger.warning(
+                        "Micro-conflict %s unresolved; using longest source tokens as fallback",
+                        conflict.conflict_id,
+                    )
+
+        resolved_text = reconstruct_segment_from_micro_conflicts(
+            result.agreed_tokens,
+            result.conflicts,
+            resolved_map,
+        )
+    except Exception as exc:
+        logger.warning("Micro-conflict LLM resolution failed for %s: %s", triple.segment_id, exc)
+        resolved_text = ""
+
+    if not resolved_text:
+        _rescue_segment(
+            triple.segment_id,
+            seg,
+            resolution_ctx,
+            triples,
+            resolved,
+            metadata,
+            source_texts,
+            max_pair_sim,
+            llm,
+            method_prefix="llm_conflict",
+        )
+    else:
+        resolved[triple.segment_id] = resolved_text
+        metadata[triple.segment_id] = {
+            "method": "llm_conflict",
+            "chosen_source": "llm",
+            "confidence": round(_mean_similarity_to_sources(resolved_text, source_texts), 4),
+            "sources_agreeing": sorted(source_texts.keys()),
+            "max_pair_similarity": round(max_pair_sim, 4),
+            "context_id": resolution_ctx["context_id"],
+            "micro_conflicts": len(result.conflicts),
+            "majority_agree_ratio": round(result.majority_agree_ratio, 4),
+            "resolution_strategy": "micro_conflict",
+        }
+
+    _apply_numeric_integrity_guard(
+        seg_id=triple.segment_id,
+        seg=seg,
+        resolution_ctx=resolution_ctx,
+        triples=triples,
+        resolved=resolved,
+        metadata=metadata,
+        allowed_numbers=allowed_numbers,
+        source_texts=source_texts,
+        max_pair_sim=max_pair_sim,
+        llm=llm,
+        method_prefix="llm_conflict",
+    )
+    _apply_post_resolution_validation(
+        seg_id=triple.segment_id,
+        seg=seg,
+        resolution_ctx=resolution_ctx,
+        triples=triples,
+        resolved=resolved,
+        metadata=metadata,
+        source_texts=source_texts,
+        max_pair_sim=max_pair_sim,
+        llm=llm,
+        method_prefix="llm_conflict",
+    )
+
+
+def _resolve_single_gap(
+    triple: AlignedTriple,
+    triples: list[AlignedTriple],
+    triple_index: dict[str, int],
+    llm: "LLM",
+    resolved: dict[str, str],
+    metadata: dict[str, dict],
+) -> None:
+    """Resolve a single GAP triple. Mutates resolved/metadata for this segment's key."""
+    seg = _triple_to_segment_dict(triple, status="gap")
+    resolution_ctx = {
+        "context_id": f"micro_{triple.segment_id}",
+        "segments": [seg],
+        "context_before": [],
+        "context_after": [],
+    }
+    gap_text = (seg.get("text") or "").strip()
+    gap_source = seg.get("gap_source", "unknown")
+    source_texts = {gap_source: gap_text} if gap_text else {}
+    allowed_numbers = _segment_allowed_numeric_tokens(seg)
+
+    idx = triple_index.get(triple.segment_id, 0)
+    context_before, context_after = _build_flanking_context(triples, idx)
+    payload = {
+        "segment_id": triple.segment_id,
+        "block_type": seg.get("block_type", "paragraph"),
+        "context_before": context_before,
+        "context_after": context_after,
+        "grobid": seg.get("grobid", ""),
+        "docling": seg.get("docling", ""),
+        "marker": seg.get("marker", ""),
+    }
+
+    try:
+        gap_resolved = llm.resolve_conflicts([payload])
+        resolved_text = gap_resolved.get(triple.segment_id, "")
+    except Exception as exc:
+        logger.warning("GAP resolution failed for %s: %s", triple.segment_id, exc)
+        resolved_text = gap_text
+
+    resolved[triple.segment_id] = resolved_text
+    metadata[triple.segment_id] = {
+        "method": "llm_gap",
+        "chosen_source": "llm" if resolved_text != gap_text else gap_source,
+        "confidence": 0.0,
+        "sources_agreeing": sorted(source_texts.keys()),
+        "max_pair_similarity": 0.0,
+        "context_id": resolution_ctx["context_id"],
+    }
+    _apply_numeric_integrity_guard(
+        seg_id=triple.segment_id,
+        seg=seg,
+        resolution_ctx=resolution_ctx,
+        triples=triples,
+        resolved=resolved,
+        metadata=metadata,
+        allowed_numbers=allowed_numbers,
+        source_texts=source_texts,
+        max_pair_sim=0.0,
+        llm=llm,
+        method_prefix="llm_gap",
+    )
+    _apply_post_resolution_validation(
+        seg_id=triple.segment_id,
+        seg=seg,
+        resolution_ctx=resolution_ctx,
+        triples=triples,
+        resolved=resolved,
+        metadata=metadata,
+        source_texts=source_texts,
+        max_pair_sim=0.0,
+        llm=llm,
+        method_prefix="llm_gap",
+    )
+
+
+def _resolve_conflicts_micro(
+    triples: list[AlignedTriple],
+    micro_results: dict[str, MicroConflictResult],
+    llm: "LLM",
+    medium_similarity_threshold: float = _LAYERED_MEDIUM_SIM_THRESHOLD,
+    median_source_max_micro_conflicts: int = 20,
+) -> tuple[dict[str, str], dict[str, dict]]:
+    """Resolve CONFLICT and GAP segments in parallel with ThreadPoolExecutor.
+
+    Each segment writes only to its own key in the shared dicts, so no locking
+    is needed. Rescue context from neighboring segments is best-effort (some
+    neighbors may not be resolved yet during parallel execution).
+    """
+    resolved: dict[str, str] = {}
+    metadata: dict[str, dict] = {}
+
+    # Triples with micro_results go through the micro-conflict resolver
+    # (handles CONFLICT, AGREE_NEAR, and multi-source GAP with conflicts).
+    # GAP triples without micro_results (single-source) go to _resolve_single_gap.
+    micro_triples: list[AlignedTriple] = []
+    gap_only_triples: list[AlignedTriple] = []
+    triple_index = {tr.segment_id: idx for idx, tr in enumerate(triples)}
+
+    for triple in triples:
+        if triple.segment_id in micro_results and micro_results[triple.segment_id].conflicts:
+            micro_triples.append(triple)
+        elif triple.classification == CONFLICT:
+            # CONFLICT triples missing from micro_results (edge case) still need resolution.
+            micro_triples.append(triple)
+        elif triple.classification == GAP:
+            gap_only_triples.append(triple)
+
+    total = len(micro_triples) + len(gap_only_triples)
+    if total == 0:
+        return resolved, metadata
+
+    configured_workers = getattr(llm, "conflict_max_workers", 100)
+    if not isinstance(configured_workers, int):
+        configured_workers = 100
+    max_workers = min(configured_workers, total)
+    logger.info(
+        "Parallel resolution: dispatching %d micro-conflict + %d GAP-only = %d segments across %d workers",
+        len(micro_triples), len(gap_only_triples), total, max_workers,
+    )
+
+    # Track segments that fail during parallel execution for sequential retry.
+    failed_segments: list[tuple[str, str, AlignedTriple]] = []  # (classification, seg_id, triple)
+    triple_by_id = {tr.segment_id: tr for tr in micro_triples + gap_only_triples}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict = {}
+
+        for triple in micro_triples:
+            future = executor.submit(
+                _resolve_single_conflict,
+                triple, micro_results, triples, llm,
+                resolved, metadata, medium_similarity_threshold,
+                median_source_max_micro_conflicts,
+            )
+            futures[future] = ("MICRO", triple.segment_id)
+
+        for triple in gap_only_triples:
+            future = executor.submit(
+                _resolve_single_gap,
+                triple, triples, triple_index, llm,
+                resolved, metadata,
+            )
+            futures[future] = ("GAP", triple.segment_id)
+
+        for future in as_completed(futures):
+            classification, seg_id = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                logger.error(
+                    "Parallel resolution failed for %s %s: %s",
+                    classification, seg_id, exc,
+                )
+                failed_segments.append((classification, seg_id, triple_by_id[seg_id]))
+
+    # Sequential retry for segments that failed during parallel execution.
+    if failed_segments:
+        logger.warning(
+            "Retrying %d failed segment(s) sequentially", len(failed_segments),
+        )
+        still_failed: list[str] = []
+        for classification, seg_id, triple in failed_segments:
+            try:
+                if classification == "MICRO":
+                    _resolve_single_conflict(
+                        triple, micro_results, triples, llm,
+                        resolved, metadata, medium_similarity_threshold,
+                        median_source_max_micro_conflicts,
+                    )
+                else:
+                    _resolve_single_gap(
+                        triple, triples, triple_index, llm,
+                        resolved, metadata,
+                    )
+                logger.info("Sequential retry succeeded for %s %s", classification, seg_id)
+            except Exception as exc:
+                logger.error(
+                    "Sequential retry also failed for %s %s: %s",
+                    classification, seg_id, exc,
+                )
+                still_failed.append(seg_id)
+
+        if still_failed:
+            raise RuntimeError(
+                f"Resolution failed for {len(still_failed)} segment(s) after parallel + "
+                f"sequential retry: {sorted(still_failed)}"
+            )
+
+    logger.info(
+        "Parallel resolution complete: %d segments resolved, %d metadata entries",
+        len(resolved), len(metadata),
+    )
     return resolved, metadata
