@@ -7,9 +7,14 @@ import re
 import unicodedata
 
 import mistune
-import numpy as np
-from rapidfuzz import fuzz
-from scipy.optimize import linear_sum_assignment
+
+from app.services.alignment.arbitration import ArbitrationConfig, ArbitrationContext, choose_end_mode
+from app.services.alignment.dp3 import align_three_way_global
+from app.services.alignment.partitioning import AnchorPartitionConfig, build_alignment_windows
+from app.services.alignment.repair import repair_split_merge_columns
+from app.services.alignment.scoring import ScoreConfig
+from app.services.alignment.traceback import traceback_columns
+from app.services.alignment.triples import build_aligned_triples
 
 from app.services.consensus_models import AlignedTriple, Block
 
@@ -35,6 +40,18 @@ _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _MULTI_SPACE_RE = re.compile(r"  +")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(https?://[^)]*\)")
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+
+# Inline formatting stripping (for embedding-clean output).
+# Order matters: strip bold-italic (***) before bold (**) before italic (*).
+_BOLD_ITALIC_RE = re.compile(r"\*{3}(.+?)\*{3}")
+_BOLD_RE = re.compile(r"\*{2}(.+?)\*{2}")
+_ITALIC_RE = re.compile(r"\*(.+?)\*")
+_BOLD_ALT_RE = re.compile(r"__(.+?)__")
+_ITALIC_ALT_RE = re.compile(r"(?<!\w)_(.+?)_(?!\w)")  # avoid snake_case
+_STRIKETHROUGH_RE = re.compile(r"~~(.+?)~~")
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
+_FENCED_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
+_HORIZONTAL_RULE_RE = re.compile(r"^\s*(?:---+|\*\*\*+|___+)\s*$", re.MULTILINE)
 
 # Flanking context budget (~150 tokens, conservative 4 chars/token estimate).
 _CHARS_PER_TOKEN = 4
@@ -272,8 +289,11 @@ def normalize_text(text: str) -> str:
 def normalize_extractor_output(markdown_text: str) -> str:
     """Normalize full extractor markdown before block parsing.
 
-    This removes extractor-specific formatting artifacts at the source layer
-    so alignment/classification operates on cleaner inputs.
+    This removes extractor-specific formatting artifacts AND inline cosmetic
+    markdown at the source layer so alignment/classification operates on
+    cleaner inputs.  Structural markdown (headings, lists, tables, blockquotes)
+    is preserved; inline decoration (bold, italic, strikethrough, code) is
+    stripped because the output is used for embedding, not rendering.
     """
     text = unicodedata.normalize("NFKC", markdown_text or "")
     text = _SPAN_REF_RE.sub(r"\1", text)
@@ -282,6 +302,23 @@ def normalize_extractor_output(markdown_text: str) -> str:
     text = _MARKDOWN_LINK_RE.sub(r"\1", text)
     # Common Docling ligature artifacts.
     text = text.replace("/uniFB01", "fi").replace("/uniFB02", "fl")
+
+    # --- Strip cosmetic markdown (keep structural) ---
+    # Block-level: fenced code blocks and horizontal rules
+    text = _FENCED_CODE_BLOCK_RE.sub("", text)
+    text = _HORIZONTAL_RULE_RE.sub("", text)
+
+    # Inline: bold-italic (***) before bold (**) before italic (*)
+    text = _BOLD_ITALIC_RE.sub(r"\1", text)
+    text = _BOLD_RE.sub(r"\1", text)
+    text = _ITALIC_RE.sub(r"\1", text)
+    # Underscore variants
+    text = _BOLD_ALT_RE.sub(r"\1", text)
+    text = _ITALIC_ALT_RE.sub(r"\1", text)
+    # Strikethrough and inline code
+    text = _STRIKETHROUGH_RE.sub(r"\1", text)
+    text = _INLINE_CODE_RE.sub(r"\1", text)
+
     text = _MULTI_NEWLINE_RE.sub("\n\n", text)
     return text.strip()
 
@@ -347,144 +384,88 @@ def parse_markdown(markdown_text: str, source: str) -> list[Block]:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: ALIGN — Hungarian assignment with gap states
+# Step 2: ALIGN — Full 3-way global DP (Needleman family)
 # ---------------------------------------------------------------------------
-
-_HEADING_WEIGHT = 0.4
-_CONTENT_WEIGHT = 0.4
-_POSITION_WEIGHT = 0.2
-_GAP_PENALTY = 40.0  # cost of assigning a block to the gap (dummy) column
-
-
-def _pair_score(block_a: Block, block_b: Block, max_index_a: int, max_index_b: int) -> float:
-    """Score similarity between two blocks (0-100, higher is better)."""
-    # Heading similarity
-    if block_a.block_type == "heading" and block_b.block_type == "heading":
-        heading_sim = fuzz.token_set_ratio(block_a.normalized_text, block_b.normalized_text)
-    elif block_a.block_type == "heading" or block_b.block_type == "heading":
-        heading_sim = 0.0
-    else:
-        heading_sim = 50.0  # neutral for non-heading pairs
-
-    # Content overlap
-    content_sim = fuzz.token_set_ratio(block_a.normalized_text, block_b.normalized_text)
-
-    # Positional prior
-    pos_a = block_a.order_index / max(max_index_a, 1)
-    pos_b = block_b.order_index / max(max_index_b, 1)
-    position_sim = max(0, 100 * (1.0 - abs(pos_a - pos_b)))
-
-    return (
-        _HEADING_WEIGHT * heading_sim
-        + _CONTENT_WEIGHT * content_sim
-        + _POSITION_WEIGHT * position_sim
-    )
-
 
 def align_blocks(
     blocks_by_source: dict[str, list[Block]],
+    *,
+    llm=None,
+    anchor_partitioning_enabled: bool = True,
+    anchor_min_score: float = 0.72,
+    anchor_include_structural_secondary: bool = True,
+    anchor_max_heading_level: int = 2,
+    ambiguity_delta: float = 0.03,
+    semantic_rerank_enabled: bool = True,
+    semantic_margin: float = 0.02,
+    llm_tiebreak_enabled: bool = True,
 ) -> tuple[list[AlignedTriple], float]:
-    """
-    Align blocks across extractors using reference-based Hungarian assignment.
-
-    Uses the extractor with the most blocks as the reference, then aligns
-    the other two to it. Returns aligned triples and mean alignment confidence.
-    """
-    sources = sorted(blocks_by_source.keys())
-    if not sources:
+    """Align blocks across extractors using only full 3-way global DP."""
+    grobid_blocks = blocks_by_source.get("grobid", [])
+    docling_blocks = blocks_by_source.get("docling", [])
+    marker_blocks = blocks_by_source.get("marker", [])
+    if not grobid_blocks and not docling_blocks and not marker_blocks:
         return [], 0.0
 
-    # Pick reference: extractor with the most blocks
-    ref_source = max(sources, key=lambda s: len(blocks_by_source[s]))
-    other_sources = [s for s in sources if s != ref_source]
-    ref_blocks = blocks_by_source[ref_source]
+    score_config = ScoreConfig()
+    arbitration_config = ArbitrationConfig(
+        ambiguity_delta=ambiguity_delta,
+        semantic_rerank_enabled=semantic_rerank_enabled,
+        semantic_margin=semantic_margin,
+        llm_tiebreak_enabled=llm_tiebreak_enabled,
+        repair_ambiguity_delta=ambiguity_delta,
+        repair_semantic_margin=semantic_margin,
+    )
+    arbitration_context = ArbitrationContext()
+    partition_config = AnchorPartitionConfig(
+        enabled=anchor_partitioning_enabled,
+        min_anchor_score=anchor_min_score,
+        ambiguity_delta=ambiguity_delta,
+        include_structural_secondary=anchor_include_structural_secondary,
+        llm_tiebreak_enabled=llm_tiebreak_enabled,
+        max_heading_level=anchor_max_heading_level,
+    )
+    windows = build_alignment_windows(
+        grobid_blocks,
+        docling_blocks,
+        marker_blocks,
+        score_config=score_config,
+        partition_config=partition_config,
+        llm=llm,
+    )
 
-    if not ref_blocks:
-        return [], 0.0
+    columns = []
+    for win_idx, window in enumerate(windows):
+        logger.info(
+            "Alignment window %d/%d: grobid=%d, docling=%d, marker=%d blocks",
+            win_idx + 1, len(windows),
+            len(window.get("grobid", [])),
+            len(window.get("docling", [])),
+            len(window.get("marker", [])),
+        )
+        dp_result = align_three_way_global(
+            window.get("grobid", []),
+            window.get("docling", []),
+            window.get("marker", []),
+            config=score_config,
+        )
+        end_mode = choose_end_mode(
+            dp_result,
+            config=arbitration_config,
+            context=arbitration_context,
+            llm=llm,
+        )
+        window_columns = traceback_columns(dp_result, end_mode=end_mode)
+        window_columns = repair_split_merge_columns(
+            window_columns,
+            config=score_config,
+            arbitration_config=arbitration_config,
+            arbitration_context=arbitration_context,
+            llm=llm,
+        )
+        columns.extend(window_columns)
 
-    # Build alignment mapping: ref_index -> {source: (block, score)}
-    alignments: dict[int, dict[str, tuple[Block, float]]] = {
-        i: {} for i in range(len(ref_blocks))
-    }
-    leftover_blocks: list[tuple[Block, float]] = []  # (block, approx_position_ratio)
+    if arbitration_context.llm_tiebreak_calls > 0:
+        logger.info("Alignment LLM tiebreak calls: %d", arbitration_context.llm_tiebreak_calls)
 
-    for other_src in other_sources:
-        other_blocks = blocks_by_source.get(other_src, [])
-        if not other_blocks:
-            continue
-
-        n_ref = len(ref_blocks)
-        n_other = len(other_blocks)
-        max_idx_ref = max(b.order_index for b in ref_blocks) if ref_blocks else 1
-        max_idx_other = max(b.order_index for b in other_blocks) if other_blocks else 1
-
-        # Build cost matrix (minimize cost = maximize similarity)
-        # Add dummy columns/rows for gap assignment
-        size = max(n_ref, n_other)
-        cost_matrix = np.full((size, size), _GAP_PENALTY, dtype=float)
-
-        for i in range(n_ref):
-            for j in range(n_other):
-                score = _pair_score(ref_blocks[i], other_blocks[j], max_idx_ref, max_idx_other)
-                cost_matrix[i, j] = 100.0 - score  # convert similarity to cost
-
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-        matched_other_indices = set()
-        for r, c in zip(row_ind, col_ind):
-            if r < n_ref and c < n_other:
-                score = 100.0 - cost_matrix[r, c]
-                if score > (100.0 - _GAP_PENALTY):  # only accept if similarity beats gap cost
-                    alignments[r][other_src] = (other_blocks[c], score)
-                    matched_other_indices.add(c)
-
-        # Collect leftover unmatched blocks from this source
-        for j in range(n_other):
-            if j not in matched_other_indices:
-                pos_ratio = other_blocks[j].order_index / max(max_idx_other, 1)
-                leftover_blocks.append((other_blocks[j], pos_ratio))
-
-    # Build aligned triples with position ratios for interleaving
-    # Each entry: (position_ratio, triple, scores_list)
-    positioned_triples: list[tuple[float, AlignedTriple, list[float]]] = []
-    max_ref_idx = max(b.order_index for b in ref_blocks) if ref_blocks else 1
-
-    for ref_idx, ref_block in enumerate(ref_blocks):
-        triple = AlignedTriple(segment_id="")  # segment_id assigned after sorting
-        setattr(triple, f"{ref_source}_block", ref_block)
-
-        scores_for_triple: list[float] = []
-        for other_src in other_sources:
-            if other_src in alignments[ref_idx]:
-                block, score = alignments[ref_idx][other_src]
-                setattr(triple, f"{other_src}_block", block)
-                scores_for_triple.append(score)
-
-        triple.confidence = sum(scores_for_triple) / len(scores_for_triple) if scores_for_triple else 0.0
-        pos_ratio = ref_block.order_index / max(max_ref_idx, 1)
-        positioned_triples.append((pos_ratio, triple, scores_for_triple))
-
-    # Interleave leftover blocks by position ratio (not appended at end)
-    for block, pos_ratio in leftover_blocks:
-        triple = AlignedTriple(segment_id="")
-        setattr(triple, f"{block.source}_block", block)
-        triple.confidence = 0.0
-        positioned_triples.append((pos_ratio, triple, []))
-
-    # Sort all triples by document position, then assign segment_ids
-    positioned_triples.sort(key=lambda x: x[0])
-
-    triples: list[AlignedTriple] = []
-    all_scores: list[float] = []
-    for seg_idx, (_, triple, scores) in enumerate(positioned_triples):
-        triple.segment_id = f"seg_{seg_idx:03d}"
-        all_scores.extend(scores)
-        triples.append(triple)
-
-    # Mean alignment confidence
-    alignment_confidence = sum(all_scores) / len(all_scores) if all_scores else 0.0
-    alignment_confidence /= 100.0  # normalize to 0-1 range
-
-    return triples, alignment_confidence
-
-
+    return build_aligned_triples(columns, config=score_config)
