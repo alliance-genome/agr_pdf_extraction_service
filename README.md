@@ -6,6 +6,7 @@ The service runs three independent extraction engines on each PDF, then merges t
 
 ## Table of Contents
 
+- [Biocurator Quick Guide](#biocurator-quick-guide)
 - [How It Works -- Overview](#how-it-works----overview)
 - [The Three Extraction Engines](#the-three-extraction-engines)
 - [The Consensus Pipeline](#the-consensus-pipeline)
@@ -40,12 +41,56 @@ The service runs three independent extraction engines on each PDF, then merges t
 
 ---
 
+## Biocurator Quick Guide
+
+**What this service does:** You give it a scientific PDF, and it gives you back clean, structured text (in markdown format) that you can use for curation. It's more accurate than any single PDF-to-text tool because it runs three independent extraction engines and merges their outputs intelligently.
+
+**How to use it:**
+
+1. **Submit a PDF:**
+   ```bash
+   curl -X POST http://localhost:5000/api/v1/extract -F "file=@paper.pdf"
+   ```
+   This returns a `process_id` (the job runs in the background).
+
+2. **Check status:**
+   ```bash
+   curl http://localhost:5000/api/v1/extract/{process_id}
+   ```
+   Wait until `status` is `"complete"`.
+
+3. **Download the merged text:**
+   ```bash
+   curl -O http://localhost:5000/api/v1/extract/{process_id}/download/merged
+   ```
+
+**How to interpret quality grades:**
+
+| Grade | What It Means | Recommended Action |
+|-------|--------------|-------------------|
+| **A** (>= 0.95) | Nearly all text was agreed upon by multiple extractors or resolved with high confidence. Very reliable. | Use as-is for curation. |
+| **B** (>= 0.85) | Minor disagreements were resolved via LLM. Output is good. | Quick spot-check recommended. |
+| **C** (>= 0.70) | Several sections required fallback resolution. Check the `degraded_segments` list. | Review flagged sections manually. |
+| **D** (>= 0.50) | Significant portions fell back to single-extractor text. | Manual review recommended for critical data. |
+| **F** (< 0.50) | Extraction substantially failed. | Re-extract or consider manual extraction. |
+
+**Key fields in the API response:**
+- `consensus_metrics_json.degradation_metrics.quality_grade` -- The letter grade (A-F)
+- `consensus_metrics_json.degradation_metrics.quality_score` -- Numeric score (0.0-1.0)
+- `consensus_metrics_json.degradation_metrics.degraded_segments` -- Sections that may need manual review
+- `llm_cost_usd` -- How much the LLM processing cost for this paper
+- `artifacts_json.merged` -- S3 path to the merged markdown output
+
+Or just use the **web interface** at `http://localhost:5000` to upload and view results in your browser.
+
+---
+
 ## How It Works -- Overview
 
 When you submit a PDF, the service:
 
 1. **Extracts** the document with three independent engines (GROBID, Docling, Marker), each producing a markdown version of the paper
-2. **Parses** each markdown output into typed blocks (headings, paragraphs, tables, equations, figures, citations) and normalizes extractor-specific artifacts
+2. **Parses** each markdown output into typed blocks (headings, paragraphs, tables, equations, figure references) and normalizes extractor-specific artifacts
 3. **Aligns** blocks across the three sources using anchor-windowed 3-way Needleman-Wunsch DP alignment with composable scoring
 4. **Classifies** each aligned triple as AGREE_EXACT, AGREE_NEAR, GAP, or CONFLICT
 5. **Extracts micro-conflicts** -- word-level disagreement spans within each CONFLICT segment using a Numba-JIT-compiled 3-way token-level DP kernel, preserving surrounding majority-agreed tokens
@@ -62,18 +107,18 @@ The result is a single markdown file that is more accurate than any individual e
                             +------------+
                                   |
                                   v
-                     +------------------------------+
-                     |     Consensus Pipeline        |
-                     |                               |
-                     |  1. Parse into blocks          |
-                     |  2. 3-way DP alignment         |
-                     |  3. Classify agreement          |
-                     |  4. Guard gates                 |
-                     |  5. Token-level micro-conflicts |
-                     |  6. Layered resolution           |
-                     |  7. Assemble + dedup             |
-                     |  8. Heading hierarchy            |
-                     +------------------------------+
+                     +-----------------------------------+
+                     |       Consensus Pipeline          |
+                     |                                   |
+                     |  1. Parse into blocks             |
+                     |  2. 3-way DP alignment            |
+                     |  3. Classify agreement            |
+                     |  4. Guard gates                   |
+                     |  5. Token-level micro-conflicts   |
+                     |  6. Layered resolution            |
+                     |  7. Assemble + dedup              |
+                     |  8. Heading hierarchy             |
+                     +-----------------------------------+
                                   |
                                   v
                          Final Merged Markdown
@@ -85,13 +130,13 @@ The result is a single markdown file that is more accurate than any individual e
 
 Each engine has different strengths. Using all three together compensates for individual weaknesses.
 
-| Engine | How It Works | Strengths | Weaknesses |
-|--------|-------------|-----------|------------|
-| **GROBID** | Machine-learning model trained specifically on scientific papers; uses Conditional Random Fields (CRF) | Excellent at identifying paper structure (title, authors, abstract, sections, references); understands scientific document layout | Can struggle with complex tables, figures, and non-standard layouts |
-| **Docling** | IBM's document understanding toolkit; uses deep-learning vision models | Strong table extraction; good at preserving document formatting and structure | May occasionally merge adjacent sections or miss section boundaries |
-| **Marker** | Vision-language model pipeline; "sees" the PDF like a human would | Handles complex layouts, multi-column text, and embedded equations well; good image extraction | Can sometimes hallucinate text in low-quality scans; may split sections differently |
+| Engine | How It Works |
+|--------|-------------|
+| **GROBID** | Machine-learning model trained specifically on scientific papers; uses Conditional Random Fields (CRF) |
+| **Docling** | IBM's document understanding toolkit; uses deep-learning vision models |
+| **Marker** | Vision-language model pipeline; "sees" the PDF like a human would |
 
-All three engines run in parallel to minimize extraction time. GROBID is HTTP-based (runs as a separate service), while Docling and Marker run in-process and benefit from GPU acceleration when available.
+GROBID runs in a background thread while Docling and Marker run sequentially in the main thread, so GROBID extraction overlaps with the other two. GROBID is HTTP-based (runs as a separate service), while Docling and Marker run in-process and benefit from GPU acceleration when available. The web UI runs all three sequentially.
 
 ---
 
@@ -104,19 +149,18 @@ The consensus pipeline is the core algorithm that merges three independent extra
 Each extractor's markdown output is first run through **source-level normalization** (stripping HTML tags, stray image links, bold/italic/code markup, and web links so comparisons are fair), then parsed into individual **blocks** using a mistune-based AST parser. A block is a logical unit of content:
 
 - **Heading** -- Section titles (e.g., `## Introduction`, `### Methods`), with heading level recorded
-- **Paragraph** -- Body text
+- **Paragraph** -- Body text (including reference sections)
 - **Table** -- Data tables
 - **Equation** -- Mathematical expressions
 - **Figure reference** -- Image captions or figure descriptions
-- **Citation list** -- Reference entries
 
 Each block records its type, raw text, normalized text (for comparison), heading level (if applicable), position in the document (`order_index`), source extractor name, and original source markdown.
 
-**Sparse extractor exclusion:** If one extractor produced dramatically fewer blocks than the others (less than 30% of the maximum), it is excluded from alignment entirely. This prevents a partially-failed extraction from poisoning the merge.
+**Sparse extractor exclusion:** If one extractor produced dramatically fewer blocks than the others (more than zero but less than 30% of the maximum), it is excluded from alignment entirely. This prevents a partially-failed extraction from poisoning the merge. An extractor that produced zero blocks is simply absent from alignment.
 
 ### Step 2: Align -- 3-Way Needleman-Wunsch DP Alignment
 
-The pipeline needs to figure out which block from GROBID corresponds to which block from Docling and Marker. This is a three-way sequence alignment problem -- extractors may split paragraphs differently, skip sections, or order content slightly differently.
+The pipeline needs to figure out which block from each extractor corresponds to the same content in the others. This is a three-way sequence alignment problem -- extractors may split paragraphs differently, skip sections, or order content slightly differently.
 
 The alignment uses a **full 3-way Needleman-Wunsch dynamic programming algorithm** (implemented in `app/services/alignment/dp3.py`) that considers all three source sequences simultaneously. This is not a pairwise algorithm run twice -- it operates in a true 3-dimensional DP tensor.
 
@@ -143,55 +187,46 @@ Each aligned triple is classified into one of four categories:
 | Classification | What It Means | What Happens |
 |---------------|---------------|--------------|
 | **AGREE_EXACT** | Two or more extractors produced identical text (after normalization) | Text is accepted as-is -- no LLM needed |
-| **AGREE_NEAR** | Text is very similar (>92% token overlap AND >90% character-level match) with no differences in numbers or citations | Best version is selected automatically -- no LLM needed |
-| **GAP** | A block appears in only one extractor (the others have nothing at that position) | Usually kept as-is, since one extractor found content the others missed |
+| **AGREE_NEAR** | Text is very similar (>=92% token overlap AND >=90% character-level match) with no differences in numbers or citations | Best version is selected automatically. However, if token-level disagreements remain, the segment may still enter micro-conflict extraction and reach the LLM |
+| **GAP** | A block appears in only one extractor (the others have nothing at that position) | Single-source GAPs are sent to the LLM for validation (the LLM may keep, rewrite, or drop them as artifacts). If the LLM call fails, the original extractor text is preserved as fallback |
 | **CONFLICT** | The extractors disagree and the differences are significant enough to matter | Sent to the conflict resolution pipeline |
 
 **Numeric and citation guardrails for AGREE_NEAR:** If two blocks are textually similar but differ in numbers (e.g., "p < 0.05" vs "p < 0.5") or citation references (e.g., "[1,2]" vs "[1,3]"), the block is escalated to CONFLICT. This prevents silently accepting corrupted data values.
 
-**Strict numeric near mode** (default: enabled via `CONSENSUS_STRICT_NUMERIC_NEAR=true`): When enabled, AGREE_NEAR is disabled for any block containing numbers -- such blocks must be AGREE_EXACT or they become CONFLICT. This is the safest option for scientific PDFs but increases LLM usage.
+**Strict numeric near mode** (default: enabled via `CONSENSUS_STRICT_NUMERIC_NEAR=true`): When enabled, AGREE_NEAR is blocked for block pairs where the numeric tokens **differ** between extractors -- such pairs must be AGREE_EXACT or they become CONFLICT. When all numbers match between extractors, the deterministic AGREE_NEAR path is still used, avoiding unnecessary LLM exposure. This is the safest option for scientific PDFs but increases LLM usage when numbers differ.
 
 **Table and equation escalation** (default: enabled via `CONSENSUS_ALWAYS_ESCALATE_TABLES=true`): Tables and equations are always escalated to CONFLICT regardless of similarity, since even minor formatting differences can change their meaning.
 
-**Source preference for AGREE_NEAR:** When the best version needs to be selected, the pipeline uses a source preference table:
-
-| Block Type | Preferred Extractor | Why |
-|-----------|-------------------|-----|
-| Headings | GROBID | Best at identifying paper structure |
-| Paragraphs | Marker | Best at preserving complete body text |
-| Tables | Docling | Strongest table extraction |
-| Equations | Docling | Good structured content handling |
-| Figure references | Marker | Best at image/figure context |
-| Citation lists | GROBID | Trained specifically on reference parsing |
-
 ### Step 3b: GAP Deduplication
 
-Before evaluating guard gates, the pipeline removes duplicate GAP blocks using a local window comparison. Each GAP block is compared against nearby GAP blocks (within a 3-block window). If two GAPs are 85% or more similar, the shorter duplicate is removed.
+Before evaluating guard gates, the pipeline removes duplicate GAP blocks using a local window comparison. Each GAP block is compared against nearby GAP blocks (within a 3-block window). Two GAPs must first pass a length ratio gate (the shorter must be at least 70% the length of the longer), then if they are 85% or more similar, the shorter duplicate is removed.
 
 ### Step 4: Guard Gates -- Document Health Assessment
 
 Before resolving conflicts, the pipeline evaluates the overall difficulty of the document through several guard gates:
 
-| Guard Gate | Threshold | What Triggers It |
-|------------|-----------|-----------------|
-| **Overall conflict ratio** | > adaptive threshold (default 40%) | Too many total disagreements across all block types |
-| **Textual conflict ratio** | > 40% of text blocks are CONFLICT | Too many disagreements in body text |
-| **Structured conflict ratio** | > 85% of tables/equations are CONFLICT | Extractors fundamentally disagree on structured content |
-| **Alignment confidence** | < 0.50 | The block-matching step had very low confidence |
+| Guard Gate | Threshold | Effect |
+|------------|-----------|--------|
+| **Alignment confidence** | < 0.50 | **Hard failure** — extraction fails with a clear error rather than producing unreliable output |
+| **Overall conflict ratio** | > adaptive threshold (default 40%) | Telemetry only — logged for monitoring, does not block the pipeline |
+| **Textual conflict ratio** | _(computed, no threshold check)_ | Telemetry only — logged for monitoring, does not block the pipeline |
+| **Structured conflict ratio** | _(computed, no threshold check)_ | Telemetry only — logged for monitoring, does not block the pipeline |
 
-The only guard gate that causes a **hard failure** is alignment confidence -- if the block-matching step had very low confidence, the extraction fails with a clear error rather than producing unreliable output. All other guard metrics are logged as telemetry for monitoring but do not block the pipeline.
+The only guard gate that causes a hard failure is alignment confidence. All other guard metrics are computed and logged as telemetry for monitoring but do not block the pipeline or change resolution behavior.
 
-**Localized conflict relief:** If conflicts are clustered in one part of the document rather than spread throughout, this is noted in telemetry metrics. Localized conflicts within a span smaller than 35% of the document, with fewer than 25 conflict blocks, receive a configurable relief adjustment.
+**Localized conflict relief:** If conflicts are clustered in one part of the document rather than spread throughout, this is noted in telemetry metrics. Localized conflicts within a span smaller than 35% of the document, with at most 25 conflict blocks, receive a configurable relief adjustment.
 
 ### Step 5: Extract Micro-Conflicts -- Numba-JIT Token-Level DP
 
-Before sending anything to the LLM, the pipeline performs **3-way token-level dynamic programming alignment** on each CONFLICT segment to isolate exactly where the extractors disagree. This produces **micro-conflicts** -- small contiguous spans of disagreement surrounded by tokens where all extractors agree.
+> **In plain language:** When two extractors mostly agree on a paragraph but differ on specific words or phrases (for example, one says "α-synuclein" and the other says "a-synuclein"), the system identifies exactly which words differ and asks the LLM to resolve only those narrow disagreements, rather than regenerating the entire paragraph. This saves cost and preserves the already-correct surrounding text.
+
+Before sending anything to the LLM, the pipeline performs **3-way token-level dynamic programming alignment** on each CONFLICT, AGREE_NEAR, and multi-source GAP segment to isolate exactly where the extractors disagree. This produces **micro-conflicts** -- small contiguous spans of disagreement surrounded by tokens where all extractors agree.
 
 The extraction uses the same 3-way Needleman-Wunsch algorithm family as block-level alignment, but operates at the **token level** with a **Numba-JIT-compiled kernel** (`_token_dp_kernel` in `dp3.py`, decorated with `@numba.njit(nogil=True, cache=True)`). This gives ~50-100x speedup over pure Python and releases the GIL, enabling parallel token alignment across segments via `ThreadPoolExecutor`.
 
 The process for each CONFLICT segment:
 
-1. **Tokenize** all extractor texts (word-level split with sentence-end punctuation separated). Token streams are capped at 500 tokens per source.
+1. **Tokenize** all extractor texts (word-level split with sentence-end punctuation separated). If any token stream exceeds 500 tokens, the token-level DP is skipped entirely and the whole segment is treated as a single conflict sent straight to LLM resolution.
 2. **Normalize** for comparison -- strip markdown formatting, normalize Unicode dashes/quotes, collapse whitespace.
 3. **Run 3-way token DP** -- the Numba kernel fills a 3D score tensor and backpointer array. Returns aligned token columns.
 4. **Majority vote** at each position -- if 2+ extractors agree on a token, it is accepted as agreed.
@@ -199,7 +234,7 @@ The process for each CONFLICT segment:
 6. **Coalesce** nearby micro-conflicts (within a configurable gap, default 8 tokens) to avoid excessive fragmentation.
 7. **Add context** -- each micro-conflict carries surrounding agreed tokens as context for the LLM (capped at 30 tokens).
 
-**High-divergence fallback:** If the majority-agree ratio for a segment is below a threshold (default 40%), or a conflict span exceeds 12 tokens, or the segment has fewer than 10 tokens, the segment is treated as fully divergent and goes through full-segment resolution rather than micro-conflict resolution.
+**High-divergence coalescing:** If the majority-agree ratio for a segment is below a threshold (default 40%) and the segment has at least 10 tokens, or if the number of conflict spans is more than 12, nearby micro-conflicts are coalesced into larger spans (merging conflicts within 8 tokens of each other). This reduces fragmentation and sends fewer, larger conflict regions to the LLM. True full-segment fallback (skipping token-level DP entirely and treating the whole segment as one conflict) occurs when any token stream exceeds 500 tokens.
 
 **Parallelism:** Token alignment runs in parallel threads because the Numba kernel releases the GIL. The block-level DP alignment is inherently sequential (single 3D tensor fill), but each window from anchor partitioning can be aligned independently.
 
@@ -209,7 +244,7 @@ All conflicts are resolved through a **layered approach**, starting with the che
 
 #### Layer 1: Median-Source Selection (No LLM)
 
-For blocks where all three extractors have output and the micro-conflict count is below a threshold (default 20), the pipeline picks the text that is most similar to the other two -- the "median" source. If the median source has at least 60% pairwise similarity to the others, it is accepted without any LLM call.
+For blocks where all three extractors have output and the micro-conflict count is at most a threshold (default 20), the pipeline picks the text that is most similar to the other two -- the "median" source. If the maximum pairwise similarity across all source pairs is at least 60%, the median source is accepted without any LLM call.
 
 #### Layer 2: Per-Segment Micro-Conflict LLM Resolution
 
@@ -225,7 +260,7 @@ The LLM responds with a structured `action` per conflict: **keep** (use resolved
 
 **Reasoning escalation:** If the initial LLM call fails to resolve a micro-conflict, it is retried with increased reasoning effort (up to the configured number of retry rounds, default 2).
 
-**Numeric integrity guard:** After LLM resolution, the pipeline checks whether the output contains any number that did not appear anywhere in the source extractor texts. If novel numbers are detected, the segment is retried with a stricter instruction requiring explicit numeric-integrity justification. If the LLM still invents numbers, the segment falls back to best-source and the paper's quality score is heavily penalized.
+**Numeric integrity guard:** After LLM resolution, the pipeline checks whether the output contains any number that did not appear anywhere in the source extractor texts. If novel numbers are detected, the segment is retried with a stricter instruction requiring explicit numeric-integrity justification. If the rescue LLM's output still contains novel numbers, the text is **accepted but flagged as degraded** (the rescue LLM was explicitly told about the issue and given context to fix it). The segment only falls back to best-source text when the rescue LLM returns no usable text at all. Either outcome penalizes the paper's quality score.
 
 **Post-resolution validation:** Every resolved segment goes through three checks:
 1. **Dropped numbers check** -- numbers present in source but missing from output
@@ -236,7 +271,7 @@ The LLM responds with a structured `action` per conflict: **keep** (use resolved
 
 If any segments remain unresolved after micro-conflict resolution (the LLM returned empty or failed to parse), the pipeline attempts rescue resolution:
 
-**Tier 1 -- Focused LLM retry with enriched context:** The unresolved segment is re-sent to the LLM with more surrounding context (5 blocks on each side) and any already-resolved neighboring segments. The LLM can also determine that a segment genuinely should be empty (e.g., duplicate heading, page artifact) by setting `is_intentionally_empty=true` with a required explanation.
+**Tier 1 -- Focused LLM retry with enriched context:** The unresolved segment is re-sent to the LLM with more surrounding context (5 blocks on each side) and any already-resolved neighboring segments. Rescue calls use their own configurable model and reasoning effort (`LLM_MODEL_GENERAL_RESCUE` / `LLM_REASONING_GENERAL_RESCUE`), which can be set higher than the default to improve rescue success rate. The LLM can also determine that a segment genuinely should be empty (e.g., duplicate heading, page artifact) by setting `is_intentionally_empty=true` with a required explanation.
 
 **Tier 2 -- Best-source fallback (no LLM):** If the LLM retry also fails, the pipeline falls back to a deterministic heuristic -- containment check (if one extractor's text fully contains the others, that version is selected) or longest version. These segments are tracked as "degraded" in quality metrics.
 
@@ -247,7 +282,7 @@ If any segments remain unresolved after micro-conflict resolution (the LLM retur
 The resolved blocks are reassembled into a single markdown document in the correct order, then cleaned:
 
 - **Post-assembly paragraph deduplication** -- removes blocks that appear more than once (common when extractors overlap at section boundaries)
-- **HTML cleanup** -- strips leftover HTML tags, comments, and span elements
+- **HTML cleanup** -- strips leftover span tags and HTML comments
 - **Whitespace normalization** -- ensures consistent spacing between sections
 
 ### Step 8: Heading Hierarchy -- Fix Section Structure
@@ -265,7 +300,6 @@ The LLM can take three actions per heading:
 - The LLM cannot change heading text -- only the level
 - The paper title must be H1
 - Maximum one H1 heading
-- No heading level jumps greater than allowed limits
 - Demotion count is capped
 - If validation fails, the original heading levels are kept unchanged
 
@@ -274,6 +308,8 @@ A post-hierarchy deduplication pass catches any duplicates exposed by heading de
 ---
 
 ## The Alignment Subpackage
+
+> **In plain language:** The alignment system figures out which paragraphs from each PDF extractor correspond to the same part of the paper. It works similarly to how biologists align DNA or protein sequences -- finding the best match between three "sequences" of text blocks. The algorithm scores how well blocks match, handles cases where one extractor splits or merges paragraphs, and marks regions where extractors disagree for further resolution. **Biocurators can safely skip this section** -- it's here for developers who need to understand the internals.
 
 The alignment system lives in `app/services/alignment/` and consists of nine modules that implement a full 3-way sequence alignment pipeline. This section describes each component in detail.
 
@@ -289,7 +325,7 @@ The scoring system uses a composable `ScoreConfig` dataclass that operates in a 
 |--------|--------|-----------------|
 | `token_set_ratio` | 55% | Overlap regardless of word order |
 | `token_sort_ratio` | 30% | Overlap with word-order sensitivity |
-| `ratio` (raw) | 15% | Strict character-level edit distance |
+| `ratio` (raw) | 15% | Strict character-level sequence similarity |
 
 The blend ensures that tiny text fragments do not score near-perfect against long blocks (the raw ratio penalizes length mismatches).
 
@@ -297,7 +333,7 @@ The blend ensures that tiny text fragments do not score near-perfect against lon
 
 | Adjustment | Value | When Applied |
 |-----------|-------|-------------|
-| Family match bonus | +0.06 | Both blocks are the same non-paragraph type (heading-heading, table-table, etc.) |
+| Family match bonus | +0.06 | Both blocks are the same type, excluding paragraph and citation families (heading-heading, table-table, etc.) |
 | Cross-family penalty | -0.55 | Incompatible block types (e.g., table vs heading) |
 | Heading pair bonus | +0.10 | Both blocks are headings |
 | Heading level bonus | up to +0.06 | Heading level delta is small (scaled by `1.0 - 0.25 * delta`) |
@@ -322,7 +358,7 @@ Full 3-way DP has O(n_g * n_d * n_m) time complexity, which becomes expensive fo
 
 1. **Identify anchor candidates** -- blocks that are H1 or H2 headings (configurable via `max_heading_level`), and optionally tables/figures as secondary anchors.
 2. **Run a mini 3-way DP** on just the anchor blocks to find their optimal alignment.
-3. **Select strong anchors** -- aligned anchor triples where all three sources match with a score above `min_anchor_score` (default 0.72) and no ambiguity (no alternative alignment within `ambiguity_delta` of 0.03).
+3. **Select strong anchors** -- aligned columns where at least two sources match with a score above `min_anchor_score` (default 0.72). Anchors scoring within the ambiguity band (between `min_anchor_score - ambiguity_delta` and `min_anchor_score + ambiguity_delta`, default delta 0.03) are sent to an LLM keep/drop decision.
 4. **Partition** the full block sequences at anchor boundaries, creating windows of blocks between consecutive anchors.
 5. **Conservation invariant check** -- every block must appear in exactly one window after partitioning.
 6. **Align each window independently** using the full 3-way DP.
@@ -365,7 +401,7 @@ The DP recurrence at each cell considers all 7 transitions from all 8 previous m
 - Releases the GIL (`nogil=True`), enabling parallel execution across threads
 - Caches compiled code (`cache=True`) for fast subsequent invocations
 - Uses numpy arrays directly for the DP tensor
-- Caps token streams at 500 tokens per source to bound memory and runtime
+- Skips token-level DP entirely when any source exceeds 500 tokens (routes the whole segment as a single conflict)
 
 ### Traceback and Column Construction
 
@@ -382,7 +418,7 @@ After the DP tensor is filled, traceback reconstructs the optimal alignment path
 
 A **monotonicity assertion** verifies that block indices increase along the alignment path.
 
-The `build_aligned_triples` function converts columns into `AlignedTriple` objects with per-column confidence scores and a global alignment confidence (mean of all column confidences).
+The `build_aligned_triples` function converts columns into `AlignedTriple` objects with per-column confidence scores and a global alignment confidence (mean of all pairwise scores across columns, so columns with three sources contribute more weight than two-source columns).
 
 ### Split/Merge Repair
 
@@ -409,7 +445,7 @@ When two alignment candidates score within `ambiguity_delta` (default 0.03) of e
 
 1. **Semantic rerank** (enabled by default): Compute the average lexical similarity across all columns for each candidate alignment. If one candidate is better by at least `semantic_margin` (0.02), prefer it.
 
-2. **LLM tiebreak** (configurable, default disabled in production): Send a summary of the two candidate alignments to the LLM with the surrounding columns for context. The LLM returns a structured `AlignmentTieBreakResponse` choosing candidate A or B with an explanation.
+2. **LLM tiebreak** (enabled by default): Send a summary of the two candidate alignments to the LLM with the surrounding columns for context. The LLM returns a structured `AlignmentTieBreakResponse` choosing candidate A or B with an explanation. Can be disabled via `CONSENSUS_ALIGNMENT_LLM_TIEBREAK_ENABLED=false` to reduce LLM cost.
 
 The same arbitration logic is used for both end-mode selection in the main DP and repair candidate decisions.
 
@@ -433,17 +469,17 @@ The LLM service wraps OpenAI API calls with structured Pydantic response models,
 | `conflict_batch` | Batched full-segment conflict resolution | gpt-5.2 | low |
 | `alignment_tiebreak` | Break close-score alignment ties | gpt-5.2 | low |
 
-Each call type can independently override both model and reasoning effort via environment variables (e.g., `LLM_MODEL_ZONE_RESOLUTION`, `LLM_REASONING_ZONE_RESOLUTION`). Falls back to `LLM_MODEL` / `LLM_REASONING_EFFORT` when not set.
+Call types can override model and reasoning effort via environment variables. Available suffixes: `ZONE_RESOLUTION` (used by `micro_conflict` and `alignment_tiebreak`), `GENERAL_RESCUE`, `NUMERIC_RESCUE`, `CONFLICT_BATCH`. Note that `micro_conflict` and `alignment_tiebreak` share the same `ZONE_RESOLUTION` override — they are not independently configurable. Falls back to `LLM_MODEL` / `LLM_REASONING_EFFORT` when not set.
 
 ### Token Accumulator
 
 The `TokenAccumulator` class provides thread-safe per-(call_type, model) token usage tracking:
 
-- Records `prompt_tokens`, `completion_tokens`, `cached_tokens`, `reasoning_tokens` per call
+- Records `prompt_tokens`, `completion_tokens`, `cached_tokens`, and call count per call
 - Keyed by `(call_type, model)` tuples
 - Thread-safe via `threading.Lock`
-- `compute_cost()` computes total USD cost from token counts using the `LLM_PRICING` dict in config
 - `summary()` returns a serializable breakdown by call type and model
+- A companion `compute_cost()` function (module-level, not a method) computes total USD cost from the summary using the `LLM_PRICING` dict in config
 
 ### Cost Tracking in Database
 
@@ -476,33 +512,44 @@ Every extraction produces both top-level consensus metrics and detailed degradat
 
 ### Quality Score and Grade
 
-The quality score is a weighted sum based on how each segment was resolved:
+The quality score is a weighted sum based on how each segment was resolved. Segments that were agreed upon by extractors (`AGREE_EXACT`, `AGREE_NEAR`) contribute an implicit weight of 1.0 each — they are not listed in the resolution method table because they needed no conflict resolution.
 
-| Resolution Method | Quality Weight | Tier |
-|-------------------|---------------|------|
-| `agree_exact` | 1.00 | high |
-| `agree_near` | 1.00 | high |
-| `median_source` | 1.00 | high |
-| `majority_vote` | 1.00 | high |
-| `micro_conflict_llm` | 1.00 | high |
-| `llm_conflict` | 1.00 | high |
-| `llm_gap` | 1.00 | high |
-| `llm_rescue_resolved` | 0.95 | medium_high |
-| `llm_conflict_rescue_resolved` | 0.95 | medium_high |
-| `llm_rescue_intentional_drop` | 0.95 | medium_high |
-| `llm_conflict_rescue_intentional_drop` | 0.95 | medium_high |
-| `deterministic_two_source` | 0.85 | medium |
-| `llm_conflict_fallback_best_source` | 0.40 | low |
+**Resolution method weights** (from `METHOD_QUALITY_WEIGHT` in `degradation_metrics.py`):
+
+| Resolution Method | Weight | Tier | What Happened |
+|-------------------|--------|------|---------------|
+| `llm_conflict` | 1.00 | high | LLM resolved a conflict between extractors |
+| `llm_near_agree` | 1.00 | high | LLM resolved a near-agreement with token-level differences |
+| `llm_gap` | 1.00 | high | LLM validated a single-source gap segment |
+| `median_source` | 1.00 | high | Median extractor text selected without LLM |
+| `llm_rescue_resolved` | 0.95 | high | Rescue retry succeeded |
+| `llm_conflict_rescue_resolved` | 0.95 | high | Conflict rescue retry succeeded |
+| `llm_near_agree_rescue_resolved` | 0.95 | high | Near-agree rescue retry succeeded |
+| `llm_rescue_intentional_drop` | 0.95 | high | LLM determined segment is an artifact — intentionally dropped |
+| `llm_conflict_rescue_intentional_drop` | 0.95 | high | Conflict segment intentionally dropped after rescue |
+| `llm_near_agree_rescue_intentional_drop` | 0.95 | high | Near-agree segment intentionally dropped after rescue |
+| `deterministic_two_source` | 0.85 | medium_high | Two-source heuristic selection (no LLM) — defined in weight table but not currently produced by any resolution path |
+| `llm_conflict_numeric_guard_rescue_resolved` | 0.85 | medium_high | Numeric guard fired, rescue fixed the numbers |
+| `llm_near_agree_numeric_guard_rescue_resolved` | 0.85 | medium_high | Same for near-agree |
+| `llm_gap_numeric_guard_rescue_resolved` | 0.85 | medium_high | Same for gap |
+| `zone_fallback_best_source` | 0.40 | medium | Best extractor text used as fallback (no LLM validation) |
+| `llm_conflict_fallback_best_source` | 0.40 | medium | Conflict LLM failed, fell back to best extractor |
+| `llm_near_agree_fallback_best_source` | 0.40 | medium | Near-agree LLM failed, fell back to best extractor |
+| `llm_conflict_numeric_guard_fallback_best_source` | 0.30 | medium | Numeric guard fired, rescue also failed — best source used |
+| `llm_near_agree_numeric_guard_fallback_best_source` | 0.30 | medium | Same for near-agree |
+| `llm_gap_numeric_guard_fallback_best_source` | 0.30 | medium | Same for gap |
+
+Any method not listed above receives a default weight of 0.50. Notable unlisted methods: `*_post_validation_rescue` variants (segment re-rescued after post-resolution validation detected issues like dropped numbers or numeric truncation). Note: when micro-conflict extraction finds zero disagreements, the segment is reclassified as AGREE_EXACT before reaching the resolver.
 
 **Quality Grade:**
 
-| Grade | Score Range |
-|-------|------------|
-| A | >= 0.95 |
-| B | >= 0.85 |
-| C | >= 0.70 |
-| D | >= 0.50 |
-| F | < 0.50 |
+| Grade | Score Range | What It Means |
+|-------|------------|---------------|
+| A | >= 0.95 | Excellent — nearly all content agreed or high-confidence resolution |
+| B | >= 0.85 | Good — minor disagreements resolved |
+| C | >= 0.70 | Fair — several sections needed fallback resolution |
+| D | >= 0.50 | Poor — significant fallback usage |
+| F | < 0.50 | Failed — extraction substantially unreliable |
 
 A paper-level penalty is applied when the numeric integrity guard fires (best-source fallback due to LLM inventing numbers).
 
@@ -514,11 +561,11 @@ The `degradation_metrics` object in the response includes:
 |-------|-------------|
 | `quality_score` / `quality_grade` | Overall quality (0.0-1.0) and letter grade |
 | `resolution_summary` | Breakdown by method and quality tier |
-| `degraded_segments` | Segments where LLM failed and deterministic fallback was used |
+| `degraded_segments` | Segments marked as degraded (includes deterministic fallbacks after LLM failure, rescued LLM outputs with issues, and post-validation failures) |
 | `rescue_segments` | Segments that needed rescue retry, with explanations |
 | `confidence_distribution` | Statistical spread: mean, median, min, max, std_dev, p10/p25/p75/p90, percentage below 50%/25% |
 | `section_risk` | Per-section risk assessment keyed by resolved heading hierarchy paths (e.g., "Methods > RNA Extraction"). Reports risk level: none/low/medium/high |
-| `risk_flags` | Boolean alerts: `high_degradation_rate` (>10%), `low_confidence_cluster` (3+ consecutive low-confidence), `degradation_concentrated` (>50% in one section), `high_risk_top_level_heading`, `numeric_integrity` |
+| `risk_flags` | Boolean alerts: `high_degradation_rate` (>10%), `low_confidence_cluster` (3+ consecutive low-confidence), `degradation_concentrated` (>50% of degraded segments share the same context), `high_risk_top_level_heading`, `numeric_integrity_violation` (LLM invented numbers), `numeric_integrity_fallback` (fell back to best-source after numeric issue) |
 | `token_efficiency` | Token usage breakdown: micro-conflict tokens, rescue tokens, total consensus tokens |
 
 ---
@@ -555,9 +602,9 @@ Optional fields:
 curl http://localhost:5000/api/v1/extract/{process_id}
 ```
 
-**Status progression:** `pending` -> `started` -> `progress` -> `complete`
+**Status progression:** `pending` -> `started` -> `progress` -> `complete` | `failed`
 
-When complete, the response includes consensus metrics, degradation metrics, LLM cost, download paths, and artifact references.
+When complete, the response includes consensus metrics, degradation metrics, LLM cost, artifact S3 keys, and process metadata. Use the `/download/{method}` and `/artifacts/urls` endpoints to download outputs.
 
 #### Download Results
 
@@ -611,11 +658,14 @@ cd agr_pdf_extraction_service
 cp .env.example .env
 # Edit .env -- set at minimum: OPENAI_API_KEY
 
-# 3. Deploy
+# 3a. Deploy (CPU only -- no GPU acceleration)
 cd deploy && ./deploy.sh
+
+# 3b. Deploy (GPU -- recommended for production)
+docker compose -f deploy/docker-compose.gpu.yml -p pdfx up -d --build
 ```
 
-The deploy script creates data directories, builds containers, starts all services, and runs health checks. On first run, Docling and Marker download ML models (~2-5 GB), which takes several minutes.
+**Note:** `deploy.sh` uses the CPU-only compose file (`docker-compose.yml`). For GPU-accelerated deployment (recommended -- significantly faster extraction), use the GPU compose command directly. On first run, Docling and Marker download ML models (~2-5 GB), which takes several minutes.
 
 **After deployment:**
 
@@ -669,10 +719,13 @@ The deploy script creates data directories, builds containers, starts all servic
 ```bash
 cd deploy
 
+./manage.sh start          # Start all services
+./manage.sh stop           # Stop all services
+./manage.sh restart        # Restart all services
 ./manage.sh status         # Container status + health checks
 ./manage.sh logs           # Follow all logs
 ./manage.sh logs worker    # Follow worker logs only
-./manage.sh restart        # Restart all services
+./manage.sh logs-tail      # Show last 100 log lines
 ./manage.sh rebuild        # Rebuild images and redeploy
 ./manage.sh shell          # Open bash in the app container
 ./manage.sh worker-status  # Show Celery worker info
@@ -690,7 +743,7 @@ All extraction outputs are stored in S3 via the audit trail, and tracked in the 
 | Markdown outputs and source PDFs | S3 (pre-signed URLs via API) | Permanent |
 | Run logs (NDJSON format) | S3 | Permanent |
 | Extracted images | S3 | Permanent |
-| Local cache (fast access) | Docker volume | Cleared on cleanup |
+| Local cache (fast access) | Bind-mounted host directory | Persists across container restarts; manual deletion required |
 
 **Prerequisites for durable storage:**
 
@@ -706,6 +759,17 @@ Without S3 access, extraction still works but outputs are only in local cache.
 ## Configuration Reference
 
 All settings live in `config.py` with sensible defaults. Override via environment variables or `.env` file.
+
+### Essential Configuration (Most Users Only Need These)
+
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | Required — OpenAI API key for LLM-based conflict resolution |
+| `GROBID_URL` | GROBID server URL (default: `http://grobid:8070` in Docker) |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `AUDIT_S3_BUCKET` | S3 bucket for durable artifact storage (optional — works without S3) |
+
+Everything below is optional and has sensible defaults.
 
 ### Required
 
@@ -731,8 +795,8 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 |----------|---------|-------------|
 | `LLM_MODEL` | `gpt-5.2` | Base model for all LLM calls |
 | `LLM_REASONING_EFFORT` | `low` | Default reasoning effort for LLM calls |
-| `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5.2` | Model for micro-conflict resolution |
-| `LLM_REASONING_ZONE_RESOLUTION` | _(empty, falls back to LLM_REASONING_EFFORT)_ | Reasoning effort for micro-conflict resolution |
+| `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5.2` | Model for per-segment micro-conflict resolution |
+| `LLM_REASONING_ZONE_RESOLUTION` | _(empty, falls back to LLM_REASONING_EFFORT)_ | Reasoning effort for per-segment micro-conflict resolution |
 | `LLM_MODEL_GENERAL_RESCUE` | `gpt-5.2` | Model for general rescue resolution |
 | `LLM_REASONING_GENERAL_RESCUE` | _(empty)_ | Reasoning effort for general rescue |
 | `LLM_MODEL_NUMERIC_RESCUE` | `gpt-5.2` | Model for numeric integrity rescue |
@@ -752,16 +816,16 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 | `CONSENSUS_ENABLED` | `true` | Enable the consensus merge pipeline |
 | `CONSENSUS_NEAR_THRESHOLD` | `0.92` | Token similarity threshold for AGREE_NEAR classification |
 | `CONSENSUS_LEVENSHTEIN_THRESHOLD` | `0.90` | Character-level similarity threshold for AGREE_NEAR |
-| `CONSENSUS_CONFLICT_RATIO_FALLBACK` | `0.40` | Overall conflict ratio threshold (telemetry only) |
-| `CONSENSUS_CONFLICT_RATIO_TEXTUAL_FALLBACK` | `0.40` | Text-block conflict ratio (telemetry only) |
-| `CONSENSUS_CONFLICT_RATIO_STRUCTURED_FALLBACK` | `0.85` | Table/equation conflict ratio (telemetry only) |
+| `CONSENSUS_CONFLICT_RATIO_FALLBACK` | `0.40` | Overall conflict ratio threshold (telemetry/metrics only — does not block pipeline) |
+| `CONSENSUS_CONFLICT_RATIO_TEXTUAL_FALLBACK` | `0.40` | Defined but not currently consumed at runtime (reserved for future use) |
+| `CONSENSUS_CONFLICT_RATIO_STRUCTURED_FALLBACK` | `0.85` | Defined but not currently consumed at runtime (reserved for future use) |
 | `CONSENSUS_ALIGNMENT_CONFIDENCE_MIN` | `0.50` | Alignment confidence below this fails the extraction |
-| `CONSENSUS_LAYERED_ENABLED` | `true` | Enable layered conflict resolver (median-source + LLM) |
+| `CONSENSUS_LAYERED_ENABLED` | `true` | Defined but not currently checked at runtime — layered resolver always runs (reserved for future use) |
 | `CONSENSUS_LAYERED_MEDIUM_SIM_THRESHOLD` | `0.60` | Minimum pairwise similarity for median-source selection |
 | `CONSENSUS_MEDIAN_SOURCE_MAX_MICRO_CONFLICTS` | `20` | Max micro-conflicts for median-source to apply |
-| `CONSENSUS_ALWAYS_ESCALATE_TABLES` | `true` | Always send tables/equations to LLM, even if extractors agree |
-| `CONSENSUS_STRICT_NUMERIC_NEAR` | `true` | Disable AGREE_NEAR for any numeric-bearing block (must be AGREE_EXACT or CONFLICT) |
-| `CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES` | `true` | Flag global duplicates in QA gate |
+| `CONSENSUS_ALWAYS_ESCALATE_TABLES` | `true` | Always classify tables/equations as CONFLICT regardless of similarity (deterministic resolution may still resolve without LLM) |
+| `CONSENSUS_STRICT_NUMERIC_NEAR` | `true` | Escalate to CONFLICT when block pairs have differing numeric tokens (blocks with matching numbers can still be AGREE_NEAR) |
+| `CONSENSUS_FAIL_ON_GLOBAL_DUPLICATES` | `true` | Defined but not currently checked at runtime — QA duplicate detection always runs (reserved for future use) |
 | `CONSENSUS_HIERARCHY_ENABLED` | `true` | Enable heading hierarchy resolution step |
 
 ### Alignment
@@ -791,7 +855,7 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 |----------|---------|-------------|
 | `MICRO_CONFLICT_CONTEXT_CAP` | `30` | Max context tokens to include before/after each micro-conflict span |
 | `MICRO_CONFLICT_HIGH_DIVERGENCE_RATIO_THRESHOLD` | `0.40` | If majority-agree ratio is below this, treat segment as fully divergent |
-| `MICRO_CONFLICT_HIGH_DIVERGENCE_SPAN_THRESHOLD` | `12` | If a conflict span exceeds this many tokens, treat as high-divergence |
+| `MICRO_CONFLICT_HIGH_DIVERGENCE_SPAN_THRESHOLD` | `12` | If the number of micro-conflict spans exceeds this count, coalesce into larger spans |
 | `MICRO_CONFLICT_COALESCE_GAP` | `8` | Merge nearby micro-conflicts within this many tokens of each other |
 | `MICRO_CONFLICT_HIGH_DIVERGENCE_MIN_TOKENS` | `10` | Minimum token count for high-divergence detection to apply |
 
@@ -825,7 +889,7 @@ agr_pdf_extraction_service/
 |-- .env.example                      # Environment variable template
 |-- app/
 |   |-- __init__.py                   # Flask app factory
-|   |-- api.py                        # REST API v1 blueprint (11 endpoints)
+|   |-- api.py                        # REST API v1 blueprint (10 endpoints)
 |   |-- server.py                     # Web UI routes
 |   |-- models.py                     # SQLAlchemy models (ExtractionRun)
 |   |-- utils.py                      # File hashing, cache paths, image dirs
@@ -859,7 +923,8 @@ agr_pdf_extraction_service/
 |   |       |-- arbitration.py              # Close-score tiebreaking (semantic + LLM)
 |   |       +-- telemetry.py                # Audit-friendly reason string formatting
 |   +-- templates/
-|       +-- index.html                # Web UI template
+|       |-- index.html                # Web UI template
+|       +-- swagger.html              # Swagger UI for API documentation
 |-- tests/                            # Test suite
 +-- deploy/
     |-- Dockerfile                    # CPU container image

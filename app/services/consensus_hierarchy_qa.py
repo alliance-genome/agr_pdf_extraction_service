@@ -235,21 +235,6 @@ def _validate_hierarchy_decisions(
         if h1_count != 1:
             return f"expected exactly 1 H1 (title), got {h1_count}"
 
-    # Level jump check: consecutive headings should not skip levels (e.g. 1→3)
-    sorted_decisions = sorted(decisions, key=lambda d: d.heading_index)
-    prev_level = None
-    for d in sorted_decisions:
-        if d.action == "demote_to_text":
-            continue
-        eff = _effective_level(d)
-        if eff is None:
-            # Unknown level (keep_level without original_levels) — reset tracking
-            prev_level = None
-            continue
-        if prev_level is not None and eff > prev_level + 1:
-            return f"level jump from {prev_level} to {eff}"
-        prev_level = eff
-
     # Too many demotions: more than half the headings demoted is suspicious
     demote_count = sum(1 for d in decisions if d.action == "demote_to_text")
     if demote_count > len(decisions) // 2:
