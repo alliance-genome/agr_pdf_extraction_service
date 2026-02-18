@@ -27,6 +27,9 @@ gunicorn
 # Structured GELF logging
 pygelf~=0.4.2
 
+# Prompt management
+pyyaml
+
 # Utilities
 boto3
 python-multipart

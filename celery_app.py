@@ -171,6 +171,104 @@ def _is_cached(file_hash, method):
     return os.path.exists(_cached_path(file_hash, method))
 
 
+VALID_CACHE_CLEAR_SCOPES = {"none", "merge", "extraction", "all"}
+
+
+def _normalize_clear_cache_scope(clear_cache_scope=None, clear_cache=False):
+    """Normalize legacy/new cache-clear inputs to a single scope value."""
+    aliases = {
+        "": "",
+        "false": "none",
+        "0": "none",
+        "off": "none",
+        "none": "none",
+        "true": "all",
+        "1": "all",
+        "on": "all",
+        "all": "all",
+        "full": "all",
+        "merge": "merge",
+        "extraction": "extraction",
+        "extract": "extraction",
+        "extraction_and_merge": "extraction",  # "extraction" scope already includes merge artifacts
+    }
+
+    scope = ""
+    if clear_cache_scope is not None:
+        scope = str(clear_cache_scope).strip().lower()
+    scope = aliases.get(scope, scope)
+
+    if not scope:
+        return "all" if clear_cache else "none"
+    if clear_cache and scope == "none":
+        return "all"
+    if scope not in VALID_CACHE_CLEAR_SCOPES:
+        raise ValueError(
+            f"Invalid clear_cache_scope '{clear_cache_scope}'. "
+            f"Valid values: {', '.join(sorted(VALID_CACHE_CLEAR_SCOPES))}"
+        )
+    return scope
+
+
+def _clear_cached_outputs(file_hash, clear_cache_scope):
+    """Clear cached artifacts for a file hash according to scope."""
+    import glob as _glob
+    import shutil
+
+    version = Config.EXTRACTION_CONFIG_VERSION
+    prefix = os.path.join(Config.CACHE_FOLDER, f"v{version}_{file_hash}_")
+
+    patterns = []
+    if clear_cache_scope == "all":
+        patterns = [f"{prefix}*"]
+    else:
+        if clear_cache_scope in {"merge", "extraction"}:
+            patterns.extend([
+                f"{prefix}merged.md",                  # vX_<hash>_merged.md
+                f"{prefix}*_merged.md",               # vX_<hash>_<methods>_merged.md
+                f"{prefix}*_consensus_metrics.json",
+                f"{prefix}*_audit.json",
+            ])
+        if clear_cache_scope == "extraction":
+            patterns.extend([
+                f"{prefix}grobid.md",
+                f"{prefix}docling.md",
+                f"{prefix}marker.md",
+            ])
+
+    removed_files = 0
+    seen = set()
+    for pattern in patterns:
+        for cached_file in _glob.glob(pattern):
+            if cached_file in seen:
+                continue
+            seen.add(cached_file)
+            if not os.path.isfile(cached_file):
+                continue
+            try:
+                os.remove(cached_file)
+                removed_files += 1
+            except OSError as exc:
+                logger.warning("Failed to remove cached file %s: %s", cached_file, exc)
+
+    removed_images_dir = 0
+    if clear_cache_scope in {"extraction", "all"}:
+        images_dir = _get_images_dir(file_hash)
+        if os.path.isdir(images_dir):
+            try:
+                shutil.rmtree(images_dir)
+                removed_images_dir = 1
+            except OSError as exc:
+                logger.warning("Failed to remove images dir %s: %s", images_dir, exc)
+
+    return {
+        "scope": clear_cache_scope,
+        "files_removed": removed_files,
+        "images_dirs_removed": removed_images_dir,
+        "removed_total": removed_files + removed_images_dir,
+    }
+
+
 def _get_db_session():
     try:
         return get_session()
@@ -348,6 +446,7 @@ def extract_pdf(
     methods,
     merge=False,
     clear_cache=False,
+    clear_cache_scope="none",
     process_id=None,
     reference_curie=None,
     mod_abbreviation=None,
@@ -360,6 +459,8 @@ def extract_pdf(
         pdf_path: Absolute path to the uploaded PDF on disk.
         methods: List of extractor names, e.g. ["grobid", "docling", "marker"].
         merge: Whether to run the LLM merge step after extraction.
+        clear_cache: Legacy boolean full-clear flag (backward compatible).
+        clear_cache_scope: Scoped cache clear mode: none|merge|extraction|all.
 
     Returns:
         dict with status, file_hash, per-method outputs, and optional merged output.
@@ -393,29 +494,20 @@ def extract_pdf(
             _safe_close_session(db_session)
         return {"status": "failed", "error": f"PDF file not found: {pdf_path}", "process_id": process_id}
 
-    # Clear cached outputs for this PDF if requested
-    if clear_cache:
-        import glob as _glob
-        import shutil
-        version = Config.EXTRACTION_CONFIG_VERSION
-        pattern = os.path.join(Config.CACHE_FOLDER, f"v{version}_{file_hash}_*")
-        removed = 0
-        for cached_file in _glob.glob(pattern):
-            try:
-                os.remove(cached_file)
-                removed += 1
-            except OSError:
-                pass
-        # Also clear extracted images directory
-        images_dir = _get_images_dir(file_hash)
-        if os.path.isdir(images_dir):
-            shutil.rmtree(images_dir, ignore_errors=True)
-            removed += 1
-        if removed:
+    # Clear cached outputs for this PDF if requested (scoped clear supported).
+    clear_scope = _normalize_clear_cache_scope(clear_cache_scope, clear_cache=clear_cache)
+    if clear_scope != "none":
+        cleared = _clear_cached_outputs(file_hash, clear_scope)
+        if cleared["removed_total"]:
             adapter.info(
-                "Cleared %d cached file(s) for hash %s",
-                removed, file_hash,
-                extra={"_event": "cache_cleared", "_files_removed": removed},
+                "Cleared %d cached artifact(s) for hash %s (scope=%s)",
+                cleared["removed_total"], file_hash, clear_scope,
+                extra={
+                    "_event": "cache_cleared",
+                    "_cache_clear_scope": clear_scope,
+                    "_files_removed": cleared["files_removed"],
+                    "_images_dirs_removed": cleared["images_dirs_removed"],
+                },
             )
 
     try:

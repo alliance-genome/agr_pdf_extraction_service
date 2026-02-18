@@ -30,13 +30,30 @@ x-shared-volumes: &shared-volumes
   - ../config.py:/app/config.py:ro
 
 services:
+  nginx:
+    image: nginx:alpine
+    container_name: pdfx-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    logging:
+      driver: gelf
+      options:
+        gelf-address: "udp://logs.alliancegenome.org:12201"
+        tag: "pdfx-nginx"
+
   app:
     image: pdfx-gpu
     container_name: pdfx-app
     hostname: pdfx-app
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     env_file:
       - ../.env
     environment:

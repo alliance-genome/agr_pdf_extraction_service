@@ -354,6 +354,11 @@ def merge_with_consensus(
     logger.info("Consensus pipeline: assembling final document...")
     merged_md = assemble(triples, resolved_conflicts)
 
+    # Step 6a2: Post-assembly structural heading safety net
+    merged_md, abstract_injected = ensure_abstract_heading(merged_md, triples)
+    if abstract_injected:
+        logger.info("Consensus pipeline: injected missing ## Abstract heading (safety net)")
+
     # Step 6b: Post-assembly global paragraph dedup (safety net)
     merged_md, assembled_dups_removed = dedup_assembled_paragraphs(merged_md)
     if assembled_dups_removed > 0:

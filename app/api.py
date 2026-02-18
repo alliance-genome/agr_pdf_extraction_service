@@ -29,14 +29,29 @@ logger = logging.getLogger(__name__)
 api = Blueprint("api", __name__, url_prefix="/api/v1")
 
 VALID_METHODS = {"grobid", "docling", "marker"}
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in {"pdf"}
+
+
+def _parse_clear_cache_scope(form):
+    """Parse and validate cache-clear options from multipart form data.
+
+    Delegates to celery_app._normalize_clear_cache_scope for the single
+    source of truth on alias resolution and validation.
+    """
+    from celery_app import _normalize_clear_cache_scope
+
+    clear_cache = form.get("clear_cache", "false").lower() in ("true", "1", "on")
+    clear_cache_scope_raw = form.get("clear_cache_scope")
+    clear_cache_scope = _normalize_clear_cache_scope(
+        clear_cache_scope=clear_cache_scope_raw,
+        clear_cache=clear_cache,
+    )
+    return clear_cache, clear_cache_scope
 
 
 def _to_iso(dt):
@@ -238,6 +253,47 @@ def health():
 
 
 # ---------------------------------------------------------------------------
+# Config introspection (for benchmark verification)
+# ---------------------------------------------------------------------------
+
+@api.route("/config", methods=["GET"])
+def get_config():
+    """Return current LLM model and reasoning config for verification.
+
+    This endpoint lets operators confirm that per-call-type model overrides
+    are actually loaded into the running process (e.g., after container
+    restart vs. recreate).
+    """
+    from config import Config
+    return jsonify({
+        "llm_model_default": Config.LLM_MODEL,
+        "llm_reasoning_default": Config.LLM_REASONING_EFFORT,
+        "per_call_type": {
+            "zone_resolution": {
+                "model": Config.LLM_MODEL_ZONE_RESOLUTION,
+                "reasoning": Config.LLM_REASONING_ZONE_RESOLUTION or Config.LLM_REASONING_EFFORT,
+            },
+            "conflict_batch": {
+                "model": Config.LLM_MODEL_CONFLICT_BATCH,
+                "reasoning": Config.LLM_REASONING_CONFLICT_BATCH or Config.LLM_REASONING_EFFORT,
+            },
+            "general_rescue": {
+                "model": Config.LLM_MODEL_GENERAL_RESCUE,
+                "reasoning": Config.LLM_REASONING_GENERAL_RESCUE or Config.LLM_REASONING_EFFORT,
+            },
+            "numeric_rescue": {
+                "model": Config.LLM_MODEL_NUMERIC_RESCUE,
+                "reasoning": Config.LLM_REASONING_NUMERIC_RESCUE or Config.LLM_REASONING_EFFORT,
+            },
+            "header_hierarchy": {
+                "model": Config.HIERARCHY_LLM_MODEL,
+                "reasoning": Config.HIERARCHY_LLM_REASONING,
+            },
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
 # List extraction runs
 # ---------------------------------------------------------------------------
 
@@ -334,6 +390,9 @@ def submit_extraction():
         merge:            "true" to run LLM merge (default: false)
         clear_cache:      "true" to clear any existing cached results for this PDF
                           before processing (default: false)
+        clear_cache_scope: Cache clear mode. One of:
+                          "none" (default), "merge", "extraction", "all".
+                          If omitted, clear_cache=true maps to "all".
         reference_curie:  Optional curie from upstream system
         mod_abbreviation: Optional MOD abbreviation from upstream system
 
@@ -359,7 +418,10 @@ def submit_extraction():
                         f"Valid: {', '.join(sorted(VALID_METHODS))}"}), 400
 
     merge = request.form.get("merge", "true").lower() in ("true", "1", "on")
-    clear_cache = request.form.get("clear_cache", "false").lower() in ("true", "1", "on")
+    try:
+        clear_cache, clear_cache_scope = _parse_clear_cache_scope(request.form)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     reference_curie = request.form.get("reference_curie")
     mod_abbreviation = request.form.get("mod_abbreviation")
 
@@ -382,6 +444,7 @@ def submit_extraction():
             kwargs={
                 "merge": merge,
                 "clear_cache": clear_cache,
+                "clear_cache_scope": clear_cache_scope,
                 "process_id": process_id,
                 "reference_curie": reference_curie,
                 "mod_abbreviation": mod_abbreviation,
@@ -398,11 +461,12 @@ def submit_extraction():
     _insert_queued_run(process_id, reference_curie, mod_abbreviation)
 
     logger.info(
-        "Queued extraction %s for %s (methods=%s, merge=%s, reference_curie=%s, mod=%s)",
+        "Queued extraction %s for %s (methods=%s, merge=%s, clear_cache_scope=%s, reference_curie=%s, mod=%s)",
         process_id,
         filename,
         methods,
         merge,
+        clear_cache_scope,
         reference_curie,
         mod_abbreviation,
     )
@@ -412,6 +476,7 @@ def submit_extraction():
         "status": "queued",
         "methods": methods,
         "merge": merge,
+        "clear_cache_scope": clear_cache_scope,
         "reference_curie": reference_curie,
         "mod_abbreviation": mod_abbreviation,
     }), 202

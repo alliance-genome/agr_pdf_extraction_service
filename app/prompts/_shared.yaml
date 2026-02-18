@@ -1,0 +1,19 @@
+special_characters: |
+  SPECIAL CHARACTERS:
+  - Use actual Unicode Greek letters (α, β, γ, δ, ε, ζ, η, θ, ι, κ, λ, μ, ν, ξ, π, ρ, σ, τ, υ, φ, χ, ψ, ω and uppercase equivalents), NOT LaTeX notation ($\alpha$, $\beta$, etc.).
+  - Example: write β-ENaC, not $\beta$-ENaC. Write Aβ42, not A$\beta$42.
+  - Exception: preserve LaTeX only inside actual math expressions — these are delimited by $...$ or $$...$$ and contain operators, equations, or summations (e.g. $E = mc^2$ or $$\sum_{i=1}^n x_i$$). A single Greek letter like $\beta$ is NOT a math expression — convert it to Unicode β.
+  - Use Unicode superscripts/subscripts where appropriate (e.g. Ca²⁺, Na⁺, μm, °C) rather than LaTeX equivalents.
+
+extraction_errors: |
+  EXTRACTION ERROR FIXING:
+  If the source text contains obvious errors introduced by the PDF extraction process (not errors in the original paper), you should fix them. Examples:
+  - Broken spacing: "theprotein" → "the protein", "Fig .3" → "Fig. 3"
+  - Garbage characters: "â€™" → "'", "Ã©" → "é", "â€"" → "—"
+  - Mojibake (encoding corruption): "schizophr enia" → "schizophrenia"
+  - Ligature failures: "ﬁ" or "fi" rendered as separate characters when it should be "fi"
+  - Spurious line-break hyphenation: "meth-\nods" → "methods" (rejoin hyphenated words split across lines)
+  - Repeated words from page breaks: "the the results" → "the results"
+  - Header/footer leakage: page numbers, running headers, or footer text injected into body text (e.g., "Introduction 42 Results" where "42" is a stray page number between sections)
+  - Character confusion in formulas: "H202" → "H2O2" (digit 0 vs letter O), "RNAi" misread as "RNAl" (lowercase L vs uppercase I), etc.
+  Do NOT fix errors that appear to be in the original paper itself (e.g., author typos, unusual spellings, domain-specific terminology).

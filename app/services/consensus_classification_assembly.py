@@ -54,6 +54,23 @@ _SOURCE_PREFERENCE = {
 _TEXTUAL_BLOCK_TYPES = {"heading", "paragraph", "figure_ref", "citation_list"}
 _STRUCTURED_BLOCK_TYPES = {"table", "equation"}
 
+# Structural heading whitelist — headings that should be preserved deterministically
+# even when only one extractor (typically Grobid) produces them.
+_STRUCTURAL_HEADING_RE = re.compile(
+    r"^#{1,6}\s*(Abstract|Introduction|Methods|Materials\s+and\s+Methods|"
+    r"Results|Discussion|Conclusion|Conclusions|References|"
+    r"Acknowledgments?|Acknowledgements?|Supplementary|"
+    r"Supplementary\s+Materials?|Appendix|Background|Keywords)\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_structural_heading(text: str | None) -> bool:
+    """Return True if text matches a known structural heading pattern."""
+    if not text:
+        return False
+    return bool(_STRUCTURAL_HEADING_RE.match(text.strip()))
+
 
 def _extract_numeric_tokens(text: str) -> set[str]:
     """Extract numeric tokens, ignoring numbers inside tags and URLs."""
@@ -326,6 +343,41 @@ def classify_triples(
                 break
 
         if near_pair is not None:
+            # Structural heading guard: when a non-paired block has a
+            # structural heading (e.g. "## Abstract" from Grobid) that would
+            # be overwritten by non-heading text in the agreeing pair,
+            # preserve the heading instead.  This prevents mis-aligned
+            # heading/non-heading triples from silently dropping structure.
+            outlier_indices = set(range(len(blocks))) - set(near_pair)
+            structural_heading_block = None
+            for idx in outlier_indices:
+                b = blocks[idx]
+                if b.block_type == "heading" and is_structural_heading(
+                    b.source_md or b.raw_text
+                ):
+                    structural_heading_block = b
+                    break
+
+            if structural_heading_block is not None:
+                pair_has_heading = any(
+                    blocks[i].block_type == "heading" for i in near_pair
+                )
+                if not pair_has_heading:
+                    logger.info(
+                        "AGREE_NEAR %s: preserving structural heading '%s' "
+                        "from %s over non-heading agreeing pair",
+                        triple.segment_id,
+                        (structural_heading_block.source_md
+                         or structural_heading_block.raw_text),
+                        structural_heading_block.source,
+                    )
+                    triple.classification = AGREE_NEAR
+                    triple.agreed_text = (
+                        structural_heading_block.source_md
+                        or structural_heading_block.raw_text
+                    )
+                    continue
+
             triple.classification = AGREE_NEAR
             triple.agreed_text = _pick_preferred_text(blocks, block_type, near_pair)
             continue
@@ -575,6 +627,80 @@ def assemble(
                     parts.append(clean_output_md(blocks[0].source_md or blocks[0].raw_text))
 
     return "\n\n".join(parts)
+
+
+def ensure_abstract_heading(
+    assembled_md: str,
+    triples: list[AlignedTriple],
+) -> tuple[str, bool]:
+    """Post-assembly safety net: inject ``## Abstract`` if parsers had it but output doesn't.
+
+    Only injects when there is evidence from at least one extractor that an
+    Abstract heading existed in the source PDF.  Finds the first substantial
+    paragraph (>200 chars) after a heading or rule to use as the injection point.
+
+    Returns (possibly_modified_text, was_injected).
+    """
+    # Already present — nothing to do (allow optional space: "##Abstract" or "## Abstract")
+    if re.search(r"^#{1,6}\s*Abstract\s*$", assembled_md, re.MULTILINE | re.IGNORECASE):
+        return assembled_md, False
+
+    # Check if any parser produced an Abstract heading
+    parser_had_abstract = False
+    for triple in triples:
+        for block in _get_present_blocks(triple):
+            if block.block_type == "heading":
+                text = (block.source_md or block.raw_text).strip()
+                if re.match(r"^#{1,6}\s*Abstract\s*$", text, re.IGNORECASE):
+                    parser_had_abstract = True
+                    break
+        if parser_had_abstract:
+            break
+
+    if not parser_had_abstract:
+        return assembled_md, False
+
+    # Find injection point with fallback cascade:
+    # 1. First substantial paragraph (>200 chars) after front matter (heading/rule)
+    # 2. First non-heading/non-table paragraph (any length) — handles short abstracts
+    # 3. Prepend ## Abstract at the start
+    paragraphs = assembled_md.split("\n\n")
+    past_front_matter = False
+    first_body_paragraph_idx: int | None = None
+    for i, para in enumerate(paragraphs):
+        stripped = para.strip()
+        if stripped.startswith("#") or stripped.startswith("---"):
+            past_front_matter = True
+            continue
+        if stripped.startswith("|"):
+            continue
+        # Track first non-heading/non-table paragraph as fallback
+        if first_body_paragraph_idx is None and stripped:
+            first_body_paragraph_idx = i
+        if past_front_matter and len(stripped) > 200:
+            paragraphs.insert(i, "## Abstract")
+            logger.info(
+                "Post-assembly safety net: injected ## Abstract heading "
+                "before paragraph %d",
+                i,
+            )
+            return "\n\n".join(paragraphs), True
+
+    # Fallback: first body paragraph (handles short abstracts / no front matter)
+    if first_body_paragraph_idx is not None:
+        paragraphs.insert(first_body_paragraph_idx, "## Abstract")
+        logger.info(
+            "Post-assembly safety net (fallback): injected ## Abstract heading "
+            "before paragraph %d",
+            first_body_paragraph_idx,
+        )
+        return "\n\n".join(paragraphs), True
+
+    logger.warning(
+        "Post-assembly safety net: parser had Abstract heading but could not "
+        "find suitable injection point in assembled output"
+    )
+    return assembled_md, False
 
 
 def dedup_assembled_paragraphs(

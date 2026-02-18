@@ -10,6 +10,7 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 from config import Config
+from app.prompts import render_prompt
 from app.services.pdf_extractor import PDFExtractor
 
 logger = logging.getLogger(__name__)
@@ -288,34 +289,7 @@ class LLM(PDFExtractor):
         use_reasoning = Config.LLM_REASONING_CONFLICT_BATCH or self.reasoning_effort
         expected_ids = {c["segment_id"] for c in batch}
         prompt_payload = json.dumps({"conflicts": batch})
-        system_msg = (
-            "You are resolving conflicts between three PDF extraction tools "
-            "(GROBID, Docling, Marker) that processed the same scientific paper. "
-            "Each conflict has the same passage as seen by each tool. "
-            "For each conflict, pick the most accurate and complete version, "
-            "or merge the best parts from each.\n\n"
-            "IMPORTANT: Each conflict includes 'context_before' and 'context_after' "
-            "fields. These are the surrounding text (read-only). Do NOT repeat or "
-            "include this context in your output. Your resolved text must flow "
-            "naturally between context_before and context_after, but you must only "
-            "return the text for the conflict segment itself.\n\n"
-            "SPECIAL CHARACTERS:\n"
-            "- Use actual Unicode Greek letters (α, β, γ, δ, ε, ζ, η, θ, ι, κ, λ, μ, "
-            "ν, ξ, π, ρ, σ, τ, υ, φ, χ, ψ, ω and uppercase equivalents), NOT LaTeX "
-            "notation ($\\alpha$, $\\beta$, etc.).\n"
-            "- Example: write β-ENaC, not $\\beta$-ENaC. Write Aβ42, not A$\\beta$42.\n"
-            "- Exception: preserve LaTeX only inside actual math expressions "
-            "(e.g. $E = mc^2$ or $$\\sum_{i=1}^n x_i$$).\n"
-            "- Use Unicode superscripts/subscripts where appropriate (e.g. Ca²⁺, Na⁺, "
-            "μm, °C) rather than LaTeX equivalents.\n\n"
-            "Return a JSON object with a 'resolved' key containing a list of "
-            "objects, each with 'segment_id', 'action', and 'text' keys.\n"
-            "- Set action=\"keep\" and provide the resolved text for segments "
-            "that should appear in the final document.\n"
-            "- Set action=\"drop\" with empty text only for segments that are "
-            "artifacts, duplicates, or noise that should be excluded.\n"
-            "The 'text' value is the resolved markdown for that segment."
-        )
+        system_msg = render_prompt("conflict_batch")
 
         completion = self.client.chat.completions.parse(
             model=use_model,
@@ -446,6 +420,77 @@ class LLM(PDFExtractor):
 
         return {c["segment_id"]: resolved_all[c["segment_id"]] for c in conflicts}
 
+    def resolve_gap(self, payload: dict) -> dict[str, str]:
+        """Resolve a single-source GAP segment using a dedicated prompt.
+
+        Unlike resolve_conflicts (which uses the 3-way merge prompt), this uses
+        a GAP-specific prompt that acknowledges single-source input and focuses
+        on duplication checking against flanking context.
+
+        Args:
+            payload: Dict with segment_id, block_type, context_before,
+                context_after, grobid, docling, marker keys.
+
+        Returns:
+            Dict mapping segment_id to resolved text (may be empty for drops).
+        """
+        use_model = Config.LLM_MODEL_ZONE_RESOLUTION
+        use_reasoning = Config.LLM_REASONING_ZONE_RESOLUTION or self.reasoning_effort
+        seg_id = payload["segment_id"]
+        system_msg = render_prompt("gap_resolution")
+        prompt_payload = json.dumps({"conflicts": [payload]})
+
+        completion = self.client.chat.completions.parse(
+            model=use_model,
+            reasoning_effort=use_reasoning,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt_payload},
+            ],
+            response_format=ConflictResolutionResponse,
+        )
+
+        usage = completion.usage
+        self.usage.record(usage, "gap_resolution", use_model)
+        if usage:
+            logger.info(
+                "LLM gap resolution: seg=%s, model=%s, tokens=%d (prompt=%d, completion=%d)",
+                seg_id, use_model, usage.total_tokens, usage.prompt_tokens, usage.completion_tokens,
+                extra={
+                    "_event": "llm_gap_resolution_complete",
+                    "_llm_model": use_model,
+                    "_llm_tokens_used": usage.total_tokens,
+                },
+            )
+
+        message = completion.choices[0].message
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            raise ValueError(f"Model refused gap resolution: {refusal}")
+        if not message.parsed:
+            raise ValueError("No parsed response from model for gap resolution")
+
+        result: dict[str, str] = {}
+        for seg_result in message.parsed.resolved:
+            if seg_result.action == "keep":
+                if seg_result.text.strip():
+                    result[seg_result.segment_id] = seg_result.text.strip()
+                # keep+empty → don't add to result (caller sees missing key)
+            elif seg_result.action == "drop":
+                if seg_result.text.strip():
+                    # Said drop but provided text — use it (matches _resolve_conflict_batch)
+                    result[seg_result.segment_id] = seg_result.text.strip()
+                else:
+                    result[seg_result.segment_id] = ""
+
+        # Ensure the requested segment_id is present in the result
+        if seg_id not in result:
+            raise ValueError(
+                f"Gap resolution did not return segment_id {seg_id!r}; "
+                f"got: {sorted(result.keys())}"
+            )
+        return result
+
     def resolve_micro_conflicts(
         self,
         payload: dict,
@@ -462,34 +507,9 @@ class LLM(PDFExtractor):
 
         resolved_map: dict[str, str] = {}
         pending_ids = list(expected_ids)
-        current_model = model or Config.LLM_MODEL_ZONE_RESOLUTION
-        use_reasoning = Config.LLM_REASONING_ZONE_RESOLUTION or self.reasoning_effort
-        system_msg = (
-            "You are resolving small disagreements between three PDF extraction tools "
-            "(GROBID, Docling, Marker) that processed the same scientific paper.\n\n"
-            "You will receive one or more MICRO-CONFLICTS. Each shows a small region "
-            "where the tools disagree, surrounded by context where they agree.\n\n"
-            "FORMAT:\n"
-            "- conflict_id: unique identifier\n"
-            "- context_before: agreed text before the disagreement (read-only)\n"
-            "- disagreement: what each extractor has (some may be empty)\n"
-            "- context_after: agreed text after the disagreement (read-only)\n\n"
-            "RULES:\n"
-            "1. Pick the most accurate version or merge the best parts.\n"
-            "2. Return ONLY the resolved text for the disagreement span.\n"
-            "3. Do NOT repeat context_before or context_after.\n"
-            "4. Preserve ALL numbers exactly as they appear in sources.\n"
-            "5. Use actual Unicode Greek letters (α, β, γ, δ, ε, μ, etc.), NOT LaTeX "
-            "notation ($\\alpha$, $\\beta$, etc.). Example: β-ENaC not $\\beta$-ENaC.\n"
-            "6. When sources disagree on a number, pick one verbatim — do NOT invent.\n"
-            "7. Prefer selecting from source text over rewriting.\n"
-            "8. For table cell disagreements, preserve markdown table formatting.\n"
-            "9. For equation disagreements, preserve LaTeX/mathematical notation.\n"
-            "10. Use Unicode superscripts/subscripts where appropriate (Ca²⁺, Na⁺, μm, °C).\n\n"
-            "Return JSON: {\"resolved\": [{\"conflict_id\": \"...\", \"text\": \"...\", \"action\": \"keep\"}, ...]}\n"
-            "Set action=\"keep\" (default) with resolved text for normal spans.\n"
-            "Set action=\"drop\" with empty text to intentionally delete a span."
-        )
+        current_model = model or Config.LLM_MODEL_CONFLICT_BATCH
+        use_reasoning = Config.LLM_REASONING_CONFLICT_BATCH or self.reasoning_effort
+        system_msg = render_prompt("micro_conflict")
 
         for attempt in range(self.conflict_retry_rounds + 1):
             if not pending_ids:
@@ -519,6 +539,11 @@ class LLM(PDFExtractor):
                         usage.total_tokens,
                         usage.prompt_tokens,
                         usage.completion_tokens,
+                        extra={
+                            "_event": "llm_micro_conflict_complete",
+                            "_llm_model": current_model,
+                            "_llm_tokens_used": usage.total_tokens,
+                        },
                     )
 
                 message = completion.choices[0].message
@@ -580,6 +605,7 @@ class LLM(PDFExtractor):
         reason: str | None = None,
         previous_text: str | None = None,
         novel_numbers: list[str] | None = None,
+        call_type: str = "rescue",
     ) -> RescueSegmentResponse | None:
         """Focused rescue call for a single segment that zone resolution returned empty.
 
@@ -646,53 +672,22 @@ class LLM(PDFExtractor):
             if previous_text and previous_text.strip():
                 prev_note = f"\n\nPREVIOUS OUTPUT (do not trust blindly):\n{previous_text.strip()}\n"
 
-            system_msg = (
-                "You are resolving a SINGLE segment from a scientific paper where PDF extraction "
-                "tools (GROBID, Docling, Marker) produced different text.\n\n"
-                "IMPORTANT CONTEXT: This segment was previously resolved, but the output triggered a "
-                "numeric-integrity guard (it contained numbers not present in any source).\n"
-                "This is a CRITICAL scientific-accuracy issue.\n"
-                f"{numeric_note}"
-                f"{prev_note}\n"
-                "RULES:\n"
-                "1. Do NOT introduce any new numbers. Every number in your output must appear in at least one source.\n"
-                "2. You MAY delete numbers that appear to be extractor artifacts (but explain why).\n"
-                "3. If sources disagree on a number, choose one that appears in a source and explain which source you followed.\n"
-                "4. If status is conflict/near_agree, you must provide non-empty resolved_text.\n"
-                "5. If status is gap, you may set is_intentionally_empty=true ONLY if you justify why it should be dropped.\n"
-                "6. Use actual Unicode Greek letters (α, β, γ, δ, ε, μ, etc.), NOT LaTeX "
-                "notation ($\\alpha$, $\\beta$, etc.). Example: β-ENaC not $\\beta$-ENaC. "
-                "Only preserve LaTeX inside actual math expressions.\n"
-                "You MUST provide an explanation in ALL cases.\n\n"
-                "SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):\n"
-                f"{context_display}\n\n"
-                f"SEGMENT TO RESOLVE ({seg_id}, status: {seg_status}):\n\n"
-                f"{sources_display}"
+            system_msg = render_prompt(
+                "rescue_numeric",
+                numeric_note=numeric_note,
+                prev_note=prev_note,
+                context_display=context_display,
+                seg_id=seg_id,
+                seg_status=seg_status,
+                sources_display=sources_display,
             )
         else:
-            system_msg = (
-                "You are resolving a SINGLE segment from a scientific paper where three PDF extraction "
-                "tools (GROBID, Docling, Marker) produced different text.\n\n"
-                "IMPORTANT CONTEXT: This segment was previously sent to you as part of a larger conflict "
-                "zone, and you returned EMPTY text for it. We need you to look at it again carefully.\n\n"
-                "You have two valid options:\n"
-                "1. PROVIDE RESOLVED TEXT: Pick the best version from the sources below, merge them, "
-                "   or clean one up. Set is_intentionally_empty=false and put the text in resolved_text.\n"
-                "2. EXPLAIN WHY IT SHOULD BE EMPTY: If this segment genuinely should not appear in the "
-                "   final document (it's a duplicate of nearby text, a page artifact, metadata noise, "
-                "   a figure label that doesn't belong inline, etc.), set is_intentionally_empty=true, "
-                "   leave resolved_text as empty string, and explain your reasoning in the explanation field.\n\n"
-                "SPECIAL CHARACTERS:\n"
-                "- Use actual Unicode Greek letters (α, β, γ, δ, ε, μ, etc.), NOT LaTeX "
-                "notation ($\\alpha$, $\\beta$, etc.). Example: β-ENaC not $\\beta$-ENaC.\n"
-                "- Use Unicode superscripts/subscripts where appropriate (Ca²⁺, Na⁺, μm, °C).\n"
-                "- Only preserve LaTeX inside actual math expressions.\n\n"
-                "You MUST provide an explanation in ALL cases — even when providing resolved text, briefly "
-                "explain what you did (e.g., 'Chose Docling version as it was most complete').\n\n"
-                "SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):\n"
-                f"{context_display}\n\n"
-                f"SEGMENT TO RESOLVE ({seg_id}, status: {seg_status}):\n\n"
-                f"{sources_display}"
+            system_msg = render_prompt(
+                "rescue_general",
+                context_display=context_display,
+                seg_id=seg_id,
+                seg_status=seg_status,
+                sources_display=sources_display,
             )
 
         try:
@@ -710,11 +705,16 @@ class LLM(PDFExtractor):
             )
 
             usage = completion.usage
-            self.usage.record(usage, "rescue", use_model)
+            self.usage.record(usage, call_type, use_model)
             if usage:
                 logger.info(
-                    "LLM rescue call: seg=%s, tokens=%d (prompt=%d, completion=%d)",
-                    seg_id, usage.total_tokens, usage.prompt_tokens, usage.completion_tokens,
+                    "LLM rescue call: seg=%s, model=%s, tokens=%d (prompt=%d, completion=%d)",
+                    seg_id, use_model, usage.total_tokens, usage.prompt_tokens, usage.completion_tokens,
+                    extra={
+                        "_event": "llm_rescue_complete",
+                        "_llm_model": use_model,
+                        "_llm_tokens_used": usage.total_tokens,
+                    },
                 )
 
             message = completion.choices[0].message
@@ -737,13 +737,7 @@ class LLM(PDFExtractor):
         """Choose between two candidate alignments for ambiguous close-score cases."""
         use_model = model or Config.LLM_MODEL_ZONE_RESOLUTION
         use_reasoning = reasoning_effort or Config.LLM_REASONING_ZONE_RESOLUTION or self.reasoning_effort
-        system_msg = (
-            "You are selecting between two candidate alignments for the same local document region.\n"
-            "Choose only the better candidate ID. Do not rewrite any text.\n"
-            "Return JSON with keys: choice, confidence, explanation.\n"
-            "- choice must be exactly 'candidate_a' or 'candidate_b'.\n"
-            "- Prefer semantic coherence and scientific fidelity."
-        )
+        system_msg = render_prompt("alignment_tiebreak")
 
         last_error = None
         for attempt in range(self.conflict_retry_rounds + 1):
@@ -760,6 +754,16 @@ class LLM(PDFExtractor):
 
                 usage = completion.usage
                 self.usage.record(usage, "alignment_tiebreak", use_model)
+                if usage:
+                    logger.info(
+                        "LLM alignment tiebreak: model=%s, tokens=%d (prompt=%d, completion=%d)",
+                        use_model, usage.total_tokens, usage.prompt_tokens, usage.completion_tokens,
+                        extra={
+                            "_event": "llm_tiebreak_complete",
+                            "_llm_model": use_model,
+                            "_llm_tokens_used": usage.total_tokens,
+                        },
+                    )
                 message = completion.choices[0].message
                 refusal = getattr(message, "refusal", None)
                 if refusal:
@@ -811,69 +815,7 @@ class LLM(PDFExtractor):
         use_model = model or self.model
         use_reasoning = reasoning_effort or self.reasoning_effort
 
-        system_msg = (
-            "You are an expert at analyzing scientific paper structure. "
-            "Given a list of headings extracted from a merged PDF document, "
-            "assign the correct MARKDOWN HEADING LEVEL to each one.\n\n"
-
-            "CRITICAL — DO NOT MODIFY HEADING TEXT:\n"
-            "- You are ONLY assigning heading levels (1-6) or demoting to plain text.\n"
-            "- You must NEVER rename, rephrase, reword, or invent headings.\n"
-            "- The original_text you return MUST be the EXACT text from the input.\n"
-            "- Do NOT convert Unicode characters to LaTeX. If the input has β, return β — "
-            "NOT $\\beta$. If it has α, return α — NOT $\\alpha$. Copy characters exactly.\n"
-            "- Every paper is different. Section names vary widely across journals "
-            "and disciplines. Work with what the paper actually contains.\n\n"
-
-            "YOUR TASK — LEVEL ASSIGNMENT:\n"
-            "For each heading in the input, decide its correct level based on its "
-            "role in THIS specific paper's structure:\n\n"
-
-            "Level 1 — Paper title:\n"
-            "- If one of the headings IS the paper title, assign it level 1.\n"
-            "- If NONE of the headings contain the paper title (it may appear as "
-            "plain text in the opening_text instead), do NOT force any heading to "
-            "level 1. Instead, set the detected_title field to the EXACT title "
-            "text as it appears in opening_text. In this case, 0 headings get level 1.\n\n"
-
-            "Level 2 — Major top-level sections:\n"
-            "- The primary structural divisions of the paper.\n"
-            "- Examples might include things like an abstract, introduction, methods, "
-            "results, discussion, references, etc. — but every paper is different. "
-            "Use the actual headings present in THIS paper.\n\n"
-
-            "Level 3+ — Subsections:\n"
-            "- Headings nested under a top-level section.\n"
-            "- Numbered subsections (e.g., '2.1. Something') are typically one level "
-            "deeper than their parent numbered section.\n"
-            "- Sub-subsections (e.g., '2.1.1.') go one level deeper still.\n"
-            "- Use the content_preview to help determine context when a heading's "
-            "role is ambiguous.\n\n"
-
-            "Demote to text (demote_to_text):\n"
-            "- Lines that are NOT real section headings but were incorrectly "
-            "extracted as headings by the PDF parser.\n"
-            "- Common examples: DOI lines, journal URLs, copyright notices, "
-            "email addresses, ORCID identifiers, page numbers.\n"
-            "- Only demote when you are confident the line is metadata, not a "
-            "section heading.\n\n"
-
-            "ACTIONS:\n"
-            "- 'keep_level': the current heading level is already correct.\n"
-            "- 'set_level': change to new_level (1-6).\n"
-            "- 'demote_to_text': strip heading markers, make plain text.\n\n"
-
-            "DETECTED TITLE:\n"
-            "- If the paper title is NOT among the headings but IS visible in the "
-            "opening_text, set detected_title to the EXACT title string.\n"
-            "- Copy the title VERBATIM from the opening_text — do not rephrase.\n"
-            "- If the title IS already one of the headings, leave detected_title null.\n\n"
-
-            "STRUCTURAL RULES:\n"
-            "- Either exactly one heading gets level 1, OR zero headings get level 1 "
-            "and detected_title is set (the title will be inserted separately).\n"
-            "- Return a decision for EVERY heading in the input, in the same order."
-        )
+        system_msg = render_prompt("header_hierarchy")
 
         user_content = json.dumps(headers)
         if opening_text:

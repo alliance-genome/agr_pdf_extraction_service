@@ -1,0 +1,53 @@
+name: micro_conflict
+description: >
+  Token-level disagreement resolution for small regions where three PDF
+  extraction tools disagree, surrounded by agreed-upon context.
+includes:
+  - extraction_errors
+  - special_characters
+system_message: |
+  You are resolving small disagreements between three PDF extraction tools (GROBID, Docling, Marker) that processed the same scientific paper.
+
+  You will receive one or more MICRO-CONFLICTS. Each shows a small region where the tools disagree, surrounded by context where they agree.
+
+  FORMAT:
+  - conflict_id: unique identifier
+  - context_before: agreed text before the disagreement (read-only)
+  - disagreement: what each extractor has (some may be empty)
+  - context_after: agreed text after the disagreement (read-only)
+
+  RULES:
+  1. Pick the version that most likely matches the original paper, or merge the best parts. Indicators of accuracy: complete words (not truncated), correct Unicode characters, numbers matching surrounding context, proper sentence boundaries, etc.
+  2. Return ONLY the resolved text for the disagreement span.
+  3. Do NOT repeat context_before or context_after.
+  4. Preserve ALL numbers exactly as they appear in sources.
+  5. When sources disagree on a number, pick one verbatim — do NOT invent.
+  6. Prefer selecting from source text over rewriting.
+  7. For table cell disagreements, preserve markdown table formatting.
+  8. For equation disagreements, preserve LaTeX/mathematical notation.
+
+  Return JSON: {"resolved": [{"conflict_id": "...", "text": "...", "action": "keep"}, ...]}
+  Set action="keep" (default) with resolved text for normal spans.
+  Set action="drop" with empty text to intentionally delete a span (e.g., when the disagreement is a pure extraction artifact like a repeated word or orphaned punctuation that should not appear in the final text).
+
+  EXAMPLE:
+  Input:
+    segment_id: "seg_007"
+    micro_conflicts:
+      - conflict_id: "mc_001"
+        context_before: "We confirmed a previous observation that the extracellular loop of "
+        disagreement:
+          GROBID:  "β-ENaC"
+          Docling: "β -ENaC"
+          Marker:  "$\beta$-ENaC"
+        context_after: " is essential for ENaC stimulation by S3969."
+      - conflict_id: "mc_002"
+        context_before: "...measurements of ENaC heterologously expressed in "
+        disagreement:
+          GROBID:  "Xenopus laevis"
+          Docling: "Xenopus laevis"
+          Marker:  "*Xenopus laevis*"
+        context_after: " oocytes."
+  Correct output:
+    {"resolved": [{"conflict_id": "mc_001", "text": "β-ENaC", "action": "keep"}, {"conflict_id": "mc_002", "text": "*Xenopus laevis*", "action": "keep"}]}
+  Why: For mc_001, GROBID has correct Unicode β without extra spacing. Docling inserted a spurious space ("β -ENaC"). Marker used LaTeX ($\beta$) instead of Unicode. Best: GROBID's "β-ENaC". For mc_002, Marker correctly italicized the species name per binomial nomenclature convention. GROBID and Docling missed the italics. Best: Marker's "*Xenopus laevis*".

@@ -1,0 +1,51 @@
+name: rescue_numeric
+description: >
+  Rescue prompt for a segment that triggered the numeric-integrity guard
+  (output contained numbers not present in any source). Dynamic template
+  with placeholders: numeric_note, prev_note, context_display, seg_id,
+  seg_status, sources_display.
+includes:
+  - extraction_errors
+  - special_characters
+system_message: |
+  You are resolving a SINGLE segment from a scientific paper where PDF extraction tools (GROBID, Docling, Marker) produced different text.
+
+  IMPORTANT CONTEXT: This segment was previously resolved, but the output triggered a numeric-integrity guard (it contained numbers not present in any source).
+  This is a CRITICAL scientific-accuracy issue.
+  {numeric_note}{prev_note}
+  STATUS VALUES:
+  - conflict: all 3 extractors produced different text for this segment.
+  - near_agree: 2 extractors agree but 1 differs.
+  - gap: only 1 extractor produced content (the other two had nothing).
+
+  RULES:
+  1. Do NOT introduce any new numbers. Every number in your output must appear in at least one source.
+  2. You MAY delete numbers that appear to be extractor artifacts (but explain why).
+  3. If sources disagree on a number, choose one that appears in a source and explain which source you followed.
+  4. If status is conflict/near_agree, you must provide non-empty resolved_text.
+  5. If status is gap, you may set is_intentionally_empty=true ONLY if you justify why it should be dropped.
+  You MUST provide an explanation in ALL cases.
+
+  RESPONSE FORMAT:
+  Return JSON with exactly these keys:
+  - resolved_text: the corrected text for this segment, or empty string if intentionally dropped.
+  - is_intentionally_empty: true only if this segment should be excluded from the final document. false in all other cases.
+  - explanation: required in ALL cases — describe what you changed and why, which source(s) you followed, etc.
+
+  EXAMPLE:
+  Sources:
+    GROBID:  "S3969 activated ENaC with an EC50 of 0.3 μM and by 2-fold at 10 μM (43, 45)."
+    Docling: "S3969 activated ENaC with an EC 50 of ~0.3 μM and by ~2-fold at 10 μM (43, 45)."
+    Marker:  "S3969 activated ENaC with an EC₅₀ of ∼0.3 μM and by ∼2-fold at 10 μM (43, 45)."
+  Previous output (triggered guard):
+    "S3969 activated ENaC with an EC50 of approximately 0.35 μM and by 2-fold at 10 μM (43, 45)."
+  Novel number detected: 0.35
+  Correct response:
+    {{"resolved_text": "S3969 activated ENaC with an EC50 of ~0.3 μM and by ~2-fold at 10 μM (43, 45).", "is_intentionally_empty": false, "explanation": "Previous output had '0.35' which does not appear in any source. All three sources agree on '0.3'. Used Docling's version with '~' approximation symbol and fixed 'EC 50' spacing to 'EC50'."}}
+
+  SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):
+  {context_display}
+
+  SEGMENT TO RESOLVE ({seg_id}, status: {seg_status}):
+
+  {sources_display}

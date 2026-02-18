@@ -24,6 +24,7 @@ from app.services.consensus_pipeline_steps import (
     _segment_allowed_numeric_tokens,
     _triple_source_count,
     clean_output_md,
+    is_structural_heading,
     reconstruct_segment_from_micro_conflicts,
 )
 
@@ -153,6 +154,7 @@ def _rescue_segment(
         extra_flanking=extra_flanking,
         model=Config.LLM_MODEL_GENERAL_RESCUE,
         reasoning_effort=Config.LLM_REASONING_GENERAL_RESCUE or None,
+        call_type="general_rescue",
     )
 
     if rescue_result is not None:
@@ -269,6 +271,7 @@ def _apply_numeric_integrity_guard(
         reason="numeric_integrity",
         previous_text=current,
         novel_numbers=novel,
+        call_type="numeric_rescue",
     )
 
     seg_status = seg.get("status", "conflict")
@@ -472,6 +475,7 @@ def _route_to_rescue(
         reason="numeric_integrity",
         previous_text=current,
         novel_numbers=[],
+        call_type="numeric_rescue",
     )
 
     candidate: str | None = None
@@ -910,7 +914,7 @@ def _resolve_single_gap(
     }
 
     try:
-        gap_resolved = llm.resolve_conflicts([payload])
+        gap_resolved = llm.resolve_gap(payload)
         resolved_text = gap_resolved.get(triple.segment_id, "")
     except Exception as exc:
         logger.warning("GAP resolution failed for %s: %s", triple.segment_id, exc)
@@ -982,6 +986,31 @@ def _resolve_conflicts_micro(
             # CONFLICT triples missing from micro_results (edge case) still need resolution.
             micro_triples.append(triple)
         elif triple.classification == GAP:
+            # Structural heading GAPs: preserve deterministically without LLM.
+            # Headings like "## Abstract" from Grobid should not be sent to
+            # the LLM gap resolver which may non-deterministically drop them.
+            blocks = _get_present_blocks(triple)
+            if (
+                blocks
+                and blocks[0].block_type == "heading"
+                and is_structural_heading(triple.agreed_text)
+            ):
+                resolved[triple.segment_id] = triple.agreed_text or ""
+                metadata[triple.segment_id] = {
+                    "method": "structural_heading_gap_keep",
+                    "chosen_source": blocks[0].source,
+                    "confidence": 1.0,
+                    "sources_agreeing": [blocks[0].source],
+                    "max_pair_similarity": 0.0,
+                    "context_id": f"micro_{triple.segment_id}",
+                }
+                logger.info(
+                    "Structural heading GAP %s preserved: '%s' from %s",
+                    triple.segment_id,
+                    triple.agreed_text,
+                    blocks[0].source,
+                )
+                continue
             gap_only_triples.append(triple)
 
     total = len(micro_triples) + len(gap_only_triples)

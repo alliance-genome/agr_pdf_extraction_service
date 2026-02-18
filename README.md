@@ -595,6 +595,11 @@ Optional fields:
 - `reference_curie` -- link to an Alliance reference identifier (e.g., `AGRKB:101000000000001`)
 - `mod_abbreviation` -- MOD abbreviation (e.g., `WB`, `FB`, `SGD`)
 - `clear_cache` -- `true` to clear any existing cached results for this PDF before processing
+- `clear_cache_scope` -- one of `none`, `merge`, `extraction`, `all`
+  - `merge`: clear merged outputs only (`*_merged.md`, consensus metrics, audit JSON); preserves extractor cache and run logs
+  - `extraction`: clear extractor caches (`grobid/docling/marker`), merged outputs, and images; preserves run logs
+  - `all`: legacy full clear for this file hash (including run logs and images)
+  - if omitted, `clear_cache=true` maps to `all`
 
 #### Poll for Status
 
