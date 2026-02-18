@@ -66,6 +66,7 @@ class Config:
     LLM_PRICING = {
         "gpt-5.2": {"input": 1.75, "output": 14.00, "cached_input": 0.175},
         "gpt-5-mini": {"input": 0.25, "output": 2.00, "cached_input": 0.025},
+        "gpt-5-nano": {"input": 0.05, "output": 0.40, "cached_input": 0.005},
         "gpt-4.1": {"input": 2.00, "output": 8.00, "cached_input": 0.50},
         "gpt-4.1-mini": {"input": 0.40, "output": 1.60, "cached_input": 0.10},
     }

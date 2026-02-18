@@ -33,6 +33,8 @@ from app.services.consensus_service import (
     clean_output_md,
     dedup_gap_triples,
     dedup_assembled_paragraphs,
+    ensure_abstract_heading,
+    is_structural_heading,
     normalize_text,
     normalize_extractor_output,
     parse_markdown,
@@ -1644,3 +1646,402 @@ class TestMissingMicroResultRescue:
         mock_rescue.assert_called_once()
         call_args = mock_rescue.call_args
         assert call_args[0][0] == "seg_missing"  # seg_id
+
+
+# ---------------------------------------------------------------------------
+# Structural heading preservation (KANBAN-1069)
+# ---------------------------------------------------------------------------
+
+
+class TestIsStructuralHeading:
+    """Tests for the structural heading whitelist."""
+
+    def test_abstract_heading(self):
+        assert is_structural_heading("## Abstract") is True
+
+    def test_abstract_h3(self):
+        assert is_structural_heading("### Abstract") is True
+
+    def test_introduction(self):
+        assert is_structural_heading("## Introduction") is True
+
+    def test_methods(self):
+        assert is_structural_heading("## Methods") is True
+
+    def test_materials_and_methods(self):
+        assert is_structural_heading("## Materials and Methods") is True
+
+    def test_results(self):
+        assert is_structural_heading("## Results") is True
+
+    def test_discussion(self):
+        assert is_structural_heading("## Discussion") is True
+
+    def test_references(self):
+        assert is_structural_heading("## References") is True
+
+    def test_acknowledgments(self):
+        assert is_structural_heading("## Acknowledgments") is True
+        assert is_structural_heading("## Acknowledgements") is True
+
+    def test_conclusion(self):
+        assert is_structural_heading("## Conclusion") is True
+        assert is_structural_heading("## Conclusions") is True
+
+    def test_non_structural_heading(self):
+        assert is_structural_heading("## 2.1. Fly Strains") is False
+
+    def test_random_text(self):
+        assert is_structural_heading("Some random paragraph text") is False
+
+    def test_none(self):
+        assert is_structural_heading(None) is False
+
+    def test_empty(self):
+        assert is_structural_heading("") is False
+
+    def test_case_insensitive(self):
+        assert is_structural_heading("## ABSTRACT") is True
+        assert is_structural_heading("## abstract") is True
+
+
+class TestAgreeNearHeadingGuard:
+    """Tests for the AGREE_NEAR structural heading guard.
+
+    Reproduces the failure in AGRKB_101000000645569 where Grobid's
+    '## Abstract' heading was overwritten by docling/marker affiliation text.
+    """
+
+    def _make_block(self, source, block_type, text, heading_level=None, source_md=None):
+        return Block(
+            block_id=f"{source}_0",
+            block_type=block_type,
+            raw_text=text,
+            normalized_text=text.lower().strip().lstrip("#").strip(),
+            heading_level=heading_level,
+            order_index=0,
+            source=source,
+            source_md=source_md or text,
+        )
+
+    def test_heading_preserved_over_non_heading_pair(self):
+        """Grobid heading should not be overwritten by docling/marker paragraph pair."""
+        affiliation = (
+            "Perinatal Institute and Division of Neonatology, Perinatal "
+            "and Pulmonary Biology, Cincinnati Children's Hospital Medical "
+            "Center, Cincinnati, OH 45229"
+        )
+        affiliation_alt = (
+            "Perinatal Institute and Division of Neonatology, Perinatal "
+            "and Pulmonary Biology, Cincinnati Childrens Hospital Medical "
+            "Center, Cincinnati OH 45229"
+        )
+        triple = AlignedTriple(
+            segment_id="seg_002",
+            grobid_block=self._make_block(
+                "grobid", "heading", "Abstract",
+                heading_level=2, source_md="## Abstract",
+            ),
+            docling_block=self._make_block(
+                "docling", "paragraph", affiliation,
+            ),
+            marker_block=self._make_block(
+                "marker", "paragraph", affiliation_alt,
+            ),
+        )
+
+        classify_triples([triple])
+
+        assert triple.classification == AGREE_NEAR
+        assert triple.agreed_text == "## Abstract"
+
+    def test_normal_agree_near_not_affected(self):
+        """Normal AGREE_NEAR (no heading involved) should work as before."""
+        triple = AlignedTriple(
+            segment_id="seg_010",
+            grobid_block=self._make_block(
+                "grobid", "paragraph", "The quick brown fox jumps over the lazy dog.",
+            ),
+            docling_block=self._make_block(
+                "docling", "paragraph", "The quick brown fox jumps over the lazy dog.",
+            ),
+            marker_block=self._make_block(
+                "marker", "paragraph", "The quick brown fox jumps over the lazy dog.",
+            ),
+        )
+
+        classify_triples([triple])
+
+        assert triple.classification in (AGREE_EXACT, AGREE_NEAR)
+        assert "## Abstract" not in (triple.agreed_text or "")
+
+    def test_non_structural_heading_not_guarded(self):
+        """Non-structural headings (e.g. '## 2.1 Fly Strains') should NOT
+        trigger the guard — only whitelisted structural headings."""
+        similar_text_a = "Section content about fly strains and experimental setup details"
+        similar_text_b = "Section content about fly strains and experimental setup detail"
+        triple = AlignedTriple(
+            segment_id="seg_020",
+            grobid_block=self._make_block(
+                "grobid", "heading", "2.1 Fly Strains",
+                heading_level=2, source_md="## 2.1 Fly Strains",
+            ),
+            docling_block=self._make_block(
+                "docling", "paragraph", similar_text_a,
+            ),
+            marker_block=self._make_block(
+                "marker", "paragraph", similar_text_b,
+            ),
+        )
+
+        classify_triples([triple])
+
+        # Should NOT preserve the non-structural heading
+        if triple.classification == AGREE_NEAR:
+            assert triple.agreed_text != "## 2.1 Fly Strains"
+
+
+class TestGapHeadingPreservation:
+    """Tests for GAP structural heading bypass in _resolve_conflicts_micro."""
+
+    def _make_block(self, source, block_type, text, heading_level=None, source_md=None):
+        return Block(
+            block_id=f"{source}_0",
+            block_type=block_type,
+            raw_text=text,
+            normalized_text=text.lower().strip().lstrip("#").strip(),
+            heading_level=heading_level,
+            order_index=0,
+            source=source,
+            source_md=source_md or text,
+        )
+
+    def test_structural_heading_gap_preserved_without_llm(self):
+        """Structural heading GAP should be kept deterministically, no LLM call."""
+        triple = AlignedTriple(
+            segment_id="seg_gap_abstract",
+            grobid_block=self._make_block(
+                "grobid", "heading", "Abstract",
+                heading_level=2, source_md="## Abstract",
+            ),
+            classification=GAP,
+            agreed_text="## Abstract",
+        )
+
+        llm_mock = MagicMock()
+        from app.services.consensus_resolution import _resolve_conflicts_micro
+        resolved, metadata = _resolve_conflicts_micro([triple], {}, llm_mock)
+
+        assert resolved["seg_gap_abstract"] == "## Abstract"
+        assert metadata["seg_gap_abstract"]["method"] == "structural_heading_gap_keep"
+        # LLM should NOT have been called
+        llm_mock.resolve_gap.assert_not_called()
+
+    def test_non_structural_heading_gap_still_uses_llm(self):
+        """Non-structural heading GAPs should still go through LLM resolution."""
+        triple = AlignedTriple(
+            segment_id="seg_gap_custom",
+            grobid_block=self._make_block(
+                "grobid", "heading", "2.1 Fly Strains",
+                heading_level=2, source_md="## 2.1 Fly Strains",
+            ),
+            classification=GAP,
+            agreed_text="## 2.1 Fly Strains",
+        )
+
+        llm_mock = MagicMock()
+        llm_mock.resolve_gap.return_value = {"seg_gap_custom": "## 2.1 Fly Strains"}
+        from app.services.consensus_resolution import _resolve_conflicts_micro
+        _resolve_conflicts_micro([triple], {}, llm_mock)
+
+        # LLM should have been called for non-structural headings
+        llm_mock.resolve_gap.assert_called_once()
+
+    def test_paragraph_gap_still_uses_llm(self):
+        """Normal paragraph GAPs should still go through LLM resolution."""
+        triple = AlignedTriple(
+            segment_id="seg_gap_para",
+            grobid_block=self._make_block(
+                "grobid", "paragraph", "Some orphan text from grobid only.",
+            ),
+            classification=GAP,
+            agreed_text="Some orphan text from grobid only.",
+        )
+
+        llm_mock = MagicMock()
+        llm_mock.resolve_gap.return_value = {"seg_gap_para": "Some orphan text from grobid only."}
+        from app.services.consensus_resolution import _resolve_conflicts_micro
+        _resolve_conflicts_micro([triple], {}, llm_mock)
+
+        llm_mock.resolve_gap.assert_called_once()
+
+
+class TestEnsureAbstractHeading:
+    """Tests for the post-assembly safety net."""
+
+    def _make_block(self, source, block_type, text, heading_level=None, source_md=None):
+        return Block(
+            block_id=f"{source}_0",
+            block_type=block_type,
+            raw_text=text,
+            normalized_text=text.lower().strip().lstrip("#").strip(),
+            heading_level=heading_level,
+            order_index=0,
+            source=source,
+            source_md=source_md or text,
+        )
+
+    def test_injects_when_missing(self):
+        """Inject ## Abstract when parser had it but output is missing it."""
+        md = (
+            "# Paper Title\n\n"
+            "---\n\n"
+            "This is a long abstract paragraph that describes the findings of "
+            "this study in great detail. It covers methods, results, and "
+            "conclusions. The study was conducted over a period of several "
+            "years and involved multiple research teams across different "
+            "institutions. The results show significant improvements."
+        )
+        triples = [
+            AlignedTriple(
+                segment_id="seg_heading",
+                grobid_block=self._make_block(
+                    "grobid", "heading", "Abstract",
+                    heading_level=2, source_md="## Abstract",
+                ),
+                classification=GAP,
+                agreed_text="## Abstract",
+            ),
+        ]
+
+        result, injected = ensure_abstract_heading(md, triples)
+        assert injected is True
+        assert "## Abstract" in result
+
+    def test_no_injection_when_present(self):
+        """Don't inject if ## Abstract already exists."""
+        md = "# Title\n\n## Abstract\n\nThis is the abstract text."
+        triples = [
+            AlignedTriple(
+                segment_id="seg_heading",
+                grobid_block=self._make_block(
+                    "grobid", "heading", "Abstract",
+                    heading_level=2, source_md="## Abstract",
+                ),
+                classification=GAP,
+            ),
+        ]
+
+        result, injected = ensure_abstract_heading(md, triples)
+        assert injected is False
+        assert result == md
+
+    def test_no_injection_when_no_parser_evidence(self):
+        """Don't inject if no parser had an Abstract heading."""
+        md = (
+            "# Paper Title\n\n"
+            "---\n\n"
+            "This is abstract-like text but no parser had the heading. "
+            "It covers methods, results, and conclusions extensively."
+        )
+        triples = [
+            AlignedTriple(
+                segment_id="seg_para",
+                grobid_block=self._make_block(
+                    "grobid", "paragraph", "Some paragraph text.",
+                ),
+                classification=AGREE_EXACT,
+            ),
+        ]
+
+        result, injected = ensure_abstract_heading(md, triples)
+        assert injected is False
+
+    def test_no_duplicate_when_no_space_heading_present(self):
+        """Don't inject if ##Abstract (no space) already exists in output."""
+        md = "# Title\n\n##Abstract\n\nThis is the abstract text."
+        triples = [
+            AlignedTriple(
+                segment_id="seg_heading",
+                grobid_block=self._make_block(
+                    "grobid", "heading", "Abstract",
+                    heading_level=2, source_md="##Abstract",
+                ),
+                classification=GAP,
+            ),
+        ]
+
+        result, injected = ensure_abstract_heading(md, triples)
+        assert injected is False
+        assert result == md
+
+    def test_parser_evidence_no_space_heading(self):
+        """Detect parser evidence when heading has no space (##Abstract)."""
+        md = (
+            "# Paper Title\n\n"
+            "---\n\n"
+            "This is a long abstract paragraph that describes the findings of "
+            "this study in great detail. It covers methods, results, and "
+            "conclusions. The study was conducted over a period of several "
+            "years and involved multiple research teams across different "
+            "institutions. The results show significant improvements."
+        )
+        triples = [
+            AlignedTriple(
+                segment_id="seg_heading",
+                grobid_block=self._make_block(
+                    "grobid", "heading", "Abstract",
+                    heading_level=2, source_md="##Abstract",
+                ),
+                classification=GAP,
+                agreed_text="##Abstract",
+            ),
+        ]
+
+        result, injected = ensure_abstract_heading(md, triples)
+        assert injected is True
+        assert "## Abstract" in result
+
+    def test_injects_for_short_abstract(self):
+        """Short abstracts (<200 chars) should still get ## Abstract via fallback."""
+        md = (
+            "# Paper Title\n\n"
+            "---\n\n"
+            "Brief abstract about the study."
+        )
+        triples = [
+            AlignedTriple(
+                segment_id="seg_heading",
+                grobid_block=self._make_block(
+                    "grobid", "heading", "Abstract",
+                    heading_level=2, source_md="## Abstract",
+                ),
+                classification=GAP,
+                agreed_text="## Abstract",
+            ),
+        ]
+
+        result, injected = ensure_abstract_heading(md, triples)
+        assert injected is True
+        assert "## Abstract" in result
+        # Heading should appear before the abstract text
+        assert result.index("## Abstract") < result.index("Brief abstract")
+
+    def test_injects_for_no_front_matter(self):
+        """Documents without heading/rule front matter should still get injection."""
+        md = "This is the abstract text without any headings or rules preceding it."
+        triples = [
+            AlignedTriple(
+                segment_id="seg_heading",
+                grobid_block=self._make_block(
+                    "grobid", "heading", "Abstract",
+                    heading_level=2, source_md="## Abstract",
+                ),
+                classification=GAP,
+                agreed_text="## Abstract",
+            ),
+        ]
+
+        result, injected = ensure_abstract_heading(md, triples)
+        assert injected is True
+        assert "## Abstract" in result

@@ -103,6 +103,45 @@ def test_submit_extraction_passes_clear_cache_to_celery(mock_apply_async, client
     assert response.status_code == 202
     call_kwargs = mock_apply_async.call_args.kwargs
     assert call_kwargs["kwargs"]["clear_cache"] is True
+    assert call_kwargs["kwargs"]["clear_cache_scope"] == "all"
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_submit_extraction_passes_clear_cache_scope_to_celery(mock_apply_async, client):
+    mock_apply_async.return_value = SimpleNamespace(id="process-id-placeholder")
+
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "clear_cache_scope": "merge",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 202
+    payload = response.get_json()
+    call_kwargs = mock_apply_async.call_args.kwargs
+    assert call_kwargs["kwargs"]["clear_cache"] is False
+    assert call_kwargs["kwargs"]["clear_cache_scope"] == "merge"
+    assert payload["clear_cache_scope"] == "merge"
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_submit_extraction_rejects_invalid_clear_cache_scope(mock_apply_async, client):
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "clear_cache_scope": "banana",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert "clear_cache_scope" in payload["error"]
+    assert mock_apply_async.called is False
 
 
 @patch("celery_app.extract_pdf.apply_async")

@@ -11,6 +11,7 @@ NOISY_LOGGERS = {
     "docling": logging.WARNING,
     "marker": logging.WARNING,
     "openai": logging.WARNING,
+    "httpx": logging.WARNING,
 }
 
 _configured = False

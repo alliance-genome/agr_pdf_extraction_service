@@ -55,6 +55,24 @@ def test_openapi_status_schema_includes_celery_success_result(client):
     assert properties["result"]["type"] == "object"
 
 
+def test_openapi_extract_request_includes_clear_cache_scope(client):
+    response = client.get("/openapi.yaml")
+    assert response.status_code == 200
+
+    spec = yaml.safe_load(response.data)
+    extract_schema = (
+        spec["paths"]["/extract"]["post"]["requestBody"]["content"]
+        ["multipart/form-data"]["schema"]
+    )
+    properties = extract_schema["properties"]
+
+    assert "clear_cache_scope" in properties
+    assert properties["clear_cache_scope"]["type"] == "string"
+    assert set(properties["clear_cache_scope"]["enum"]) == {
+        "none", "merge", "extraction", "all"
+    }
+
+
 def test_swagger_docs_page_available(client):
     response = client.get("/docs")
     assert response.status_code == 200

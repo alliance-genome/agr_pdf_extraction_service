@@ -36,6 +36,24 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
+  /config:
+    get:
+      tags: [Health]
+      summary: Current LLM model configuration
+      operationId: getConfig
+      description: |
+        Returns the currently loaded per-call-type LLM model and reasoning
+        effort configuration. Use this to verify that environment variable
+        overrides (e.g. `LLM_MODEL_ZONE_RESOLUTION`) are actually active
+        in the running container.
+      responses:
+        "200":
+          description: Current configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigResponse"
+
   /extractions:
     get:
       tags: [Extractions]
@@ -131,6 +149,15 @@ paths:
                     When true, deletes any cached extraction outputs for this
                     PDF (keyed by file hash) before processing. Useful to
                     force a fresh extraction after config or model changes.
+                clear_cache_scope:
+                  type: string
+                  enum: [none, merge, extraction, all]
+                  default: none
+                  description: >-
+                    Scoped cache clear mode. `merge` clears merged artifacts only;
+                    `extraction` clears extractor caches and also merged artifacts;
+                    `all` keeps legacy full-clear behavior. If omitted, `clear_cache=true`
+                    behaves as `all`.
       responses:
         "202":
           description: Job queued.
@@ -480,7 +507,7 @@ components:
 
     SubmitExtractionResponse:
       type: object
-      required: [process_id, status, methods, merge]
+      required: [process_id, status, methods, merge, clear_cache_scope]
       properties:
         process_id:
           type: string
@@ -495,6 +522,9 @@ components:
             enum: [grobid, docling, marker]
         merge:
           type: boolean
+        clear_cache_scope:
+          type: string
+          enum: [none, merge, extraction, all]
         reference_curie:
           type: string
           nullable: true
@@ -651,3 +681,46 @@ components:
           type: string
         size_bytes:
           type: integer
+
+    CallTypeConfig:
+      type: object
+      required: [model, reasoning]
+      properties:
+        model:
+          type: string
+          example: gpt-5.2
+        reasoning:
+          type: string
+          example: low
+
+    ConfigResponse:
+      type: object
+      required: [llm_model_default, llm_reasoning_default, per_call_type]
+      properties:
+        llm_model_default:
+          type: string
+          example: gpt-5.2
+          description: Default LLM model (LLM_MODEL env var).
+        llm_reasoning_default:
+          type: string
+          example: low
+          description: Default reasoning effort (LLM_REASONING_EFFORT env var).
+        per_call_type:
+          type: object
+          required:
+            - zone_resolution
+            - conflict_batch
+            - general_rescue
+            - numeric_rescue
+            - header_hierarchy
+          properties:
+            zone_resolution:
+              $ref: "#/components/schemas/CallTypeConfig"
+            conflict_batch:
+              $ref: "#/components/schemas/CallTypeConfig"
+            general_rescue:
+              $ref: "#/components/schemas/CallTypeConfig"
+            numeric_rescue:
+              $ref: "#/components/schemas/CallTypeConfig"
+            header_hierarchy:
+              $ref: "#/components/schemas/CallTypeConfig"

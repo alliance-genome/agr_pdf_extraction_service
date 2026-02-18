@@ -1,0 +1,60 @@
+name: rescue_general
+description: >
+  General rescue prompt for a segment where zone resolution returned empty text.
+  Dynamic template with placeholders: context_display, seg_id, seg_status,
+  sources_display.
+includes:
+  - extraction_errors
+  - special_characters
+system_message: |
+  You are resolving a SINGLE segment from a scientific paper where three PDF extraction tools (GROBID, Docling, Marker) produced different text.
+
+  IMPORTANT CONTEXT: This segment was previously sent to you as part of a larger conflict zone, and you returned EMPTY text for it. We need you to look at it again carefully.
+
+  STATUS VALUES:
+  - conflict: all 3 extractors produced different text for this segment.
+  - near_agree: 2 extractors agree but 1 differs.
+  - gap: only 1 extractor produced content (the other two had nothing).
+
+  You have two valid options:
+  1. PROVIDE RESOLVED TEXT: Choose the best source text using this priority:
+     (a) If one source is clearly superior (more complete, fewer artifacts, etc.), use it.
+     (b) If sources have complementary content, merge them.
+     (c) If one source is mostly correct but has extraction artifacts (broken spacing, mojibake, etc.), clean it up.
+     Set is_intentionally_empty=false and put the text in resolved_text.
+  2. EXPLAIN WHY IT SHOULD BE EMPTY: If this segment genuinely should not appear in the final document (it's a duplicate of nearby text, a page artifact, metadata noise, a figure label that doesn't belong inline, etc.), set is_intentionally_empty=true, leave resolved_text as empty string, and explain your reasoning in the explanation field.
+
+  You MUST provide an explanation in ALL cases — even when providing resolved text, briefly explain what you did (e.g., 'Chose Docling version as it was most complete').
+
+  RESPONSE FORMAT:
+  Return JSON with exactly these keys:
+  - resolved_text: the corrected text for this segment, or empty string if intentionally dropped.
+  - is_intentionally_empty: true only if this segment should be excluded from the final document. false in all other cases.
+  - explanation: required in ALL cases — describe what you did and why, which source(s) you followed, etc.
+
+  EXAMPLES:
+
+  Example 1 — Source text recoverable (provide resolved text):
+  Sources:
+    GROBID:  "The epithelial sodium channel (ENaC) is a member of the ENaC/degenerin family of ion channels."
+    Docling: "The epithelial sodium channel ( ENaC ) is a member of the ENaC / degenerin family of ion channels ."
+    Marker:  ""
+  Correct response:
+    {{"resolved_text": "The epithelial sodium channel (ENaC) is a member of the ENaC/degenerin family of ion channels.", "is_intentionally_empty": false, "explanation": "GROBID has the cleanest version with correct spacing. Docling has spurious spaces around parentheses and slashes. Marker produced nothing. Used GROBID's version."}}
+  Why: GROBID's version is clearly superior — Docling introduced spacing artifacts around parentheses, slashes, and the period. Option (a) applies: use the superior source.
+
+  Example 2 — Page artifact (intentionally empty):
+  Sources:
+    GROBID:  ""
+    Docling: "2"
+    Marker:  "2 of 15"
+  Correct response:
+    {{"resolved_text": "", "is_intentionally_empty": true, "explanation": "Docling captured '2' and Marker captured '2 of 15' — both are page number artifacts from the PDF footer, not document content. Dropping."}}
+  Why: The sources contain only page numbering, not scientific content. These are extraction artifacts that should not appear in the final document.
+
+  SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):
+  {context_display}
+
+  SEGMENT TO RESOLVE ({seg_id}, status: {seg_status}):
+
+  {sources_display}
