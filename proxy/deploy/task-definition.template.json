@@ -1,0 +1,48 @@
+{
+  "family": "pdfx-proxy",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+  "taskRoleArn": "${TASK_ROLE_ARN}",
+  "containerDefinitions": [
+    {
+      "name": "pdfx-proxy",
+      "image": "${ECR_IMAGE}",
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "secrets": [
+        {"name": "EC2_INSTANCE_ID", "valueFrom": "/pdfx/ec2-instance-id"},
+        {"name": "EC2_REGION", "valueFrom": "/pdfx/ec2-region"},
+        {"name": "EC2_PORT", "valueFrom": "/pdfx/ec2-port"},
+        {"name": "COGNITO_USER_POOL_ID", "valueFrom": "/pdfx/cognito-user-pool-id"},
+        {"name": "COGNITO_REGION", "valueFrom": "/pdfx/cognito-region"},
+        {"name": "COGNITO_REQUIRED_SCOPE", "valueFrom": "/pdfx/cognito-required-scope"},
+        {"name": "IDLE_TIMEOUT_MINUTES", "valueFrom": "/pdfx/idle-timeout-minutes"},
+        {"name": "STARTUP_TIMEOUT_MINUTES", "valueFrom": "/pdfx/startup-timeout-minutes"},
+        {"name": "MAX_QUEUED_JOBS", "valueFrom": "/pdfx/max-queued-jobs"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/pdfx-proxy",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "proxy"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 10
+      },
+      "essential": true
+    }
+  ]
+}
