@@ -1,8 +1,9 @@
 """Tests for the EC2 lifecycle state machine."""
 
+import asyncio
 import time
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.state_machine import InstanceState, LifecycleManager
 
@@ -61,14 +62,34 @@ class TestLifecycleManager:
         mgr._private_ip = "172.31.1.100"
         assert mgr.ec2_base_url == "http://172.31.1.100:5000"
 
-    @pytest.mark.asyncio
-    async def test_ensure_running_noop_when_ready(self):
+    def test_ensure_running_noop_when_ready(self):
         mgr, ec2 = self._make_manager(InstanceState.READY)
-        await mgr.ensure_running()
+        asyncio.run(mgr.ensure_running())
         ec2.start_instance.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_ensure_running_noop_when_starting(self):
+    def test_ensure_running_noop_when_starting(self):
         mgr, ec2 = self._make_manager(InstanceState.STARTING)
-        await mgr.ensure_running()
+        asyncio.run(mgr.ensure_running())
         ec2.start_instance.assert_not_called()
+
+    def test_poll_until_healthy_starts_after_stopping_transitions_to_stopped(self, monkeypatch):
+        mgr, ec2 = self._make_manager(InstanceState.STARTING)
+        ec2.get_instance_state.side_effect = [
+            ("stopping", None),
+            ("stopped", None),
+            ("pending", None),
+            ("running", "10.0.0.5"),
+        ]
+        mgr._check_health = AsyncMock(return_value=True)
+        mgr._start_idle_monitor = MagicMock()
+
+        async def _no_sleep(_):
+            return None
+
+        monkeypatch.setattr("app.state_machine.asyncio.sleep", _no_sleep)
+
+        asyncio.run(mgr._poll_until_healthy())
+
+        ec2.start_instance.assert_called_once()
+        assert mgr.state == InstanceState.READY
+        assert mgr.private_ip == "10.0.0.5"

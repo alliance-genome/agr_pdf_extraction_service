@@ -13,6 +13,8 @@ x-shared-env: &shared-env
   CELERY_BROKER_URL: redis://redis:6379/0
   CELERY_RESULT_BACKEND: redis://redis:6379/1
   DATABASE_URL: postgresql://pdfx:${POSTGRES_PASSWORD:-pdfx}@postgres:5432/pdfx
+  UPLOAD_FOLDER: /app/data/uploads
+  CACHE_FOLDER: /app/data/cache
   TORCH_DEVICE: cpu
   CUDA_VISIBLE_DEVICES: ""
   HF_HOME: /app/data/models
@@ -23,6 +25,8 @@ x-shared-volumes: &shared-volumes
   - ../data/cache:/app/data/cache
   - ../data/uploads:/app/data/uploads
   - ../data/models:/app/data/models
+  - ../data/model_cache:/root/.cache
+  - ../data/rapidocr_models:/usr/local/lib/python3.11/site-packages/rapidocr/models
   - ../logs:/app/logs
 
 services:
@@ -56,8 +60,8 @@ services:
       start_period: 120s
     command: >
       gunicorn -w 4 -b 0.0.0.0:5000
-      --timeout 600
-      --graceful-timeout 300
+      --timeout ${PDFX_GUNICORN_TIMEOUT:-1800}
+      --graceful-timeout ${PDFX_GUNICORN_GRACEFUL_TIMEOUT:-600}
       "app:create_app()"
 
   worker:
@@ -70,12 +74,12 @@ services:
       - ../.env
     environment:
       <<: *shared-env
-      OMP_NUM_THREADS: "8"
-      MKL_NUM_THREADS: "8"
-      NUMEXPR_NUM_THREADS: "8"
+      OMP_NUM_THREADS: ${PDFX_WORKER_OMP_THREADS:-4}
+      MKL_NUM_THREADS: ${PDFX_WORKER_MKL_THREADS:-4}
+      NUMEXPR_NUM_THREADS: ${PDFX_WORKER_NUMEXPR_THREADS:-4}
     volumes: *shared-volumes
-    cpus: 32.0
-    mem_limit: 64g
+    cpus: ${PDFX_WORKER_CPUS:-4.0}
+    mem_limit: ${PDFX_WORKER_MEM_LIMIT:-20g}
     depends_on:
       grobid:
         condition: service_healthy
@@ -86,7 +90,8 @@ services:
     command: >
       celery -A celery_app worker
       --loglevel=info
-      --concurrency=2
+      --concurrency=${PDFX_WORKER_CONCURRENCY:-1}
+      --prefetch-multiplier=${PDFX_WORKER_PREFETCH_MULTIPLIER:-1}
       -Q default
 
   grobid:
@@ -95,12 +100,12 @@ services:
     restart: unless-stopped
     init: true
     ports:
-      - "127.0.0.1:8070:8070"
+      - "127.0.0.1:${PDFX_GROBID_PORT:-8075}:8070"
     ulimits:
       core: 0
     mem_limit: 5g
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8070/api/isalive"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8070'"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -111,7 +116,7 @@ services:
     container_name: pdfx-redis
     restart: unless-stopped
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${PDFX_REDIS_PORT:-6385}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -125,7 +130,7 @@ services:
     container_name: pdfx-postgres
     restart: unless-stopped
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${PDFX_POSTGRES_PORT:-5545}:5432"
     environment:
       POSTGRES_USER: pdfx
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pdfx}

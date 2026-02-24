@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+_PAGE_COMMENT_RE = re.compile(r"<!--\s*page:\s*\d+\s*-->", re.IGNORECASE)
 
 def extract_heading_hierarchy(merged_md: str) -> list[dict]:
     """Extract the finalized heading hierarchy from merged markdown.
@@ -263,7 +264,9 @@ def run_qa_gates(
     if span_count > 0:
         logger.warning("QA gate: found %d <span> tags in assembled output", span_count)
 
-    comment_count = len(_HTML_COMMENT_OUTPUT_RE.findall(merged_md))
+    # Canonical page markers are allowed output metadata and should not fail QA.
+    non_page_comments = _PAGE_COMMENT_RE.sub("", merged_md)
+    comment_count = len(_HTML_COMMENT_OUTPUT_RE.findall(non_page_comments))
     results["html_comment_count"] = comment_count
     if comment_count > 0:
         logger.warning("QA gate: found %d HTML comments in assembled output", comment_count)

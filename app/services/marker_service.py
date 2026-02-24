@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 _cached_models = {}  # keyed by (device_type, dtype)
 _cached_converters = {}  # keyed by (device_type, dtype, extract_images, disable_links)
 
+_PAGE_SPAN_RE = re.compile(
+    r"<span\s+id=['\"]page-(\d+)-[^'\"]*['\"]>(.*?)</span>",
+    re.DOTALL | re.IGNORECASE,
+)
 _SPAN_REF_RE = re.compile(r"<span id=['\"][^'\"]*['\"]>(.*?)</span>", re.DOTALL)
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _LINK_REF_RE = re.compile(r"\[([^\]]+)\]\(https?://[^)]*\)")
@@ -68,6 +72,8 @@ class Marker(PDFExtractor):
         with torch.inference_mode():
             rendered = converter(pdf_path)
         text, file_ext, images = text_from_rendered(rendered)
+        # Preserve page provenance as explicit markdown markers before span cleanup.
+        text = _PAGE_SPAN_RE.sub(lambda m: f"<!-- page: {m.group(1)} -->\n{m.group(2)}", text)
         text = _SPAN_REF_RE.sub(r"\1", text)
         text = _IMAGE_REF_RE.sub("", text)
         text = _LINK_REF_RE.sub(r"\1", text)

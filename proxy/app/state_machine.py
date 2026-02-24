@@ -91,10 +91,17 @@ class LifecycleManager:
         """Poll EC2 health endpoint until ready or timeout."""
         deadline = time.time() + settings.STARTUP_TIMEOUT_MINUTES * 60
         poll_interval = settings.HEALTH_POLL_INTERVAL_SECONDS
+        start_requested = False
 
         while time.time() < deadline:
             try:
                 ec2_state, ip = self._ec2.get_instance_state()
+                if ec2_state == "stopped" and not start_requested:
+                    # If the first observed state was "stopping", issue start once
+                    # after AWS transitions to fully "stopped".
+                    logger.info("EC2 reached stopped during startup poll; issuing start request.")
+                    self._ec2.start_instance()
+                    start_requested = True
                 if ip:
                     self._private_ip = ip
                 if ec2_state == "running" and ip:

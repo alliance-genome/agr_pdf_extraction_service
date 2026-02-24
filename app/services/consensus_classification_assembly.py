@@ -51,6 +51,7 @@ _SOURCE_PREFERENCE = {
     "paragraph": "marker",
     "equation": "docling",
 }
+_PAGE_SOURCE_PREFERENCE = ("docling", "marker", "grobid")
 _TEXTUAL_BLOCK_TYPES = {"heading", "paragraph", "figure_ref", "citation_list"}
 _STRUCTURED_BLOCK_TYPES = {"table", "equation"}
 
@@ -598,33 +599,75 @@ def dedup_gap_triples(
 def assemble(
     triples: list[AlignedTriple],
     resolved_conflicts: dict[str, str],
+    resolution_metadata: dict[str, dict] | None = None,
 ) -> str:
-    """Assemble final markdown and clean non-LLM blocks for output quality."""
+    """Assemble final markdown and inject deterministic page markers."""
+    resolution_metadata = resolution_metadata or {}
     parts: list[str] = []
+    current_page: int | None = None
+
+    def _resolve_segment_page_no(triple: AlignedTriple) -> int | None:
+        source_pages: dict[str, int] = {}
+        for source in ("grobid", "docling", "marker"):
+            block = getattr(triple, f"{source}_block")
+            if block is None or block.page_no is None:
+                continue
+            if int(block.page_no) > 0:
+                source_pages[source] = int(block.page_no)
+        if not source_pages:
+            return None
+
+        page_counts = Counter(source_pages.values())
+        top_page, top_count = page_counts.most_common(1)[0]
+        if top_count >= 2:
+            return top_page
+
+        chosen_source = str(
+            (resolution_metadata.get(triple.segment_id) or {}).get("chosen_source", "")
+        ).strip().lower()
+        if chosen_source in source_pages:
+            return source_pages[chosen_source]
+
+        for source in _PAGE_SOURCE_PREFERENCE:
+            if source in source_pages:
+                return source_pages[source]
+
+        return next(iter(source_pages.values()))
 
     for triple in triples:
+        segment_text: str | None = None
         if triple.classification in (AGREE_EXACT, AGREE_NEAR, GAP):
             # Check if this segment was resolved by LLM resolution
             if triple.segment_id in resolved_conflicts:
                 resolved_text = resolved_conflicts[triple.segment_id]
                 if resolved_text:
-                    parts.append(resolved_text)
+                    segment_text = resolved_text
                 elif triple.classification == GAP:
-                    pass  # LLM explicitly dropped this gap — do not include
+                    segment_text = None  # LLM explicitly dropped this gap — do not include
                 elif triple.agreed_text:
                     # Non-GAP (e.g. AGREE_NEAR) with empty LLM result — keep agreed_text
-                    parts.append(clean_output_md(triple.agreed_text))
+                    segment_text = clean_output_md(triple.agreed_text)
             elif triple.agreed_text:
-                parts.append(clean_output_md(triple.agreed_text))
+                segment_text = clean_output_md(triple.agreed_text)
         elif triple.classification == CONFLICT:
             resolved = resolved_conflicts.get(triple.segment_id)
             if resolved:
-                parts.append(resolved)
+                segment_text = resolved
             else:
                 # Fallback: use first available block text
                 blocks = _get_present_blocks(triple)
                 if blocks:
-                    parts.append(clean_output_md(blocks[0].source_md or blocks[0].raw_text))
+                    segment_text = clean_output_md(blocks[0].source_md or blocks[0].raw_text)
+
+        if not segment_text:
+            continue
+
+        page_no = _resolve_segment_page_no(triple)
+        if page_no is not None and page_no != current_page:
+            parts.append(f"<!-- page: {page_no} -->")
+            current_page = page_no
+
+        parts.append(segment_text)
 
     return "\n\n".join(parts)
 
@@ -794,5 +837,4 @@ def dedup_assembled_paragraphs(
         para for i, para in enumerate(paragraphs) if i not in removed_indices
     )
     return cleaned, len(removed_indices)
-
 

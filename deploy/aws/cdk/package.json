@@ -1,0 +1,23 @@
+{
+  "name": "pdfx-oom-alerts-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CDK app for PDFX OOM alert infrastructure",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "diff": "cdk diff"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "aws-cdk": "^2.178.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.178.2",
+    "constructs": "^10.4.2"
+  }
+}
