@@ -80,6 +80,7 @@ def _merge_blocks(left: Block, right: Block) -> Block:
         order_index=left.order_index,
         source=left.source,
         source_md=merged_md,
+        page_no=left.page_no if left.page_no == right.page_no else (left.page_no or right.page_no),
     )
 
 

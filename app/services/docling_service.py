@@ -1,5 +1,6 @@
 """Docling-based PDF extraction service with process-local converter caching."""
 
+import inspect
 import os
 import logging
 from app.services.pdf_extractor import PDFExtractor
@@ -72,10 +73,38 @@ class Docling(PDFExtractor):
         result = converter.convert(pdf_path)
         doc = result.document
 
-        markdown = doc.export_to_markdown(
-            image_placeholder="",
-            page_break_placeholder="",
-            text_width=-1,
-        )
+        export_signature = inspect.signature(doc.export_to_markdown)
+        if "page_no" not in export_signature.parameters:
+            raise RuntimeError(
+                "Installed Docling version does not support page-aware markdown export "
+                "(missing export_to_markdown(page_no=...))."
+            )
+
+        if not hasattr(doc, "num_pages"):
+            raise RuntimeError(
+                "Installed Docling document object does not expose num_pages(); "
+                "cannot produce page-aware markdown."
+            )
+
+        total_pages = int(doc.num_pages())
+        if total_pages <= 0:
+            raise RuntimeError("Docling reported zero pages for document; cannot export markdown.")
+
+        page_blocks = []
+        for page_no in range(1, total_pages + 1):
+            page_markdown = doc.export_to_markdown(
+                image_placeholder="",
+                page_break_placeholder="",
+                text_width=-1,
+                page_no=page_no,
+            ).strip()
+            page_blocks.append(f"<!-- page: {page_no} -->")
+            if page_markdown:
+                page_blocks.append(page_markdown)
+
+        markdown = "\n\n".join(page_blocks).strip()
+        if not markdown:
+            raise RuntimeError("Docling returned empty markdown during page-aware export.")
+
         with open(output_filename, "w", encoding="utf-8") as f:
             f.write(markdown)

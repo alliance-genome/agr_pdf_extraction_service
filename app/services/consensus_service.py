@@ -352,7 +352,7 @@ def merge_with_consensus(
 
     # Step 6: Assemble
     logger.info("Consensus pipeline: assembling final document...")
-    merged_md = assemble(triples, resolved_conflicts)
+    merged_md = assemble(triples, resolved_conflicts, resolution_metadata)
 
     # Step 6a2: Post-assembly structural heading safety net
     merged_md, abstract_injected = ensure_abstract_heading(merged_md, triples)

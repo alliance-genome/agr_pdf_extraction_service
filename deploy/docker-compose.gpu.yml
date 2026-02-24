@@ -24,6 +24,7 @@ x-shared-volumes: &shared-volumes
   - ../data/uploads:/app/data/uploads
   - ../data/models:/app/data/models
   - ../data/model_cache:/root/.cache
+  - ../data/rapidocr_models:/usr/local/lib/python3.11/site-packages/rapidocr/models
   - ../logs:/app/logs
   - ../app:/app/app:ro
   - ../celery_app.py:/app/celery_app.py:ro
@@ -53,7 +54,7 @@ services:
     hostname: pdfx-app
     restart: unless-stopped
     ports:
-      - "127.0.0.1:5000:5000"
+      - "5000:5000"
     env_file:
       - ../.env
     environment:

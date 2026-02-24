@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Parameterized OOM alerting resources for AGR PDF extraction service"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: pdfx
+    Description: Project short name
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name (dev/staging/prod)
+  AlertEmail:
+    Type: String
+    Description: Email address for SNS alert subscription
+  AlertSsmPrefix:
+    Type: String
+    Default: /pdfx/alerts
+    Description: SSM path prefix for alert config parameters
+  InstanceRoleName:
+    Type: String
+    Default: ""
+    Description: Optional existing EC2 instance role name to grant SNS publish + SSM read
+
+Conditions:
+  HasInstanceRole: !Not [!Equals [!Ref InstanceRoleName, ""]]
+
+Resources:
+  OomAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${EnvironmentName}-oom-alerts"
+      DisplayName: !Sub "${ProjectName}-${EnvironmentName} OOM Alerts"
+      Tags:
+        - Key: project
+          Value: !Ref ProjectName
+        - Key: environment
+          Value: !Ref EnvironmentName
+
+  OomAlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OomAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  OomAlertTopicArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${AlertSsmPrefix}/sns_topic_arn"
+      Type: String
+      Tier: Standard
+      Description: SNS topic ARN for host-side OOM alert watcher
+      Value: !Ref OomAlertTopic
+
+  OomAlertEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${AlertSsmPrefix}/email"
+      Type: String
+      Tier: Standard
+      Description: Human contact email for OOM alerts
+      Value: !Ref AlertEmail
+
+  OomWatcherRegionParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${AlertSsmPrefix}/region"
+      Type: String
+      Tier: Standard
+      Description: Region used by host-side OOM alert watcher
+      Value: !Ref AWS::Region
+
+  OomWatcherPollSecondsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${AlertSsmPrefix}/dedupe_window_seconds"
+      Type: String
+      Tier: Standard
+      Description: Dedupe window for repeated OOM alerts from same source/key
+      Value: "300"
+
+  OomWatcherInlinePolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasInstanceRole
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${EnvironmentName}-oom-watcher"
+      Roles:
+        - !Ref InstanceRoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublishOomAlerts
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref OomAlertTopic
+          - Sid: ReadOomWatcherConfig
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource:
+              - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AlertSsmPrefix}/sns_topic_arn"
+              - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AlertSsmPrefix}/region"
+              - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AlertSsmPrefix}/dedupe_window_seconds"
+
+Outputs:
+  TopicArn:
+    Description: SNS topic ARN for OOM alerts
+    Value: !Ref OomAlertTopic
+
+  TopicSsmParameterName:
+    Description: SSM parameter containing SNS topic ARN
+    Value: !Ref OomAlertTopicArnParameter
+
+  AlertEmail:
+    Description: Configured alert email endpoint (requires SNS confirmation)
+    Value: !Ref AlertEmail

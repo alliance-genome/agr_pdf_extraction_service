@@ -11,8 +11,51 @@
 
 set -e
 
-COMPOSE_FILE="docker-compose.yml"
 PROJECT_NAME="pdfx"
+GPU_MODE="${GPU_MODE:-auto}" # auto|on|off
+
+detect_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+}
+
+select_compose_file() {
+    case "${GPU_MODE}" in
+        on)
+            if ! detect_gpu; then
+                echo "ERROR: GPU_MODE=on but no NVIDIA GPU detected (or nvidia-smi unavailable)." >&2
+                return 1
+            fi
+            echo "docker-compose.gpu.yml"
+            ;;
+        off)
+            echo "docker-compose.yml"
+            ;;
+        auto)
+            if detect_gpu; then
+                echo "docker-compose.gpu.yml"
+            else
+                echo "docker-compose.yml"
+            fi
+            ;;
+        *)
+            echo "ERROR: Invalid GPU_MODE='${GPU_MODE}'. Use auto|on|off." >&2
+            return 1
+            ;;
+    esac
+}
+
+if ! COMPOSE_FILE="$(select_compose_file)"; then
+    exit 1
+fi
+COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
+
+if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
+    GROBID_HEALTH_PORT="8070"
+    echo "GPU deployment mode selected (${GPU_MODE}); using ${COMPOSE_FILE}"
+else
+    GROBID_HEALTH_PORT="${PDFX_GROBID_PORT:-8075}"
+    echo "CPU deployment mode selected (${GPU_MODE}); using ${COMPOSE_FILE}"
+fi
 
 echo "=== PDF Extraction Service Deployment ==="
 
@@ -24,7 +67,7 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-if ! command -v docker compose &> /dev/null; then
+if ! docker compose version >/dev/null 2>&1; then
     echo "ERROR: Docker Compose is not installed"
     exit 1
 fi
@@ -39,15 +82,17 @@ echo "Creating persistent directories..."
 mkdir -p data/cache
 mkdir -p data/uploads
 mkdir -p data/models
+mkdir -p data/model_cache
+mkdir -p data/rapidocr_models
 mkdir -p logs
 
 # Step 3: Stop existing services
 echo "Stopping existing services..."
-docker compose -p $PROJECT_NAME down 2>/dev/null || true
+docker compose "${COMPOSE_ARGS[@]}" down 2>/dev/null || true
 
 # Step 4: Build and start services
 echo "Building and starting services..."
-docker compose -p $PROJECT_NAME up -d --build
+docker compose "${COMPOSE_ARGS[@]}" up -d --build
 
 # Step 5: Wait for services to start
 echo "Waiting for services to start..."
@@ -55,7 +100,7 @@ sleep 10
 
 # Step 6: Run database migrations
 echo "Running database migrations..."
-docker compose -p $PROJECT_NAME exec -T app alembic upgrade head 2>/dev/null && \
+docker compose "${COMPOSE_ARGS[@]}" exec -T app alembic upgrade head 2>/dev/null && \
     echo "  Database migrations applied." || \
     echo "  WARNING: Migration failed or Alembic not available. DB tracking may not work."
 
@@ -65,10 +110,10 @@ echo "=== Health Checks ==="
 
 # Check GROBID
 echo -n "  GROBID: "
-if curl -sf http://localhost:8070/api/isalive > /dev/null 2>&1; then
+if curl -sf "http://localhost:${GROBID_HEALTH_PORT}/api/isalive" > /dev/null 2>&1; then
     echo "HEALTHY"
 else
-    echo "NOT READY (may still be loading models, check: docker compose -p $PROJECT_NAME logs grobid)"
+    echo "NOT READY (may still be loading models, check: docker compose ${COMPOSE_ARGS[*]} logs grobid)"
 fi
 
 # Check Redis
@@ -102,9 +147,9 @@ echo "Service endpoints:"
 echo "  Web UI:    http://localhost:5000"
 echo "  REST API:  http://localhost:5000/api/v1/"
 echo "  Health:    http://localhost:5000/api/v1/health"
-echo "  GROBID:    http://localhost:8070"
+echo "  GROBID:    http://localhost:${GROBID_HEALTH_PORT}"
 echo ""
 echo "Management:"
-echo "  Logs:      docker compose -p $PROJECT_NAME logs -f"
+echo "  Logs:      docker compose ${COMPOSE_ARGS[*]} logs -f"
 echo "  Status:    ./manage.sh status"
-echo "  Stop:      docker compose -p $PROJECT_NAME down"
+echo "  Stop:      docker compose ${COMPOSE_ARGS[*]} down"

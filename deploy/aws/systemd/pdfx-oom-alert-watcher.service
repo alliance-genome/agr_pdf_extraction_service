@@ -1,0 +1,17 @@
+[Unit]
+Description=PDFX OOM alert watcher (Docker + kernel -> SNS)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/pdfx-oom-alert-watcher
+ExecStart=/usr/local/bin/pdfx-oom-alert-watcher.sh
+Restart=always
+RestartSec=5
+User=root
+Group=root
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

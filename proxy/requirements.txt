@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+httpx
+boto3
+PyJWT[crypto]
+cryptography
+requests
+python-multipart

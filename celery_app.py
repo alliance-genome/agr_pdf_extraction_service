@@ -798,24 +798,41 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
     extractions = {}
     methods_used = []
     cached_methods = []
-    total_steps = len(methods) + (1 if merge else 0)
 
-    # --- Run extractors (parallel where possible) -----------------------------
-    # GROBID is HTTP-bound (separate container), Docling/Marker are CPU-bound.
-    # Running GROBID in a thread overlapping with CPU extractors saves wall time.
+    # --- Stage tracking for granular progress reporting -----------------------
+    all_stages = ["initializing"] + list(methods) + (["llm_merge"] if merge else []) + ["finalizing"]
+    completed_stages = []
 
+    # Determine parallel execution strategy
     non_cached = [m for m in methods if not _is_cached(file_hash, m)]
     has_grobid_work = "grobid" in non_cached
     cpu_methods = [m for m in non_cached if m != "grobid"]
     use_parallel = has_grobid_work and len(cpu_methods) > 0
 
-    self.update_state(state="PROGRESS", meta={
-        "step": "extracting", "current": 0, "total": total_steps,
-        "parallel": use_parallel,
-    })
+    def _emit_progress(current_stage, display_text):
+        pending = [s for s in all_stages if s not in completed_stages and s != current_stage]
+        self.update_state(state="PROGRESS", meta={
+            "step": current_stage,
+            "stage": current_stage,
+            "stage_display": display_text,
+            "stages_completed": list(completed_stages),
+            "stages_pending": pending,
+            "stages_total": len(all_stages),
+            "stages_done": len(completed_stages),
+            "percent": round(len(completed_stages) / len(all_stages) * 100),
+            "parallel": use_parallel,
+        })
+
+    _emit_progress("initializing", "Initializing extraction job")
+    completed_stages.append("initializing")
+
+    # --- Run extractors (parallel where possible) -----------------------------
+    # GROBID is HTTP-bound (separate container), Docling/Marker are CPU-bound.
+    # Running GROBID in a thread overlapping with CPU extractors saves wall time.
 
     if use_parallel:
         # Run GROBID in a thread while CPU extractors run sequentially in main thread
+        _emit_progress("grobid", "Running extractions (parallel)")
         log.info("Running GROBID in parallel with %s", cpu_methods)
         errors = []
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="grobid") as pool:
@@ -826,6 +843,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
             # Run CPU extractors sequentially in the main thread
             for method in cpu_methods:
                 try:
+                    _emit_progress(method, f"Running {method.upper()} extraction")
                     m, text, was_cached = _run_single_extractor(
                         method, pdf_path, file_hash, Config, audit_logger, adapter,
                     )
@@ -833,6 +851,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                     methods_used.append(m)
                     if was_cached:
                         cached_methods.append(m)
+                    completed_stages.append(method)
                 except Exception as exc:
                     errors.append((method, exc))
 
@@ -843,6 +862,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                 methods_used.append(m)
                 if was_cached:
                     cached_methods.append(m)
+                completed_stages.append("grobid")
             except Exception as exc:
                 errors.append(("grobid", exc))
 
@@ -855,6 +875,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                 extractions[m] = text
                 methods_used.append(m)
                 cached_methods.append(m)
+                completed_stages.append(method)
 
         if errors:
             # Raise the first error (same behavior as sequential)
@@ -862,6 +883,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
     else:
         # Sequential fallback (no GROBID work, or only one method)
         for method in methods:
+            _emit_progress(method, f"Running {method.upper()} extraction")
             m, text, was_cached = _run_single_extractor(
                 method, pdf_path, file_hash, Config, audit_logger, adapter,
             )
@@ -869,6 +891,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
             methods_used.append(m)
             if was_cached:
                 cached_methods.append(m)
+            completed_stages.append(method)
 
     # --- Optional LLM merge ---------------------------------------------------
 
@@ -899,10 +922,9 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
             if os.path.exists(metrics_cache_path):
                 with open(metrics_cache_path, "r", encoding="utf-8") as f:
                     consensus_metrics = json.load(f)
+            completed_stages.append("llm_merge")
         else:
-            self.update_state(state="PROGRESS", meta={
-                "step": "llm_merge", "current": len(methods_used), "total": total_steps
-            })
+            _emit_progress("llm_merge", "Merging extraction outputs with LLM")
 
             llm = LLM(
                 api_key=Config.OPENAI_API_KEY,
@@ -973,6 +995,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                     "completed",
                     duration_s=merge_duration,
                 )
+                completed_stages.append("llm_merge")
             except Exception as exc:
                 _safe_log_event(
                     audit_logger,
@@ -1012,6 +1035,8 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
             merged_preview = merged_preview[:1000] + "..."
 
     images = _list_images(file_hash)
+
+    _emit_progress("finalizing", "Uploading artifacts and finalizing")
 
     result = {
         "status": "success",

@@ -36,6 +36,7 @@ The service runs three independent extraction engines on each PDF, then merges t
   - [Architecture](#architecture)
   - [Management Commands](#management-commands)
   - [Durable Storage](#durable-storage)
+  - [OOM Alerts (AWS IaC)](#oom-alerts-aws-iac)
 - [Configuration Reference](#configuration-reference)
 - [Project Structure](#project-structure)
 
@@ -57,7 +58,7 @@ The service runs three independent extraction engines on each PDF, then merges t
    ```bash
    curl http://localhost:5000/api/v1/extract/{process_id}
    ```
-   Wait until `status` is `"complete"`.
+   Wait until `status` is `"complete"`. While running, the response includes a `progress` object showing the current stage (e.g., "Running GROBID extraction"), completion percentage, and which stages are done or pending.
 
 3. **Download the merged text:**
    ```bash
@@ -609,6 +610,40 @@ curl http://localhost:5000/api/v1/extract/{process_id}
 
 **Status progression:** `pending` -> `started` -> `progress` -> `complete` | `failed`
 
+While the job is running (`status: "progress"`), the response includes a `progress` object with granular stage tracking:
+
+```json
+{
+  "process_id": "...",
+  "status": "progress",
+  "progress": {
+    "stage": "grobid",
+    "stage_display": "Running GROBID extraction",
+    "stages_completed": ["initializing"],
+    "stages_pending": ["docling", "marker", "llm_merge", "finalizing"],
+    "stages_total": 6,
+    "stages_done": 1,
+    "percent": 16
+  }
+}
+```
+
+**Canonical stages** (in pipeline order):
+
+| Stage | Display Text | When |
+|-------|-------------|------|
+| `ec2_starting` | Spinning up GPU instance | Proxy only -- EC2 is booting |
+| `initializing` | Initializing extraction job | Backend -- job picked up by worker |
+| `grobid` | Running GROBID extraction | Conditional -- included if GROBID is in methods |
+| `docling` | Running Docling extraction | Conditional -- included if Docling is in methods |
+| `marker` | Running Marker extraction | Conditional -- included if Marker is in methods |
+| `llm_merge` | Merging extraction outputs with LLM | Conditional -- included if merge=true |
+| `finalizing` | Uploading artifacts and finalizing | Backend -- S3 upload and cleanup |
+
+The stage list is dynamic based on the `methods` and `merge` parameters submitted with the job. `stages_total`, `stages_completed`, and `stages_pending` reflect only the stages relevant to that specific job.
+
+When the proxy is queuing a job while EC2 boots, it returns `status: "queued"` with `progress.stage: "ec2_starting"`. Once the backend picks up the job, stages transition through the extraction engines and merge.
+
 When complete, the response includes consensus metrics, degradation metrics, LLM cost, artifact S3 keys, and process metadata. Use the `/download/{method}` and `/artifacts/urls` endpoints to download outputs.
 
 #### Download Results
@@ -640,7 +675,7 @@ Returns pre-signed S3 URLs (1-hour expiry) for all artifacts.
 | `/api/v1/health` | GET | Service health check (GROBID, Redis, Celery worker status) |
 | `/api/v1/extractions` | GET | List extraction runs (filterable by status, MOD, reference; paginated) |
 | `/api/v1/extract` | POST | Submit a PDF for extraction (returns 202) |
-| `/api/v1/extract/{id}` | GET | Poll extraction status and results |
+| `/api/v1/extract/{id}` | GET | Poll extraction status with granular progress tracking |
 | `/api/v1/extract/{id}/download/{method}` | GET | Download output (grobid, docling, marker, merged, audit) |
 | `/api/v1/extract/{id}/images` | GET | List extracted images |
 | `/api/v1/extract/{id}/images/{file}` | GET | Download a specific extracted image |
@@ -670,7 +705,7 @@ cd deploy && ./deploy.sh
 docker compose -f deploy/docker-compose.gpu.yml -p pdfx up -d --build
 ```
 
-**Note:** `deploy.sh` uses the CPU-only compose file (`docker-compose.yml`). For GPU-accelerated deployment (recommended -- significantly faster extraction), use the GPU compose command directly. On first run, Docling and Marker download ML models (~2-5 GB), which takes several minutes.
+**Note:** `deploy.sh` uses the CPU-only compose file (`docker-compose.yml`). For GPU-accelerated deployment (recommended -- significantly faster extraction), use the GPU compose command directly. On first run, Docling and Marker download ML models (~2-5 GB), which takes several minutes. These model assets are persisted under `data/model_cache`, `data/rapidocr_models`, and `data/models`, so normal container restarts should not re-download them.
 
 **After deployment:**
 
@@ -758,6 +793,57 @@ All extraction outputs are stored in S3 via the audit trail, and tracked in the 
 4. **No AWS keys needed** -- The service uses the default boto3 credential chain (instance profile on EC2, env vars or config for local dev)
 
 Without S3 access, extraction still works but outputs are only in local cache.
+
+### OOM Alerts (AWS IaC)
+
+This repo now includes parameterized infrastructure and host automation for OOM alerts:
+
+- `deploy/aws/oom-alerts-stack.yaml` -- CloudFormation stack (SNS topic, email subscription, SSM config parameters, optional IAM policy attachment to an existing instance role)
+- `deploy/aws/deploy_oom_alerts.sh` -- deploy/update script for the stack
+- `deploy/aws/scripts/pdfx-oom-alert-watcher.sh` -- host watcher (Docker OOM events + kernel OOM log lines -> SNS)
+- `deploy/aws/install_oom_alert_watcher.sh` -- installs and enables the systemd service
+
+Quick start:
+
+```bash
+# 1) Deploy alert infra
+deploy/aws/deploy_oom_alerts.sh \
+  --email <alert-email> \
+  --project pdfx \
+  --env dev \
+  --region us-east-1 \
+  --profile <aws-profile> \
+  --ssm-prefix /pdfx/alerts \
+  --instance-role-name <your-ec2-instance-role-name>
+
+# 2) Confirm the SNS email subscription (check inbox)
+
+# 3) Install watcher on the host
+sudo deploy/aws/install_oom_alert_watcher.sh \
+  --region us-east-1 \
+  --profile <aws-profile> \
+  --aws-credentials-file ~/.aws/credentials \
+  --aws-config-file ~/.aws/config \
+  --ssm-param /pdfx/alerts/sns_topic_arn
+```
+
+CDK alternative:
+
+```bash
+deploy/aws/cdk/deploy.sh \
+  --email <alert-email> \
+  --project pdfx \
+  --env dev \
+  --region us-east-1 \
+  --profile <aws-profile> \
+  --ssm-prefix /pdfx/alerts \
+  --instance-role-name <your-ec2-instance-role-name>
+```
+
+Notes:
+
+- No application secrets are required for SNS email alerts. The host watcher reads non-sensitive config from SSM Parameter Store.
+- For future non-email channels (e.g., webhook/chatops), store credentials in AWS Secrets Manager and pass only the secret ARN through SSM.
 
 ---
 

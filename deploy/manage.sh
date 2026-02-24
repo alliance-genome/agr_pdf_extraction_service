@@ -4,56 +4,103 @@
 # Adapted from ai_curation_prototype/backend/docling-service/manage.sh
 
 PROJECT_NAME="pdfx"
+GPU_MODE="${GPU_MODE:-auto}" # auto|on|off
+
+detect_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+}
+
+select_compose_file() {
+    case "${GPU_MODE}" in
+        on)
+            if ! detect_gpu; then
+                echo "ERROR: GPU_MODE=on but no NVIDIA GPU detected (or nvidia-smi unavailable)." >&2
+                return 1
+            fi
+            echo "docker-compose.gpu.yml"
+            ;;
+        off)
+            echo "docker-compose.yml"
+            ;;
+        auto)
+            if detect_gpu; then
+                echo "docker-compose.gpu.yml"
+            else
+                echo "docker-compose.yml"
+            fi
+            ;;
+        *)
+            echo "ERROR: Invalid GPU_MODE='${GPU_MODE}'. Use auto|on|off." >&2
+            return 1
+            ;;
+    esac
+}
+
+if ! COMPOSE_FILE="$(select_compose_file)"; then
+    exit 1
+fi
+COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
+
+if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
+    GROBID_HEALTH_PORT="8070"
+else
+    GROBID_HEALTH_PORT="${PDFX_GROBID_PORT:-8075}"
+fi
+
+redis_container="pdfx-redis"
+postgres_container="pdfx-postgres"
+app_container="pdfx-app"
+worker_container="pdfx-worker"
 
 case "$1" in
     start)
         echo "Starting PDF extraction service..."
-        docker compose -p $PROJECT_NAME up -d
+        docker compose "${COMPOSE_ARGS[@]}" up -d
         ;;
 
     stop)
         echo "Stopping PDF extraction service..."
-        docker compose -p $PROJECT_NAME down
+        docker compose "${COMPOSE_ARGS[@]}" down
         ;;
 
     restart)
         echo "Restarting PDF extraction service..."
-        docker compose -p $PROJECT_NAME down
-        docker compose -p $PROJECT_NAME up -d
+        docker compose "${COMPOSE_ARGS[@]}" down
+        docker compose "${COMPOSE_ARGS[@]}" up -d
         ;;
 
     status)
         echo "=== Container Status ==="
-        docker compose -p $PROJECT_NAME ps
+        docker compose "${COMPOSE_ARGS[@]}" ps
         echo ""
         echo "=== Health Checks ==="
         echo -n "  GROBID:  "
-        curl -s http://localhost:8070/api/isalive > /dev/null 2>&1 && echo "HEALTHY" || echo "DOWN"
+        curl -s "http://localhost:${GROBID_HEALTH_PORT}/api/isalive" > /dev/null 2>&1 && echo "HEALTHY" || echo "DOWN"
         echo -n "  Redis:   "
-        docker exec ${PROJECT_NAME}-redis redis-cli ping 2>/dev/null | grep -q PONG && echo "HEALTHY" || echo "DOWN"
+        docker exec "${redis_container}" redis-cli ping 2>/dev/null | grep -q PONG && echo "HEALTHY" || echo "DOWN"
         echo -n "  Postgres:"
-        docker exec pdfx-postgres pg_isready -U pdfx 2>/dev/null | grep -q "accepting connections" && echo " HEALTHY" || echo " DOWN"
+        docker exec "${postgres_container}" pg_isready -U pdfx 2>/dev/null | grep -q "accepting connections" && echo " HEALTHY" || echo " DOWN"
         echo -n "  App:     "
         curl -s http://localhost:5000/api/v1/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "DOWN"
         ;;
 
     logs)
-        docker compose -p $PROJECT_NAME logs -f ${2:-}
+        docker compose "${COMPOSE_ARGS[@]}" logs -f ${2:-}
         ;;
 
     logs-tail)
-        docker compose -p $PROJECT_NAME logs --tail 100 ${2:-}
+        docker compose "${COMPOSE_ARGS[@]}" logs --tail 100 ${2:-}
         ;;
 
     shell)
         echo "Opening shell in app container..."
-        docker exec -it ${PROJECT_NAME}-app /bin/bash
+        docker exec -it "${app_container}" /bin/bash
         ;;
 
     rebuild)
         echo "Rebuilding and redeploying..."
-        docker compose -p $PROJECT_NAME down
-        docker compose -p $PROJECT_NAME up -d --build
+        docker compose "${COMPOSE_ARGS[@]}" down
+        docker compose "${COMPOSE_ARGS[@]}" up -d --build
         ;;
 
     test)
@@ -77,17 +124,18 @@ case "$1" in
 
     worker-status)
         echo "=== Celery Worker Status ==="
-        docker exec ${PROJECT_NAME}-worker celery -A celery_app inspect active 2>/dev/null || echo "No workers running"
+        docker exec "${worker_container}" celery -A celery_app inspect active 2>/dev/null || echo "No workers running"
         ;;
 
     cleanup)
         echo "Cleaning up Docker resources..."
-        docker compose -p $PROJECT_NAME down -v
+        docker compose "${COMPOSE_ARGS[@]}" down -v
         echo "Cleanup complete (volumes removed)"
         ;;
 
     *)
         echo "Usage: $0 {start|stop|restart|status|logs|logs-tail|shell|rebuild|test|worker-status|cleanup}"
+        echo "Env:   GPU_MODE=auto|on|off (default: auto)"
         echo ""
         echo "Commands:"
         echo "  start          - Start all services"
