@@ -3,11 +3,11 @@
 import asyncio
 import logging
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import httpx
 from fastapi import FastAPI, Header, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from app.auth import CognitoAuth
 from app.config import settings
@@ -23,14 +23,51 @@ ec2_mgr = EC2Manager()
 lifecycle = LifecycleManager(ec2_mgr)
 cognito_auth = CognitoAuth()
 job_queue = JobQueue(max_size=settings.MAX_QUEUED_JOBS)
+# Tracks queued proxy process IDs -> backend process IDs after replay.
+proxy_to_backend_process: dict[str, str] = {}
+# Tracks jobs actively being replayed to avoid transient 404 during queue drain.
+replay_inflight_jobs: set[str] = set()
+# Tracks replay submission failures so clients can fail fast instead of hanging in queued state.
+replay_submission_errors: dict[str, str] = {}
+
+
+def _queued_response(process_id: str) -> JSONResponse:
+    """Standard queued response payload for startup buffering."""
+    _stage = "ec2_starting" if lifecycle.state in (InstanceState.STARTING, InstanceState.STOPPED) else "queued"
+    _display = "Spinning up GPU instance" if lifecycle.state in (InstanceState.STARTING, InstanceState.STOPPED) else "Job queued"
+    return JSONResponse(
+        status_code=202,
+        content={
+            "process_id": process_id,
+            "status": "queued",
+            "state": lifecycle.state.value,
+            "message": "EC2 is starting. Job queued. Poll GET /api/v1/extract/{process_id} for status.",
+            "retry_after": 30,
+            "progress": {
+                "stage": _stage,
+                "stage_display": _display,
+                "stages_completed": [],
+                "stages_pending": [],
+                "stages_total": 0,
+                "stages_done": 0,
+                "percent": 0,
+            },
+        },
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Sync EC2 state on proxy boot."""
-    await lifecycle.sync_state_from_ec2()
-    logger.info("Proxy started. EC2 state: %s", lifecycle.state)
-    yield
+    """Kick off EC2 state sync on boot without blocking container readiness."""
+    sync_task = asyncio.create_task(lifecycle.sync_state_from_ec2())
+    logger.info("Proxy startup: scheduled EC2 state sync task")
+    try:
+        yield
+    finally:
+        if not sync_task.done():
+            sync_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await sync_task
 
 
 app = FastAPI(title="PDFX Proxy", version="1.0.0", lifespan=lifespan)
@@ -114,9 +151,29 @@ async def submit_extraction(
     if mod_abbreviation is not None:
         form_fields["mod_abbreviation"] = mod_abbreviation
 
-    # If EC2 is ready, forward immediately
+    # If EC2 is ready, forward immediately.
+    # If forwarding fails (e.g., instance is transitioning), queue and recover.
     if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
-        return await _forward_extraction(process_id, pdf_data, filename, form_fields)
+        try:
+            return await _forward_extraction(process_id, pdf_data, filename, form_fields)
+        except HTTPException as exc:
+            if exc.status_code != 502:
+                raise
+            logger.warning(
+                "Immediate forward failed for process %s; queueing for startup replay instead.",
+                process_id,
+            )
+            try:
+                await lifecycle.sync_state_from_ec2()
+            except Exception:
+                logger.debug("sync_state_from_ec2 failed during forward recovery", exc_info=True)
+            try:
+                job_queue.enqueue(process_id, pdf_data, form_fields, filename)
+            except QueueFullError:
+                raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
+            await lifecycle.ensure_running()
+            asyncio.create_task(_replay_when_ready())
+            return _queued_response(process_id)
 
     # Otherwise, queue the job and ensure EC2 is starting
     try:
@@ -129,15 +186,7 @@ async def submit_extraction(
     # Start background task to replay queued jobs once EC2 is ready
     asyncio.create_task(_replay_when_ready())
 
-    return JSONResponse(
-        status_code=202,
-        content={
-            "process_id": process_id,
-            "state": lifecycle.state.value,
-            "message": "EC2 is starting. Job queued. Poll GET /api/v1/extract/{process_id} for status.",
-            "retry_after": 30,
-        },
-    )
+    return _queued_response(process_id)
 
 
 # --- Extract: poll status (auth required, proxied to EC2) ---
@@ -149,11 +198,64 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
 
     # If the job is still queued locally, report that
     if job_queue.has_job(process_id):
+        if lifecycle.state == InstanceState.STARTING:
+            _stage, _display = "ec2_starting", "Spinning up GPU instance"
+        elif lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
+            _stage, _display = "queued", "Job queued, waiting for backend"
+        else:
+            _stage, _display = "ec2_starting", "Job queued, waiting for GPU instance"
+
         return {
             "process_id": process_id,
             "status": "queued",
             "state": lifecycle.state.value,
-            "message": "Waiting for EC2 to start.",
+            "message": _display,
+            "progress": {
+                "stage": _stage,
+                "stage_display": _display,
+                "stages_completed": [],
+                "stages_pending": [],
+                "stages_total": 0,
+                "stages_done": 0,
+                "percent": 0,
+            },
+        }
+
+    if process_id in replay_inflight_jobs:
+        _display = "Submitting queued job to backend"
+        return {
+            "process_id": process_id,
+            "status": "queued",
+            "state": lifecycle.state.value,
+            "message": _display,
+            "progress": {
+                "stage": "queued",
+                "stage_display": _display,
+                "stages_completed": [],
+                "stages_pending": [],
+                "stages_total": 0,
+                "stages_done": 0,
+                "percent": 0,
+            },
+        }
+
+    if process_id in replay_submission_errors:
+        error_message = replay_submission_errors[process_id]
+        return {
+            "process_id": process_id,
+            "status": "failed",
+            "state": lifecycle.state.value,
+            "error": error_message,
+            "message": "Failed to submit queued job to backend.",
+            "progress": {
+                "stage": "failed",
+                "stage_display": "Queued job submission failed",
+                "stages_completed": [],
+                "stages_pending": [],
+                "stages_total": 0,
+                "stages_done": 0,
+                "percent": 0,
+            },
         }
 
     # Forward to EC2
@@ -161,11 +263,55 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
         raise HTTPException(status_code=503, detail="EC2 is not running")
 
     try:
+        backend_process_id = proxy_to_backend_process.get(process_id, process_id)
         async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
-            resp = await client.get(f"{lifecycle.ec2_base_url}/api/v1/extract/{process_id}")
-            return JSONResponse(status_code=resp.status_code, content=resp.json())
+            resp = await client.get(f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}")
+            payload = resp.json()
+            if isinstance(payload, dict) and backend_process_id != process_id:
+                # Keep caller-visible process_id stable when queue replay rewrites backend IDs.
+                payload["process_id"] = process_id
+            return JSONResponse(status_code=resp.status_code, content=payload)
     except Exception as exc:
         logger.error("Failed to proxy status request: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
+
+
+# --- Extract: download artifact output (auth required, proxied to EC2) ---
+
+@app.get("/api/v1/extract/{process_id}/download/{method}")
+async def download_extraction_output(
+    process_id: str,
+    method: str,
+    authorization: str = Header(None),
+):
+    _require_auth(authorization)
+    lifecycle.touch()
+
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        raise HTTPException(status_code=503, detail="EC2 is not running")
+
+    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
+    download_url = f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}/download/{method}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.FORWARD_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        ) as client:
+            upstream = await client.get(download_url)
+
+        content_type = upstream.headers.get("content-type", "application/octet-stream")
+        content_disposition = upstream.headers.get("content-disposition")
+        response_headers = {"content-type": content_type}
+        if content_disposition:
+            response_headers["content-disposition"] = content_disposition
+
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=response_headers,
+        )
+    except Exception as exc:
+        logger.error("Failed to proxy download request for %s/%s: %s", process_id, method, exc)
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
 
 
@@ -182,7 +328,12 @@ async def _forward_extraction(process_id: str, pdf_data: bytes, filename: str, f
                 data=form_fields,
                 files=files,
             )
-            return JSONResponse(status_code=resp.status_code, content=resp.json())
+            payload = resp.json()
+            if isinstance(payload, dict):
+                backend_process_id = str(payload.get("process_id", "")).strip()
+                if backend_process_id:
+                    proxy_to_backend_process[process_id] = backend_process_id
+            return JSONResponse(status_code=resp.status_code, content=payload)
     except Exception as exc:
         logger.error("Failed to forward extraction to EC2: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
@@ -210,7 +361,12 @@ async def _replay_when_ready():
     jobs = job_queue.drain()
     logger.info("Replaying %d queued jobs to EC2", len(jobs))
     for job in jobs:
+        replay_inflight_jobs.add(job.job_id)
         try:
             await _forward_extraction(job.job_id, job.pdf_data, job.filename, job.form_fields)
+            replay_submission_errors.pop(job.job_id, None)
         except Exception as exc:
             logger.error("Failed to replay job %s: %s", job.job_id, exc)
+            replay_submission_errors[job.job_id] = str(exc)
+        finally:
+            replay_inflight_jobs.discard(job.job_id)

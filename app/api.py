@@ -515,6 +515,26 @@ def get_extraction_status(process_id):
             response["error_code"] = run["error_code"]
             response["error"] = run["error_message"]
 
+        # When the job is still running, check Celery for granular progress info
+        if run["status"] == "running":
+            try:
+                from celery_app import celery
+                result = celery.AsyncResult(process_id)
+                if result.state == "PROGRESS" and result.info:
+                    info = result.info
+                    response["status"] = "progress"
+                    response["progress"] = {
+                        "stage": info.get("stage", info.get("step", "unknown")),
+                        "stage_display": info.get("stage_display", ""),
+                        "stages_completed": info.get("stages_completed", []),
+                        "stages_pending": info.get("stages_pending", []),
+                        "stages_total": info.get("stages_total", 0),
+                        "stages_done": info.get("stages_done", 0),
+                        "percent": info.get("percent", 0),
+                    }
+            except Exception as exc:
+                logger.debug("Could not fetch Celery progress for %s: %s", process_id, exc)
+
         if run["status"] == "failed":
             return jsonify(response), 500
 
@@ -533,10 +553,20 @@ def get_extraction_status(process_id):
         return jsonify({"process_id": process_id, "status": "started"}), 200
 
     if result.state == "PROGRESS":
+        info = result.info or {}
         return jsonify({
             "process_id": process_id,
             "status": "progress",
-            "detail": result.info,
+            "progress": {
+                "stage": info.get("stage", info.get("step", "unknown")),
+                "stage_display": info.get("stage_display", ""),
+                "stages_completed": info.get("stages_completed", []),
+                "stages_pending": info.get("stages_pending", []),
+                "stages_total": info.get("stages_total", 0),
+                "stages_done": info.get("stages_done", 0),
+                "percent": info.get("percent", 0),
+            },
+            "detail": info,
         }), 200
 
     if result.state == "SUCCESS":

@@ -20,6 +20,7 @@ class Block:
     order_index: int  # 0-based position in source document
     source: str  # "grobid", "docling", "marker"
     source_md: str = ""  # original markdown syntax; falls back to raw_text when empty
+    page_no: int | None = None  # page hint from source extraction, if available
 
 
 @dataclass

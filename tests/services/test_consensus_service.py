@@ -228,7 +228,8 @@ class TestNormalization:
         result = normalize_extractor_output(text)
         assert "Alpha" in result
         assert "<span" not in result
-        assert "<!--" not in result
+        assert "<!-- image -->" not in result
+        assert "<!-- page: 1 -->" in result
         assert "![" not in result
         assert "https://doi.org" not in result
         assert "fi fl" in result
@@ -705,6 +706,85 @@ class TestAssembly:
         assert "Alpha" in result
         assert "Resolved text" in result
 
+    def test_assembly_injects_page_markers_from_block_pages(self):
+        triples = [
+            AlignedTriple(
+                segment_id="seg_000",
+                classification=AGREE_EXACT,
+                agreed_text="Intro",
+                docling_block=Block(
+                    block_id="d0",
+                    block_type="paragraph",
+                    raw_text="Intro",
+                    normalized_text="intro",
+                    heading_level=None,
+                    order_index=0,
+                    source="docling",
+                    page_no=1,
+                ),
+            ),
+            AlignedTriple(
+                segment_id="seg_001",
+                classification=AGREE_EXACT,
+                agreed_text="Methods",
+                marker_block=Block(
+                    block_id="m1",
+                    block_type="paragraph",
+                    raw_text="Methods",
+                    normalized_text="methods",
+                    heading_level=None,
+                    order_index=1,
+                    source="marker",
+                    page_no=2,
+                ),
+            ),
+        ]
+        result = assemble(triples, {})
+        assert "<!-- page: 1 -->" in result
+        assert "<!-- page: 2 -->" in result
+        assert result.index("<!-- page: 1 -->") < result.index("Intro")
+        assert result.index("<!-- page: 2 -->") < result.index("Methods")
+
+    def test_assembly_page_majority_vote_beats_source_preference(self):
+        triple = AlignedTriple(
+            segment_id="seg_100",
+            classification=AGREE_EXACT,
+            agreed_text="Result text",
+            grobid_block=Block(
+                block_id="g100",
+                block_type="paragraph",
+                raw_text="Result text",
+                normalized_text="result text",
+                heading_level=None,
+                order_index=0,
+                source="grobid",
+                page_no=5,
+            ),
+            docling_block=Block(
+                block_id="d100",
+                block_type="paragraph",
+                raw_text="Result text",
+                normalized_text="result text",
+                heading_level=None,
+                order_index=0,
+                source="docling",
+                page_no=6,
+            ),
+            marker_block=Block(
+                block_id="m100",
+                block_type="paragraph",
+                raw_text="Result text",
+                normalized_text="result text",
+                heading_level=None,
+                order_index=0,
+                source="marker",
+                page_no=6,
+            ),
+        )
+        result = assemble([triple], {})
+        assert "<!-- page: 6 -->" in result
+        assert "<!-- page: 5 -->" not in result
+
 
 class TestGapDedup:
     def test_dedup_gap_triples_drops_shorter_duplicate(self):
@@ -1091,6 +1171,14 @@ class TestMarkdownPreservation:
         assert len(paragraphs) >= 1
         assert "**important**" in paragraphs[0].source_md
 
+    def test_page_markers_assign_page_numbers_in_parse(self):
+        md = "<!-- page: 2 -->\n\nPara 2.\n\n<!-- page: 4 -->\n\nPara 4."
+        blocks = parse_markdown(md, "docling")
+        paragraphs = [b for b in blocks if b.block_type == "paragraph"]
+        assert len(paragraphs) == 2
+        assert paragraphs[0].page_no == 2
+        assert paragraphs[1].page_no == 4
+
     @patch("config.Config")
     def test_heading_markers_survive_full_pipeline(self, mock_config):
         """Heading markers (##) should be present in final assembled output."""
@@ -1412,13 +1500,13 @@ class TestMicroConflictExtraction:
         mock_config.CONSENSUS_HIERARCHY_ENABLED = False
         llm = MagicMock()
         llm.usage = TokenAccumulator()
-        llm.resolve_conflicts.return_value = {"seg_001": "kept gap text"}
+        llm.resolve_gap.return_value = {"seg_002": "kept gap text"}
 
         md_a = "# Title\n\nShared paragraph.\n\nOnly grobid has this."
         md_b = "# Title\n\nShared paragraph."
         md_c = "# Title\n\nShared paragraph."
         _result, _metrics, _audit = merge_with_consensus(md_a, md_b, md_c, llm)
-        assert llm.resolve_conflicts.called
+        assert llm.resolve_gap.called
 
     def test_no_full_segment_fallback_paths_exist(self):
         llm_source = Path("app/services/llm_service.py").read_text()

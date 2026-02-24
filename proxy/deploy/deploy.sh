@@ -37,7 +37,7 @@ TASK_ROLE_NAME=$(read_param /pdfx/task-role-name)
 
 EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}"
 TASK_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${TASK_ROLE_NAME}"
-ECR_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/pdfx-proxy:latest"
+ECR_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/agr_pdfx_proxy:latest"
 
 echo "    Account:        ${AWS_ACCOUNT_ID}"
 echo "    EC2 Instance:   ${EC2_INSTANCE_ID}"

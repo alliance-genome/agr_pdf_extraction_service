@@ -36,6 +36,9 @@ _SPAN_OPEN_RE = re.compile(r"<span[^>]*>")
 _SPAN_CLOSE_RE = re.compile(r"</span>")
 _SPAN_REF_RE = re.compile(r"<span id=['\"][^'\"]*['\"]>(.*?)</span>", re.DOTALL)
 _HTML_COMMENT_OUTPUT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_PAGE_COMMENT_RE = re.compile(r"<!--\s*page\s*[:=]?\s*(\d+)\s*-->", re.IGNORECASE)
+_PAGE_BRACKET_RE = re.compile(r"^\[\s*page\s+(\d+)\s*\]$", re.IGNORECASE)
+_PAGE_SPAN_ID_RE = re.compile(r"<span[^>]*id=['\"]page-(\d+)-[^'\"]*['\"][^>]*>", re.IGNORECASE)
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _MULTI_SPACE_RE = re.compile(r"  +")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(https?://[^)]*\)")
@@ -135,6 +138,31 @@ def _extract_text(token: dict) -> str:
         if isinstance(children, str):
             return children
     return ""
+
+
+def _extract_page_marker(text: str) -> int | None:
+    """Extract a page marker from supported syntaxes."""
+    if not text:
+        return None
+    comment_match = _PAGE_COMMENT_RE.search(text)
+    if comment_match:
+        return max(1, int(comment_match.group(1)))
+    bracket_match = _PAGE_BRACKET_RE.match(text.strip())
+    if bracket_match:
+        return max(1, int(bracket_match.group(1)))
+    span_match = _PAGE_SPAN_ID_RE.search(text)
+    if span_match:
+        return max(1, int(span_match.group(1)))
+    return None
+
+
+def _strip_non_page_comments(text: str) -> str:
+    """Remove HTML comments except page markers."""
+    def _replacer(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        return raw if _PAGE_COMMENT_RE.fullmatch(raw.strip()) else ""
+
+    return _HTML_COMMENT_OUTPUT_RE.sub(_replacer, text)
 
 
 def _reconstruct_children(token: dict) -> str:
@@ -296,8 +324,15 @@ def normalize_extractor_output(markdown_text: str) -> str:
     stripped because the output is used for embedding, not rendering.
     """
     text = unicodedata.normalize("NFKC", markdown_text or "")
+    # Convert marker page anchors into explicit page comments for downstream parsing.
+    text = re.sub(
+        r"<span\s+id=['\"]page-(\d+)-[^'\"]*['\"]>(.*?)</span>",
+        lambda m: f"<!-- page: {m.group(1)} -->\n{m.group(2)}",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     text = _SPAN_REF_RE.sub(r"\1", text)
-    text = _HTML_COMMENT_OUTPUT_RE.sub("", text)
+    text = _strip_non_page_comments(text)
     text = _IMAGE_REF_RE.sub("", text)
     text = _MARKDOWN_LINK_RE.sub(r"\1", text)
     # Common Docling ligature artifacts.
@@ -340,6 +375,7 @@ def parse_markdown(markdown_text: str, source: str) -> list[Block]:
 
     blocks: list[Block] = []
     idx = 0
+    current_page = 1
 
     if not isinstance(tokens, list):
         # Fallback: split by double newlines if AST returns unexpected type
@@ -351,11 +387,24 @@ def parse_markdown(markdown_text: str, source: str) -> list[Block]:
             token = {"type": "paragraph", "raw": token}
 
         ttype = token.get("type", "")
-        if ttype in ("newline", "space", "thematic_break"):
+        if ttype in ("newline", "space", "thematic_break", "blank_line"):
             continue
+
+        if ttype == "block_html":
+            page_marker = _extract_page_marker(token.get("raw", ""))
+            if page_marker is not None:
+                current_page = page_marker
+            continue
+
+        inline_page_marker = _extract_page_marker(_extract_text(token))
+        if inline_page_marker is not None:
+            current_page = inline_page_marker
 
         raw_text = _extract_text(token)
         if not raw_text.strip():
+            continue
+        if _PAGE_BRACKET_RE.match(raw_text.strip()):
+            current_page = max(1, int(_PAGE_BRACKET_RE.match(raw_text.strip()).group(1)))
             continue
 
         block_type, heading_level = _classify_block_type(token)
@@ -377,6 +426,7 @@ def parse_markdown(markdown_text: str, source: str) -> list[Block]:
             order_index=idx,
             source=source,
             source_md=source_md,
+            page_no=current_page,
         ))
         idx += 1
 
