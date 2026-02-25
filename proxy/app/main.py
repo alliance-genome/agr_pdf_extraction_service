@@ -312,7 +312,9 @@ async def health_deep():
             if token:
                 downstream_ok = resp.status_code in {200, 404, 422}
             else:
-                downstream_ok = resp.status_code in {401, 403}
+                # Some backend environments are reachable without auth on private network.
+                # For token-less deep checks, any non-5xx downstream response confirms roundtrip.
+                downstream_ok = resp.status_code < 500
         except Exception as exc:  # pragma: no cover - defensive log path
             downstream_error = str(exc)
     else:
