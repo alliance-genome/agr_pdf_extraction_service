@@ -103,6 +103,14 @@ def _clear_terminal_state(process_id: str) -> None:
     job_payload_cache.pop(process_id, None)
 
 
+def _drop_submission_state(process_id: str) -> None:
+    """Drop cached job data for submissions that never entered durable processing."""
+    _clear_terminal_state(process_id)
+    replay_inflight_jobs.discard(process_id)
+    proxy_to_backend_process.pop(process_id, None)
+    job_trackers.pop(process_id, None)
+
+
 def _active_backend_jobs() -> int:
     count = 0
     for process_id, tracker in job_trackers.items():
@@ -449,6 +457,7 @@ async def submit_extraction(
             )
         except HTTPException as exc:
             if exc.status_code in {401, 403, 422}:
+                _drop_submission_state(process_id)
                 raise
             logger.warning(
                 "Immediate forward failed for process %s; queueing for replay. detail=%s",
@@ -468,6 +477,7 @@ async def submit_extraction(
                     authorization=authorization,
                 )
             except QueueFullError:
+                _drop_submission_state(process_id)
                 raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
             await lifecycle.ensure_running()
             _ensure_replay_task()
@@ -483,6 +493,7 @@ async def submit_extraction(
             authorization=authorization,
         )
     except QueueFullError:
+        _drop_submission_state(process_id)
         raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
 
     await lifecycle.ensure_running()

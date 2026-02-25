@@ -144,6 +144,57 @@ class TestExtractEndpoint:
         main_mod.lifecycle.sync_state_from_ec2.assert_called_once()
         main_mod.lifecycle.ensure_running.assert_called()
 
+    def test_extract_non_retriable_error_clears_cached_payload(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.job_payload_cache.clear()
+        main_mod.job_trackers.clear()
+
+        async def _forward_unauthorized(*args, **kwargs):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        monkeypatch.setattr(main_mod, "_forward_extraction", _forward_unauthorized)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
+            data={"methods": "grobid,docling,marker", "merge": "true"},
+        )
+
+        assert resp.status_code == 401
+        assert main_mod.job_payload_cache == {}
+        assert main_mod.job_trackers == {}
+
+    def test_extract_queue_full_on_retry_clears_cached_payload(self, client, monkeypatch):
+        from app.job_queue import QueueFullError
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.sync_state_from_ec2 = AsyncMock()
+        main_mod.job_payload_cache.clear()
+        main_mod.job_trackers.clear()
+
+        async def _forward_fail(*args, **kwargs):
+            raise HTTPException(status_code=502, detail="backend unavailable")
+
+        def _queue_full(*args, **kwargs):
+            raise QueueFullError("full")
+
+        monkeypatch.setattr(main_mod, "_forward_extraction", _forward_fail)
+        monkeypatch.setattr(main_mod.job_queue, "enqueue", _queue_full)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
+            data={"methods": "grobid,docling,marker", "merge": "true"},
+        )
+
+        assert resp.status_code == 429
+        assert main_mod.job_payload_cache == {}
+        assert main_mod.job_trackers == {}
+
 
 class TestExtractStatusEndpoint:
     def test_queued_job_returns_queued(self, client, monkeypatch):
