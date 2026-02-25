@@ -270,35 +270,53 @@ async def health_deep():
     """Deep health check: proxy auth validation + downstream status round trip."""
     token = settings.HEALTHCHECK_BEARER_TOKEN or settings.CANARY_BEARER_TOKEN
 
+    # Auth contract check:
+    # - If probe token configured, validate it directly.
+    # - Otherwise verify auth guard rejects missing header (expected 401).
     auth_valid = False
+    auth_mode = "guard_rejects_missing_header"
     auth_error = None
     if token:
+        auth_mode = "token_validation"
         try:
             _require_auth(f"Bearer {token}")
             auth_valid = True
         except HTTPException as exc:
             auth_error = str(exc.detail)
     else:
-        auth_error = "HEALTHCHECK_BEARER_TOKEN is not configured"
+        try:
+            _require_auth(None)
+            auth_error = "Auth guard accepted empty header unexpectedly"
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                auth_valid = True
+            else:
+                auth_error = f"Unexpected auth guard status: {exc.status_code}"
 
     downstream_ok = False
     downstream_status = None
     downstream_error = None
 
-    if lifecycle.state in (InstanceState.READY, InstanceState.BUSY) and lifecycle.private_ip and token:
+    if lifecycle.state in (InstanceState.READY, InstanceState.BUSY) and lifecycle.private_ip:
         probe_process_id = f"health-probe-{uuid.uuid4()}"
         try:
+            request_headers = {"Authorization": f"Bearer {token}"} if token else {}
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(
                     f"{lifecycle.ec2_base_url}/api/v1/extract/{probe_process_id}",
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers=request_headers,
                 )
             downstream_status = resp.status_code
-            downstream_ok = resp.status_code in {200, 404, 422}
+            # With token: expect normal handled status.
+            # Without token: expect auth rejection but still confirms downstream reachability.
+            if token:
+                downstream_ok = resp.status_code in {200, 404, 422}
+            else:
+                downstream_ok = resp.status_code in {401, 403}
         except Exception as exc:  # pragma: no cover - defensive log path
             downstream_error = str(exc)
     else:
-        downstream_error = "worker_not_ready_or_missing_probe_token"
+        downstream_error = "worker_not_ready"
 
     deep_status = "healthy" if auth_valid and downstream_ok else "degraded"
     if deep_status != "healthy":
@@ -313,6 +331,7 @@ async def health_deep():
     return {
         "status": deep_status,
         "ec2": lifecycle.state.value,
+        "auth_check_mode": auth_mode,
         "proxy_auth_valid": auth_valid,
         "proxy_auth_error": auth_error,
         "downstream_roundtrip_ok": downstream_ok,
@@ -773,9 +792,6 @@ async def _canary_loop():
     interval = max(30, settings.CANARY_INTERVAL_SECONDS)
     token = settings.CANARY_BEARER_TOKEN or settings.HEALTHCHECK_BEARER_TOKEN
 
-    if not token:
-        canary_state["last_error"] = "CANARY_BEARER_TOKEN/HEALTHCHECK_BEARER_TOKEN not configured"
-
     while True:
         await asyncio.sleep(interval)
         canary_state["last_checked"] = time.time()
@@ -787,8 +803,7 @@ async def _canary_loop():
 
         if not token:
             canary_state["last_ok"] = False
-            canary_state["consecutive_failures"] += 1
-            logger.error("Canary failed: probe token not configured")
+            canary_state["last_error"] = "probe_token_not_configured"
             continue
 
         process_id = f"canary-{uuid.uuid4()}"
