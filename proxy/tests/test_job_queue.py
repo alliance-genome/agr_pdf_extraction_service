@@ -54,3 +54,15 @@ class TestJobQueue:
         q.enqueue("job-1", b"data", {"merge": "true"}, filename="paper.pdf")
         job = q.dequeue()
         assert job.filename == "paper.pdf"
+
+    def test_authorization_context_is_preserved(self):
+        q = JobQueue(max_size=5)
+        q.enqueue(
+            "job-auth-1",
+            b"data",
+            {"merge": "true"},
+            filename="paper.pdf",
+            authorization="Bearer token-abc",
+        )
+        job = q.dequeue()
+        assert job.authorization == "Bearer token-abc"

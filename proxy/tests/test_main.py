@@ -189,7 +189,8 @@ class TestExtractStatusEndpoint:
             "/api/v1/extract/nonexistent",
             headers={"Authorization": "Bearer test"},
         )
-        assert resp.status_code == 503
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "warming_up"
 
     def test_status_uses_mapped_backend_process_id(self, client, monkeypatch):
         import app.main as main_mod

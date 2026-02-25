@@ -1,18 +1,23 @@
 """FastAPI proxy for the PDF Extraction GPU service."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from app.auth import CognitoAuth
 from app.config import settings
 from app.ec2_manager import EC2Manager
-from app.job_queue import JobQueue, QueueFullError
+from app.job_queue import BaseJobQueue, QueueFullError, QueuedJob, build_job_queue
 from app.state_machine import InstanceState, LifecycleManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -22,55 +27,180 @@ logger = logging.getLogger(__name__)
 ec2_mgr = EC2Manager()
 lifecycle = LifecycleManager(ec2_mgr)
 cognito_auth = CognitoAuth()
-job_queue = JobQueue(max_size=settings.MAX_QUEUED_JOBS)
+job_queue: BaseJobQueue = build_job_queue(max_size=settings.MAX_QUEUED_JOBS)
+
 # Tracks queued proxy process IDs -> backend process IDs after replay.
 proxy_to_backend_process: dict[str, str] = {}
 # Tracks jobs actively being replayed to avoid transient 404 during queue drain.
 replay_inflight_jobs: set[str] = set()
-# Tracks replay submission failures so clients can fail fast instead of hanging in queued state.
+# Tracks terminal submission failures (replay/forward/reconciler) for fast-fail polling.
 replay_submission_errors: dict[str, str] = {}
 
+# Cached source payload for replay/reconciliation.
+job_payload_cache: dict[str, QueuedJob] = {}
 
-def _queued_response(process_id: str) -> JSONResponse:
-    """Standard queued response payload for startup buffering."""
-    _stage = "ec2_starting" if lifecycle.state in (InstanceState.STARTING, InstanceState.STOPPED) else "queued"
-    _display = "Spinning up GPU instance" if lifecycle.state in (InstanceState.STARTING, InstanceState.STOPPED) else "Job queued"
+# Background tasks.
+replay_task: asyncio.Task | None = None
+reconciler_task: asyncio.Task | None = None
+canary_task: asyncio.Task | None = None
+
+
+ACTIVE_JOB_STATUSES = {"queued", "pending", "started", "running", "progress", "warming_up"}
+TERMINAL_JOB_STATUSES = {"complete", "completed", "succeeded", "success", "failed", "failure", "error"}
+
+
+@dataclass
+class JobTracker:
+    process_id: str
+    status: str = "queued"
+    first_seen_at: float = 0.0
+    last_seen_at: float = 0.0
+    last_progress_signature: str = ""
+    last_progress_at: float = 0.0
+    requeue_attempted: bool = False
+
+
+job_trackers: dict[str, JobTracker] = {}
+
+# Lightweight canary state for observability.
+canary_state: dict[str, Any] = {
+    "enabled": settings.CANARY_INTERVAL_SECONDS > 0,
+    "last_checked": None,
+    "last_ok": None,
+    "last_error": None,
+    "consecutive_failures": 0,
+}
+
+
+def _ensure_tracker(process_id: str) -> JobTracker:
+    now = time.time()
+    tracker = job_trackers.get(process_id)
+    if tracker is None:
+        tracker = JobTracker(process_id=process_id, first_seen_at=now, last_seen_at=now, last_progress_at=now)
+        job_trackers[process_id] = tracker
+    return tracker
+
+
+def _record_job_event(process_id: str, event: str, *, reason: str | None = None) -> None:
+    tracker = _ensure_tracker(process_id)
+    tracker.status = event
+    tracker.last_seen_at = time.time()
+    if event in TERMINAL_JOB_STATUSES:
+        tracker.last_progress_at = tracker.last_seen_at
+    if reason:
+        logger.info("job=%s event=%s reason=%s", process_id, event, reason)
+    else:
+        logger.info("job=%s event=%s", process_id, event)
+
+
+def _mark_job_failed(process_id: str, reason: str) -> None:
+    replay_submission_errors[process_id] = reason
+    _record_job_event(process_id, "failed", reason=reason)
+
+
+def _clear_terminal_state(process_id: str) -> None:
+    replay_submission_errors.pop(process_id, None)
+    job_payload_cache.pop(process_id, None)
+
+
+def _active_backend_jobs() -> int:
+    count = 0
+    for process_id, tracker in job_trackers.items():
+        if process_id in replay_submission_errors:
+            continue
+        if tracker.status in ACTIVE_JOB_STATUSES:
+            count += 1
+    return count
+
+
+def _oldest_pending_age_seconds() -> float:
+    now = time.time()
+    ages: list[float] = []
+    queue_age = job_queue.oldest_age_seconds()
+    if queue_age > 0:
+        ages.append(queue_age)
+
+    for process_id, tracker in job_trackers.items():
+        if process_id in replay_submission_errors:
+            continue
+        if tracker.status in ACTIVE_JOB_STATUSES:
+            ages.append(max(0.0, now - tracker.last_progress_at))
+
+    return max(ages) if ages else 0.0
+
+
+def _can_stop_ec2() -> bool:
+    if replay_inflight_jobs:
+        return False
+    if job_queue.size > 0:
+        return False
+    if _active_backend_jobs() > 0:
+        return False
+    return True
+
+
+lifecycle.set_stop_guard(_can_stop_ec2)
+
+
+def _progress_payload(stage: str, stage_display: str, percent: int = 0) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "stage_display": stage_display,
+        "stages_completed": [],
+        "stages_pending": [],
+        "stages_total": 0,
+        "stages_done": 0,
+        "percent": int(max(0, min(100, percent))),
+    }
+
+
+def _queued_response(process_id: str, status_value: str = "queued") -> JSONResponse:
+    """Standard queued/warming response payload for startup buffering."""
+    is_starting = lifecycle.state in (InstanceState.STARTING, InstanceState.STOPPED)
+    if is_starting:
+        stage = "ec2_starting"
+        display = "Spinning up GPU instance"
+        message = "GPU worker is waking up. Job queued. Poll GET /api/v1/extract/{process_id} for status."
+    else:
+        stage = "queued"
+        display = "Job queued"
+        message = "Job queued. Poll GET /api/v1/extract/{process_id} for status."
+
     return JSONResponse(
         status_code=202,
         content={
             "process_id": process_id,
-            "status": "queued",
+            "status": status_value,
             "state": lifecycle.state.value,
-            "message": "EC2 is starting. Job queued. Poll GET /api/v1/extract/{process_id} for status.",
+            "message": message,
             "retry_after": 30,
-            "progress": {
-                "stage": _stage,
-                "stage_display": _display,
-                "stages_completed": [],
-                "stages_pending": [],
-                "stages_total": 0,
-                "stages_done": 0,
-                "percent": 0,
-            },
+            "progress": _progress_payload(stage, display, 0),
         },
     )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Kick off EC2 state sync on boot without blocking container readiness."""
+    """Kick off EC2 state sync and reconciliation loops on boot."""
+    global reconciler_task, canary_task
+
     sync_task = asyncio.create_task(lifecycle.sync_state_from_ec2())
-    logger.info("Proxy startup: scheduled EC2 state sync task")
+    reconciler_task = asyncio.create_task(_reconciler_loop())
+    if settings.CANARY_INTERVAL_SECONDS > 0:
+        canary_task = asyncio.create_task(_canary_loop())
+
+    logger.info("Proxy startup: scheduled EC2 state sync and maintenance tasks")
     try:
         yield
     finally:
-        if not sync_task.done():
-            sync_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await sync_task
+        for task in (sync_task, reconciler_task, canary_task):
+            if task and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
 
-app = FastAPI(title="PDFX Proxy", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="PDFX Proxy", version="1.1.0", lifespan=lifespan)
 
 
 # --- Auth helper ---
@@ -84,24 +214,129 @@ def _require_auth(authorization: str | None) -> dict:
 @app.get("/api/v1/health")
 async def health():
     ec2_state = lifecycle.state.value
-    result = {"proxy": "ok", "ec2": ec2_state}
-    if lifecycle.state in (InstanceState.READY, InstanceState.BUSY) and lifecycle.private_ip:
+    result: dict[str, Any] = {
+        "proxy": "ok",
+        "status": "degraded",
+        "ec2": ec2_state,
+        "queue_depth": job_queue.size,
+        "queue_durable": job_queue.durable,
+        "active_jobs": lifecycle.active_jobs,
+        "active_backend_jobs": _active_backend_jobs(),
+    }
+
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        result["reason"] = "worker_sleeping_or_starting"
+        return result
+
+    if not lifecycle.private_ip:
+        result["reason"] = "missing_worker_ip"
+        return result
+
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{lifecycle.ec2_base_url}/api/v1/health")
+        result["gpu_healthy"] = resp.status_code == 200
+
+        payload: dict[str, Any] | None = None
         try:
-            async with httpx.AsyncClient(timeout=3) as client:
-                resp = await client.get(f"{lifecycle.ec2_base_url}/api/v1/health")
-                result["gpu_healthy"] = resp.status_code == 200
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    if isinstance(payload, dict):
-                        result["gpu_status"] = payload.get("status")
-                        checks = payload.get("checks")
-                        if isinstance(checks, dict):
-                            result["gpu_workers"] = checks.get("workers")
-                            result["gpu_redis"] = checks.get("redis")
-                            result["gpu_grobid"] = checks.get("grobid")
-        except Exception:
-            result["gpu_healthy"] = False
+            payload = resp.json()
+        except ValueError:
+            payload = None
+
+        if isinstance(payload, dict):
+            result["gpu_status"] = payload.get("status")
+            checks = payload.get("checks")
+            if isinstance(checks, dict):
+                result["gpu_workers"] = checks.get("workers")
+                result["gpu_redis"] = checks.get("redis")
+                result["gpu_grobid"] = checks.get("grobid")
+
+        result["status"] = "healthy" if resp.status_code == 200 else "degraded"
+        if resp.status_code != 200:
+            result["reason"] = f"downstream_health_status_{resp.status_code}"
+            logger.error("Proxy health returned degraded; downstream health status=%s", resp.status_code)
+    except Exception as exc:  # pragma: no cover - defensive log path
+        result["gpu_healthy"] = False
+        result["status"] = "degraded"
+        result["reason"] = "downstream_unreachable"
+        result["error"] = str(exc)
+        logger.error("Proxy health reported degraded: downstream unreachable: %s", exc)
+
     return result
+
+
+@app.get("/api/v1/health/deep")
+async def health_deep():
+    """Deep health check: proxy auth validation + downstream status round trip."""
+    token = settings.HEALTHCHECK_BEARER_TOKEN or settings.CANARY_BEARER_TOKEN
+
+    auth_valid = False
+    auth_error = None
+    if token:
+        try:
+            _require_auth(f"Bearer {token}")
+            auth_valid = True
+        except HTTPException as exc:
+            auth_error = str(exc.detail)
+    else:
+        auth_error = "HEALTHCHECK_BEARER_TOKEN is not configured"
+
+    downstream_ok = False
+    downstream_status = None
+    downstream_error = None
+
+    if lifecycle.state in (InstanceState.READY, InstanceState.BUSY) and lifecycle.private_ip and token:
+        probe_process_id = f"health-probe-{uuid.uuid4()}"
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"{lifecycle.ec2_base_url}/api/v1/extract/{probe_process_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            downstream_status = resp.status_code
+            downstream_ok = resp.status_code in {200, 404, 422}
+        except Exception as exc:  # pragma: no cover - defensive log path
+            downstream_error = str(exc)
+    else:
+        downstream_error = "worker_not_ready_or_missing_probe_token"
+
+    deep_status = "healthy" if auth_valid and downstream_ok else "degraded"
+    if deep_status != "healthy":
+        logger.error(
+            "Deep health degraded auth_valid=%s downstream_ok=%s status=%s error=%s",
+            auth_valid,
+            downstream_ok,
+            downstream_status,
+            downstream_error or auth_error,
+        )
+
+    return {
+        "status": deep_status,
+        "ec2": lifecycle.state.value,
+        "proxy_auth_valid": auth_valid,
+        "proxy_auth_error": auth_error,
+        "downstream_roundtrip_ok": downstream_ok,
+        "downstream_status_code": downstream_status,
+        "downstream_error": downstream_error,
+        "queue_depth": job_queue.size,
+        "queue_durable": job_queue.durable,
+    }
+
+
+@app.get("/api/v1/metrics")
+async def metrics():
+    """Operational metrics for alerting dashboards."""
+    return {
+        "queue_depth": job_queue.size,
+        "queue_durable": job_queue.durable,
+        "oldest_pending_age_seconds": round(_oldest_pending_age_seconds(), 2),
+        "replay_failure_count": len(replay_submission_errors),
+        "replay_inflight_count": len(replay_inflight_jobs),
+        "active_backend_jobs": _active_backend_jobs(),
+        "ec2_stop_events_total": lifecycle.stop_events_total,
+        "ec2_stop_blocked_total": lifecycle.stop_blocked_total,
+        "canary": canary_state,
+    }
 
 
 # --- Status (auth required) ---
@@ -110,11 +345,21 @@ async def health():
 async def status(authorization: str = Header(None)):
     _require_auth(authorization)
     lifecycle.touch()
+
+    warming = False
+    if lifecycle.state == InstanceState.STOPPED:
+        await lifecycle.ensure_running()
+        warming = True
+
     return {
         "state": lifecycle.state.value,
+        "warming_up": warming or lifecycle.state == InstanceState.STARTING,
         "idle_minutes": round(lifecycle.idle_seconds / 60, 1),
+        "ready_minutes": round(lifecycle.ready_seconds / 60, 1),
         "active_jobs": lifecycle.active_jobs,
+        "active_backend_jobs": _active_backend_jobs(),
         "queued_jobs": job_queue.size,
+        "queue_durable": job_queue.durable,
     }
 
 
@@ -160,42 +405,69 @@ async def submit_extraction(
     if mod_abbreviation is not None:
         form_fields["mod_abbreviation"] = mod_abbreviation
 
+    queued_job = QueuedJob(
+        job_id=process_id,
+        pdf_data=pdf_data,
+        form_fields=form_fields,
+        filename=filename,
+        authorization=authorization,
+    )
+    job_payload_cache[process_id] = queued_job
+    _record_job_event(process_id, "queued")
+
     # If EC2 is ready, forward immediately.
-    # If forwarding fails (e.g., instance is transitioning), queue and recover.
+    # If forwarding fails due transient startup/transport issue, queue and recover.
     if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
         try:
-            return await _forward_extraction(process_id, pdf_data, filename, form_fields)
+            return await _forward_extraction(
+                process_id,
+                pdf_data,
+                filename,
+                form_fields,
+                authorization=authorization,
+            )
         except HTTPException as exc:
-            if exc.status_code != 502:
+            if exc.status_code in {401, 403, 422}:
                 raise
             logger.warning(
-                "Immediate forward failed for process %s; queueing for startup replay instead.",
+                "Immediate forward failed for process %s; queueing for replay. detail=%s",
                 process_id,
+                exc.detail,
             )
             try:
                 await lifecycle.sync_state_from_ec2()
             except Exception:
                 logger.debug("sync_state_from_ec2 failed during forward recovery", exc_info=True)
             try:
-                job_queue.enqueue(process_id, pdf_data, form_fields, filename)
+                job_queue.enqueue(
+                    process_id,
+                    pdf_data,
+                    form_fields,
+                    filename,
+                    authorization=authorization,
+                )
             except QueueFullError:
                 raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
             await lifecycle.ensure_running()
-            asyncio.create_task(_replay_when_ready())
-            return _queued_response(process_id)
+            _ensure_replay_task()
+            return _queued_response(process_id, status_value="queued")
 
-    # Otherwise, queue the job and ensure EC2 is starting
+    # Otherwise, queue the job and ensure EC2 is starting.
     try:
-        job_queue.enqueue(process_id, pdf_data, form_fields, filename)
+        job_queue.enqueue(
+            process_id,
+            pdf_data,
+            form_fields,
+            filename,
+            authorization=authorization,
+        )
     except QueueFullError:
         raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
 
     await lifecycle.ensure_running()
+    _ensure_replay_task()
 
-    # Start background task to replay queued jobs once EC2 is ready
-    asyncio.create_task(_replay_when_ready())
-
-    return _queued_response(process_id)
+    return _queued_response(process_id, status_value="warming_up")
 
 
 # --- Extract: poll status (auth required, proxied to EC2) ---
@@ -205,47 +477,36 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
     _require_auth(authorization)
     lifecycle.touch()
 
-    # If the job is still queued locally, report that
+    # If the job is still queued locally, report that.
     if job_queue.has_job(process_id):
         if lifecycle.state == InstanceState.STARTING:
-            _stage, _display = "ec2_starting", "Spinning up GPU instance"
+            stage, display = "ec2_starting", "Spinning up GPU instance"
+            status_value = "queued"
         elif lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
-            _stage, _display = "queued", "Job queued, waiting for backend"
+            stage, display = "queued", "Job queued, waiting for backend"
+            status_value = "queued"
         else:
-            _stage, _display = "ec2_starting", "Job queued, waiting for GPU instance"
+            stage, display = "ec2_starting", "Job queued, waiting for GPU instance"
+            status_value = "queued"
 
+        _record_job_event(process_id, status_value)
         return {
             "process_id": process_id,
-            "status": "queued",
+            "status": status_value,
             "state": lifecycle.state.value,
-            "message": _display,
-            "progress": {
-                "stage": _stage,
-                "stage_display": _display,
-                "stages_completed": [],
-                "stages_pending": [],
-                "stages_total": 0,
-                "stages_done": 0,
-                "percent": 0,
-            },
+            "message": display,
+            "progress": _progress_payload(stage, display, 0),
         }
 
     if process_id in replay_inflight_jobs:
-        _display = "Submitting queued job to backend"
+        display = "Submitting queued job to backend"
+        _record_job_event(process_id, "queued")
         return {
             "process_id": process_id,
             "status": "queued",
             "state": lifecycle.state.value,
-            "message": _display,
-            "progress": {
-                "stage": "queued",
-                "stage_display": _display,
-                "stages_completed": [],
-                "stages_pending": [],
-                "stages_total": 0,
-                "stages_done": 0,
-                "percent": 0,
-            },
+            "message": display,
+            "progress": _progress_payload("queued", display, 0),
         }
 
     if process_id in replay_submission_errors:
@@ -256,30 +517,44 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
             "state": lifecycle.state.value,
             "error": error_message,
             "message": "Failed to submit queued job to backend.",
-            "progress": {
-                "stage": "failed",
-                "stage_display": "Queued job submission failed",
-                "stages_completed": [],
-                "stages_pending": [],
-                "stages_total": 0,
-                "stages_done": 0,
-                "percent": 0,
-            },
+            "progress": _progress_payload("failed", "Queued job submission failed", 0),
         }
 
-    # Forward to EC2
+    # On status checks while asleep/stopped, wake instance and return warming state.
     if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
-        raise HTTPException(status_code=503, detail="EC2 is not running")
+        await lifecycle.ensure_running()
+        _record_job_event(process_id, "warming_up")
+        return {
+            "process_id": process_id,
+            "status": "warming_up",
+            "state": lifecycle.state.value,
+            "message": "Worker is starting. Please retry status shortly.",
+            "progress": _progress_payload("ec2_starting", "Spinning up GPU instance", 0),
+        }
 
+    # Forward to EC2.
     try:
         backend_process_id = proxy_to_backend_process.get(process_id, process_id)
+        headers = {"Authorization": authorization} if authorization else {}
         async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
-            resp = await client.get(f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}")
-            payload = resp.json()
-            if isinstance(payload, dict) and backend_process_id != process_id:
-                # Keep caller-visible process_id stable when queue replay rewrites backend IDs.
+            status_url = f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}"
+            if headers:
+                try:
+                    resp = await client.get(status_url, headers=headers)
+                except TypeError:
+                    resp = await client.get(status_url)
+            else:
+                resp = await client.get(status_url)
+
+        payload = _coerce_json_payload(resp)
+        if isinstance(payload, dict):
+            if backend_process_id != process_id:
+                # Keep caller-visible process_id stable when replay rewrites backend IDs.
                 payload["process_id"] = process_id
-            return JSONResponse(status_code=resp.status_code, content=payload)
+            _update_tracker_from_payload(process_id, payload)
+            _mark_terminal_cleanup_if_needed(process_id, payload)
+
+        return JSONResponse(status_code=resp.status_code, content=payload)
     except Exception as exc:
         logger.error("Failed to proxy status request: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
@@ -306,7 +581,13 @@ async def download_extraction_output(
             timeout=settings.FORWARD_TIMEOUT_SECONDS,
             follow_redirects=True,
         ) as client:
-            upstream = await client.get(download_url)
+            if authorization:
+                try:
+                    upstream = await client.get(download_url, headers={"Authorization": authorization})
+                except TypeError:
+                    upstream = await client.get(download_url)
+            else:
+                upstream = await client.get(download_url)
 
         content_type = upstream.headers.get("content-type", "application/octet-stream")
         content_disposition = upstream.headers.get("content-disposition")
@@ -326,23 +607,58 @@ async def download_extraction_output(
 
 # --- Proxy helpers ---
 
-async def _forward_extraction(process_id: str, pdf_data: bytes, filename: str, form_fields: dict):
+
+def _coerce_json_payload(resp: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict):
+            return payload
+        return {"detail": payload}
+    except ValueError:
+        text = resp.text.strip()
+        return {"detail": text or f"Non-JSON response (status={resp.status_code})"}
+
+
+async def _forward_extraction(
+    process_id: str,
+    pdf_data: bytes,
+    filename: str,
+    form_fields: dict,
+    *,
+    authorization: str | None,
+) -> JSONResponse:
     """Forward a PDF extraction request to the EC2 backend."""
     lifecycle.job_started()
     try:
         async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
             files = {"file": (filename, pdf_data, "application/pdf")}
+            headers = {"Authorization": authorization} if authorization else None
             resp = await client.post(
                 f"{lifecycle.ec2_base_url}/api/v1/extract",
                 data=form_fields,
                 files=files,
+                headers=headers,
             )
-            payload = resp.json()
-            if isinstance(payload, dict):
-                backend_process_id = str(payload.get("process_id", "")).strip()
-                if backend_process_id:
-                    proxy_to_backend_process[process_id] = backend_process_id
-            return JSONResponse(status_code=resp.status_code, content=payload)
+
+        payload = _coerce_json_payload(resp)
+
+        if resp.status_code >= 400:
+            detail = payload.get("detail") or f"HTTP {resp.status_code}"
+            raise HTTPException(
+                status_code=502 if resp.status_code >= 500 else resp.status_code,
+                detail=f"Backend extraction submit failed ({resp.status_code}): {detail}",
+            )
+
+        backend_process_id = str(payload.get("process_id", "")).strip()
+        if backend_process_id:
+            proxy_to_backend_process[process_id] = backend_process_id
+
+        _record_job_event(process_id, "accepted_by_backend")
+        replay_submission_errors.pop(process_id, None)
+
+        return JSONResponse(status_code=resp.status_code, content=payload)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Failed to forward extraction to EC2: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
@@ -350,32 +666,176 @@ async def _forward_extraction(process_id: str, pdf_data: bytes, filename: str, f
         lifecycle.job_finished()
 
 
+def _ensure_replay_task() -> None:
+    global replay_task
+    if replay_task and not replay_task.done():
+        return
+    replay_task = asyncio.create_task(_replay_when_ready())
+
+
 async def _replay_when_ready():
     """Wait for EC2 to become ready, then replay all queued jobs."""
     deadline = asyncio.get_event_loop().time() + settings.STARTUP_TIMEOUT_MINUTES * 60
     while asyncio.get_event_loop().time() < deadline:
-        if lifecycle.state == InstanceState.READY:
+        if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
             break
         if lifecycle.state == InstanceState.STOPPED:
-            logger.error("EC2 startup failed. Dropping %d queued jobs.", job_queue.size)
-            job_queue.drain()
+            jobs = job_queue.drain()
+            for job in jobs:
+                _mark_job_failed(job.job_id, "EC2 startup failed before queued replay.")
+            logger.error("EC2 startup failed. Marked %d queued jobs as failed.", len(jobs))
             return
         await asyncio.sleep(5)
     else:
-        logger.error("Timed out waiting for EC2. Dropping %d queued jobs.", job_queue.size)
-        job_queue.drain()
+        jobs = job_queue.drain()
+        for job in jobs:
+            _mark_job_failed(job.job_id, "EC2 startup timed out before queued replay.")
+        logger.error("Timed out waiting for EC2. Marked %d queued jobs as failed.", len(jobs))
         return
 
-    # Replay all queued jobs
     jobs = job_queue.drain()
     logger.info("Replaying %d queued jobs to EC2", len(jobs))
     for job in jobs:
         replay_inflight_jobs.add(job.job_id)
+        _record_job_event(job.job_id, "replayed")
         try:
-            await _forward_extraction(job.job_id, job.pdf_data, job.filename, job.form_fields)
-            replay_submission_errors.pop(job.job_id, None)
+            await _forward_extraction(
+                job.job_id,
+                job.pdf_data,
+                job.filename,
+                job.form_fields,
+                authorization=job.authorization,
+            )
         except Exception as exc:
             logger.error("Failed to replay job %s: %s", job.job_id, exc)
-            replay_submission_errors[job.job_id] = str(exc)
+            _mark_job_failed(job.job_id, str(exc))
         finally:
             replay_inflight_jobs.discard(job.job_id)
+
+
+async def _reconciler_loop():
+    """Close stale pending/running records and optionally requeue once."""
+    interval = max(15, settings.RECONCILER_INTERVAL_SECONDS)
+    stale_after = max(1, settings.STUCK_PENDING_MINUTES) * 60
+
+    while True:
+        await asyncio.sleep(interval)
+        now = time.time()
+
+        for process_id, tracker in list(job_trackers.items()):
+            if process_id in replay_submission_errors:
+                continue
+            if tracker.status not in ACTIVE_JOB_STATUSES:
+                continue
+
+            age = now - tracker.last_progress_at
+            if age < stale_after:
+                continue
+
+            if settings.RECONCILER_REQUEUE_ONCE and not tracker.requeue_attempted and process_id in job_payload_cache:
+                tracker.requeue_attempted = True
+                job = job_payload_cache[process_id]
+                logger.warning("Reconciler requeueing stale job %s after %.0fs", process_id, age)
+                try:
+                    if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
+                        await _forward_extraction(
+                            process_id,
+                            job.pdf_data,
+                            job.filename,
+                            job.form_fields,
+                            authorization=job.authorization,
+                        )
+                    else:
+                        job_queue.enqueue(
+                            process_id,
+                            job.pdf_data,
+                            job.form_fields,
+                            job.filename,
+                            authorization=job.authorization,
+                        )
+                        await lifecycle.ensure_running()
+                        _ensure_replay_task()
+                        _record_job_event(process_id, "queued")
+                    continue
+                except Exception as exc:
+                    _mark_job_failed(process_id, f"Requeue attempt failed: {exc}")
+                    continue
+
+            _mark_job_failed(
+                process_id,
+                "Progress monitoring timeout in proxy. "
+                "The worker may still be processing; backend extraction timeout is separate.",
+            )
+
+
+async def _canary_loop():
+    """Periodic canary round-trip against downstream status endpoint."""
+    interval = max(30, settings.CANARY_INTERVAL_SECONDS)
+    token = settings.CANARY_BEARER_TOKEN or settings.HEALTHCHECK_BEARER_TOKEN
+
+    if not token:
+        canary_state["last_error"] = "CANARY_BEARER_TOKEN/HEALTHCHECK_BEARER_TOKEN not configured"
+
+    while True:
+        await asyncio.sleep(interval)
+        canary_state["last_checked"] = time.time()
+
+        if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY) or not lifecycle.private_ip:
+            canary_state["last_ok"] = False
+            canary_state["last_error"] = "worker_not_ready"
+            continue
+
+        if not token:
+            canary_state["last_ok"] = False
+            canary_state["consecutive_failures"] += 1
+            logger.error("Canary failed: probe token not configured")
+            continue
+
+        process_id = f"canary-{uuid.uuid4()}"
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"{lifecycle.ec2_base_url}/api/v1/extract/{process_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            ok = resp.status_code in {200, 404, 422}
+            canary_state["last_ok"] = ok
+            if ok:
+                canary_state["last_error"] = None
+                canary_state["consecutive_failures"] = 0
+            else:
+                canary_state["last_error"] = f"unexpected_status_{resp.status_code}"
+                canary_state["consecutive_failures"] += 1
+                logger.error("Canary failed: status=%s", resp.status_code)
+        except Exception as exc:  # pragma: no cover - defensive log path
+            canary_state["last_ok"] = False
+            canary_state["last_error"] = str(exc)
+            canary_state["consecutive_failures"] += 1
+            logger.error("Canary failed: %s", exc)
+
+
+def _update_tracker_from_payload(process_id: str, payload: dict[str, Any]) -> None:
+    tracker = _ensure_tracker(process_id)
+    status = str(payload.get("status", "")).strip().lower() or tracker.status
+
+    progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
+    stage = str(progress.get("stage", "")).strip().lower()
+    percent = progress.get("percent")
+    signature = f"{status}|{stage}|{percent}"
+
+    tracker.status = status
+    tracker.last_seen_at = time.time()
+    if signature != tracker.last_progress_signature:
+        tracker.last_progress_signature = signature
+        tracker.last_progress_at = tracker.last_seen_at
+
+
+def _mark_terminal_cleanup_if_needed(process_id: str, payload: dict[str, Any]) -> None:
+    status = str(payload.get("status", "")).strip().lower()
+    if status in {"complete", "completed", "succeeded", "success"}:
+        _record_job_event(process_id, "complete")
+        _clear_terminal_state(process_id)
+    elif status in {"failed", "failure", "error"}:
+        detail = payload.get("error") or payload.get("detail") or "Backend reported failure"
+        _mark_job_failed(process_id, str(detail))
+        _clear_terminal_state(process_id)

@@ -4,7 +4,7 @@ import asyncio
 import enum
 import logging
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 
@@ -28,9 +28,13 @@ class LifecycleManager:
         self._state = InstanceState.STOPPED
         self._private_ip: Optional[str] = None
         self._last_activity: float = time.time()
+        self._ready_since: Optional[float] = None
         self._startup_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
         self._active_jobs: int = 0
+        self._stop_guard: Optional[Callable[[], bool]] = None
+        self._stop_events_total: int = 0
+        self._stop_blocked_total: int = 0
 
     @property
     def state(self) -> InstanceState:
@@ -48,6 +52,24 @@ class LifecycleManager:
     def active_jobs(self) -> int:
         return self._active_jobs
 
+    @property
+    def ready_seconds(self) -> float:
+        if self._ready_since is None:
+            return 0.0
+        return max(0.0, time.time() - self._ready_since)
+
+    @property
+    def stop_events_total(self) -> int:
+        return self._stop_events_total
+
+    @property
+    def stop_blocked_total(self) -> int:
+        return self._stop_blocked_total
+
+    def set_stop_guard(self, guard: Callable[[], bool]) -> None:
+        """Register callback that must return True before EC2 can stop."""
+        self._stop_guard = guard
+
     def touch(self) -> None:
         """Reset the idle timer. Call on every incoming request."""
         self._last_activity = time.time()
@@ -60,6 +82,8 @@ class LifecycleManager:
         self._active_jobs = max(0, self._active_jobs - 1)
         if self._active_jobs == 0 and self._state == InstanceState.BUSY:
             self._state = InstanceState.READY
+            if self._ready_since is None:
+                self._ready_since = time.time()
 
     @property
     def ec2_base_url(self) -> str:
@@ -78,6 +102,8 @@ class LifecycleManager:
             self._private_ip = ip
             if await self._check_health():
                 self._state = InstanceState.READY
+                if self._ready_since is None:
+                    self._ready_since = time.time()
                 self._start_idle_monitor()
                 return
 
@@ -108,6 +134,7 @@ class LifecycleManager:
                     if await self._check_health():
                         logger.info("EC2 instance healthy at %s", ip)
                         self._state = InstanceState.READY
+                        self._ready_since = time.time()
                         self._start_idle_monitor()
                         return
             except Exception as exc:
@@ -117,6 +144,8 @@ class LifecycleManager:
 
         logger.error("EC2 startup timed out after %d minutes", settings.STARTUP_TIMEOUT_MINUTES)
         self._state = InstanceState.STOPPED
+        self._private_ip = None
+        self._ready_since = None
 
     async def _check_health(self) -> bool:
         """Hit the EC2 Flask health endpoint and validate worker readiness."""
@@ -162,12 +191,26 @@ class LifecycleManager:
     async def _idle_monitor(self) -> None:
         """Periodically check idle time and stop EC2 when threshold reached."""
         timeout = settings.IDLE_TIMEOUT_MINUTES * 60
+        min_uptime_seconds = settings.MIN_UPTIME_MINUTES * 60
         while True:
             await asyncio.sleep(60)  # check every minute
             if self._state not in (InstanceState.READY, InstanceState.BUSY):
                 return
+            if settings.ALWAYS_ON_MODE:
+                continue
             if self._state == InstanceState.BUSY:
                 continue  # don't stop while jobs are running
+            if self._ready_since and (time.time() - self._ready_since) < min_uptime_seconds:
+                continue
+            if self._stop_guard:
+                try:
+                    can_stop = self._stop_guard()
+                except Exception as exc:
+                    logger.error("Stop guard callback failed: %s", exc)
+                    can_stop = False
+                if not can_stop:
+                    self._stop_blocked_total += 1
+                    continue
             if self.idle_seconds >= timeout:
                 logger.info(
                     "Idle timeout reached (%.0f seconds). Stopping EC2.",
@@ -175,10 +218,12 @@ class LifecycleManager:
                 )
                 try:
                     self._ec2.stop_instance()
+                    self._stop_events_total += 1
                 except Exception as exc:
                     logger.error("Failed to stop EC2: %s", exc)
                 self._state = InstanceState.STOPPED
                 self._private_ip = None
+                self._ready_since = None
                 return
 
     async def sync_state_from_ec2(self) -> None:
@@ -189,6 +234,7 @@ class LifecycleManager:
             if ec2_state == "running" and ip:
                 if await self._check_health():
                     self._state = InstanceState.READY
+                    self._ready_since = time.time()
                     self._start_idle_monitor()
                     logger.info("Synced: EC2 is running and healthy at %s", ip)
                 else:
@@ -198,9 +244,12 @@ class LifecycleManager:
             elif ec2_state in ("pending", "shutting-down", "stopping"):
                 self._state = InstanceState.STARTING
                 self._startup_task = asyncio.create_task(self._poll_until_healthy())
+                self._ready_since = None
             else:
                 self._state = InstanceState.STOPPED
+                self._ready_since = None
                 logger.info("Synced: EC2 is stopped")
         except Exception as exc:
             logger.warning("Failed to sync EC2 state: %s", exc)
             self._state = InstanceState.STOPPED
+            self._ready_since = None

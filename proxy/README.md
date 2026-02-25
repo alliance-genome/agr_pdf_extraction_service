@@ -8,7 +8,7 @@ The PDF extraction backend runs on a GPU instance (g5.2xlarge) that costs ~$1/ho
 
 1. Running cheaply on Fargate (256 CPU / 512 MB — pennies/hour)
 2. Auto-starting the GPU instance when a job arrives
-3. Queuing jobs in memory while EC2 boots (~2-3 minutes)
+3. Queuing jobs while EC2 boots (~2-3 minutes), with optional durable S3 queue
 4. Replaying queued jobs once the backend is healthy
 5. Auto-stopping the GPU instance after an idle timeout
 
@@ -43,11 +43,13 @@ Callers talk to the proxy at a stable endpoint and never need to know whether th
 
 ## API Endpoints
 
-All endpoints except `/api/v1/health` require a Cognito Bearer token.
+All endpoints except `/api/v1/health`, `/api/v1/health/deep`, and `/api/v1/metrics` require a Cognito Bearer token.
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/api/v1/health` | GET | No | Proxy health + EC2 state |
+| `/api/v1/health` | GET | No | Proxy health + EC2 state (degraded unless worker is ready) |
+| `/api/v1/health/deep` | GET | No | Deep probe: proxy auth validation + downstream status round-trip |
+| `/api/v1/metrics` | GET | No | Queue/replay/lifecycle/canary metrics for alerting |
 | `/api/v1/status` | GET | Yes | EC2 state, idle time, active/queued job counts |
 | `/api/v1/wake` | POST | Yes | Start the GPU instance (idempotent) |
 | `/api/v1/extract` | POST | Yes | Submit a PDF for extraction |
@@ -60,7 +62,7 @@ Accepts the same multipart form fields as the backend (`file`, `methods`, `merge
 
 **If EC2 is running:** the request is forwarded immediately and the backend's 202 response is returned.
 
-**If EC2 is stopped:** the job is queued in memory, EC2 is started, and a 202 response is returned:
+**If EC2 is stopped:** the job is queued, EC2 is started, and a 202 response is returned:
 
 ```json
 {
@@ -81,7 +83,7 @@ Accepts the same multipart form fields as the backend (`file`, `methods`, `merge
 }
 ```
 
-Once EC2 is healthy, all queued jobs are automatically replayed to the backend.
+Once EC2 is healthy, all queued jobs are automatically replayed to the backend. Replay failures are marked as explicit `failed` states (no infinite pending loop).
 
 ### Poll Status (`GET /api/v1/extract/{id}`)
 
@@ -151,7 +153,14 @@ Extraction stages are dynamic based on the `methods` parameter. `llm_merge` only
 | `READY` | EC2 is healthy. Requests are forwarded. |
 | `BUSY` | At least one job is in flight. Idle timer is paused. |
 
-The idle monitor checks every 60 seconds. When the instance has been idle (no requests at all) for `IDLE_TIMEOUT_MINUTES`, it is stopped automatically.
+The idle monitor checks every 60 seconds. The worker is only eligible for stop when all guards pass:
+- no queued jobs
+- no replay-inflight jobs
+- no tracked active backend jobs
+- minimum uptime (`MIN_UPTIME_MINUTES`) has elapsed
+- `ALWAYS_ON_MODE` is disabled
+
+When guards pass and idle exceeds `IDLE_TIMEOUT_MINUTES`, the instance is stopped automatically.
 
 On proxy startup, `sync_state_from_ec2()` checks the actual EC2 state so the proxy's internal state matches reality.
 
@@ -168,10 +177,22 @@ All settings come from environment variables. In production, values are injected
 | `COGNITO_REGION` | No | `us-east-1` | AWS region for Cognito |
 | `COGNITO_REQUIRED_SCOPE` | No | `pdfx-api/extract` | OAuth scope required in the JWT |
 | `IDLE_TIMEOUT_MINUTES` | No | `30` | Minutes of inactivity before EC2 is stopped |
+| `MIN_UPTIME_MINUTES` | No | `20` | Minimum uptime after wake before idle stop is allowed |
 | `STARTUP_TIMEOUT_MINUTES` | No | `10` | Max minutes to wait for EC2 health check |
 | `HEALTH_POLL_INTERVAL_SECONDS` | No | `15` | Seconds between EC2 health polls during startup |
 | `MAX_QUEUED_JOBS` | No | `10` | Max jobs to hold in memory during startup |
 | `FORWARD_TIMEOUT_SECONDS` | No | `600` | Timeout for forwarded HTTP requests to EC2 |
+| `ALWAYS_ON_MODE` | No | `false` | Emergency mode that disables idle auto-stop |
+| `QUEUE_BACKEND` | No | `memory` | Queue backend: `memory` or `s3` |
+| `QUEUE_S3_BUCKET` | No | — | S3 bucket for durable queue (`QUEUE_BACKEND=s3`) |
+| `QUEUE_S3_PREFIX` | No | `pdfx-proxy-queue` | S3 prefix for durable queue jobs |
+| `QUEUE_S3_REGION` | No | — | Optional S3 region override |
+| `STUCK_PENDING_MINUTES` | No | `20` | Age threshold for stale pending/running jobs |
+| `RECONCILER_INTERVAL_SECONDS` | No | `60` | Background reconciler interval |
+| `RECONCILER_REQUEUE_ONCE` | No | `false` | Optional one-time requeue of stale jobs |
+| `HEALTHCHECK_BEARER_TOKEN` | No | — | Token used by `/api/v1/health/deep` |
+| `CANARY_INTERVAL_SECONDS` | No | `0` | Downstream canary interval (0 disables) |
+| `CANARY_BEARER_TOKEN` | No | — | Token used for canary downstream probe |
 
 ## Deployment
 
@@ -223,7 +244,7 @@ proxy/
 │   ├── auth.py             # Cognito JWT validation
 │   ├── ec2_manager.py      # EC2 start/stop/describe via boto3
 │   ├── state_machine.py    # InstanceState enum + LifecycleManager
-│   └── job_queue.py        # In-memory FIFO queue for startup buffering
+│   └── job_queue.py        # Queue backends (in-memory + optional durable S3)
 ├── tests/
 │   ├── test_main.py        # Integration tests for all routes
 │   ├── test_auth.py        # Cognito token validation tests
@@ -262,3 +283,8 @@ uvicorn app.main:app --reload --port 8080
 ```
 
 The proxy will sync with the actual EC2 instance state on startup.
+
+## Operational Fallbacks
+
+### Always-On Worker Window
+During high-throughput curation windows, set `ALWAYS_ON_MODE=true` and redeploy proxy. This disables idle auto-stop until reverted.
