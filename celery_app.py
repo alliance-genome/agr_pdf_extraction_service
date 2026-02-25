@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from celery import Celery
 from celery.signals import setup_logging as celery_setup_logging, worker_process_init
+from sqlalchemy.exc import IntegrityError
 
 from config import Config
 from app.models import ExtractionRun, get_session
@@ -343,6 +344,18 @@ def _safe_upsert_extraction_run(db_session, **kwargs):
     if not db_session:
         return False
 
+    def _is_unique_violation(exc):
+        orig = getattr(exc, "orig", None)
+        pgcode = getattr(orig, "pgcode", None)
+        if pgcode == "23505":  # Postgres unique_violation
+            return True
+        msg = str(orig or exc).lower()
+        return (
+            "duplicate key value" in msg
+            or "unique constraint" in msg
+            or "unique failed" in msg
+        )
+
     try:
         _upsert_extraction_run(db_session, **kwargs)
         return True
@@ -352,6 +365,22 @@ def _safe_upsert_extraction_run(db_session, **kwargs):
             db_session.rollback()
         except Exception:
             pass
+        # Common race: API inserts "queued" row while worker is upserting "running".
+        # Retry once after rollback so we don't lose DB state updates for this run.
+        if isinstance(exc, IntegrityError) or _is_unique_violation(exc):
+            try:
+                _upsert_extraction_run(db_session, **kwargs)
+                return True
+            except Exception as retry_exc:
+                logger.warning(
+                    "Retry write failed for extraction_run row %s: %s",
+                    kwargs.get("process_id"),
+                    retry_exc,
+                )
+                try:
+                    db_session.rollback()
+                except Exception:
+                    pass
         return False
 
 
