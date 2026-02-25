@@ -21,6 +21,25 @@
       "Effect": "Allow",
       "Action": "ssm:GetParameters",
       "Resource": "arn:aws:ssm:${REGION}:${AWS_ACCOUNT_ID}:parameter/pdfx/*"
+    },
+    {
+      "Sid": "S3QueueListBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::${QUEUE_S3_BUCKET}"
+    },
+    {
+      "Sid": "S3QueueReadWriteObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::${QUEUE_S3_BUCKET}/*"
     }
   ]
 }

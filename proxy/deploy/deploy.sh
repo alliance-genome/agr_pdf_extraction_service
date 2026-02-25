@@ -34,6 +34,7 @@ AWS_ACCOUNT_ID=$(read_param /pdfx/aws-account-id)
 EC2_INSTANCE_ID=$(read_param /pdfx/ec2-instance-id)
 EXECUTION_ROLE_NAME=$(read_param /pdfx/execution-role-name)
 TASK_ROLE_NAME=$(read_param /pdfx/task-role-name)
+QUEUE_S3_BUCKET=$(read_param /pdfx/audit-s3-bucket)
 
 EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}"
 TASK_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${TASK_ROLE_NAME}"
@@ -44,6 +45,7 @@ echo "    EC2 Instance:   ${EC2_INSTANCE_ID}"
 echo "    Execution Role: ${EXECUTION_ROLE_ARN}"
 echo "    Task Role:      ${TASK_ROLE_ARN}"
 echo "    ECR Image:      ${ECR_IMAGE}"
+echo "    Queue Bucket:   ${QUEUE_S3_BUCKET}"
 
 # --- Generate task definition ---
 echo "==> Generating task definition..."
@@ -51,6 +53,7 @@ TASK_DEF=$(sed \
     -e "s|\${EXECUTION_ROLE_ARN}|${EXECUTION_ROLE_ARN}|g" \
     -e "s|\${TASK_ROLE_ARN}|${TASK_ROLE_ARN}|g" \
     -e "s|\${ECR_IMAGE}|${ECR_IMAGE}|g" \
+    -e "s|\${QUEUE_S3_BUCKET}|${QUEUE_S3_BUCKET}|g" \
     "${SCRIPT_DIR}/task-definition.template.json")
 
 # --- Generate IAM policy ---
@@ -58,6 +61,7 @@ echo "==> Generating IAM policy..."
 IAM_POLICY=$(sed \
     -e "s|\${AWS_ACCOUNT_ID}|${AWS_ACCOUNT_ID}|g" \
     -e "s|\${EC2_INSTANCE_ID}|${EC2_INSTANCE_ID}|g" \
+    -e "s|\${QUEUE_S3_BUCKET}|${QUEUE_S3_BUCKET}|g" \
     -e "s|\${REGION}|${REGION}|g" \
     "${SCRIPT_DIR}/iam-policy.template.json")
 

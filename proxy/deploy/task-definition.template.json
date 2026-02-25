@@ -16,6 +16,17 @@
           "protocol": "tcp"
         }
       ],
+      "environment": [
+        {"name": "QUEUE_BACKEND", "value": "s3"},
+        {"name": "QUEUE_S3_BUCKET", "value": "${QUEUE_S3_BUCKET}"},
+        {"name": "QUEUE_S3_PREFIX", "value": "pdfx-proxy-queue"},
+        {"name": "QUEUE_S3_REGION", "value": "us-east-1"},
+        {"name": "MIN_UPTIME_MINUTES", "value": "20"},
+        {"name": "STUCK_PENDING_MINUTES", "value": "20"},
+        {"name": "RECONCILER_INTERVAL_SECONDS", "value": "60"},
+        {"name": "RECONCILER_REQUEUE_ONCE", "value": "false"},
+        {"name": "ALWAYS_ON_MODE", "value": "false"}
+      ],
       "secrets": [
         {"name": "EC2_INSTANCE_ID", "valueFrom": "/pdfx/ec2-instance-id"},
         {"name": "EC2_REGION", "valueFrom": "/pdfx/ec2-region"},
