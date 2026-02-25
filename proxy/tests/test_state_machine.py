@@ -93,3 +93,63 @@ class TestLifecycleManager:
         ec2.start_instance.assert_called_once()
         assert mgr.state == InstanceState.READY
         assert mgr.private_ip == "10.0.0.5"
+
+    def test_check_health_requires_active_workers(self, monkeypatch):
+        mgr, _ = self._make_manager()
+        mgr._private_ip = "10.0.0.5"
+
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "status": "ok",
+                    "checks": {"grobid": "ok", "redis": "ok", "workers": 0},
+                }
+
+        class _Client:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _Resp()
+
+        monkeypatch.setattr("app.state_machine.httpx.AsyncClient", _Client)
+        assert asyncio.run(mgr._check_health()) is False
+
+    def test_check_health_passes_with_workers_and_dependencies_ok(self, monkeypatch):
+        mgr, _ = self._make_manager()
+        mgr._private_ip = "10.0.0.5"
+
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "status": "ok",
+                    "checks": {"grobid": "ok", "redis": "ok", "workers": 1},
+                }
+
+        class _Client:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _Resp()
+
+        monkeypatch.setattr("app.state_machine.httpx.AsyncClient", _Client)
+        assert asyncio.run(mgr._check_health()) is True

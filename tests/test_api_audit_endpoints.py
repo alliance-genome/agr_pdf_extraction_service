@@ -217,6 +217,45 @@ def test_get_extraction_status_falls_back_to_celery_when_db_row_missing(client):
     assert payload["status"] == "pending"
 
 
+def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="queued",
+        reference_curie="PMID:11111",
+    ))
+    session.commit()
+    session.close()
+
+    mock_result = MagicMock()
+    mock_result.state = "SUCCESS"
+    mock_result.result = {
+        "reference_curie": "PMID:11111",
+        "started_at": "2026-02-25T12:00:00Z",
+        "ended_at": "2026-02-25T12:10:00Z",
+        "log_s3_key": "pdfx/audit/2026/02/25/test.ndjson",
+        "artifacts_json": {"merged": "pdfx/audit/2026/02/25/x/merged.md"},
+        "llm_usage_json": {"total_tokens": 123},
+        "llm_cost_usd": 0.42,
+    }
+
+    with patch("celery_app.celery.AsyncResult", return_value=mock_result):
+        response = client.get(f"/api/v1/extract/{process_id}")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["process_id"] == process_id
+    assert payload["status"] == "complete"
+    assert payload["started_at"] == "2026-02-25T12:00:00Z"
+    assert payload["ended_at"] == "2026-02-25T12:10:00Z"
+    assert payload["log_s3_key"] == "pdfx/audit/2026/02/25/test.ndjson"
+    assert payload["artifacts_json"]["merged"].endswith("merged.md")
+    assert payload["llm_usage_json"]["total_tokens"] == 123
+    assert payload["llm_cost_usd"] == 0.42
+
+
 @patch("celery_app.extract_pdf.apply_async")
 @patch("app.api._get_db_session", return_value=None)
 def test_submit_extraction_works_when_db_unavailable(mock_db_session, mock_apply_async, client):

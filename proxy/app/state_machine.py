@@ -119,13 +119,37 @@ class LifecycleManager:
         self._state = InstanceState.STOPPED
 
     async def _check_health(self) -> bool:
-        """Hit the EC2 Flask health endpoint."""
+        """Hit the EC2 Flask health endpoint and validate worker readiness."""
         if not self._private_ip:
             return False
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{self.ec2_base_url}/api/v1/health")
-                return resp.status_code == 200
+                if resp.status_code != 200:
+                    return False
+
+                payload = resp.json()
+                if not isinstance(payload, dict):
+                    return False
+
+                checks = payload.get("checks")
+                if not isinstance(checks, dict):
+                    return False
+
+                workers = checks.get("workers")
+                if not isinstance(workers, int) or workers <= 0:
+                    logger.debug("EC2 health not ready: workers=%r", workers)
+                    return False
+
+                if checks.get("redis") != "ok":
+                    logger.debug("EC2 health not ready: redis=%r", checks.get("redis"))
+                    return False
+
+                if checks.get("grobid") != "ok":
+                    logger.debug("EC2 health not ready: grobid=%r", checks.get("grobid"))
+                    return False
+
+                return True
         except Exception:
             return False
 

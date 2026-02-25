@@ -237,15 +237,21 @@ def health():
     try:
         from celery_app import celery
         inspector = celery.control.inspect(timeout=2)
-        active = inspector.active()
-        checks["workers"] = len(active) if active else 0
+        # Count live worker nodes, not active tasks.
+        # `active()` can be empty when workers are idle.
+        ping = inspector.ping() if inspector else None
+        checks["workers"] = len(ping) if ping else 0
     except Exception:
         checks["workers"] = "unknown"
 
     overall = "ok"
     if checks["grobid"] != "ok" or checks["redis"] != "ok":
         overall = "degraded"
+    if checks["workers"] == "unknown":
+        overall = "degraded"
     if checks["redis"] == "unavailable":
+        overall = "unhealthy"
+    if isinstance(checks["workers"], int) and checks["workers"] <= 0:
         overall = "unhealthy"
 
     status_code = 200 if overall != "unhealthy" else 503
@@ -515,11 +521,31 @@ def get_extraction_status(process_id):
             response["error_code"] = run["error_code"]
             response["error"] = run["error_message"]
 
-        # When the job is still running, check Celery for granular progress info
-        if run["status"] == "running":
+        # For non-terminal DB states, reconcile with Celery truth to avoid stale "pending".
+        if run["status"] in {"queued", "running"}:
             try:
                 from celery_app import celery
                 result = celery.AsyncResult(process_id)
+                if result.state == "SUCCESS":
+                    response["status"] = "complete"
+                    if isinstance(result.result, dict):
+                        response["reference_curie"] = result.result.get("reference_curie") or response["reference_curie"]
+                        response["started_at"] = result.result.get("started_at") or response["started_at"]
+                        response["ended_at"] = result.result.get("ended_at") or response["ended_at"]
+                        response["log_s3_key"] = result.result.get("log_s3_key") or response["log_s3_key"]
+                        response["artifacts_json"] = result.result.get("artifacts_json") or response["artifacts_json"]
+                        response["llm_usage_json"] = result.result.get("llm_usage_json") or response["llm_usage_json"]
+                        response["llm_cost_usd"] = result.result.get("llm_cost_usd") or response["llm_cost_usd"]
+                    return jsonify(response), 200
+
+                if result.state == "FAILURE":
+                    response["status"] = "failed"
+                    response["error"] = str(result.info)
+                    return jsonify(response), 500
+
+                if result.state == "STARTED":
+                    response["status"] = "started"
+
                 if result.state == "PROGRESS" and result.info:
                     info = result.info
                     response["status"] = "progress"
@@ -533,7 +559,7 @@ def get_extraction_status(process_id):
                         "percent": info.get("percent", 0),
                     }
             except Exception as exc:
-                logger.debug("Could not fetch Celery progress for %s: %s", process_id, exc)
+                logger.debug("Could not fetch Celery state for %s: %s", process_id, exc)
 
         if run["status"] == "failed":
             return jsonify(response), 500

@@ -90,6 +90,15 @@ async def health():
             async with httpx.AsyncClient(timeout=3) as client:
                 resp = await client.get(f"{lifecycle.ec2_base_url}/api/v1/health")
                 result["gpu_healthy"] = resp.status_code == 200
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        result["gpu_status"] = payload.get("status")
+                        checks = payload.get("checks")
+                        if isinstance(checks, dict):
+                            result["gpu_workers"] = checks.get("workers")
+                            result["gpu_redis"] = checks.get("redis")
+                            result["gpu_grobid"] = checks.get("grobid")
         except Exception:
             result["gpu_healthy"] = False
     return result
