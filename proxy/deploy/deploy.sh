@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# deploy.sh — Resolve SSM parameters and register the ECS task definition.
+# deploy.sh — Resolve SSM parameters, register ECS task definition,
+# and roll the ECS service.
 #
 # Usage:
-#   ./deploy.sh [--profile PROFILE] [--dry-run]
+#   ./deploy.sh [--profile PROFILE] [--region REGION] [--cluster NAME] [--service NAME]
+#               [--dry-run] [--no-update-service] [--no-wait]
 #
 # Reads infrastructure values from AWS SSM Parameter Store under /pdfx/*,
 # substitutes them into the template files, and registers the task definition.
+# By default, it also updates the ECS service to the new revision and waits
+# for service stability.
 
 set -euo pipefail
 
@@ -13,11 +17,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REGION="us-east-1"
 PROFILE=""
 DRY_RUN=false
+CLUSTER_NAME="pdfx-proxy"
+SERVICE_NAME="pdfx-proxy"
+UPDATE_SERVICE=true
+WAIT_FOR_STABLE=true
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --profile) PROFILE="$2"; shift 2 ;;
+        --region) REGION="$2"; shift 2 ;;
+        --cluster) CLUSTER_NAME="$2"; shift 2 ;;
+        --service) SERVICE_NAME="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --no-update-service) UPDATE_SERVICE=false; shift ;;
+        --no-wait) WAIT_FOR_STABLE=false; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -46,6 +59,8 @@ echo "    Execution Role: ${EXECUTION_ROLE_ARN}"
 echo "    Task Role:      ${TASK_ROLE_ARN}"
 echo "    ECR Image:      ${ECR_IMAGE}"
 echo "    Queue Bucket:   ${QUEUE_S3_BUCKET}"
+echo "    ECS Cluster:    ${CLUSTER_NAME}"
+echo "    ECS Service:    ${SERVICE_NAME}"
 
 # --- Generate task definition ---
 echo "==> Generating task definition..."
@@ -79,10 +94,39 @@ fi
 
 # --- Register task definition ---
 echo "==> Registering ECS task definition..."
-$AWS_CMD ecs register-task-definition \
+TASK_DEF_ARN=$($AWS_CMD ecs register-task-definition \
     --region "$REGION" \
     --cli-input-json "$TASK_DEF" \
     --query "taskDefinition.taskDefinitionArn" \
-    --output text
+    --output text)
+
+echo "    Registered: ${TASK_DEF_ARN}"
+
+if ! $UPDATE_SERVICE; then
+    echo "==> Skipping ECS service update (--no-update-service)."
+    echo "==> Done."
+    exit 0
+fi
+
+echo "==> Updating ECS service to new task definition..."
+$AWS_CMD ecs update-service \
+    --region "$REGION" \
+    --cluster "$CLUSTER_NAME" \
+    --service "$SERVICE_NAME" \
+    --task-definition "$TASK_DEF_ARN" \
+    --force-new-deployment \
+    --query "service.{serviceName:serviceName,taskDefinition:taskDefinition}" \
+    --output json
+
+if $WAIT_FOR_STABLE; then
+    echo "==> Waiting for service stability..."
+    $AWS_CMD ecs wait services-stable \
+        --region "$REGION" \
+        --cluster "$CLUSTER_NAME" \
+        --services "$SERVICE_NAME"
+    echo "==> Service is stable."
+else
+    echo "==> Skipping service wait (--no-wait)."
+fi
 
 echo "==> Done."

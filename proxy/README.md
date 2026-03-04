@@ -218,12 +218,15 @@ docker build -t agr_pdfx_proxy .
 docker tag agr_pdfx_proxy:latest <account>.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_proxy:latest
 docker push <account>.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_proxy:latest
 
-# Register the ECS task definition (reads SSM parameters automatically)
+# Register the ECS task definition and roll ECS service (reads SSM parameters automatically)
 cd deploy
 ./deploy.sh --profile <profile>
 
 # Or dry-run to inspect the generated task definition
 ./deploy.sh --profile <profile> --dry-run
+
+# Optional: register task definition only (skip ECS service update)
+./deploy.sh --profile <profile> --no-update-service
 ```
 
 ### IAM Permissions (Task Role)
