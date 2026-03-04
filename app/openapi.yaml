@@ -198,6 +198,36 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExtractionStatusResponse"
+  /extract/{process_id}/cancel:
+    post:
+      tags: [Extractions]
+      summary: Cancel an extraction job
+      operationId: cancelExtraction
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Optional cancellation reason.
+      responses:
+        "202":
+          description: Cancellation accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CancelExtractionResponse"
+        "409":
+          description: Job already terminal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CancelExtractionResponse"
 
   /extract/{process_id}/download/{method}:
     get:
@@ -461,7 +491,7 @@ components:
           format: uuid
         status:
           type: string
-          enum: [pending, started, complete, failed, queued, running, succeeded]
+          enum: [pending, started, complete, failed, queued, running, succeeded, cancelled]
         reference_curie:
           type: string
           nullable: true
@@ -549,6 +579,7 @@ components:
             - queued
             - running
             - succeeded
+            - cancelled
         detail:
           description: Celery PROGRESS payload.
           oneOf:
@@ -605,6 +636,18 @@ components:
           description: >-
             Consensus pipeline metrics including quality score,
             agreement/conflict counts, and degradation analysis.
+
+    CancelExtractionResponse:
+      type: object
+      required: [process_id, status, message]
+      properties:
+        process_id:
+          type: string
+        status:
+          type: string
+          enum: [cancelled, complete, failed]
+        message:
+          type: string
 
     LogUrlResponse:
       type: object

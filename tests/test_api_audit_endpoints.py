@@ -256,6 +256,87 @@ def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(c
     assert payload["llm_cost_usd"] == 0.42
 
 
+@patch("celery_app.celery.control.revoke")
+def test_cancel_extraction_marks_running_job_cancelled(mock_revoke, client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    ))
+    session.commit()
+    session.close()
+
+    response = client.post(
+        f"/api/v1/extract/{process_id}/cancel",
+        json={"reason": "User cancelled"},
+    )
+    assert response.status_code == 202
+    payload = response.get_json()
+    assert payload["process_id"] == process_id
+    assert payload["status"] == "cancelled"
+
+    mock_revoke.assert_called_once()
+
+    session = get_session()
+    run = session.get(ExtractionRun, process_id)
+    assert run is not None
+    assert run.status == "cancelled"
+    assert run.error_code == "cancelled"
+    assert run.error_message == "User cancelled"
+    assert run.ended_at is not None
+    session.close()
+
+
+@patch("celery_app.celery.control.revoke")
+def test_cancel_extraction_returns_409_for_terminal_job(mock_revoke, client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="succeeded",
+        started_at=datetime.now(timezone.utc),
+        ended_at=datetime.now(timezone.utc),
+    ))
+    session.commit()
+    session.close()
+
+    response = client.post(f"/api/v1/extract/{process_id}/cancel")
+    assert response.status_code == 409
+    payload = response.get_json()
+    assert payload["status"] == "complete"
+    assert "terminal" in payload["message"].lower()
+    mock_revoke.assert_not_called()
+
+
+def test_get_extraction_status_maps_revoked_to_cancelled(client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    ))
+    session.commit()
+    session.close()
+
+    mock_result = MagicMock()
+    mock_result.state = "REVOKED"
+    mock_result.info = None
+
+    with patch("celery_app.celery.AsyncResult", return_value=mock_result):
+        response = client.get(f"/api/v1/extract/{process_id}")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["process_id"] == process_id
+    assert payload["status"] == "cancelled"
+
+
 @patch("celery_app.extract_pdf.apply_async")
 @patch("app.api._get_db_session", return_value=None)
 def test_submit_extraction_works_when_db_unavailable(mock_db_session, mock_apply_async, client):

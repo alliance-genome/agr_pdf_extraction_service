@@ -676,6 +676,7 @@ Returns pre-signed S3 URLs (1-hour expiry) for all artifacts.
 | `/api/v1/extractions` | GET | List extraction runs (filterable by status, MOD, reference; paginated) |
 | `/api/v1/extract` | POST | Submit a PDF for extraction (returns 202) |
 | `/api/v1/extract/{id}` | GET | Poll extraction status with granular progress tracking |
+| `/api/v1/extract/{id}/cancel` | POST | Cancel an active extraction job |
 | `/api/v1/extract/{id}/download/{method}` | GET | Download output (grobid, docling, marker, merged, audit) |
 | `/api/v1/extract/{id}/images` | GET | List extracted images |
 | `/api/v1/extract/{id}/images/{file}` | GET | Download a specific extracted image |

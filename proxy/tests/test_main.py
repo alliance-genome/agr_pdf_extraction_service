@@ -1,5 +1,6 @@
 """Integration tests for the FastAPI proxy routes."""
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
@@ -35,6 +36,16 @@ def _patch_singletons(monkeypatch):
     # Reset job queue
     from app.job_queue import JobQueue
     monkeypatch.setattr("app.main.job_queue", JobQueue(max_size=10))
+
+    # Reset module-level tracking state so tests do not leak across cases.
+    import app.main as main_mod
+    main_mod.proxy_to_backend_process.clear()
+    main_mod.replay_inflight_jobs.clear()
+    main_mod.replay_submission_errors.clear()
+    main_mod.job_payload_cache.clear()
+    main_mod.pending_cancel_requests.clear()
+    main_mod.cancelled_jobs.clear()
+    main_mod.job_trackers.clear()
 
 
 @pytest.fixture
@@ -387,3 +398,185 @@ class TestExtractDownloadEndpoint:
         )
         assert resp.status_code == 200
         assert captured["url"].endswith("/api/v1/extract/backend-dl-9/download/merged")
+
+
+class TestExtractCancelEndpoint:
+    def test_cancel_removes_queued_job(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.STARTING
+        main_mod.job_queue.enqueue("queued-cancel-1", b"pdf", {})
+
+        resp = client.post(
+            "/api/v1/extract/queued-cancel-1/cancel",
+            headers={"Authorization": "Bearer test"},
+            json={},
+        )
+
+        assert resp.status_code == 202
+        payload = resp.json()
+        assert payload["process_id"] == "queued-cancel-1"
+        assert payload["status"] == "cancelled"
+        assert main_mod.job_queue.has_job("queued-cancel-1") is False
+
+    def test_cancelled_queued_job_status_persists(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.enqueue("queued-cancel-2", b"pdf", {})
+
+        cancel_resp = client.post(
+            "/api/v1/extract/queued-cancel-2/cancel",
+            headers={"Authorization": "Bearer test"},
+            json={"reason": "User requested stop"},
+        )
+        assert cancel_resp.status_code == 202
+        assert cancel_resp.json()["status"] == "cancelled"
+
+        status_resp = client.get(
+            "/api/v1/extract/queued-cancel-2",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert status_resp.status_code == 200
+        payload = status_resp.json()
+        assert payload["status"] == "cancelled"
+        assert payload["message"] == "User requested stop"
+
+    def test_cancel_proxies_to_backend_using_mapped_process_id(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.proxy_to_backend_process["proxy-cancel-1"] = "backend-cancel-9"
+
+        captured = {"url": None, "json": None}
+
+        class _DummyResponse:
+            status_code = 202
+
+            @staticmethod
+            def json():
+                return {
+                    "process_id": "backend-cancel-9",
+                    "status": "cancelled",
+                    "message": "Cancellation requested",
+                }
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                captured["url"] = url
+                captured["json"] = json
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.post(
+            "/api/v1/extract/proxy-cancel-1/cancel",
+            headers={"Authorization": "Bearer test"},
+            json={"reason": "No longer needed"},
+        )
+
+        assert resp.status_code == 202
+        assert captured["url"].endswith("/api/v1/extract/backend-cancel-9/cancel")
+        assert captured["json"] == {"reason": "No longer needed"}
+        payload = resp.json()
+        assert payload["process_id"] == "proxy-cancel-1"
+        assert payload["status"] == "cancelled"
+
+    def test_cancel_returns_409_for_locally_cancelled_job(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.cancelled_jobs["already-cancelled-1"] = "Already cancelled"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+
+        resp = client.post(
+            "/api/v1/extract/already-cancelled-1/cancel",
+            headers={"Authorization": "Bearer test"},
+            json={},
+        )
+
+        assert resp.status_code == 409
+        payload = resp.json()
+        assert payload["status"] == "cancelled"
+        assert payload["message"] == "Already cancelled"
+
+    def test_cancel_returns_503_when_not_ready_and_not_queued(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.STOPPED
+
+        resp = client.post(
+            "/api/v1/extract/not-queued-anywhere/cancel",
+            headers={"Authorization": "Bearer test"},
+            json={},
+        )
+
+        assert resp.status_code == 503
+        payload = resp.json()
+        assert payload["status"] == "unavailable"
+
+    def test_replay_enforces_pending_cancel_request(self, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.job_queue.enqueue(
+            "replay-cancel-1",
+            b"%PDF-1.4",
+            {},
+            authorization="Bearer test",
+        )
+        main_mod.pending_cancel_requests["replay-cancel-1"] = "Cancel during replay"
+
+        async def _forward_stub(*args, **kwargs):
+            main_mod.proxy_to_backend_process["replay-cancel-1"] = "backend-replay-1"
+            return None
+
+        forward_mock = AsyncMock(side_effect=_forward_stub)
+        cancel_mock = AsyncMock(return_value=MagicMock())
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward_mock)
+        monkeypatch.setattr(main_mod, "_forward_cancel_to_backend", cancel_mock)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        forward_mock.assert_awaited_once()
+        cancel_mock.assert_awaited_once_with(
+            "replay-cancel-1",
+            authorization="Bearer test",
+            reason="Cancel during replay",
+        )
+        assert "replay-cancel-1" not in main_mod.pending_cancel_requests
+
+    def test_replay_marks_all_drained_jobs_inflight_before_forward(self, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.job_queue.enqueue("race-a", b"a", {})
+        main_mod.job_queue.enqueue("race-b", b"b", {})
+
+        observed_inflight_snapshots = []
+
+        async def _forward_stub(process_id, *_args, **_kwargs):
+            observed_inflight_snapshots.append((process_id, set(main_mod.replay_inflight_jobs)))
+            return None
+
+        monkeypatch.setattr(main_mod, "_forward_extraction", AsyncMock(side_effect=_forward_stub))
+        monkeypatch.setattr(main_mod, "_forward_cancel_to_backend", AsyncMock(return_value=MagicMock()))
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert len(observed_inflight_snapshots) == 2
+        first_call_process_id, first_call_inflight = observed_inflight_snapshots[0]
+        second_process_id = "race-b" if first_call_process_id == "race-a" else "race-a"
+        assert second_process_id in first_call_inflight
+
+    def test_local_cancel_cache_is_bounded(self, monkeypatch):
+        import app.main as main_mod
+        main_mod.cancelled_jobs.clear()
+
+        for idx in range(main_mod.MAX_LOCAL_CANCELLED_JOBS + 1):
+            main_mod._record_job_cancelled(f"cancel-{idx}", "reason")
+
+        assert len(main_mod.cancelled_jobs) == main_mod.MAX_LOCAL_CANCELLED_JOBS
+        assert "cancel-0" not in main_mod.cancelled_jobs

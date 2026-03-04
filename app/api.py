@@ -6,6 +6,7 @@ Endpoints:
     GET  /api/v1/extractions                           - List all extraction runs
     POST /api/v1/extract                               - Submit a PDF extraction job (async)
     GET  /api/v1/extract/<process_id>                  - Poll job status / retrieve results
+    POST /api/v1/extract/<process_id>/cancel           - Cancel an active extraction job
     GET  /api/v1/extract/<process_id>/download/<method> - Download full extraction output
     GET  /api/v1/extract/<process_id>/images            - List extracted images
     GET  /api/v1/extract/<process_id>/images/<filename> - Download a single image
@@ -17,6 +18,7 @@ Endpoints:
 import os
 import uuid
 import logging
+from datetime import datetime, timezone
 
 from flask import Blueprint, request, jsonify, send_file, current_app
 from werkzeug.utils import secure_filename
@@ -204,6 +206,38 @@ def _find_image_s3_key(artifacts_json, filename):
         if isinstance(img, dict) and img.get("filename") == filename:
             return img.get("s3_key")
     return None
+
+
+def _mark_run_cancelled(process_id, reason):
+    """Best-effort mark extraction_run row as cancelled."""
+    db_session = _get_db_session()
+    if not db_session:
+        return
+
+    try:
+        run = db_session.get(ExtractionRun, process_id)
+        if run is None:
+            return
+
+        if run.status in {"succeeded", "failed", "cancelled"}:
+            return
+
+        run.status = "cancelled"
+        run.ended_at = datetime.now(timezone.utc)
+        run.error_code = "cancelled"
+        run.error_message = reason
+        db_session.commit()
+    except Exception as exc:
+        logger.warning("Failed to mark extraction_run cancelled for %s: %s", process_id, exc)
+        try:
+            db_session.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            db_session.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +576,10 @@ def get_extraction_status(process_id):
                     response["status"] = "failed"
                     response["error"] = str(result.info)
                     return jsonify(response), 500
+                if result.state == "REVOKED":
+                    response["status"] = "cancelled"
+                    response["error"] = run.get("error_message") or "Extraction cancelled"
+                    return jsonify(response), 200
 
                 if result.state == "STARTED":
                     response["status"] = "started"
@@ -614,11 +652,45 @@ def get_extraction_status(process_id):
             "status": "failed",
             "error": str(result.info),
         }), 500
+    if result.state == "REVOKED":
+        return jsonify({
+            "process_id": process_id,
+            "status": "cancelled",
+            "message": "Extraction cancelled",
+        }), 200
 
     return jsonify({
         "process_id": process_id,
         "status": result.state.lower(),
     }), 200
+
+
+@api.route("/extract/<process_id>/cancel", methods=["POST"])
+def cancel_extraction(process_id):
+    """Cancel an active extraction run by process_id."""
+    reason = (request.get_json(silent=True) or {}).get("reason") or "Cancelled by user request"
+    run = _get_run_by_process_id(process_id)
+    if run and run["status"] in {"succeeded", "failed", "cancelled"}:
+        return jsonify({
+            "process_id": process_id,
+            "status": _map_db_status(run["status"]),
+            "message": f"Job already terminal ({run['status']})",
+        }), 409
+
+    from celery_app import celery
+
+    try:
+        celery.control.revoke(process_id, terminate=True, signal="SIGTERM")
+    except Exception as exc:
+        logger.warning("Failed to revoke extraction task %s: %s", process_id, exc)
+
+    _mark_run_cancelled(process_id, reason)
+
+    return jsonify({
+        "process_id": process_id,
+        "status": "cancelled",
+        "message": "Cancellation requested",
+    }), 202
 
 
 # ---------------------------------------------------------------------------

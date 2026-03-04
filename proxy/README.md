@@ -54,6 +54,7 @@ All endpoints except `/api/v1/health`, `/api/v1/health/deep`, and `/api/v1/metri
 | `/api/v1/wake` | POST | Yes | Start the GPU instance (idempotent) |
 | `/api/v1/extract` | POST | Yes | Submit a PDF for extraction |
 | `/api/v1/extract/{id}` | GET | Yes | Poll job status with granular progress |
+| `/api/v1/extract/{id}/cancel` | POST | Yes | Request cancellation of a queued/running extraction job |
 | `/api/v1/extract/{id}/download/{method}` | GET | Yes | Download backend extraction output |
 
 ### Submit Extraction (`POST /api/v1/extract`)

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from app.auth import CognitoAuth
@@ -38,6 +38,10 @@ replay_submission_errors: dict[str, str] = {}
 
 # Cached source payload for replay/reconciliation.
 job_payload_cache: dict[str, QueuedJob] = {}
+# Pending cancel requests keyed by proxy-visible process_id.
+pending_cancel_requests: dict[str, str] = {}
+# Local terminal cancel records for jobs cancelled before backend handoff.
+cancelled_jobs: dict[str, str] = {}
 
 # Background tasks.
 replay_task: asyncio.Task | None = None
@@ -45,8 +49,19 @@ reconciler_task: asyncio.Task | None = None
 canary_task: asyncio.Task | None = None
 
 
-ACTIVE_JOB_STATUSES = {"queued", "pending", "started", "running", "progress", "warming_up"}
-TERMINAL_JOB_STATUSES = {"complete", "completed", "succeeded", "success", "failed", "failure", "error"}
+ACTIVE_JOB_STATUSES = {"queued", "pending", "started", "running", "progress", "warming_up", "cancel_requested"}
+TERMINAL_JOB_STATUSES = {
+    "complete",
+    "completed",
+    "succeeded",
+    "success",
+    "failed",
+    "failure",
+    "error",
+    "cancelled",
+    "canceled",
+}
+MAX_LOCAL_CANCELLED_JOBS = max(200, settings.MAX_QUEUED_JOBS * 20)
 
 
 @dataclass
@@ -101,6 +116,7 @@ def _mark_job_failed(process_id: str, reason: str) -> None:
 def _clear_terminal_state(process_id: str) -> None:
     replay_submission_errors.pop(process_id, None)
     job_payload_cache.pop(process_id, None)
+    pending_cancel_requests.pop(process_id, None)
 
 
 def _drop_submission_state(process_id: str) -> None:
@@ -109,6 +125,22 @@ def _drop_submission_state(process_id: str) -> None:
     replay_inflight_jobs.discard(process_id)
     proxy_to_backend_process.pop(process_id, None)
     job_trackers.pop(process_id, None)
+
+
+def _remove_queued_job(process_id: str) -> bool:
+    """Remove one queued job by ID without draining unrelated jobs."""
+    return job_queue.remove_job(process_id)
+
+
+def _record_job_cancelled(process_id: str, reason: str) -> None:
+    # Keep a bounded terminal cache for locally-cancelled IDs so polling can
+    # report stable terminal state without unbounded growth.
+    if process_id not in cancelled_jobs and len(cancelled_jobs) >= MAX_LOCAL_CANCELLED_JOBS:
+        oldest_process_id = next(iter(cancelled_jobs))
+        cancelled_jobs.pop(oldest_process_id, None)
+    cancelled_jobs[process_id] = reason
+    replay_submission_errors.pop(process_id, None)
+    _record_job_event(process_id, "cancelled", reason=reason)
 
 
 def _active_backend_jobs() -> int:
@@ -509,6 +541,16 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
     _require_auth(authorization)
     lifecycle.touch()
 
+    if process_id in cancelled_jobs:
+        reason = cancelled_jobs[process_id]
+        return {
+            "process_id": process_id,
+            "status": "cancelled",
+            "state": lifecycle.state.value,
+            "message": reason,
+            "progress": _progress_payload("cancelled", "Job cancelled", 0),
+        }
+
     # If the job is still queued locally, report that.
     if job_queue.has_job(process_id):
         if lifecycle.state == InstanceState.STARTING:
@@ -531,11 +573,16 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
         }
 
     if process_id in replay_inflight_jobs:
-        display = "Submitting queued job to backend"
-        _record_job_event(process_id, "queued")
+        if process_id in pending_cancel_requests:
+            display = "Cancellation requested while submitting queued job"
+            status_value = "cancel_requested"
+        else:
+            display = "Submitting queued job to backend"
+            status_value = "queued"
+        _record_job_event(process_id, status_value)
         return {
             "process_id": process_id,
-            "status": "queued",
+            "status": status_value,
             "state": lifecycle.state.value,
             "message": display,
             "progress": _progress_payload("queued", display, 0),
@@ -589,6 +636,111 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
         return JSONResponse(status_code=resp.status_code, content=payload)
     except Exception as exc:
         logger.error("Failed to proxy status request: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
+
+
+async def _forward_cancel_to_backend(
+    process_id: str,
+    *,
+    authorization: str | None,
+    reason: str,
+) -> JSONResponse:
+    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
+    cancel_url = f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}/cancel"
+
+    async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
+        if authorization:
+            try:
+                upstream = await client.post(
+                    cancel_url,
+                    headers={"Authorization": authorization},
+                    json={"reason": reason},
+                )
+            except TypeError:
+                upstream = await client.post(cancel_url, json={"reason": reason})
+        else:
+            upstream = await client.post(cancel_url, json={"reason": reason})
+
+    payload = _coerce_json_payload(upstream)
+    if isinstance(payload, dict):
+        if backend_process_id != process_id:
+            payload["process_id"] = process_id
+        _update_tracker_from_payload(process_id, payload)
+        _mark_terminal_cleanup_if_needed(process_id, payload)
+        status_value = str(payload.get("status", "")).strip().lower()
+        if status_value in {"cancelled", "canceled"}:
+            _record_job_cancelled(process_id, str(payload.get("message") or reason))
+        elif status_value == "cancel_requested":
+            pending_cancel_requests[process_id] = reason
+            _record_job_event(process_id, "cancel_requested", reason=reason)
+
+    return JSONResponse(status_code=upstream.status_code, content=payload)
+
+
+@app.post("/api/v1/extract/{process_id}/cancel")
+async def cancel_extraction(
+    process_id: str,
+    cancellation: dict[str, Any] | None = Body(default=None),
+    authorization: str = Header(None),
+):
+    _require_auth(authorization)
+    lifecycle.touch()
+    reason = str((cancellation or {}).get("reason", "")).strip() or "Cancelled by user request"
+
+    if process_id in cancelled_jobs:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "process_id": process_id,
+                "status": "cancelled",
+                "message": cancelled_jobs[process_id],
+            },
+        )
+
+    if _remove_queued_job(process_id):
+        _clear_terminal_state(process_id)
+        replay_inflight_jobs.discard(process_id)
+        proxy_to_backend_process.pop(process_id, None)
+        _record_job_cancelled(process_id, reason)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "process_id": process_id,
+                "status": "cancelled",
+                "message": reason,
+            },
+        )
+
+    if process_id in replay_inflight_jobs:
+        pending_cancel_requests[process_id] = reason
+        _record_job_event(process_id, "cancel_requested", reason=reason)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "process_id": process_id,
+                "status": "cancel_requested",
+                "message": reason,
+            },
+        )
+
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "process_id": process_id,
+                "status": "unavailable",
+                "message": "EC2 is not running; unable to forward cancellation request.",
+            },
+        )
+
+    try:
+        return await _forward_cancel_to_backend(
+            process_id,
+            authorization=authorization,
+            reason=reason,
+        )
+    except Exception as exc:
+        logger.error("Failed to proxy cancel request for %s: %s", process_id, exc)
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
 
 
@@ -729,6 +881,8 @@ async def _replay_when_ready():
     logger.info("Replaying %d queued jobs to EC2", len(jobs))
     for job in jobs:
         replay_inflight_jobs.add(job.job_id)
+
+    for job in jobs:
         _record_job_event(job.job_id, "replayed")
         try:
             await _forward_extraction(
@@ -738,6 +892,17 @@ async def _replay_when_ready():
                 job.form_fields,
                 authorization=job.authorization,
             )
+            if job.job_id in pending_cancel_requests:
+                reason = pending_cancel_requests.pop(job.job_id)
+                try:
+                    await _forward_cancel_to_backend(
+                        job.job_id,
+                        authorization=job.authorization,
+                        reason=reason,
+                    )
+                except Exception as cancel_exc:
+                    logger.error("Failed to enforce pending cancellation for %s: %s", job.job_id, cancel_exc)
+                    pending_cancel_requests[job.job_id] = reason
         except Exception as exc:
             logger.error("Failed to replay job %s: %s", job.job_id, exc)
             _mark_job_failed(job.job_id, str(exc))
@@ -862,8 +1027,13 @@ def _mark_terminal_cleanup_if_needed(process_id: str, payload: dict[str, Any]) -
     status = str(payload.get("status", "")).strip().lower()
     if status in {"complete", "completed", "succeeded", "success"}:
         _record_job_event(process_id, "complete")
+        cancelled_jobs.pop(process_id, None)
+        _clear_terminal_state(process_id)
+    elif status in {"cancelled", "canceled"}:
+        _record_job_cancelled(process_id, str(payload.get("message") or "Cancelled by user request"))
         _clear_terminal_state(process_id)
     elif status in {"failed", "failure", "error"}:
         detail = payload.get("error") or payload.get("detail") or "Backend reported failure"
         _mark_job_failed(process_id, str(detail))
+        cancelled_jobs.pop(process_id, None)
         _clear_terminal_state(process_id)

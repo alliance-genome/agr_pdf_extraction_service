@@ -34,6 +34,7 @@ def test_openapi_includes_all_v1_paths(client):
         "/extractions",
         "/extract",
         "/extract/{process_id}",
+        "/extract/{process_id}/cancel",
         "/extract/{process_id}/download/{method}",
         "/extract/{process_id}/images",
         "/extract/{process_id}/images/{filename}",
@@ -71,6 +72,22 @@ def test_openapi_extract_request_includes_clear_cache_scope(client):
     assert set(properties["clear_cache_scope"]["enum"]) == {
         "none", "merge", "extraction", "all"
     }
+
+
+def test_openapi_cancel_response_enum_is_precise(client):
+    response = client.get("/openapi.yaml")
+    assert response.status_code == 200
+
+    spec = yaml.safe_load(response.data)
+    cancel_operation = spec["paths"]["/extract/{process_id}/cancel"]["post"]
+    assert set(cancel_operation["responses"].keys()) == {"202", "409"}
+    assert "requestBody" in cancel_operation
+    reason_schema = cancel_operation["requestBody"]["content"]["application/json"]["schema"]["properties"]["reason"]
+    assert reason_schema["type"] == "string"
+
+    cancel_schema = spec["components"]["schemas"]["CancelExtractionResponse"]
+    enum_values = set(cancel_schema["properties"]["status"]["enum"])
+    assert enum_values == {"cancelled", "complete", "failed"}
 
 
 def test_swagger_docs_page_available(client):

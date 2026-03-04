@@ -82,6 +82,9 @@ class BaseJobQueue:
     def has_job(self, job_id: str) -> bool:
         raise NotImplementedError
 
+    def remove_job(self, job_id: str) -> bool:
+        raise NotImplementedError
+
     def oldest_age_seconds(self) -> float:
         raise NotImplementedError
 
@@ -131,6 +134,13 @@ class InMemoryJobQueue(BaseJobQueue):
 
     def has_job(self, job_id: str) -> bool:
         return any(j.job_id == job_id for j in self._queue)
+
+    def remove_job(self, job_id: str) -> bool:
+        for idx, queued_job in enumerate(self._queue):
+            if queued_job.job_id == job_id:
+                del self._queue[idx]
+                return True
+        return False
 
     def oldest_age_seconds(self) -> float:
         if not self._queue:
@@ -240,6 +250,14 @@ class S3JobQueue(BaseJobQueue):
     def has_job(self, job_id: str) -> bool:
         suffix = f"_{job_id}.json"
         return any(key.endswith(suffix) for key in self._iter_keys())
+
+    def remove_job(self, job_id: str) -> bool:
+        suffix = f"_{job_id}.json"
+        for key in self._iter_keys():
+            if key.endswith(suffix):
+                self._client.delete_object(Bucket=self._bucket, Key=key)
+                return True
+        return False
 
     def oldest_age_seconds(self) -> float:
         keys = self._iter_keys()
