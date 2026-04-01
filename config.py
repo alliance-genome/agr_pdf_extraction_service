@@ -44,8 +44,8 @@ class Config:
 
     # ---- LLM (merge) ---------------------------------------------------------
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-    LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.4-mini")
-    LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
+    LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.4")
+    LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "medium")
     LLM_CONFLICT_BATCH_SIZE = int(os.environ.get("LLM_CONFLICT_BATCH_SIZE", 500))
     LLM_CONFLICT_MAX_WORKERS = int(os.environ.get("LLM_CONFLICT_MAX_WORKERS", 100))
     LLM_CONFLICT_RETRY_ROUNDS = int(os.environ.get("LLM_CONFLICT_RETRY_ROUNDS", 2))
@@ -53,18 +53,19 @@ class Config:
     # ---- Per-call-type model + reasoning defaults ----------------------------
     # Each call type can override both model and reasoning effort individually.
     # Falls back to LLM_MODEL / LLM_REASONING_EFFORT when not set.
-    LLM_MODEL_ZONE_RESOLUTION = os.environ.get("LLM_MODEL_ZONE_RESOLUTION", "gpt-5.4-mini")
-    LLM_REASONING_ZONE_RESOLUTION = os.environ.get("LLM_REASONING_ZONE_RESOLUTION", "")
-    LLM_MODEL_GENERAL_RESCUE = os.environ.get("LLM_MODEL_GENERAL_RESCUE", "gpt-5.4-mini")
-    LLM_REASONING_GENERAL_RESCUE = os.environ.get("LLM_REASONING_GENERAL_RESCUE", "")
-    LLM_MODEL_NUMERIC_RESCUE = os.environ.get("LLM_MODEL_NUMERIC_RESCUE", "gpt-5.4-mini")
-    LLM_REASONING_NUMERIC_RESCUE = os.environ.get("LLM_REASONING_NUMERIC_RESCUE", "")
-    LLM_MODEL_CONFLICT_BATCH = os.environ.get("LLM_MODEL_CONFLICT_BATCH", "gpt-5.4-mini")
-    LLM_REASONING_CONFLICT_BATCH = os.environ.get("LLM_REASONING_CONFLICT_BATCH", "")
+    LLM_MODEL_ZONE_RESOLUTION = os.environ.get("LLM_MODEL_ZONE_RESOLUTION", "gpt-5.4")
+    LLM_REASONING_ZONE_RESOLUTION = os.environ.get("LLM_REASONING_ZONE_RESOLUTION", "medium")
+    LLM_MODEL_GENERAL_RESCUE = os.environ.get("LLM_MODEL_GENERAL_RESCUE", "gpt-5.4")
+    LLM_REASONING_GENERAL_RESCUE = os.environ.get("LLM_REASONING_GENERAL_RESCUE", "medium")
+    LLM_MODEL_NUMERIC_RESCUE = os.environ.get("LLM_MODEL_NUMERIC_RESCUE", "gpt-5.4")
+    LLM_REASONING_NUMERIC_RESCUE = os.environ.get("LLM_REASONING_NUMERIC_RESCUE", "medium")
+    LLM_MODEL_CONFLICT_BATCH = os.environ.get("LLM_MODEL_CONFLICT_BATCH", "gpt-5.4")
+    LLM_REASONING_CONFLICT_BATCH = os.environ.get("LLM_REASONING_CONFLICT_BATCH", "medium")
 
     # ---- LLM pricing (USD per 1M tokens) ------------------------------------
     LLM_PRICING = {
         "gpt-5.2": {"input": 1.75, "output": 14.00, "cached_input": 0.175},
+        "gpt-5.4": {"input": 2.50, "output": 15.00, "cached_input": 0.25},
         "gpt-5.4-mini": {"input": 0.75, "output": 4.50, "cached_input": 0.075},
         "gpt-5-mini": {"input": 0.25, "output": 2.00, "cached_input": 0.025},
         "gpt-5-nano": {"input": 0.05, "output": 0.40, "cached_input": 0.005},
@@ -146,5 +147,5 @@ class Config:
 
     # ---- Header hierarchy resolution -----------------------------------------
     CONSENSUS_HIERARCHY_ENABLED = os.environ.get("CONSENSUS_HIERARCHY_ENABLED", "true").lower() == "true"
-    HIERARCHY_LLM_MODEL = os.environ.get("HIERARCHY_LLM_MODEL", "gpt-5.4-mini")
-    HIERARCHY_LLM_REASONING = os.environ.get("HIERARCHY_LLM_REASONING", "low")
+    HIERARCHY_LLM_MODEL = os.environ.get("HIERARCHY_LLM_MODEL", "gpt-5.4")
+    HIERARCHY_LLM_REASONING = os.environ.get("HIERARCHY_LLM_REASONING", "medium")

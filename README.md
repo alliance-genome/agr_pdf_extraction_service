@@ -464,11 +464,11 @@ The LLM service wraps OpenAI API calls with structured Pydantic response models,
 
 | Call Type | Purpose | Default Model | Reasoning |
 |-----------|---------|---------------|-----------|
-| `micro_conflict` | Resolve word-level disagreement spans | gpt-5.4-mini | low |
-| `rescue` | Retry unresolved segments with enriched context | gpt-5.4-mini | low |
-| `header_hierarchy` | Restore heading levels | gpt-5.4-mini | low |
-| `conflict_batch` | Batched full-segment conflict resolution | gpt-5.4-mini | low |
-| `alignment_tiebreak` | Break close-score alignment ties | gpt-5.4-mini | low |
+| `micro_conflict` | Resolve word-level disagreement spans | gpt-5.4 | medium |
+| `rescue` | Retry unresolved segments with enriched context | gpt-5.4 | medium |
+| `header_hierarchy` | Restore heading levels | gpt-5.4 | medium |
+| `conflict_batch` | Batched full-segment conflict resolution | gpt-5.4 | medium |
+| `alignment_tiebreak` | Break close-score alignment ties | gpt-5.4 | medium |
 
 Call types can override model and reasoning effort via environment variables. Available suffixes: `ZONE_RESOLUTION` (used by `micro_conflict` and `alignment_tiebreak`), `GENERAL_RESCUE`, `NUMERIC_RESCUE`, `CONFLICT_BATCH`. Note that `micro_conflict` and `alignment_tiebreak` share the same `ZONE_RESOLUTION` override — they are not independently configurable. Falls back to `LLM_MODEL` / `LLM_REASONING_EFFORT` when not set.
 
@@ -495,6 +495,7 @@ Cost is recorded on both success and failure paths (partial LLM work before a fa
 | Model | Input (per 1M tokens) | Output (per 1M tokens) | Cached Input (per 1M tokens) |
 |-------|----------------------|----------------------|---------------------------|
 | gpt-5.2 | $1.75 | $14.00 | $0.175 |
+| gpt-5.4 | $2.50 | $15.00 | $0.25 |
 | gpt-5.4-mini | $0.75 | $4.50 | $0.075 |
 | gpt-5-mini | $0.25 | $2.00 | $0.025 |
 | gpt-4.1 | $2.00 | $8.00 | $0.50 |
@@ -886,18 +887,18 @@ Everything below is optional and has sensible defaults.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_MODEL` | `gpt-5.4-mini` | Base model for all LLM calls |
-| `LLM_REASONING_EFFORT` | `low` | Default reasoning effort for LLM calls |
-| `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5.4-mini` | Model for per-segment micro-conflict resolution |
-| `LLM_REASONING_ZONE_RESOLUTION` | _(empty, falls back to LLM_REASONING_EFFORT)_ | Reasoning effort for per-segment micro-conflict resolution |
-| `LLM_MODEL_GENERAL_RESCUE` | `gpt-5.4-mini` | Model for general rescue resolution |
-| `LLM_REASONING_GENERAL_RESCUE` | _(empty)_ | Reasoning effort for general rescue |
-| `LLM_MODEL_NUMERIC_RESCUE` | `gpt-5.4-mini` | Model for numeric integrity rescue |
-| `LLM_REASONING_NUMERIC_RESCUE` | _(empty)_ | Reasoning effort for numeric rescue |
-| `LLM_MODEL_CONFLICT_BATCH` | `gpt-5.4-mini` | Model for batched conflict resolution |
-| `LLM_REASONING_CONFLICT_BATCH` | _(empty)_ | Reasoning effort for batched conflicts |
-| `HIERARCHY_LLM_MODEL` | `gpt-5.4-mini` | Model for heading hierarchy resolution |
-| `HIERARCHY_LLM_REASONING` | `low` | Reasoning effort for heading hierarchy |
+| `LLM_MODEL` | `gpt-5.4` | Base model for all LLM calls |
+| `LLM_REASONING_EFFORT` | `medium` | Default reasoning effort for LLM calls |
+| `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5.4` | Model for per-segment micro-conflict resolution |
+| `LLM_REASONING_ZONE_RESOLUTION` | `medium` | Reasoning effort for per-segment micro-conflict resolution |
+| `LLM_MODEL_GENERAL_RESCUE` | `gpt-5.4` | Model for general rescue resolution |
+| `LLM_REASONING_GENERAL_RESCUE` | `medium` | Reasoning effort for general rescue |
+| `LLM_MODEL_NUMERIC_RESCUE` | `gpt-5.4` | Model for numeric integrity rescue |
+| `LLM_REASONING_NUMERIC_RESCUE` | `medium` | Reasoning effort for numeric rescue |
+| `LLM_MODEL_CONFLICT_BATCH` | `gpt-5.4` | Model for batched conflict resolution |
+| `LLM_REASONING_CONFLICT_BATCH` | `medium` | Reasoning effort for batched conflicts |
+| `HIERARCHY_LLM_MODEL` | `gpt-5.4` | Model for heading hierarchy resolution |
+| `HIERARCHY_LLM_REASONING` | `medium` | Reasoning effort for heading hierarchy |
 | `LLM_CONFLICT_BATCH_SIZE` | `500` | Number of conflicts per batch in batched resolution |
 | `LLM_CONFLICT_MAX_WORKERS` | `100` | Max parallel workers for batched conflict resolution |
 | `LLM_CONFLICT_RETRY_ROUNDS` | `2` | Number of retry rounds for unresolved micro-conflicts |

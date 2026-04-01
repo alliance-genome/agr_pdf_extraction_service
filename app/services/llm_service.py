@@ -258,8 +258,8 @@ class LLM(PDFExtractor):
     def __init__(
         self,
         api_key,
-        model="gpt-5.4-mini",
-        reasoning_effort="low",
+        model="gpt-5.4",
+        reasoning_effort="medium",
         conflict_batch_size: int = 500,
         conflict_max_workers: int = 100,
         conflict_retry_rounds: int = 2,

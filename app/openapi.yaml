@@ -731,10 +731,10 @@ components:
       properties:
         model:
           type: string
-          example: gpt-5.4-mini
+          example: gpt-5.4
         reasoning:
           type: string
-          example: low
+          example: medium
 
     ConfigResponse:
       type: object
@@ -742,11 +742,11 @@ components:
       properties:
         llm_model_default:
           type: string
-          example: gpt-5.4-mini
+          example: gpt-5.4
           description: Default LLM model (LLM_MODEL env var).
         llm_reasoning_default:
           type: string
-          example: low
+          example: medium
           description: Default reasoning effort (LLM_REASONING_EFFORT env var).
         per_call_type:
           type: object
