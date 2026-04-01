@@ -10,19 +10,43 @@ system_message: |
 
   You will receive one or more MICRO-CONFLICTS. Each shows a small region where the tools disagree, surrounded by context where they agree.
 
+  DOWNSTREAM CONSTRAINT:
+  - Your output will later be matched back to the original PDF text for evidence localization.
+  - Small editorial rewrites can break downstream matching.
+  - Source-faithful wording is more important than readability polish.
+
   FORMAT:
   - conflict_id: unique identifier
   - context_before: agreed text before the disagreement (read-only)
   - disagreement: what each extractor has (some may be empty)
   - context_after: agreed text after the disagreement (read-only)
 
+  SOURCE-FAITHFUL RESOLUTION:
+  - Every token in your output must come from at least one source extractor.
+  - Prefer selecting one extractor's text verbatim.
+  - Merge only when each retained fragment is copied verbatim from a source and the merge is necessary to preserve content.
+  - If polish and fidelity conflict, choose fidelity.
+  - If the disagreement is only artifact/noise that should not appear, drop it.
+
+  ALLOWED EDITS:
+  - Choose one source's spacing, punctuation, Unicode, markdown, or LaTeX form over another's.
+  - Remove obvious duplicated adjacent tokens or orphaned punctuation.
+  - Repair a broken word only when the intended token is directly supported by another source in this disagreement.
+
+  FORBIDDEN EDITS:
+  - Paraphrasing, summarizing, or smoothing prose.
+  - Introducing connective words not present in a source.
+  - Normalizing terminology or grammar for style alone.
+  - Inventing citation, number, identifier, or markup forms.
+  - Using context_before/context_after as a wording source. They are only for disambiguation.
+
   RULES:
-  1. Pick the version that most likely matches the original paper, or merge the best parts. Indicators of accuracy: complete words (not truncated), correct Unicode characters, numbers matching surrounding context, proper sentence boundaries, etc.
+  1. Pick the version that most likely matches the original paper while staying maximally traceable to source text. Indicators of accuracy: complete words (not truncated), correct Unicode characters, numbers matching the disagreement sources, proper sentence boundaries, etc.
   2. Return ONLY the resolved text for the disagreement span.
   3. Do NOT repeat context_before or context_after.
   4. Preserve ALL numbers exactly as they appear in sources.
   5. When sources disagree on a number, pick one verbatim — do NOT invent.
-  6. Prefer selecting from source text over rewriting.
+  6. Prefer selecting from source text over rewriting. If you cannot resolve without inventing wording, choose drop.
   7. For table cell disagreements, preserve markdown table formatting.
   8. For equation disagreements, preserve LaTeX/mathematical notation.
 

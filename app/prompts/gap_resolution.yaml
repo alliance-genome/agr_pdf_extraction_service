@@ -12,12 +12,33 @@ system_message: |
 
   Be meticulous and careful. Your goal is to preserve the original paper's content faithfully. Do NOT unnecessarily reword, restructure, or edit the text. Minimal cleanup of extraction artifacts is acceptable, but the substance must remain unchanged.
 
+  DOWNSTREAM CONSTRAINT:
+  - Your output will later be matched back to the original PDF text for evidence localization.
+  - Because of this, source-faithful wording is more important than smooth prose.
+  - If you cannot keep the segment without inventing wording, prefer drop.
+
+  PRIMARY GOAL:
+  - Decide keep/drop conservatively.
+  - If kept, the output should remain as close as possible to the single extractor text.
+  - Use flanking context only to detect duplication, boundary overlap, or artifact status — not as a wording source.
+
+  ALLOWED EDITS:
+  - Remove exact duplication by dropping the segment.
+  - Remove obvious isolated extraction noise such as standalone page numbers, repeated headers/footers, or stray punctuation.
+  - Apply minimal source-supported cleanup such as removing duplicated adjacent tokens, removing purely decorative markdown wrappers, or fixing obvious whitespace splits within a word when the intended token is already visible in the source segment itself.
+
+  FORBIDDEN EDITS:
+  - Paraphrasing, restructuring, or smoothing prose.
+  - Introducing words from context_before or context_after.
+  - Completing missing clauses from surrounding context.
+  - Changing terminology, identifiers, numbers, citations, or section wording unless directly supported by the single source segment.
+
   FLANKING CONTEXT AND DUPLICATION:
   The segment includes 'context_before' and 'context_after' fields showing the surrounding resolved text (read-only). You MUST:
   - Check whether the segment's content is already covered by the flanking context. If the segment exactly duplicates what appears in context_before or context_after, drop it.
-  - Check whether the segment contains content that spans a segment boundary — if neighboring segments each captured part of a sentence, and this segment completes it, keep it and merge appropriately.
+  - Check whether the segment contains unique source text that completes a boundary-overlap region. If so, keep only the text recoverable from the GAP segment itself.
   - Do NOT repeat or include the flanking context in your output.
-  - Ensure your resolved text flows naturally between context_before and context_after.
+  - Do NOT add bridging words to improve flow.
   - Only return the text for the GAP segment itself.
 
   KEEP/DROP CRITERIA:
@@ -49,17 +70,17 @@ system_message: |
     {"resolved": [{"segment_id": "seg_013", "action": "keep", "text": "## Binding site for the small molecule ENaC activator S3969"}]}
   Why: Only Docling captured this section heading. It is not duplicated in flanking context — it is a structural heading bridging the introduction and results. Keep as-is.
 
-  Example 2 — Extraction artifact with OCR corruption (keep with cleanup):
+  Example 2 — Minimal source-supported cleanup (keep):
   Input segment:
     segment_id: "seg_001"
     context_before: ""
     context_after: "Florian Sure, Jürgen Einsiedel, Peter Gmeiner"
     GROBID:  ""
     Docling: ""
-    Marker:  "### **BC** RESEARCH ARTICLE"
+    Marker:  "### **JBC** RESEARCH ARTICLE"
   Correct output:
     {"resolved": [{"segment_id": "seg_001", "action": "keep", "text": "### JBC RESEARCH ARTICLE"}]}
-  Why: Only Marker captured this journal label. "**BC**" is an OCR corruption of "JBC" (Journal of Biological Chemistry). Fix the extraction error and remove the spurious bold markers, but keep the content since it is not in flanking context.
+  Why: Only Marker captured this journal label. Remove the decorative bold markers, but keep the wording exactly as supported by the source segment. This is minimal cleanup, not reconstruction.
 
   Example 3 — Flanking context duplicate (drop):
   Input segment:

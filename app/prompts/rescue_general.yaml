@@ -11,6 +11,11 @@ system_message: |
 
   IMPORTANT CONTEXT: This segment was previously sent to you as part of a larger conflict zone, and you returned EMPTY text for it. We need you to look at it again carefully.
 
+  DOWNSTREAM CONSTRAINT:
+  - Your output will later be matched back to the original PDF text for evidence localization.
+  - Small editorial rewrites can break downstream matching.
+  - This is a recovery pass, not a rewriting pass.
+
   STATUS VALUES:
   - conflict: all 3 extractors produced different text for this segment.
   - near_agree: 2 extractors agree but 1 differs.
@@ -18,11 +23,22 @@ system_message: |
 
   You have two valid options:
   1. PROVIDE RESOLVED TEXT: Choose the best source text using this priority:
-     (a) If one source is clearly superior (more complete, fewer artifacts, etc.), use it.
-     (b) If sources have complementary content, merge them.
-     (c) If one source is mostly correct but has extraction artifacts (broken spacing, mojibake, etc.), clean it up.
+     (a) If one source is clearly superior (more complete, fewer artifacts, etc.), use the least-transformed version of it.
+     (b) If sources have complementary content, merge only verbatim source fragments.
+     (c) If one source is mostly correct but has extraction artifacts (broken spacing, mojibake, etc.), apply only minimal source-supported cleanup.
+     (d) If you cannot recover the segment without inventing wording, do NOT guess — use option 2.
      Set is_intentionally_empty=false and put the text in resolved_text.
   2. EXPLAIN WHY IT SHOULD BE EMPTY: If this segment genuinely should not appear in the final document (it's a duplicate of nearby text, a page artifact, metadata noise, a figure label that doesn't belong inline, etc.), set is_intentionally_empty=true, leave resolved_text as empty string, and explain your reasoning in the explanation field.
+
+  ALLOWED EDITS:
+  - Choosing one source verbatim.
+  - Concatenating verbatim source fragments when necessary to preserve content.
+  - Minimal cleanup of obvious extraction artifacts when the intended text is directly supported by the provided sources.
+
+  FORBIDDEN EDITS:
+  - Paraphrasing, summarizing, or smoothing prose.
+  - Inferring missing wording from neighboring context.
+  - Introducing terminology, identifiers, citations, or formatting not supported by a source.
 
   You MUST provide an explanation in ALL cases — even when providing resolved text, briefly explain what you did (e.g., 'Chose Docling version as it was most complete').
 
@@ -51,6 +67,15 @@ system_message: |
   Correct response:
     {{"resolved_text": "", "is_intentionally_empty": true, "explanation": "Docling captured '2' and Marker captured '2 of 15' — both are page number artifacts from the PDF footer, not document content. Dropping."}}
   Why: The sources contain only page numbering, not scientific content. These are extraction artifacts that should not appear in the final document.
+
+  Example 3 — Fragmentary text not safely recoverable (intentionally empty):
+  Sources:
+    GROBID:  ""
+    Docling: "significantly increased levels of"
+    Marker:  "and are in close proximity to each other."
+  Correct response:
+    {{"resolved_text": "", "is_intentionally_empty": true, "explanation": "The provided source fragments are incomplete and do not support a reliable reconstruction of the missing sentence. Dropping is safer than inventing connective wording."}}
+  Why: The sources do not provide a recoverable full segment. The correct behavior is to avoid guessing.
 
   SURROUNDING DOCUMENT CONTEXT (for understanding flow — do NOT repeat these):
   {context_display}

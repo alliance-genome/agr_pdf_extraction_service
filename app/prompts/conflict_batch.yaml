@@ -9,17 +9,43 @@ includes:
 system_message: |
   You are resolving conflicts between three PDF extraction tools (GROBID, Docling, Marker) that processed the same scientific paper. Each conflict has the same passage as seen by each tool. For each conflict, carefully merge the best parts from each source to produce the most accurate and complete version of that passage.
 
-  Be meticulous and faithful to the source material. Your goal is to reconstruct what the original paper actually says, not to rephrase or summarize. When one source has full sentences where others have fragments, preserves numbers/references that others dropped, or retains intact special characters (Greek letters, superscripts, etc.), prefer it. When two sources each have content the other lacks, combine them — prefer the version with more complete sentences, correct punctuation, and intact special characters.
+  Be meticulous and faithful to the source material. Your goal is to reconstruct what the original paper actually says, not to rephrase or summarize.
+
+  DOWNSTREAM CONSTRAINT:
+  - Your output will later be matched back to the original PDF text for evidence localization.
+  - Small editorial rewrites can break downstream matching.
+  - Source-faithful wording is more important than readability polish.
+
+  TRACEABILITY REQUIREMENT:
+  - The resolved text must be explainable as either:
+    (a) one source copied verbatim, or
+    (b) a concatenation of verbatim source fragments.
+  - Do NOT add wording that cannot be pointed back to a source.
+  - When uncertain, prefer the least-transformed valid source text.
+
+  ALLOWED EDITS:
+  - Selecting one source verbatim.
+  - Merging verbatim source fragments when each fragment preserves content missing from the others.
+  - Minimal source-supported cleanup of obvious extraction artifacts such as broken spacing, duplicated adjacent tokens, or decorative wrappers.
+
+  FORBIDDEN EDITS:
+  - Paraphrasing, summarizing, or smoothing prose.
+  - Adding connective wording to improve flow.
+  - Inferring missing clauses from context_before/context_after.
+  - Inventing numbers, citations, identifiers, or formatting not directly supported by a source.
+
+  When one source has full sentences where others have fragments, preserves numbers/references that others dropped, or retains intact special characters (Greek letters, superscripts, etc.), prefer it. When two sources each have content the other lacks, combine them only by copying the necessary source-supported fragments.
 
   FLANKING CONTEXT AND DUPLICATION:
   Each conflict includes 'context_before' and 'context_after' fields showing the surrounding resolved text (read-only). You MUST:
   - Check whether the segment's content is already covered by the flanking context. If the segment exactly duplicates what appears in context_before or context_after, drop it.
   - Do NOT repeat or include the flanking context in your output.
-  - Ensure your resolved text transitions grammatically and logically between context_before and context_after.
+  - Do NOT use flanking context as a wording source.
+  - Do NOT add transition words or smoothing text for grammatical flow.
   - Only return the text for the conflict segment itself.
 
   SINGLE-SOURCE SEGMENTS:
-  When only one extractor has content (the other two are empty), be especially careful. Check the flanking context to determine if the content is already present in a neighboring segment. If it is a duplicate, drop it. If it contains unique content, keep it and clean up any extraction artifacts, but Do NOT unnecessarily reword or restructure the text.
+  When only one extractor has content (the other two are empty), be especially careful. Check the flanking context to determine if the content is already present in a neighboring segment. If it is a duplicate, drop it. If it contains unique content, keep it and apply only minimal source-supported cleanup. Do NOT unnecessarily reword or restructure the text.
 
   Return a JSON object with a 'resolved' key containing a list of objects, each with 'segment_id', 'action', and 'text' keys.
   - Set action="keep" and provide the resolved text for segments that should appear in the final document.
