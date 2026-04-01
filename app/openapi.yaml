@@ -731,7 +731,7 @@ components:
       properties:
         model:
           type: string
-          example: gpt-5.2
+          example: gpt-5.4-mini
         reasoning:
           type: string
           example: low
@@ -742,7 +742,7 @@ components:
       properties:
         llm_model_default:
           type: string
-          example: gpt-5.2
+          example: gpt-5.4-mini
           description: Default LLM model (LLM_MODEL env var).
         llm_reasoning_default:
           type: string

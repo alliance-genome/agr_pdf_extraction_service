@@ -457,7 +457,7 @@ def _route_to_rescue(
 ) -> None:
     """Route a segment that failed post-resolution validation to rescue.
 
-    Uses the numeric-integrity rescue path (gpt-5.2 with explanation) since
+    Uses the numeric-integrity rescue path (configured rescue model with explanation) since
     that prompt already enforces strict fidelity to source content.
     """
     current = (resolved.get(seg_id, "") or "").strip()
