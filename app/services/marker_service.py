@@ -23,6 +23,7 @@ _PAGE_SPAN_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _SPAN_REF_RE = re.compile(r"<span id=['\"][^'\"]*['\"]>(.*?)</span>", re.DOTALL)
+_SUP_TAG_RE = re.compile(r"</?sup>", re.IGNORECASE)
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _LINK_REF_RE = re.compile(r"\[([^\]]+)\]\(https?://[^)]*\)")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
@@ -75,6 +76,7 @@ class Marker(PDFExtractor):
         # Preserve page provenance as explicit markdown markers before span cleanup.
         text = _PAGE_SPAN_RE.sub(lambda m: f"<!-- page: {m.group(1)} -->\n{m.group(2)}", text)
         text = _SPAN_REF_RE.sub(r"\1", text)
+        text = _SUP_TAG_RE.sub("", text)
         text = _IMAGE_REF_RE.sub("", text)
         text = _LINK_REF_RE.sub(r"\1", text)
         text = _MULTI_NEWLINE_RE.sub("\n\n", text).strip()

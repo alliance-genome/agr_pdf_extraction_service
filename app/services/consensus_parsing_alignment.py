@@ -35,6 +35,7 @@ _CITATION_LIST_RE = re.compile(
 _SPAN_OPEN_RE = re.compile(r"<span[^>]*>")
 _SPAN_CLOSE_RE = re.compile(r"</span>")
 _SPAN_REF_RE = re.compile(r"<span id=['\"][^'\"]*['\"]>(.*?)</span>", re.DOTALL)
+_SUP_TAG_RE = re.compile(r"</?sup>", re.IGNORECASE)
 _HTML_COMMENT_OUTPUT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _PAGE_COMMENT_RE = re.compile(r"<!--\s*page\s*[:=]?\s*(\d+)\s*-->", re.IGNORECASE)
 _PAGE_BRACKET_RE = re.compile(r"^\[\s*page\s+(\d+)\s*\]$", re.IGNORECASE)
@@ -289,6 +290,7 @@ def normalize_text(text: str) -> str:
     # Marker: <span id="page-X-Y"> ... </span> anchors
     text = re.sub(r"<span[^>]*>", "", text)
     text = re.sub(r"</span>", "", text)
+    text = _SUP_TAG_RE.sub("", text)
 
     # Docling: HTML comments like <!-- image -->
     text = re.sub(r"<!--.*?-->", "", text)
@@ -332,6 +334,7 @@ def normalize_extractor_output(markdown_text: str) -> str:
         flags=re.DOTALL | re.IGNORECASE,
     )
     text = _SPAN_REF_RE.sub(r"\1", text)
+    text = _SUP_TAG_RE.sub("", text)
     text = _strip_non_page_comments(text)
     text = _IMAGE_REF_RE.sub("", text)
     text = _MARKDOWN_LINK_RE.sub(r"\1", text)
@@ -362,6 +365,7 @@ def clean_output_md(text: str) -> str:
     """Strip extractor-specific artifacts while preserving markdown formatting."""
     text = _SPAN_OPEN_RE.sub("", text)
     text = _SPAN_CLOSE_RE.sub("", text)
+    text = _SUP_TAG_RE.sub("", text)
     text = _HTML_COMMENT_OUTPUT_RE.sub("", text)
     text = _MULTI_NEWLINE_RE.sub("\n\n", text)
     text = _MULTI_SPACE_RE.sub(" ", text)

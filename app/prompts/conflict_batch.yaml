@@ -34,7 +34,7 @@ system_message: |
   - Inferring missing clauses from context_before/context_after.
   - Inventing numbers, citations, identifiers, or formatting not directly supported by a source.
 
-  When one source has full sentences where others have fragments, preserves numbers/references that others dropped, or retains intact special characters (Greek letters, superscripts, etc.), prefer it. When two sources each have content the other lacks, combine them only by copying the necessary source-supported fragments.
+  When one source has full sentences where others have fragments, preserves numbers/references that others dropped, or retains intact special characters and symbols, prefer it. When two sources each have content the other lacks, combine them only by copying the necessary source-supported fragments.
 
   FLANKING CONTEXT AND DUPLICATION:
   Each conflict includes 'context_before' and 'context_after' fields showing the surrounding resolved text (read-only). You MUST:
@@ -61,10 +61,10 @@ system_message: |
     context_after: "Edited by Mike Welsh"
     GROBID:  "From the 1Institute of Cellular and MolecularPhysiology, 2Department of Chemistry andPharmacy, Friedrich-Alexander-Universität Erlangen-Nürnberg, Germany"
     Docling: "From the 1 Institute of Cellular and Molecular Physiology, 2 Department of Chemistry and Pharmacy, Friedrich-Alexander-Universität Erlangen-Nürnberg, Germany"
-    Marker:  "From the <sup>1</sup>Institute of Cellular and Molecular Physiology, <sup>2</sup>Department of Chemistry and Pharmacy, Friedrich-Alexander-Universität Erlangen-Nürnberg, Germany"
+    Marker:  "From the 1 Institute of Cellular and Molecular Physiology, 2 Department of Chemistry and Pharmacy, Friedrich-Alexander-Universität Erlangen-Nürnberg, Germany"
   Correct output:
-    {"resolved": [{"segment_id": "seg_012", "action": "keep", "text": "From the <sup>1</sup>Institute of Cellular and Molecular Physiology, <sup>2</sup>Department of Chemistry and Pharmacy, Friedrich-Alexander-Universität Erlangen-Nürnberg, Germany"}]}
-  Why: GROBID has broken spacing ("MolecularPhysiology", "andPharmacy") — extraction artifacts. Docling has correct spacing but plain-text affiliate numbers. Marker has correct spacing AND proper <sup> tags. Use Marker's version.
+    {"resolved": [{"segment_id": "seg_012", "action": "keep", "text": "From the 1 Institute of Cellular and Molecular Physiology, 2 Department of Chemistry and Pharmacy, Friedrich-Alexander-Universität Erlangen-Nürnberg, Germany"}]}
+  Why: GROBID has broken spacing ("MolecularPhysiology", "andPharmacy") — extraction artifacts. Docling and Marker both preserve the affiliate numbers in plain text with correct spacing. Use the least-transformed readable source text.
 
   Example 2 — Flanking context duplicate (drop):
   Input segment:

@@ -888,17 +888,17 @@ Everything below is optional and has sensible defaults.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLM_MODEL` | `gpt-5.4-mini` | Base model for all LLM calls |
-| `LLM_REASONING_EFFORT` | `high` | Default reasoning effort for LLM calls |
+| `LLM_REASONING_EFFORT` | `medium` | Default reasoning effort for LLM calls |
 | `LLM_MODEL_ZONE_RESOLUTION` | `gpt-5.4-mini` | Model for per-segment micro-conflict resolution |
-| `LLM_REASONING_ZONE_RESOLUTION` | `high` | Reasoning effort for per-segment micro-conflict resolution |
+| `LLM_REASONING_ZONE_RESOLUTION` | `medium` | Reasoning effort for per-segment micro-conflict resolution |
 | `LLM_MODEL_GENERAL_RESCUE` | `gpt-5.4-mini` | Model for general rescue resolution |
-| `LLM_REASONING_GENERAL_RESCUE` | `high` | Reasoning effort for general rescue |
+| `LLM_REASONING_GENERAL_RESCUE` | `medium` | Reasoning effort for general rescue |
 | `LLM_MODEL_NUMERIC_RESCUE` | `gpt-5.4-mini` | Model for numeric integrity rescue |
-| `LLM_REASONING_NUMERIC_RESCUE` | `high` | Reasoning effort for numeric rescue |
+| `LLM_REASONING_NUMERIC_RESCUE` | `medium` | Reasoning effort for numeric rescue |
 | `LLM_MODEL_CONFLICT_BATCH` | `gpt-5.4-mini` | Model for batched conflict resolution |
-| `LLM_REASONING_CONFLICT_BATCH` | `high` | Reasoning effort for batched conflicts |
+| `LLM_REASONING_CONFLICT_BATCH` | `medium` | Reasoning effort for batched conflicts |
 | `HIERARCHY_LLM_MODEL` | `gpt-5.4-mini` | Model for heading hierarchy resolution |
-| `HIERARCHY_LLM_REASONING` | `high` | Reasoning effort for heading hierarchy |
+| `HIERARCHY_LLM_REASONING` | `medium` | Reasoning effort for heading hierarchy |
 | `LLM_CONFLICT_BATCH_SIZE` | `500` | Number of conflicts per batch in batched resolution |
 | `LLM_CONFLICT_MAX_WORKERS` | `100` | Max parallel workers for batched conflict resolution |
 | `LLM_CONFLICT_RETRY_ROUNDS` | `2` | Number of retry rounds for unresolved micro-conflicts |
