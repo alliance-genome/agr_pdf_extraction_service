@@ -45,15 +45,6 @@ _MULTI_SPACE_RE = re.compile(r"  +")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(https?://[^)]*\)")
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 
-# Inline formatting stripping (for embedding-clean output).
-# Order matters: strip bold-italic (***) before bold (**) before italic (*).
-_BOLD_ITALIC_RE = re.compile(r"\*{3}(.+?)\*{3}")
-_BOLD_RE = re.compile(r"\*{2}(.+?)\*{2}")
-_ITALIC_RE = re.compile(r"\*(.+?)\*")
-_BOLD_ALT_RE = re.compile(r"__(.+?)__")
-_ITALIC_ALT_RE = re.compile(r"(?<!\w)_(.+?)_(?!\w)")  # avoid snake_case
-_STRIKETHROUGH_RE = re.compile(r"~~(.+?)~~")
-_INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
 _FENCED_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
 _HORIZONTAL_RULE_RE = re.compile(r"^\s*(?:---+|\*\*\*+|___+)\s*$", re.MULTILINE)
 
@@ -319,11 +310,12 @@ def normalize_text(text: str) -> str:
 def normalize_extractor_output(markdown_text: str) -> str:
     """Normalize full extractor markdown before block parsing.
 
-    This removes extractor-specific formatting artifacts AND inline cosmetic
-    markdown at the source layer so alignment/classification operates on
-    cleaner inputs.  Structural markdown (headings, lists, tables, blockquotes)
-    is preserved; inline decoration (bold, italic, strikethrough, code) is
-    stripped because the output is used for embedding, not rendering.
+    Removes extractor-specific artifacts (span tags, image references,
+    non-page HTML comments, ligature escapes, fenced code blocks) while
+    preserving schema-valid inline formatting (``<sup>``, ``<sub>``,
+    ``**bold**``, ``*italic*``) that the ABC Markdown Schema requires in
+    the final output.  Comparison-level stripping is handled separately
+    by ``normalize_text()``.
     """
     text = unicodedata.normalize("NFKC", markdown_text or "")
     # Convert marker page anchors into explicit page comments for downstream parsing.
@@ -334,38 +326,25 @@ def normalize_extractor_output(markdown_text: str) -> str:
         flags=re.DOTALL | re.IGNORECASE,
     )
     text = _SPAN_REF_RE.sub(r"\1", text)
-    text = _SUP_TAG_RE.sub("", text)
     text = _strip_non_page_comments(text)
     text = _IMAGE_REF_RE.sub("", text)
     text = _MARKDOWN_LINK_RE.sub(r"\1", text)
     # Common Docling ligature artifacts.
     text = text.replace("/uniFB01", "fi").replace("/uniFB02", "fl")
 
-    # --- Strip cosmetic markdown (keep structural) ---
-    # Block-level: fenced code blocks and horizontal rules
+    # Block-level artifacts only — fenced code blocks and horizontal rules
+    # are not part of the ABC schema.
     text = _FENCED_CODE_BLOCK_RE.sub("", text)
     text = _HORIZONTAL_RULE_RE.sub("", text)
-
-    # Inline: bold-italic (***) before bold (**) before italic (*)
-    text = _BOLD_ITALIC_RE.sub(r"\1", text)
-    text = _BOLD_RE.sub(r"\1", text)
-    text = _ITALIC_RE.sub(r"\1", text)
-    # Underscore variants
-    text = _BOLD_ALT_RE.sub(r"\1", text)
-    text = _ITALIC_ALT_RE.sub(r"\1", text)
-    # Strikethrough and inline code
-    text = _STRIKETHROUGH_RE.sub(r"\1", text)
-    text = _INLINE_CODE_RE.sub(r"\1", text)
 
     text = _MULTI_NEWLINE_RE.sub("\n\n", text)
     return text.strip()
 
 
 def clean_output_md(text: str) -> str:
-    """Strip extractor-specific artifacts while preserving markdown formatting."""
+    """Strip extractor-specific artifacts while preserving schema-valid formatting."""
     text = _SPAN_OPEN_RE.sub("", text)
     text = _SPAN_CLOSE_RE.sub("", text)
-    text = _SUP_TAG_RE.sub("", text)
     text = _HTML_COMMENT_OUTPUT_RE.sub("", text)
     text = _MULTI_NEWLINE_RE.sub("\n\n", text)
     text = _MULTI_SPACE_RE.sub(" ", text)

@@ -19,6 +19,7 @@ from app.services import consensus_pipeline_steps as _consensus_pipeline_steps
 from app.services import consensus_reporting as _consensus_reporting
 from app.services import consensus_resolution as _consensus_resolution
 from app.services.degradation_metrics import build_degradation_metrics
+from app.services.schema_enforcer import enforce_schema
 
 if TYPE_CHECKING:
     from app.services.llm_service import LLM
@@ -384,6 +385,34 @@ def merge_with_consensus(
             post_hierarchy_dups,
         )
 
+    # Step 6e: Schema enforcement — round-trip through agr_abc_document_parsers
+    #          to normalize output to the ABC Markdown Schema.
+    #          Note: enforce_schema() has its own internal exception handling;
+    #          the outer try/except is a belt-and-suspenders guard.
+    enforcement_metrics: dict = {}
+    try:
+        merged_md, enforcement_metrics = enforce_schema(merged_md)
+        if enforcement_metrics.get("enforcement_applied"):
+            logger.info(
+                "Consensus pipeline: schema enforcement applied "
+                "(valid=%s, errors=%d, warnings=%d)",
+                enforcement_metrics.get("validation_valid"),
+                enforcement_metrics.get("validation_errors", 0),
+                enforcement_metrics.get("validation_warnings", 0),
+            )
+        else:
+            logger.warning(
+                "Consensus pipeline: schema enforcement skipped: %s",
+                enforcement_metrics.get("skip_reason", "unknown"),
+            )
+    except Exception as e:
+        logger.warning("Schema enforcement failed: %s — using original output", e)
+        enforcement_metrics = {
+            "enforcement_applied": False,
+            "skip_reason": "error",
+            "error": str(e),
+        }
+
     # Finalized heading hierarchy (post optional hierarchy resolution).
     heading_hierarchy = extract_heading_hierarchy(merged_md)
 
@@ -415,6 +444,7 @@ def merge_with_consensus(
     metrics["gap_dedup_removed"] = gap_dups_removed
     metrics["assembled_dedup_removed"] = assembled_dups_removed
     metrics["qa"] = qa_results
+    metrics["schema_enforcement"] = enforcement_metrics
 
     # Compute degradation metrics from resolution metadata
     degradation = build_degradation_metrics(

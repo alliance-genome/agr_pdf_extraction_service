@@ -1,0 +1,258 @@
+"""Post-merge schema enforcement for the PDFX consensus pipeline.
+
+Normalizes merged markdown output to conform to the AGR ABC Markdown
+Schema by running it through the ``agr_abc_document_parsers`` round-trip:
+pre-process → ``read_markdown`` → Document model fixups → ``emit_markdown``
+→ ``validate_markdown``.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from agr_abc_document_parsers import (
+    emit_markdown,
+    read_markdown,
+    validate_markdown,
+)
+from agr_abc_document_parsers.models import Document
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Pre-processing patterns
+# ---------------------------------------------------------------------------
+
+# Section numbers at the start of headings: "## 2.1. Methods" or "## 2.1 Methods"
+_SECTION_NUMBER_RE = re.compile(
+    r"^(#{1,6})\s+\d+(?:\.\d+)*\.?\s+(.+)$",
+    re.MULTILINE,
+)
+
+# Unicode escape literals that some extractors produce
+_UNICODE_ESCAPE_RE = re.compile(r"/uni[0-9A-Fa-f]{4}")
+
+# Common watermark / download notice patterns
+_WATERMARK_PATTERNS = [
+    re.compile(r"^Downloaded from .+$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^Authorized licensed use limited to.+$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^This article is licensed under.+$", re.MULTILINE | re.IGNORECASE),
+]
+
+# DOI / PMID patterns for metadata relocation
+_DOI_RE = re.compile(r"\b(10\.\d{4,}/\S+)\b")
+_PMID_RE = re.compile(r"\bPMID:\s*(\d+)\b", re.IGNORECASE)
+
+# Lines that should never be merged across paragraph boundaries
+_NO_MERGE_LINE = re.compile(
+    r"^(?:#{1,6}\s|[|>*\-]|\d+\.\s|\[\^|\*\*Figure|\*\*Table|<!-- )"
+)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def enforce_schema(merged_md: str) -> tuple[str, dict]:
+    """Enforce ABC markdown schema on consensus-merged output.
+
+    Returns ``(normalized_md, enforcement_metrics)``.
+
+    If the round-trip fails or produces a degenerate document, returns the
+    original *merged_md* unchanged with metrics indicating the skip reason.
+    """
+    if not merged_md or not merged_md.strip():
+        return merged_md, {
+            "enforcement_applied": False,
+            "skip_reason": "empty_input",
+        }
+
+    try:
+        return _enforce(merged_md)
+    except Exception as e:
+        logger.warning("Schema enforcement error: %s — returning original output", e)
+        return merged_md, {
+            "enforcement_applied": False,
+            "skip_reason": "error",
+            "error": str(e),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Internal implementation
+# ---------------------------------------------------------------------------
+
+
+def _enforce(merged_md: str) -> tuple[str, dict]:
+    """Core enforcement logic (no exception handling — caller wraps)."""
+
+    # Phase 1: Pre-process
+    preprocessed = _preprocess(merged_md)
+
+    # Phase 2: Round-trip through Document model
+    doc = read_markdown(preprocessed)
+
+    # Degenerate check: parser couldn't meaningfully parse the input
+    if not doc.sections and not doc.abstract:
+        logger.warning("Schema enforcement: document has no sections and no abstract — skipping")
+        return merged_md, {
+            "enforcement_applied": False,
+            "skip_reason": "unparseable",
+        }
+
+    # PDFX-specific fixups on the Document model
+    _relocate_metadata_from_body(doc)
+
+    normalized_md = emit_markdown(doc)
+
+    # Content-preservation guard: reject if too much content was lost
+    original_words = len(merged_md.split())
+    normalized_words = len(normalized_md.split())
+    if original_words > 0 and normalized_words / original_words < 0.90:
+        logger.warning(
+            "Schema enforcement: word count dropped from %d to %d (%.0f%%) — "
+            "falling back to original output",
+            original_words,
+            normalized_words,
+            (normalized_words / original_words) * 100,
+        )
+        return merged_md, {
+            "enforcement_applied": False,
+            "skip_reason": "content_loss",
+            "original_words": original_words,
+            "normalized_words": normalized_words,
+        }
+
+    # Phase 3: Validate
+    validation = validate_markdown(normalized_md)
+    metrics = {
+        "enforcement_applied": True,
+        "validation_valid": validation.valid,
+        "validation_errors": len(validation.errors),
+        "validation_warnings": len(validation.warnings),
+        "validation_issues": [
+            {
+                "rule_id": issue.rule_id,
+                "severity": issue.severity.value,
+                "line": issue.line,
+                "message": issue.message,
+            }
+            for issue in (validation.errors + validation.warnings)
+        ],
+    }
+
+    return normalized_md, metrics
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Pre-processing
+# ---------------------------------------------------------------------------
+
+
+def _preprocess(text: str) -> str:
+    """Clean PDFX-specific content issues before the round-trip."""
+    text = _strip_section_numbers(text)
+    text = _strip_pdf_artifacts(text)
+    text = _fix_mid_sentence_splits(text)
+    return text
+
+
+def _strip_section_numbers(text: str) -> str:
+    """Remove leading section numbers from headings.
+
+    ``## 2.1. Methods`` → ``## Methods``
+    ``### 3.2.1 Analysis`` → ``### Analysis``
+    """
+    return _SECTION_NUMBER_RE.sub(r"\1 \2", text)
+
+
+def _strip_pdf_artifacts(text: str) -> str:
+    """Remove PDF-specific artifacts: unicode escapes, watermarks."""
+    # Unicode escape literals (e.g., /uniFB01 already handled upstream,
+    # but catch remaining /uniXXXX patterns)
+    text = _UNICODE_ESCAPE_RE.sub("", text)
+
+    # Watermark / download notice lines
+    for pattern in _WATERMARK_PATTERNS:
+        text = pattern.sub("", text)
+
+    return text
+
+
+def _fix_mid_sentence_splits(text: str) -> str:
+    """Merge paragraphs that were split at page or column boundaries.
+
+    Detects cases where a paragraph ends without sentence-ending punctuation
+    and the next paragraph starts with a lowercase letter — a strong signal
+    of a mid-sentence split from PDF column/page layout.
+    """
+    paragraphs = text.split("\n\n")
+    merged: list[str] = []
+
+    i = 0
+    while i < len(paragraphs):
+        current = paragraphs[i]
+        # Try to merge with the next paragraph if conditions are met
+        while (
+            i + 1 < len(paragraphs)
+            and _should_merge(current, paragraphs[i + 1])
+        ):
+            i += 1
+            current = current.rstrip() + " " + paragraphs[i].lstrip()
+        merged.append(current)
+        i += 1
+
+    return "\n\n".join(merged)
+
+
+def _should_merge(preceding: str, following: str) -> bool:
+    """Determine if two adjacent paragraphs should be merged."""
+    preceding = preceding.strip()
+    following = following.strip()
+
+    if not preceding or not following:
+        return False
+
+    # Don't merge if either is a structural element
+    if _NO_MERGE_LINE.match(preceding) or _NO_MERGE_LINE.match(following):
+        return False
+
+    # Preceding must be long enough to be a real paragraph fragment
+    if len(preceding) < 40:
+        return False
+
+    # Preceding must NOT end with sentence-ending punctuation
+    if preceding[-1] in ".!?:":
+        return False
+
+    # Following must start with a lowercase letter
+    if not following[0].islower():
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Document model fixups
+# ---------------------------------------------------------------------------
+
+
+def _relocate_metadata_from_body(doc: Document) -> None:
+    """Extract metadata (DOI, PMID) from body paragraphs and promote to doc fields."""
+    for section in doc.sections:
+        for para in section.paragraphs:
+            text = para.text
+
+            # DOI
+            if not doc.doi:
+                m = _DOI_RE.search(text)
+                if m:
+                    doc.doi = m.group(1).rstrip(".,;:)")
+
+            # PMID
+            if not doc.pmid:
+                m = _PMID_RE.search(text)
+                if m:
+                    doc.pmid = m.group(1)
