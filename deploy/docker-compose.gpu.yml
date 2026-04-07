@@ -136,6 +136,8 @@ services:
       core: 0
     mem_limit: 6g
     environment:
+      # Work around a JVM cgroup v2 detection NPE seen with this image on some Ubuntu 24.04 Docker hosts.
+      JAVA_TOOL_OPTIONS: "-XX:-UseContainerSupport"
       JAVA_OPTS: "-Xms2g -Xmx4g -XX:+UseG1GC"
     logging:
       driver: gelf
