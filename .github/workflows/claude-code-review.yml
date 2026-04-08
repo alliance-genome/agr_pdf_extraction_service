@@ -1,0 +1,26 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  claude-review:
+    if: |
+      (github.event_name == 'pull_request' && github.event.action == 'opened') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    uses: alliance-genome/.github/.github/workflows/claude-code-review.yml@main
+    with:
+      max_turns: "60"
+      trigger_phrase: "@claude"
+      review_focus: "critical bugs, security vulnerabilities, and performance issues in the **Python Flask/Celery PDF extraction service**. Focus on: Celery task reliability and error handling, GPU resource management (CUDA/PyTorch), PDF processing pipeline correctness, SQLAlchemy model integrity, file upload security, API endpoint validation, Docker deployment configuration, and proper async task state management"
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
