@@ -16,7 +16,7 @@ from agr_abc_document_parsers import (
     read_markdown,
     validate_markdown,
 )
-from agr_abc_document_parsers.models import Document
+from agr_abc_document_parsers.models import Document, Section
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +41,15 @@ _WATERMARK_PATTERNS = [
 ]
 
 # DOI / PMID patterns for metadata relocation
-_DOI_RE = re.compile(r"\b(10\.\d{4,}/\S+)\b")
-_PMID_RE = re.compile(r"\bPMID:\s*(\d+)\b", re.IGNORECASE)
+_DOI_METADATA_RE = re.compile(
+    r"^\(?\s*(?:doi\s*[: ]\s*|https?://(?:dx\.)?doi\.org/)?"
+    r"(10\.\d{4,}/\S+?)\s*\)?[.,;:]*\s*$",
+    re.IGNORECASE,
+)
+_PMID_METADATA_RE = re.compile(
+    r"^\(?\s*PMID\s*[: ]\s*(\d+)\s*\)?[.,;:]*\s*$",
+    re.IGNORECASE,
+)
 
 # Lines that should never be merged across paragraph boundaries
 _NO_MERGE_LINE = re.compile(
@@ -103,47 +110,52 @@ def _enforce(merged_md: str) -> tuple[str, dict]:
         }
 
     # PDFX-specific fixups on the Document model
+    adjusted_original_words = max(
+        1,
+        len(preprocessed.split()) - _estimate_intentional_word_loss(doc),
+    )
+    _normalize_authors(doc)
     _relocate_metadata_from_body(doc)
 
     normalized_md = emit_markdown(doc)
 
     # Content-preservation guard: reject if too much content was lost
-    original_words = len(merged_md.split())
     normalized_words = len(normalized_md.split())
-    if original_words > 0 and normalized_words / original_words < 0.90:
+    if normalized_words / adjusted_original_words < 0.90:
         logger.warning(
             "Schema enforcement: word count dropped from %d to %d (%.0f%%) — "
             "falling back to original output",
-            original_words,
+            adjusted_original_words,
             normalized_words,
-            (normalized_words / original_words) * 100,
+            (normalized_words / adjusted_original_words) * 100,
         )
         return merged_md, {
             "enforcement_applied": False,
             "skip_reason": "content_loss",
-            "original_words": original_words,
+            "original_words": adjusted_original_words,
             "normalized_words": normalized_words,
         }
 
     # Phase 3: Validate
     validation = validate_markdown(normalized_md)
-    metrics = {
-        "enforcement_applied": True,
-        "validation_valid": validation.valid,
-        "validation_errors": len(validation.errors),
-        "validation_warnings": len(validation.warnings),
-        "validation_issues": [
-            {
-                "rule_id": issue.rule_id,
-                "severity": issue.severity.value,
-                "line": issue.line,
-                "message": issue.message,
-            }
-            for issue in (validation.errors + validation.warnings)
-        ],
-    }
+    validation_metrics = _build_validation_metrics(validation)
+    if validation.errors:
+        logger.warning(
+            "Schema enforcement: validation failed with %d error(s) and %d warning(s) "
+            "— falling back to original output",
+            validation_metrics["validation_errors"],
+            validation_metrics["validation_warnings"],
+        )
+        return merged_md, {
+            "enforcement_applied": False,
+            "skip_reason": "validation_failed",
+            **validation_metrics,
+        }
 
-    return normalized_md, metrics
+    return normalized_md, {
+        "enforcement_applied": True,
+        **validation_metrics,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -239,20 +251,94 @@ def _should_merge(preceding: str, following: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_authors(doc: Document) -> None:
+    """Emit plain comma-separated author names without affiliation superscripts."""
+    for author in doc.authors:
+        author.affiliations = []
+
+
 def _relocate_metadata_from_body(doc: Document) -> None:
-    """Extract metadata (DOI, PMID) from body paragraphs and promote to doc fields."""
+    """Promote metadata-like body paragraphs to document fields and remove them."""
     for section in doc.sections:
+        _relocate_metadata_from_section(section, doc)
+
+
+def _relocate_metadata_from_section(section: Section, doc: Document) -> None:
+    """Walk a section tree, relocating metadata paragraphs in place."""
+    kept_paragraphs = []
+    for para in section.paragraphs:
+        text = para.text.strip()
+        doi = _extract_metadata_value(text, _DOI_METADATA_RE)
+        pmid = _extract_metadata_value(text, _PMID_METADATA_RE)
+
+        if doi or pmid:
+            if doi and not doc.doi:
+                doc.doi = doi
+            if pmid and not doc.pmid:
+                doc.pmid = pmid
+            continue
+
+        kept_paragraphs.append(para)
+
+    section.paragraphs = kept_paragraphs
+    for subsection in section.subsections:
+        _relocate_metadata_from_section(subsection, doc)
+
+
+def _extract_metadata_value(text: str, pattern: re.Pattern[str]) -> str:
+    """Return a metadata value only when the full paragraph is metadata-like."""
+    match = pattern.match(text)
+    if not match:
+        return ""
+    return match.group(1).rstrip(".,;:)")
+
+
+def _estimate_intentional_word_loss(doc: Document) -> int:
+    """Estimate words intentionally removed by author and metadata normalization."""
+    return _count_affiliation_line_words(doc) + _count_metadata_paragraph_words(doc.sections)
+
+
+def _count_affiliation_line_words(doc: Document) -> int:
+    """Count numbered affiliation-line words that the plain-author output removes."""
+    seen_affiliations: set[str] = set()
+    total = 0
+    for author in doc.authors:
+        for affiliation in author.affiliations:
+            affiliation = affiliation.strip()
+            if not affiliation or affiliation.isdigit() or affiliation in seen_affiliations:
+                continue
+            seen_affiliations.add(affiliation)
+            total += len(affiliation.split()) + 1
+    return total
+
+
+def _count_metadata_paragraph_words(sections: list[Section]) -> int:
+    """Count exact metadata paragraphs that will be relocated out of the body."""
+    total = 0
+    for section in sections:
         for para in section.paragraphs:
-            text = para.text
+            text = para.text.strip()
+            if _extract_metadata_value(text, _DOI_METADATA_RE) or _extract_metadata_value(
+                text, _PMID_METADATA_RE,
+            ):
+                total += len(text.split())
+        total += _count_metadata_paragraph_words(section.subsections)
+    return total
 
-            # DOI
-            if not doc.doi:
-                m = _DOI_RE.search(text)
-                if m:
-                    doc.doi = m.group(1).rstrip(".,;:)")
 
-            # PMID
-            if not doc.pmid:
-                m = _PMID_RE.search(text)
-                if m:
-                    doc.pmid = m.group(1)
+def _build_validation_metrics(validation) -> dict:
+    """Return serializable validation counts and issues."""
+    return {
+        "validation_valid": validation.valid,
+        "validation_errors": len(validation.errors),
+        "validation_warnings": len(validation.warnings),
+        "validation_issues": [
+            {
+                "rule_id": issue.rule_id,
+                "severity": issue.severity.value,
+                "line": issue.line,
+                "message": issue.message,
+            }
+            for issue in (validation.errors + validation.warnings)
+        ],
+    }

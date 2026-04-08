@@ -14,6 +14,7 @@ def _has_consensus_deps() -> bool:
 
 from app.services.schema_enforcer import (
     _fix_mid_sentence_splits,
+    _normalize_authors,
     _preprocess,
     _relocate_metadata_from_body,
     _strip_pdf_artifacts,
@@ -186,11 +187,40 @@ class TestEnforceSchema:
             "## Abstract\n\n"
             "Abstract text.\n\n"
             "## Introduction\n\n"
-            "See doi 10.1234/test.example for details.\n"
+            "DOI: 10.1234/test.example\n"
         )
         result_md, metrics = enforce_schema(md)
         assert metrics["enforcement_applied"] is True
         assert "**DOI:** 10.1234/test.example" in result_md
+        assert result_md.count("10.1234/test.example") == 1
+
+    def test_prose_doi_reference_not_promoted(self):
+        md = (
+            "# Test Title\n\n"
+            "## Abstract\n\n"
+            "Abstract text.\n\n"
+            "## Introduction\n\n"
+            "See doi 10.1234/test.example for details.\n"
+        )
+        result_md, metrics = enforce_schema(md)
+        assert metrics["enforcement_applied"] is True
+        assert "**DOI:** 10.1234/test.example" not in result_md
+        assert "See doi 10.1234/test.example for details." in result_md
+
+    def test_validation_failure_falls_back(self):
+        md = (
+            "# Test Title\n\n"
+            "## Abstract\n\n"
+            "Abstract text.\n\n"
+            "# Duplicate H1\n\n"
+            "More body text.\n"
+        )
+        result_md, metrics = enforce_schema(md)
+        assert metrics["enforcement_applied"] is False
+        assert metrics["skip_reason"] == "validation_failed"
+        assert metrics["validation_valid"] is False
+        assert metrics["validation_errors"] > 0
+        assert result_md == md
 
     def test_content_preservation_guard(self):
         """If round-trip loses >10% of words, fall back to original."""
@@ -205,6 +235,35 @@ class TestEnforceSchema:
         )
         result_md, metrics = enforce_schema(md)
         assert metrics["enforcement_applied"] is True
+
+    def test_author_affiliations_removed_from_output(self):
+        md = (
+            "# Test Title\n\n"
+            "Alice Smith<sup>1</sup>, Bob Jones<sup>2</sup>\n\n"
+            "1. Department A\n"
+            "2. Department B\n\n"
+            "## Abstract\n\n"
+            "Abstract text.\n"
+        )
+        result_md, metrics = enforce_schema(md)
+        assert metrics["enforcement_applied"] is True
+        assert "Alice Smith, Bob Jones" in result_md
+        assert "<sup>" not in result_md
+        assert "Department A" not in result_md
+        assert "Department B" not in result_md
+
+    def test_author_superscripts_without_affiliations_do_not_emit_numbered_list(self):
+        md = (
+            "# Test Title\n\n"
+            "Alice Smith<sup>1</sup>, Bob Jones<sup>2</sup>\n\n"
+            "## Abstract\n\n"
+            "Abstract text.\n"
+        )
+        result_md, metrics = enforce_schema(md)
+        assert metrics["enforcement_applied"] is True
+        assert "Alice Smith, Bob Jones" in result_md
+        assert "1. 1" not in result_md
+        assert "2. 2" not in result_md
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +280,13 @@ class TestRelocateMetadata:
             sections=[
                 Section(
                     heading="Introduction",
-                    paragraphs=[Paragraph(text="See 10.1234/test.paper for details.")],
+                    paragraphs=[Paragraph(text="DOI: 10.1234/test.paper")],
                 ),
             ],
         )
         _relocate_metadata_from_body(doc)
         assert doc.doi == "10.1234/test.paper"
+        assert doc.sections[0].paragraphs == []
 
     def test_pmid_extraction(self):
         from agr_abc_document_parsers.models import Document, Paragraph, Section
@@ -236,12 +296,13 @@ class TestRelocateMetadata:
             sections=[
                 Section(
                     heading="Introduction",
-                    paragraphs=[Paragraph(text="This study (PMID: 12345678) shows...")],
+                    paragraphs=[Paragraph(text="PMID: 12345678")],
                 ),
             ],
         )
         _relocate_metadata_from_body(doc)
         assert doc.pmid == "12345678"
+        assert doc.sections[0].paragraphs == []
 
     def test_does_not_overwrite_existing(self):
         from agr_abc_document_parsers.models import Document, Paragraph, Section
@@ -252,12 +313,46 @@ class TestRelocateMetadata:
             sections=[
                 Section(
                     heading="Introduction",
-                    paragraphs=[Paragraph(text="See 10.1234/other for details.")],
+                    paragraphs=[Paragraph(text="DOI: 10.1234/other")],
                 ),
             ],
         )
         _relocate_metadata_from_body(doc)
         assert doc.doi == "10.9999/existing"
+        assert doc.sections[0].paragraphs == []
+
+    def test_prose_mentions_not_relocated(self):
+        from agr_abc_document_parsers.models import Document, Paragraph, Section
+
+        doc = Document(
+            title="Test",
+            sections=[
+                Section(
+                    heading="Introduction",
+                    paragraphs=[Paragraph(text="See doi 10.1234/test.paper for details.")],
+                ),
+            ],
+        )
+        _relocate_metadata_from_body(doc)
+        assert doc.doi == ""
+        assert doc.sections[0].paragraphs[0].text == "See doi 10.1234/test.paper for details."
+
+
+class TestNormalizeAuthors:
+    def test_removes_affiliations_from_authors(self):
+        from agr_abc_document_parsers.models import Author, Document
+
+        doc = Document(
+            authors=[
+                Author(given_name="Alice", surname="Smith", affiliations=["Department A"]),
+                Author(given_name="Bob", surname="Jones", affiliations=["Department B"]),
+            ],
+        )
+
+        _normalize_authors(doc)
+
+        assert doc.authors[0].affiliations == []
+        assert doc.authors[1].affiliations == []
 
 
 # ---------------------------------------------------------------------------
