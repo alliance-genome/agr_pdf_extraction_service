@@ -11,6 +11,7 @@ openai
 pydantic>=2.0
 
 # Consensus pipeline
+agr-abc-document-parsers>=1.5.0
 mistune
 rapidfuzz
 scipy
