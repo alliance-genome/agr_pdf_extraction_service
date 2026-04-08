@@ -254,6 +254,9 @@ def _should_merge(preceding: str, following: str) -> bool:
 def _normalize_authors(doc: Document) -> None:
     """Emit plain comma-separated author names without affiliation superscripts."""
     for author in doc.authors:
+        # PDFX author lines commonly encode affiliation markers as superscripts or
+        # numbered affiliation lists. The ABC markdown schema emits plain
+        # comma-separated names, so we intentionally drop affiliations here.
         author.affiliations = []
 
 
@@ -287,10 +290,14 @@ def _relocate_metadata_from_section(section: Section, doc: Document) -> None:
 
 def _extract_metadata_value(text: str, pattern: re.Pattern[str]) -> str:
     """Return a metadata value only when the full paragraph is metadata-like."""
-    match = pattern.match(text)
+    stripped_text = text.strip()
+    if stripped_text.startswith("(") and stripped_text.endswith(")"):
+        stripped_text = stripped_text[1:-1].strip()
+
+    match = pattern.match(stripped_text)
     if not match:
         return ""
-    return match.group(1).rstrip(".,;:)")
+    return match.group(1)
 
 
 def _estimate_intentional_word_loss(doc: Document) -> int:

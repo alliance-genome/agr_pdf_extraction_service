@@ -281,6 +281,8 @@ def normalize_text(text: str) -> str:
     # Marker: <span id="page-X-Y"> ... </span> anchors
     text = re.sub(r"<span[^>]*>", "", text)
     text = re.sub(r"</span>", "", text)
+    # Comparison-only: drop superscript tags so extractor variants align even
+    # though the rendered output path preserves schema-valid <sup> markup.
     text = _SUP_TAG_RE.sub("", text)
 
     # Docling: HTML comments like <!-- image -->

@@ -321,6 +321,23 @@ class TestRelocateMetadata:
         assert doc.doi == "10.9999/existing"
         assert doc.sections[0].paragraphs == []
 
+    def test_doi_with_parentheses_preserved(self):
+        from agr_abc_document_parsers.models import Document, Paragraph, Section
+
+        doi = "10.1002/(SICI)1097-0177(199801)213:1<1::AID-AJA1>3.0.CO;2-#"
+        doc = Document(
+            title="Test",
+            sections=[
+                Section(
+                    heading="Introduction",
+                    paragraphs=[Paragraph(text=f"(DOI: {doi})")],
+                ),
+            ],
+        )
+        _relocate_metadata_from_body(doc)
+        assert doc.doi == doi
+        assert doc.sections[0].paragraphs == []
+
     def test_prose_mentions_not_relocated(self):
         from agr_abc_document_parsers.models import Document, Paragraph, Section
 
