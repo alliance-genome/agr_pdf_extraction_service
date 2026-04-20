@@ -49,11 +49,26 @@ read_param() {
 # empty-string values; the proxy's config layer .strip()s the result back to
 # "" so the auth allow-lists remain inactive until an operator updates the
 # parameter with real values.
+#
+# Only ParameterNotFound triggers the placeholder write. Other errors
+# (IAM denied, throttle, network) are surfaced so a misconfigured deploy
+# fails loudly with a useful message instead of being misinterpreted as
+# "param missing → create".
 ensure_ssm_param() {
     local name="$1"
-    if $AWS_CMD ssm get-parameter --name "$name" >/dev/null 2>&1; then
+    local err_file
+    err_file=$(mktemp)
+    if $AWS_CMD ssm get-parameter --name "$name" >/dev/null 2>"$err_file"; then
+        rm -f "$err_file"
         return 0
     fi
+    if ! grep -q 'ParameterNotFound' "$err_file"; then
+        echo "ERROR: failed to read SSM parameter ${name}:" >&2
+        cat "$err_file" >&2
+        rm -f "$err_file"
+        return 1
+    fi
+    rm -f "$err_file"
     echo "    Creating placeholder SSM parameter ${name} (was missing)"
     $AWS_CMD ssm put-parameter \
         --name "$name" \
