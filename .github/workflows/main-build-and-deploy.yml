@@ -1,0 +1,267 @@
+name: Main Build and Deploy
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  on-merge:
+    name: Skip on unmerged
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image-tag }}
+      source-ref: ${{ steps.meta.outputs.source-ref }}
+    env:
+      MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      FALLBACK_SHA: ${{ github.sha }}
+    steps:
+      - name: Capture deployment metadata
+        id: meta
+        run: |
+          source_ref="${MERGE_COMMIT_SHA:-$FALLBACK_SHA}"
+          echo "source-ref=${source_ref}" >> "$GITHUB_OUTPUT"
+          echo "image-tag=${source_ref}" >> "$GITHUB_OUTPUT"
+      - name: Confirm execution
+        run: |
+          echo "Merged PR detected for ${GITHUB_REPOSITORY}."
+          echo "Deploying commit ${{ steps.meta.outputs.source-ref }}."
+
+  on-deploy:
+    name: Skip on 'no-deploy' PRs
+    needs: on-merge
+    if: "!contains(github.event.pull_request.labels.*.name, 'no-deploy')"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Confirm execution
+        run: |
+          echo "No 'no-deploy' label found."
+
+  build-proxy-image:
+    name: Build proxy image once
+    needs: [on-merge, on-deploy]
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ github.workflow }}-build-proxy-image
+      cancel-in-progress: false
+    outputs:
+      image-artifact-name: ${{ steps.meta.outputs.image-artifact-name }}
+      image-archive-sha256: ${{ steps.hash.outputs.image-archive-sha256 }}
+    env:
+      IMAGE_TAG: ${{ needs.on-merge.outputs.image-tag }}
+      SOURCE_REF: ${{ needs.on-merge.outputs.source-ref }}
+      IMAGE_NAME: agr_pdfx_proxy
+      IMAGE_ARCHIVE_PATH: /tmp/agr_pdfx_proxy-image.tar
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - name: Capture artifact metadata
+        id: meta
+        run: |
+          echo "image-artifact-name=proxy-image-${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build proxy image archive
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_SUMMARY: false
+        with:
+          context: ./proxy
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          outputs: type=docker,dest=${{ env.IMAGE_ARCHIVE_PATH }}
+          platforms: linux/amd64
+      - name: Hash image archive
+        id: hash
+        run: |
+          archive_sha256=$(sha256sum "${IMAGE_ARCHIVE_PATH}" | awk '{print $1}')
+          printf '%s  %s\n' "${archive_sha256}" "${IMAGE_ARCHIVE_PATH}" > "${IMAGE_ARCHIVE_PATH}.sha256"
+          echo "image-archive-sha256=${archive_sha256}" >> "$GITHUB_OUTPUT"
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.image-artifact-name }}
+          path: |
+            ${{ env.IMAGE_ARCHIVE_PATH }}
+            ${{ env.IMAGE_ARCHIVE_PATH }}.sha256
+          if-no-files-found: error
+
+  deploy-dev:
+    name: Deploy proxy to dev
+    needs: [on-merge, on-deploy, build-proxy-image]
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    environment: dev
+    concurrency:
+      group: ${{ github.workflow }}-dev
+      cancel-in-progress: false
+    env:
+      AWS_REGION: us-east-1
+      IMAGE_TAG: ${{ needs.on-merge.outputs.image-tag }}
+      SOURCE_REF: ${{ needs.on-merge.outputs.source-ref }}
+      IMAGE_NAME: agr_pdfx_proxy
+      IMAGE_ARTIFACT_NAME: ${{ needs.build-proxy-image.outputs.image-artifact-name }}
+      IMAGE_ARCHIVE_SHA256: ${{ needs.build-proxy-image.outputs.image-archive-sha256 }}
+      IMAGE_ARCHIVE_PATH: /tmp/agr_pdfx_proxy-image.tar
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - name: Download built image artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ env.IMAGE_ARTIFACT_NAME }}
+          path: /tmp
+      - name: Verify image artifact checksum
+        run: |
+          echo "${IMAGE_ARCHIVE_SHA256}  ${IMAGE_ARCHIVE_PATH}" | sha256sum --check --
+      - name: Load built proxy image
+        run: |
+          docker load --input "${IMAGE_ARCHIVE_PATH}"
+      - name: AWS credentials configuration
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}
+          role-session-name: gh-actions-${{ github.run_id }}.${{ github.run_number }}.${{ github.run_attempt }}-pdfx-dev
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Amazon ECR login
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Push promoted proxy image
+        env:
+          TARGET_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:${{ env.IMAGE_TAG }}
+          TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:latest
+        run: |
+          docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_TAGGED}"
+          docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_LATEST}"
+          docker push "${TARGET_IMAGE_TAGGED}"
+          docker push "${TARGET_IMAGE_LATEST}"
+      - name: Register task definition and roll ECS service
+        working-directory: proxy/deploy
+        run: ./deploy.sh --region "${AWS_REGION}" --image-tag "${IMAGE_TAG}"
+
+  deploy-stage:
+    name: Deploy proxy to stage
+    needs: [on-merge, on-deploy, build-proxy-image, deploy-dev]
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    environment: stage
+    concurrency:
+      group: ${{ github.workflow }}-stage
+      cancel-in-progress: false
+    env:
+      AWS_REGION: us-east-1
+      IMAGE_TAG: ${{ needs.on-merge.outputs.image-tag }}
+      SOURCE_REF: ${{ needs.on-merge.outputs.source-ref }}
+      IMAGE_NAME: agr_pdfx_proxy
+      IMAGE_ARTIFACT_NAME: ${{ needs.build-proxy-image.outputs.image-artifact-name }}
+      IMAGE_ARCHIVE_SHA256: ${{ needs.build-proxy-image.outputs.image-archive-sha256 }}
+      IMAGE_ARCHIVE_PATH: /tmp/agr_pdfx_proxy-image.tar
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - name: Download built image artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ env.IMAGE_ARTIFACT_NAME }}
+          path: /tmp
+      - name: Verify image artifact checksum
+        run: |
+          echo "${IMAGE_ARCHIVE_SHA256}  ${IMAGE_ARCHIVE_PATH}" | sha256sum --check --
+      - name: Load built proxy image
+        run: |
+          docker load --input "${IMAGE_ARCHIVE_PATH}"
+      - name: AWS credentials configuration
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}
+          role-session-name: gh-actions-${{ github.run_id }}.${{ github.run_number }}.${{ github.run_attempt }}-pdfx-stage
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Amazon ECR login
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Push promoted proxy image
+        env:
+          TARGET_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:${{ env.IMAGE_TAG }}
+          TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:latest
+        run: |
+          docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_TAGGED}"
+          docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_LATEST}"
+          docker push "${TARGET_IMAGE_TAGGED}"
+          docker push "${TARGET_IMAGE_LATEST}"
+      - name: Register task definition and roll ECS service
+        working-directory: proxy/deploy
+        run: ./deploy.sh --region "${AWS_REGION}" --image-tag "${IMAGE_TAG}"
+
+  deploy-prod:
+    name: Deploy proxy to prod
+    needs: [on-merge, on-deploy, build-proxy-image, deploy-stage]
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    environment: prod
+    concurrency:
+      group: ${{ github.workflow }}-prod
+      cancel-in-progress: false
+    env:
+      AWS_REGION: us-east-1
+      IMAGE_TAG: ${{ needs.on-merge.outputs.image-tag }}
+      SOURCE_REF: ${{ needs.on-merge.outputs.source-ref }}
+      IMAGE_NAME: agr_pdfx_proxy
+      IMAGE_ARTIFACT_NAME: ${{ needs.build-proxy-image.outputs.image-artifact-name }}
+      IMAGE_ARCHIVE_SHA256: ${{ needs.build-proxy-image.outputs.image-archive-sha256 }}
+      IMAGE_ARCHIVE_PATH: /tmp/agr_pdfx_proxy-image.tar
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - name: Download built image artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ env.IMAGE_ARTIFACT_NAME }}
+          path: /tmp
+      - name: Verify image artifact checksum
+        run: |
+          echo "${IMAGE_ARCHIVE_SHA256}  ${IMAGE_ARCHIVE_PATH}" | sha256sum --check --
+      - name: Load built proxy image
+        run: |
+          docker load --input "${IMAGE_ARCHIVE_PATH}"
+      - name: AWS credentials configuration
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}
+          role-session-name: gh-actions-${{ github.run_id }}.${{ github.run_number }}.${{ github.run_attempt }}-pdfx-prod
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Amazon ECR login
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Push promoted proxy image
+        env:
+          TARGET_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:${{ env.IMAGE_TAG }}
+          TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:latest
+        run: |
+          docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_TAGGED}"
+          docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_LATEST}"
+          docker push "${TARGET_IMAGE_TAGGED}"
+          docker push "${TARGET_IMAGE_LATEST}"
+      - name: Register task definition and roll ECS service
+        working-directory: proxy/deploy
+        run: ./deploy.sh --region "${AWS_REGION}" --image-tag "${IMAGE_TAG}"

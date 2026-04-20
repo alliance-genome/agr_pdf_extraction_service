@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./deploy.sh [--profile PROFILE] [--region REGION] [--cluster NAME] [--service NAME]
-#               [--dry-run] [--no-update-service] [--no-wait]
+#               [--image-tag TAG] [--dry-run] [--no-update-service] [--no-wait]
 #
 # Reads infrastructure values from AWS SSM Parameter Store under /pdfx/*,
 # substitutes them into the template files, and registers the task definition.
@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REGION="us-east-1"
 PROFILE=""
+IMAGE_TAG="latest"
 DRY_RUN=false
 CLUSTER_NAME="pdfx-proxy"
 SERVICE_NAME="pdfx-proxy"
@@ -28,6 +29,7 @@ while [[ $# -gt 0 ]]; do
         --region) REGION="$2"; shift 2 ;;
         --cluster) CLUSTER_NAME="$2"; shift 2 ;;
         --service) SERVICE_NAME="$2"; shift 2 ;;
+        --image-tag) IMAGE_TAG="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         --no-update-service) UPDATE_SERVICE=false; shift ;;
         --no-wait) WAIT_FOR_STABLE=false; shift ;;
@@ -93,13 +95,14 @@ ensure_ssm_param /pdfx/cognito-accepted-client-ids
 
 EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}"
 TASK_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${TASK_ROLE_NAME}"
-ECR_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/agr_pdfx_proxy:latest"
+ECR_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/agr_pdfx_proxy:${IMAGE_TAG}"
 
 echo "    Account:        ${AWS_ACCOUNT_ID}"
 echo "    EC2 Instance:   ${EC2_INSTANCE_ID}"
 echo "    Execution Role: ${EXECUTION_ROLE_ARN}"
 echo "    Task Role:      ${TASK_ROLE_ARN}"
 echo "    ECR Image:      ${ECR_IMAGE}"
+echo "    Image Tag:      ${IMAGE_TAG}"
 echo "    Queue Bucket:   ${QUEUE_S3_BUCKET}"
 echo "    ECS Cluster:    ${CLUSTER_NAME}"
 echo "    ECS Service:    ${SERVICE_NAME}"

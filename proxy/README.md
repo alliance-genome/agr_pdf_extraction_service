@@ -224,12 +224,51 @@ docker push <account>.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_proxy:latest
 cd deploy
 ./deploy.sh --profile <profile>
 
+# Optional: deploy an immutable image tag instead of :latest
+./deploy.sh --profile <profile> --image-tag <git-sha-or-release-tag>
+
 # Or dry-run to inspect the generated task definition
 ./deploy.sh --profile <profile> --dry-run
 
 # Optional: register task definition only (skip ECS service update)
 ./deploy.sh --profile <profile> --no-update-service
 ```
+
+### GitHub Actions auto-deploy
+
+The repo-level workflow at `.github/workflows/main-build-and-deploy.yml`
+automates the manual steps above when a PR is merged into `main`.
+
+- Trigger: `pull_request.closed` on `main`, guarded by `github.event.pull_request.merged == true`
+- Escape hatch: add the `no-deploy` label to the PR to skip all deployment jobs
+- Rollout order: `dev` -> `stage` -> `prod`
+- Approval gate: the `prod` job is attached to the GitHub Actions `prod`
+  environment, so required reviewers can block production rollout until
+  explicitly approved
+- Image promotion: the workflow builds the proxy image once, uploads it as a
+  GitHub Actions artifact, and each environment downloads that exact archive,
+  verifies its checksum, pushes it to ECR as
+  `agr_pdfx_proxy:<merge-commit-sha>` plus `:latest`, then runs
+  `proxy/deploy/deploy.sh --image-tag <merge-commit-sha>`
+
+Recommended GitHub setup:
+
+- Create GitHub Actions environments named `dev`, `stage`, and `prod`
+- Store `GH_ACTIONS_AWS_ROLE` in each environment so the workflow assumes the
+  correct AWS role per environment/account
+- Configure required reviewers on the `prod` environment to enforce the manual
+  approval gate
+
+The assumed AWS role needs enough access to:
+
+- authenticate to and push images into the `agr_pdfx_proxy` ECR repository
+- read `/pdfx/*` from SSM Parameter Store
+- register ECS task definitions and update the `pdfx-proxy` ECS service
+- pass the ECS execution and task roles referenced by the task definition
+
+If you want `deploy.sh` to auto-create the optional
+`/pdfx/cognito-accepted-scopes` and `/pdfx/cognito-accepted-client-ids`
+placeholders when missing, also grant `ssm:PutParameter` on `/pdfx/*`.
 
 ### IAM Permissions (Task Role)
 
