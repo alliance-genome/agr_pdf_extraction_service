@@ -16,6 +16,13 @@ class Settings:
     COGNITO_USER_POOL_ID: str = os.environ["COGNITO_USER_POOL_ID"]
     COGNITO_REGION: str = os.environ.get("COGNITO_REGION", "us-east-1")
     COGNITO_REQUIRED_SCOPE: str = os.environ.get("COGNITO_REQUIRED_SCOPE", "pdfx-api/extract")
+    # Additional scopes that also grant access (comma-separated).
+    # Combined with COGNITO_REQUIRED_SCOPE to form the accepted-scope set.
+    COGNITO_ACCEPTED_SCOPES: str = os.environ.get("COGNITO_ACCEPTED_SCOPES", "").strip()
+    # Allow-list of Cognito app client_ids whose tokens are accepted without
+    # requiring any PDFX-specific scope. Used to honor shared M2M admin tokens
+    # such as CurationAPI-Admin. Comma-separated; empty disables the allow-list.
+    COGNITO_ACCEPTED_CLIENT_IDS: str = os.environ.get("COGNITO_ACCEPTED_CLIENT_IDS", "").strip()
 
     IDLE_TIMEOUT_MINUTES: int = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "30"))
     MIN_UPTIME_MINUTES: int = int(os.environ.get("MIN_UPTIME_MINUTES", "20"))

@@ -25,7 +25,9 @@
         {"name": "STUCK_PENDING_MINUTES", "value": "20"},
         {"name": "RECONCILER_INTERVAL_SECONDS", "value": "60"},
         {"name": "RECONCILER_REQUEUE_ONCE", "value": "false"},
-        {"name": "ALWAYS_ON_MODE", "value": "false"}
+        {"name": "ALWAYS_ON_MODE", "value": "false"},
+        {"name": "COGNITO_ACCEPTED_SCOPES", "value": "${COGNITO_ACCEPTED_SCOPES}"},
+        {"name": "COGNITO_ACCEPTED_CLIENT_IDS", "value": "${COGNITO_ACCEPTED_CLIENT_IDS}"}
       ],
       "secrets": [
         {"name": "EC2_INSTANCE_ID", "valueFrom": "/pdfx/ec2-instance-id"},
