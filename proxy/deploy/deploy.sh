@@ -43,18 +43,23 @@ read_param() {
     $AWS_CMD ssm get-parameter --name "$1" --query "Parameter.Value" --output text
 }
 
-# Optional parameter: returns "" (and warns) if the SSM key is not present,
-# so first-time deploys don't fail when an optional config has not yet been
-# provisioned. Re-raises any other error.
-read_optional_param() {
+# Idempotently ensure an SSM String parameter exists so the ECS task
+# definition's `secrets` block can resolve it. Existing values are never
+# touched (no --overwrite). Created with a single space because SSM rejects
+# empty-string values; the proxy's config layer .strip()s the result back to
+# "" so the auth allow-lists remain inactive until an operator updates the
+# parameter with real values.
+ensure_ssm_param() {
     local name="$1"
-    local value
-    if value=$($AWS_CMD ssm get-parameter --name "$name" --query "Parameter.Value" --output text 2>/dev/null); then
-        printf '%s' "$value"
-    else
-        echo "    (optional) ${name} not found in SSM; defaulting to empty" >&2
-        printf ''
+    if $AWS_CMD ssm get-parameter --name "$name" >/dev/null 2>&1; then
+        return 0
     fi
+    echo "    Creating placeholder SSM parameter ${name} (was missing)"
+    $AWS_CMD ssm put-parameter \
+        --name "$name" \
+        --type "String" \
+        --value " " \
+        >/dev/null
 }
 
 AWS_ACCOUNT_ID=$(read_param /pdfx/aws-account-id)
@@ -62,8 +67,14 @@ EC2_INSTANCE_ID=$(read_param /pdfx/ec2-instance-id)
 EXECUTION_ROLE_NAME=$(read_param /pdfx/execution-role-name)
 TASK_ROLE_NAME=$(read_param /pdfx/task-role-name)
 QUEUE_S3_BUCKET=$(read_param /pdfx/audit-s3-bucket)
-COGNITO_ACCEPTED_SCOPES=$(read_optional_param /pdfx/cognito-accepted-scopes)
-COGNITO_ACCEPTED_CLIENT_IDS=$(read_optional_param /pdfx/cognito-accepted-client-ids)
+
+# Ensure optional auth allow-list parameters exist so the task definition's
+# `secrets` references resolve on first deploy. Operator must have
+# ssm:PutParameter for /pdfx/* (in addition to ssm:GetParameter) for these
+# placeholder writes; populate real values via `aws ssm put-parameter
+# --overwrite` per environment when the allow-list should be enabled.
+ensure_ssm_param /pdfx/cognito-accepted-scopes
+ensure_ssm_param /pdfx/cognito-accepted-client-ids
 
 EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}"
 TASK_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${TASK_ROLE_NAME}"
@@ -85,8 +96,6 @@ TASK_DEF=$(sed \
     -e "s|\${TASK_ROLE_ARN}|${TASK_ROLE_ARN}|g" \
     -e "s|\${ECR_IMAGE}|${ECR_IMAGE}|g" \
     -e "s|\${QUEUE_S3_BUCKET}|${QUEUE_S3_BUCKET}|g" \
-    -e "s|\${COGNITO_ACCEPTED_SCOPES}|${COGNITO_ACCEPTED_SCOPES}|g" \
-    -e "s|\${COGNITO_ACCEPTED_CLIENT_IDS}|${COGNITO_ACCEPTED_CLIENT_IDS}|g" \
     "${SCRIPT_DIR}/task-definition.template.json")
 
 # --- Generate IAM policy ---

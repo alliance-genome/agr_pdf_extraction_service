@@ -25,9 +25,7 @@
         {"name": "STUCK_PENDING_MINUTES", "value": "20"},
         {"name": "RECONCILER_INTERVAL_SECONDS", "value": "60"},
         {"name": "RECONCILER_REQUEUE_ONCE", "value": "false"},
-        {"name": "ALWAYS_ON_MODE", "value": "false"},
-        {"name": "COGNITO_ACCEPTED_SCOPES", "value": "${COGNITO_ACCEPTED_SCOPES}"},
-        {"name": "COGNITO_ACCEPTED_CLIENT_IDS", "value": "${COGNITO_ACCEPTED_CLIENT_IDS}"}
+        {"name": "ALWAYS_ON_MODE", "value": "false"}
       ],
       "secrets": [
         {"name": "EC2_INSTANCE_ID", "valueFrom": "/pdfx/ec2-instance-id"},
@@ -36,6 +34,8 @@
         {"name": "COGNITO_USER_POOL_ID", "valueFrom": "/pdfx/cognito-user-pool-id"},
         {"name": "COGNITO_REGION", "valueFrom": "/pdfx/cognito-region"},
         {"name": "COGNITO_REQUIRED_SCOPE", "valueFrom": "/pdfx/cognito-required-scope"},
+        {"name": "COGNITO_ACCEPTED_SCOPES", "valueFrom": "/pdfx/cognito-accepted-scopes"},
+        {"name": "COGNITO_ACCEPTED_CLIENT_IDS", "valueFrom": "/pdfx/cognito-accepted-client-ids"},
         {"name": "IDLE_TIMEOUT_MINUTES", "valueFrom": "/pdfx/idle-timeout-minutes"},
         {"name": "STARTUP_TIMEOUT_MINUTES", "valueFrom": "/pdfx/startup-timeout-minutes"},
         {"name": "MAX_QUEUED_JOBS", "valueFrom": "/pdfx/max-queued-jobs"}

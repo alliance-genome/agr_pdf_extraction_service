@@ -310,17 +310,26 @@ only the authorization check (scope vs. client_id) is relaxed.
 
 ### Provisioning per environment
 
-These two settings are sourced from optional SSM parameters by `deploy.sh`:
+Both settings are injected into the ECS task via the task definition's
+`secrets` block, sourced from these SSM parameters:
 
 | SSM parameter | Maps to env var |
 |---------------|-----------------|
 | `/pdfx/cognito-accepted-scopes` | `COGNITO_ACCEPTED_SCOPES` |
 | `/pdfx/cognito-accepted-client-ids` | `COGNITO_ACCEPTED_CLIENT_IDS` |
 
-If a parameter is absent, `deploy.sh` defaults the value to an empty string
-(prints a notice and continues), so the first deployment after this feature
-ships does not require any new SSM keys to be present. To enable shared M2M
-access, create or update the SSM parameter and redeploy:
+`deploy.sh` ensures both parameters exist before registering the task
+definition: if either is missing it creates a String parameter with a
+single-space placeholder (SSM does not allow empty String values; the
+proxy's config layer `.strip()`s the placeholder back to `""`, leaving
+the allow-list inactive). Existing values are never overwritten.
+
+This means the operator running `deploy.sh` needs `ssm:PutParameter` on
+`/pdfx/*` in addition to `ssm:GetParameter` (the ECS task execution role
+only needs `ssm:GetParameters`, which is already granted by
+`iam-policy.template.json`).
+
+To enable shared M2M access, populate the parameter and redeploy:
 
 ```bash
 aws ssm put-parameter \
