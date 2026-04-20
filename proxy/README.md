@@ -176,7 +176,9 @@ All settings come from environment variables. In production, values are injected
 | `EC2_REGION` | No | `us-east-1` | AWS region for EC2 API calls |
 | `EC2_PORT` | No | `5000` | Port the backend listens on |
 | `COGNITO_REGION` | No | `us-east-1` | AWS region for Cognito |
-| `COGNITO_REQUIRED_SCOPE` | No | `pdfx-api/extract` | OAuth scope required in the JWT |
+| `COGNITO_REQUIRED_SCOPE` | No | `pdfx-api/extract` | OAuth scope accepted in the JWT |
+| `COGNITO_ACCEPTED_SCOPES` | No | — | Comma-separated additional scopes that also grant access |
+| `COGNITO_ACCEPTED_CLIENT_IDS` | No | — | Comma-separated Cognito app client_ids accepted without requiring a PDFX-specific scope (e.g. the CurationAPI-Admin M2M client) |
 | `IDLE_TIMEOUT_MINUTES` | No | `30` | Minutes of inactivity before EC2 is stopped |
 | `MIN_UPTIME_MINUTES` | No | `20` | Minimum uptime after wake before idle stop is allowed |
 | `STARTUP_TIMEOUT_MINUTES` | No | `10` | Max minutes to wait for EC2 health check |
@@ -287,6 +289,57 @@ uvicorn app.main:app --reload --port 8080
 ```
 
 The proxy will sync with the actual EC2 instance state on startup.
+
+## Accepting Shared M2M Admin Tokens
+
+By default the proxy only accepts tokens carrying the `pdfx-api/extract` scope.
+Backend services that already hold a shared admin token (for example the
+CurationAPI-Admin M2M client used by AGR and the A-team) can be admitted
+without being reissued a PDFX-specific token by setting either:
+
+- `COGNITO_ACCEPTED_CLIENT_IDS` — comma-separated Cognito app client_ids
+  whose tokens are accepted regardless of scope. This is the recommended
+  mechanism for the CurationAPI-Admin client: drop the client's app client_id
+  into this list per environment (dev / stage / prod).
+- `COGNITO_ACCEPTED_SCOPES` — comma-separated additional scopes that also
+  grant access. Useful if a shared client always issues tokens with a known
+  admin scope.
+
+JWT signature, issuer, and expiry are still verified for every request;
+only the authorization check (scope vs. client_id) is relaxed.
+
+### Provisioning per environment
+
+Both settings are injected into the ECS task via the task definition's
+`secrets` block, sourced from these SSM parameters:
+
+| SSM parameter | Maps to env var |
+|---------------|-----------------|
+| `/pdfx/cognito-accepted-scopes` | `COGNITO_ACCEPTED_SCOPES` |
+| `/pdfx/cognito-accepted-client-ids` | `COGNITO_ACCEPTED_CLIENT_IDS` |
+
+`deploy.sh` ensures both parameters exist before registering the task
+definition: if either is missing it creates a String parameter with a
+single-space placeholder (SSM does not allow empty String values; the
+proxy's config layer `.strip()`s the placeholder back to `""`, leaving
+the allow-list inactive). Existing values are never overwritten.
+
+This means the operator running `deploy.sh` needs `ssm:PutParameter` on
+`/pdfx/*` in addition to `ssm:GetParameter` (the ECS task execution role
+only needs `ssm:GetParameters`, which is already granted by
+`iam-policy.template.json`).
+
+To enable shared M2M access, populate the parameter and redeploy:
+
+```bash
+aws ssm put-parameter \
+  --name /pdfx/cognito-accepted-client-ids \
+  --type String \
+  --overwrite \
+  --value "<curation-admin-client-id>[,<other-client-id>...]"
+
+cd proxy/deploy && ./deploy.sh --profile <profile>
+```
 
 ## Operational Fallbacks
 

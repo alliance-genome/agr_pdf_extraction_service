@@ -43,11 +43,53 @@ read_param() {
     $AWS_CMD ssm get-parameter --name "$1" --query "Parameter.Value" --output text
 }
 
+# Idempotently ensure an SSM String parameter exists so the ECS task
+# definition's `secrets` block can resolve it. Existing values are never
+# touched (no --overwrite). Created with a single space because SSM rejects
+# empty-string values; the proxy's config layer .strip()s the result back to
+# "" so the auth allow-lists remain inactive until an operator updates the
+# parameter with real values.
+#
+# Only ParameterNotFound triggers the placeholder write. Other errors
+# (IAM denied, throttle, network) are surfaced so a misconfigured deploy
+# fails loudly with a useful message instead of being misinterpreted as
+# "param missing → create".
+ensure_ssm_param() {
+    local name="$1"
+    local err_file
+    err_file=$(mktemp)
+    if $AWS_CMD ssm get-parameter --name "$name" >/dev/null 2>"$err_file"; then
+        rm -f "$err_file"
+        return 0
+    fi
+    if ! grep -q 'ParameterNotFound' "$err_file"; then
+        echo "ERROR: failed to read SSM parameter ${name}:" >&2
+        cat "$err_file" >&2
+        rm -f "$err_file"
+        return 1
+    fi
+    rm -f "$err_file"
+    echo "    Creating placeholder SSM parameter ${name} (was missing)"
+    $AWS_CMD ssm put-parameter \
+        --name "$name" \
+        --type "String" \
+        --value " " \
+        >/dev/null
+}
+
 AWS_ACCOUNT_ID=$(read_param /pdfx/aws-account-id)
 EC2_INSTANCE_ID=$(read_param /pdfx/ec2-instance-id)
 EXECUTION_ROLE_NAME=$(read_param /pdfx/execution-role-name)
 TASK_ROLE_NAME=$(read_param /pdfx/task-role-name)
 QUEUE_S3_BUCKET=$(read_param /pdfx/audit-s3-bucket)
+
+# Ensure optional auth allow-list parameters exist so the task definition's
+# `secrets` references resolve on first deploy. Operator must have
+# ssm:PutParameter for /pdfx/* (in addition to ssm:GetParameter) for these
+# placeholder writes; populate real values via `aws ssm put-parameter
+# --overwrite` per environment when the allow-list should be enabled.
+ensure_ssm_param /pdfx/cognito-accepted-scopes
+ensure_ssm_param /pdfx/cognito-accepted-client-ids
 
 EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}"
 TASK_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${TASK_ROLE_NAME}"
