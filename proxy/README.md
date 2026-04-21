@@ -240,24 +240,37 @@ The repo-level workflow at `.github/workflows/main-build-and-deploy.yml`
 automates the manual steps above when a PR is merged into `main`.
 
 - Trigger: `pull_request.closed` on `main`, guarded by `github.event.pull_request.merged == true`
-- Escape hatch: add the `no-deploy` label to the PR to skip all deployment jobs
-- Rollout order: `dev` -> `stage` -> `prod`
-- Approval gate: the `prod` job is attached to the GitHub Actions `prod`
-  environment, so required reviewers can block production rollout until
-  explicitly approved
-- Image promotion: the workflow builds the proxy image once, uploads it as a
-  GitHub Actions artifact, and each environment downloads that exact archive,
+- Escape hatch: add the `no-deploy` label to the PR to skip the deployment job
+- Target: a single `prod` environment (there is no separate dev or stage
+  PDFX environment today; a future ticket covers adding a stage environment)
+- Approval gate: the `deploy-prod` job is attached to the GitHub Actions
+  `prod` environment, so required reviewers can block production rollout
+  until explicitly approved
+- Image handling: the workflow builds the proxy image once, uploads it as a
+  GitHub Actions artifact, and the deploy job downloads that exact archive,
   verifies its checksum, pushes it to ECR as
   `agr_pdfx_proxy:<merge-commit-sha>` plus `:latest`, then runs
   `proxy/deploy/deploy.sh --image-tag <merge-commit-sha>`
 
-Recommended GitHub setup:
+Required GitHub setup:
 
-- Create GitHub Actions environments named `dev`, `stage`, and `prod`
-- Store `GH_ACTIONS_AWS_ROLE` in each environment so the workflow assumes the
-  correct AWS role per environment/account
-- Configure required reviewers on the `prod` environment to enforce the manual
-  approval gate
+- Create a GitHub Actions environment named `prod`
+- Store `GH_ACTIONS_AWS_ROLE` as an **environment** secret on `prod` (not a
+  repository secret) pointing at the AWS role ARN below. Keeping it scoped
+  to the environment is what lets required-reviewer protection actually gate
+  access to the role.
+- Configure required reviewers on the `prod` environment if you want a
+  manual approval gate before the deploy job runs
+
+The image promotion sequence inside the deploy job is:
+
+1. push `agr_pdfx_proxy:<merge-commit-sha>` to ECR (immutable artifact)
+2. run `proxy/deploy/deploy.sh --image-tag <merge-commit-sha>` to register a
+   new ECS task definition and roll the `pdfx-proxy` service
+3. only after step 2 succeeds, re-tag the same image as `:latest` and push
+
+This keeps `:latest` pointing at the most recent image that actually rolled
+out to prod — if ECS rollout fails, `:latest` does not move.
 
 The assumed AWS role needs enough access to:
 
