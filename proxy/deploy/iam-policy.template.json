@@ -20,7 +20,7 @@
       "Sid": "SSMReadPdfxParams",
       "Effect": "Allow",
       "Action": "ssm:GetParameters",
-      "Resource": "arn:aws:ssm:${REGION}:${AWS_ACCOUNT_ID}:parameter/pdfx/*"
+      "Resource": "arn:aws:ssm:${REGION}:${AWS_ACCOUNT_ID}:parameter/${SSM_PARAMETER_RESOURCE}/*"
     },
     {
       "Sid": "S3QueueListBucket",
@@ -36,6 +36,7 @@
       "Action": [
         "s3:GetObject",
         "s3:PutObject",
+        "s3:PutObjectTagging",
         "s3:DeleteObject",
         "s3:DeleteObjectVersion"
       ],

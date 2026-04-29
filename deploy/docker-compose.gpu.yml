@@ -49,6 +49,9 @@ services:
         tag: "pdfx-nginx"
 
   app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gpu
     image: pdfx-gpu
     container_name: pdfx-app
     hostname: pdfx-app
@@ -84,6 +87,9 @@ services:
       "app:create_app()"
 
   worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gpu
     image: pdfx-gpu
     container_name: pdfx-worker
     hostname: pdfx-worker

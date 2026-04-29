@@ -442,6 +442,8 @@ async def submit_extraction(
     methods: str = Form("grobid,docling,marker"),
     merge: str = Form("true"),
     clear_cache: str = Form("false"),
+    extract_images: str = Form("false"),
+    review_images: str = Form(default=None),
     clear_cache_scope: str = Form(default=None),
     reference_curie: str = Form(default=None),
     mod_abbreviation: str = Form(default=None),
@@ -458,7 +460,10 @@ async def submit_extraction(
         "methods": methods,
         "merge": merge,
         "clear_cache": clear_cache,
+        "extract_images": extract_images,
     }
+    if review_images is not None:
+        form_fields["review_images"] = review_images
     if clear_cache_scope is not None:
         form_fields["clear_cache_scope"] = clear_cache_scope
     if reference_curie is not None:

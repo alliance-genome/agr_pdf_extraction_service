@@ -4,7 +4,7 @@ flask
 # PDF extraction tools
 requests
 docling[vlm]
-marker-pdf
+marker-pdf>=1.10.2,<1.11
 
 # LLM
 openai

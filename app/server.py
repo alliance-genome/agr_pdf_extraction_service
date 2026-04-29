@@ -11,19 +11,20 @@ import os
 from flask import Blueprint, current_app, request, jsonify, render_template, send_file, url_for
 from werkzeug.utils import secure_filename
 
-from app.services.grobid_service import Grobid
-from app.services.docling_service import Docling
-from app.services.marker_service import Marker
-from app.services.llm_service import LLM
-from app.services.consensus_service import merge_with_consensus
 from app.utils import (
     allowed_file, get_file_hash, get_cached_path, is_extraction_cached,
-    get_images_dir, list_images, rewrite_image_paths,
+    get_images_dir, has_image_extraction_manifest, list_images, rewrite_image_paths,
 )
 
 logger = logging.getLogger(__name__)
 
 web = Blueprint("web", __name__)
+
+Grobid = None
+Docling = None
+Marker = None
+LLM = None
+merge_with_consensus = None
 
 
 @web.route("/")
@@ -60,6 +61,7 @@ def process_pdf():
     VALID_METHODS = {"grobid", "docling", "marker"}
     selected_methods = request.form.getlist("methods")
     merge_enabled = request.form.get("merge", "on") in ("on", "true", "1")
+    extract_images = request.form.get("extract_images", "false") in ("on", "true", "1")
 
     if not selected_methods:
         return jsonify({"error": "Please select at least one extraction method"}), 400
@@ -86,6 +88,9 @@ def process_pdf():
             if is_extraction_cached(file_hash, "grobid"):
                 cached_methods.append("GROBID")
             else:
+                global Grobid
+                if Grobid is None:
+                    from app.services.grobid_service import Grobid
                 grobid = Grobid(
                     base_url=cfg["GROBID_URL"],
                     timeout=cfg["GROBID_REQUEST_TIMEOUT"],
@@ -102,6 +107,9 @@ def process_pdf():
             if is_extraction_cached(file_hash, "docling"):
                 cached_methods.append("Docling")
             else:
+                global Docling
+                if Docling is None:
+                    from app.services.docling_service import Docling
                 docling = Docling(device=cfg["DOCLING_DEVICE"])
                 docling.extract(pdf_path, docling_output)
             with open(docling_output, "r", encoding="utf-8") as f:
@@ -110,12 +118,18 @@ def process_pdf():
 
         if "marker" in selected_methods:
             marker_output = get_cached_path(file_hash, "marker")
-            if is_extraction_cached(file_hash, "marker"):
+            marker_cached = is_extraction_cached(file_hash, "marker") and (
+                not extract_images or has_image_extraction_manifest(file_hash)
+            )
+            if marker_cached:
                 cached_methods.append("Marker")
             else:
+                global Marker
+                if Marker is None:
+                    from app.services.marker_service import Marker
                 marker = Marker(
                     device=cfg["MARKER_DEVICE"],
-                    extract_images=cfg["MARKER_EXTRACT_IMAGES"],
+                    extract_images=extract_images,
                 )
                 marker.extract(pdf_path, marker_output)
             with open(marker_output, "r", encoding="utf-8") as f:
@@ -130,7 +144,7 @@ def process_pdf():
         }
 
         # Collect image info for the response
-        images = list_images(file_hash)
+        images = list_images(file_hash) if extract_images else []
         response_data["images"] = images
         response_data["has_images"] = bool(images)
 
@@ -152,6 +166,12 @@ def process_pdf():
             else:
                 if not cfg.get("OPENAI_API_KEY"):
                     return jsonify({"error": "merge=true but OPENAI_API_KEY is not set"}), 400
+
+                global LLM, merge_with_consensus
+                if LLM is None:
+                    from app.services.llm_service import LLM
+                if merge_with_consensus is None:
+                    from app.services.consensus_service import merge_with_consensus
 
                 llm = LLM(
                     api_key=cfg["OPENAI_API_KEY"],
@@ -194,7 +214,10 @@ def process_pdf():
                     with open(metrics_cache_path, "w", encoding="utf-8") as f:
                         json.dump(metrics, f, ensure_ascii=False)
 
-            response_data["merged_output"] = rewrite_image_paths(merged_md, file_hash)
+            response_data["merged_output"] = (
+                rewrite_image_paths(merged_md, file_hash)
+                if extract_images else merged_md
+            )
             if metrics is not None:
                 response_data["consensus_metrics"] = metrics
         else:

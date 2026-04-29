@@ -30,7 +30,6 @@ def client(monkeypatch):
     app.config["GROBID_INCLUDE_RAW_CITATIONS"] = False
     app.config["DOCLING_DEVICE"] = "cpu"
     app.config["MARKER_DEVICE"] = "cpu"
-    app.config["MARKER_EXTRACT_IMAGES"] = True
     app.config["CONSENSUS_ENABLED"] = True
     app.config["CONSENSUS_NEAR_THRESHOLD"] = 0.92
     app.config["CONSENSUS_LEVENSHTEIN_THRESHOLD"] = 0.90
@@ -40,6 +39,8 @@ def client(monkeypatch):
     app.config["AUDIT_S3_BUCKET"] = "test-bucket"
     app.config["AUDIT_S3_PREFIX"] = "pdfx/audit"
     app.config["AUDIT_S3_BUCKET_SSM_PARAM"] = ""
+    app.config["IMAGE_URL_TTL_SECONDS"] = 3600
+    app.config["IMAGE_RETENTION_TTL_SECONDS"] = 604800
     app.config["AWS_DEFAULT_REGION"] = "us-east-1"
 
     with app.test_client() as test_client:
@@ -77,6 +78,10 @@ def test_submit_extraction_returns_process_id_and_creates_db_row(mock_apply_asyn
     assert call_kwargs["kwargs"]["process_id"] == payload["process_id"]
     assert call_kwargs["kwargs"]["reference_curie"] == "PMID:12345"
     assert call_kwargs["kwargs"]["mod_abbreviation"] == "RGD"
+    assert call_kwargs["kwargs"]["extract_images"] is False
+    assert call_kwargs["kwargs"]["review_images"] is False
+    assert payload["extract_images"] is False
+    assert payload["review_images"] is False
 
     session = get_session()
     run = session.get(ExtractionRun, payload["process_id"])
@@ -84,6 +89,65 @@ def test_submit_extraction_returns_process_id_and_creates_db_row(mock_apply_asyn
     assert run.status == "queued"
     assert run.reference_curie == "PMID:12345"
     assert run.mod_abbreviation == "RGD"
+    assert run.extract_images is False
+    assert run.review_images is False
+    session.close()
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_submit_extraction_passes_extract_images_to_celery(mock_apply_async, client):
+    mock_apply_async.return_value = SimpleNamespace(id="process-id-placeholder")
+
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "extract_images": "true",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 202
+    payload = response.get_json()
+    call_kwargs = mock_apply_async.call_args.kwargs
+    assert call_kwargs["kwargs"]["extract_images"] is True
+    assert call_kwargs["kwargs"]["review_images"] is True
+    assert payload["extract_images"] is True
+    assert payload["review_images"] is True
+
+    session = get_session()
+    run = session.get(ExtractionRun, payload["process_id"])
+    assert run.extract_images is True
+    assert run.review_images is True
+    session.close()
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_submit_extraction_can_disable_default_image_review(mock_apply_async, client):
+    mock_apply_async.return_value = SimpleNamespace(id="process-id-placeholder")
+
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "extract_images": "true",
+            "review_images": "false",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 202
+    payload = response.get_json()
+    call_kwargs = mock_apply_async.call_args.kwargs
+    assert call_kwargs["kwargs"]["extract_images"] is True
+    assert call_kwargs["kwargs"]["review_images"] is False
+    assert payload["extract_images"] is True
+    assert payload["review_images"] is False
+
+    session = get_session()
+    run = session.get(ExtractionRun, payload["process_id"])
+    assert run.extract_images is True
+    assert run.review_images is False
     session.close()
 
 
@@ -171,6 +235,7 @@ def test_get_extraction_status_prefers_db(client):
     session.add(ExtractionRun(
         process_id=process_id,
         status="succeeded",
+        extract_images=True,
         reference_curie="PMID:99999",
         started_at=datetime.now(timezone.utc),
         ended_at=datetime.now(timezone.utc),
@@ -194,6 +259,7 @@ def test_get_extraction_status_prefers_db(client):
     assert payload["process_id"] == process_id
     assert payload["status"] == "complete"
     assert payload["reference_curie"] == "PMID:99999"
+    assert payload["extract_images"] is True
     assert payload["log_s3_key"] == "pdfx/audit/2026/02/11/test.ndjson"
     assert "grobid" in payload["artifacts_json"]
     assert payload["consensus_metrics_json"]["total_blocks"] == 100
@@ -237,6 +303,7 @@ def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(c
         "ended_at": "2026-02-25T12:10:00Z",
         "log_s3_key": "pdfx/audit/2026/02/25/test.ndjson",
         "artifacts_json": {"merged": "pdfx/audit/2026/02/25/x/merged.md"},
+        "extract_images": True,
         "llm_usage_json": {"total_tokens": 123},
         "llm_cost_usd": 0.42,
     }
@@ -252,6 +319,7 @@ def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(c
     assert payload["ended_at"] == "2026-02-25T12:10:00Z"
     assert payload["log_s3_key"] == "pdfx/audit/2026/02/25/test.ndjson"
     assert payload["artifacts_json"]["merged"].endswith("merged.md")
+    assert payload["extract_images"] is True
     assert payload["llm_usage_json"]["total_tokens"] == 123
     assert payload["llm_cost_usd"] == 0.42
 
@@ -444,3 +512,151 @@ def test_get_artifact_urls_returns_presigned_urls_for_nested_artifacts(mock_buil
     assert "pdfx/audit/2026/02/11/x/grobid.md" in keys
     assert "pdfx/audit/2026/02/11/x/inputs/source.pdf" in keys
     assert "pdfx/audit/2026/02/11/x/images/fig1.png" in keys
+
+
+@patch("app.api.build_s3_client")
+def test_get_image_urls_returns_presigned_manifest(mock_build_s3_client, client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="succeeded",
+        artifacts_json={
+            "images": [
+                {
+                    "filename": "fig1.png",
+                    "s3_key": "pdfx/audit/2026/02/11/x/images/fig1.png",
+                    "size_bytes": 123,
+                    "page_index": 1,
+                    "marker_image_type": "Figure",
+                    "marker_image_index": 3,
+                    "block_id": "/page/1/Figure/3",
+                    "group_id": "/page/1/FigureGroup/7",
+                    "bbox": [10.0, 20.0, 200.0, 300.0],
+                    "caption_text": "Figure 2. Test caption.",
+                    "nearby_text": "Figure 2. Test caption.",
+                    "figure_label": "Figure 2",
+                    "figure_number": "2",
+                    "figure_decision_source": "llm_text",
+                    "image_reviewed": True,
+                    "image_review_method": "llm_text",
+                    "image_review_classification": "scientific_figure",
+                    "image_review_is_scientific_figure": True,
+                    "image_review_confidence": 0.98,
+                    "image_review_reason": "Caption explicitly identifies a figure.",
+                }
+            ],
+        },
+    ))
+    session.commit()
+    session.close()
+
+    mock_s3 = MagicMock()
+    mock_s3.generate_presigned_url.side_effect = lambda *_args, **kwargs: (
+        f"https://example.com/{kwargs['Params']['Key']}"
+    )
+    mock_build_s3_client.return_value = mock_s3
+
+    response = client.get(f"/api/v1/extract/{process_id}/images/urls")
+    assert response.status_code == 200
+
+    payload = response.get_json()
+    assert payload["process_id"] == process_id
+    assert payload["manifest_ttl_seconds"] == 3600
+    assert payload["image_retention_ttl_seconds"] == 604800
+    assert payload["images"][0]["filename"] == "fig1.png"
+    assert payload["images"][0]["url"].endswith("/pdfx/audit/2026/02/11/x/images/fig1.png")
+    assert payload["images"][0]["expires_at"].endswith("Z")
+    assert payload["images"][0]["page_index"] == 1
+    assert payload["images"][0]["marker_image_type"] == "Figure"
+    assert payload["images"][0]["marker_image_index"] == 3
+    assert payload["images"][0]["block_id"] == "/page/1/Figure/3"
+    assert payload["images"][0]["group_id"] == "/page/1/FigureGroup/7"
+    assert payload["images"][0]["bbox"] == [10.0, 20.0, 200.0, 300.0]
+    assert payload["images"][0]["caption_text"] == "Figure 2. Test caption."
+    assert payload["images"][0]["nearby_text"] == "Figure 2. Test caption."
+    assert payload["images"][0]["figure_label"] == "Figure 2"
+    assert payload["images"][0]["figure_number"] == "2"
+    assert payload["images"][0]["figure_decision_source"] == "llm_text"
+    assert payload["images"][0]["image_reviewed"] is True
+    assert payload["images"][0]["image_review_classification"] == "scientific_figure"
+    assert payload["images"][0]["image_review_is_scientific_figure"] is True
+
+
+@patch("app.api.build_s3_client", return_value=None)
+def test_get_image_urls_returns_503_when_s3_unavailable(_mock_build_s3_client, client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="succeeded",
+        artifacts_json={
+            "images": [
+                {
+                    "filename": "fig1.png",
+                    "s3_key": "pdfx/audit/2026/02/11/x/images/fig1.png",
+                }
+            ],
+        },
+    ))
+    session.commit()
+    session.close()
+
+    response = client.get(f"/api/v1/extract/{process_id}/images/urls")
+    assert response.status_code == 503
+
+
+@patch("app.api.build_s3_client")
+def test_get_image_urls_records_per_image_presign_failure(mock_build_s3_client, client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="succeeded",
+        artifacts_json={
+            "images": [
+                {
+                    "filename": "fig1.png",
+                    "s3_key": "pdfx/audit/2026/02/11/x/images/fig1.png",
+                    "size_bytes": 123,
+                }
+            ],
+        },
+    ))
+    session.commit()
+    session.close()
+
+    mock_s3 = MagicMock()
+    mock_s3.generate_presigned_url.side_effect = RuntimeError("boom")
+    mock_build_s3_client.return_value = mock_s3
+
+    response = client.get(f"/api/v1/extract/{process_id}/images/urls")
+    assert response.status_code == 200
+
+    payload = response.get_json()
+    assert payload["images"][0]["filename"] == "fig1.png"
+    assert payload["images"][0]["error"] == "Unable to generate URL"
+    assert "url" not in payload["images"][0]
+
+
+def test_get_image_urls_404s_for_unknown_process(client):
+    response = client.get(f"/api/v1/extract/{uuid.uuid4()}/images/urls")
+    assert response.status_code == 404
+
+
+def test_get_image_urls_409s_for_incomplete_job(client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="running",
+    ))
+    session.commit()
+    session.close()
+
+    response = client.get(f"/api/v1/extract/{process_id}/images/urls")
+    assert response.status_code == 409

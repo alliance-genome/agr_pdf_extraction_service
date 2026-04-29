@@ -11,6 +11,9 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 PROJECT_NAME="pdfx"
 GPU_MODE="${GPU_MODE:-auto}" # auto|on|off
 
@@ -73,18 +76,28 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 
 if [ ! -f ".env" ]; then
-    echo "ERROR: .env file not found. Copy from .env.example and configure."
+    if [ ! -f "$REPO_ROOT/.env" ]; then
+        echo "ERROR: .env file not found. Copy from .env.example and configure."
+        exit 1
+    fi
+    cd "$SCRIPT_DIR"
+elif [ "$PWD" != "$SCRIPT_DIR" ]; then
+    cd "$SCRIPT_DIR"
+fi
+
+if [ ! -f "$REPO_ROOT/.env" ]; then
+    echo "ERROR: .env file not found at $REPO_ROOT/.env. Copy from .env.example and configure."
     exit 1
 fi
 
 # Step 2: Create persistent directories
 echo "Creating persistent directories..."
-mkdir -p data/cache
-mkdir -p data/uploads
-mkdir -p data/models
-mkdir -p data/model_cache
-mkdir -p data/rapidocr_models
-mkdir -p logs
+mkdir -p "$REPO_ROOT/data/cache"
+mkdir -p "$REPO_ROOT/data/uploads"
+mkdir -p "$REPO_ROOT/data/models"
+mkdir -p "$REPO_ROOT/data/model_cache"
+mkdir -p "$REPO_ROOT/data/rapidocr_models"
+mkdir -p "$REPO_ROOT/logs"
 
 # Step 3: Stop existing services
 echo "Stopping existing services..."

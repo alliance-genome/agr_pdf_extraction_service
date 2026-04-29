@@ -23,6 +23,8 @@ def test_extraction_run_insert_and_query():
         reference_curie="PMID:12345",
         mod_abbreviation="ZFIN",
         source_pdf_md5="abc123",
+        extract_images=True,
+        review_images=True,
         status="queued",
     ))
     session.commit()
@@ -33,6 +35,8 @@ def test_extraction_run_insert_and_query():
     assert run.reference_curie == "PMID:12345"
     assert run.mod_abbreviation == "ZFIN"
     assert run.source_pdf_md5 == "abc123"
+    assert run.extract_images is True
+    assert run.review_images is True
     assert run.status == "queued"
 
     session.close()
@@ -48,5 +52,7 @@ def test_extraction_run_default_status():
     run = session.get(ExtractionRun, process_id)
     assert run is not None
     assert run.status == "queued"
+    assert run.extract_images is False
+    assert run.review_images is False
 
     session.close()

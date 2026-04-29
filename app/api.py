@@ -9,6 +9,7 @@ Endpoints:
     POST /api/v1/extract/<process_id>/cancel           - Cancel an active extraction job
     GET  /api/v1/extract/<process_id>/download/<method> - Download full extraction output
     GET  /api/v1/extract/<process_id>/images            - List extracted images
+    GET  /api/v1/extract/<process_id>/images/urls       - Pre-signed URLs for extracted images
     GET  /api/v1/extract/<process_id>/images/<filename> - Download a single image
     GET  /api/v1/extract/<process_id>/logs              - Pre-signed URL for NDJSON audit log
     GET  /api/v1/extract/<process_id>/artifacts         - Artifact S3 keys from extraction_run
@@ -18,11 +19,12 @@ Endpoints:
 import os
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, request, jsonify, send_file, current_app
 from werkzeug.utils import secure_filename
 
+from app.image_metadata import copy_image_metadata, normalize_image_manifest_entry
 from app.models import ExtractionRun, get_session
 from app.services.audit_logger import build_s3_client
 
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 api = Blueprint("api", __name__, url_prefix="/api/v1")
 
 VALID_METHODS = {"grobid", "docling", "marker"}
+TRUE_VALUES = {"true", "1", "on", "yes"}
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -54,6 +57,19 @@ def _parse_clear_cache_scope(form):
         clear_cache=clear_cache,
     )
     return clear_cache, clear_cache_scope
+
+
+def _parse_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in TRUE_VALUES
+
+
+def _parse_review_images(form, extract_images):
+    """Image text review is on for image extraction unless explicitly disabled."""
+    if not extract_images:
+        return False
+    return _parse_bool(form.get("review_images"), default=True)
 
 
 def _to_iso(dt):
@@ -80,7 +96,7 @@ def _get_db_session():
         return None
 
 
-def _insert_queued_run(process_id, reference_curie, mod_abbreviation):
+def _insert_queued_run(process_id, reference_curie, mod_abbreviation, extract_images=False, review_images=False):
     db_session = _get_db_session()
     if not db_session:
         return
@@ -93,6 +109,8 @@ def _insert_queued_run(process_id, reference_curie, mod_abbreviation):
                 reference_curie=reference_curie,
                 mod_abbreviation=mod_abbreviation,
                 config_version=current_app.config.get("EXTRACTION_CONFIG_VERSION"),
+                extract_images=bool(extract_images),
+                review_images=bool(review_images),
                 status="queued",
             ))
             db_session.commit()
@@ -125,6 +143,8 @@ def _get_run_by_process_id(process_id):
             "mod_abbreviation": run.mod_abbreviation,
             "source_pdf_md5": run.source_pdf_md5,
             "config_version": run.config_version,
+            "extract_images": bool(run.extract_images),
+            "review_images": bool(run.review_images),
             "status": run.status,
             "started_at": _to_iso(run.started_at),
             "ended_at": _to_iso(run.ended_at),
@@ -206,6 +226,28 @@ def _find_image_s3_key(artifacts_json, filename):
         if isinstance(img, dict) and img.get("filename") == filename:
             return img.get("s3_key")
     return None
+
+
+def _get_image_artifacts(artifacts_json):
+    if not artifacts_json or not isinstance(artifacts_json, dict):
+        return []
+    images = artifacts_json.get("images")
+    if not isinstance(images, list):
+        return []
+    artifacts = []
+    for img in images:
+        normalized = normalize_image_manifest_entry(img)
+        if normalized and normalized.get("s3_key"):
+            artifacts.append(normalized)
+    return artifacts
+
+
+def _image_url_ttl_seconds():
+    return int(current_app.config.get("IMAGE_URL_TTL_SECONDS", 3600))
+
+
+def _image_retention_ttl_seconds():
+    return int(current_app.config.get("IMAGE_RETENTION_TTL_SECONDS", 7 * 24 * 60 * 60))
 
 
 def _mark_run_cancelled(process_id, reason):
@@ -329,6 +371,10 @@ def get_config():
                 "model": Config.HIERARCHY_LLM_MODEL,
                 "reasoning": Config.HIERARCHY_LLM_REASONING,
             },
+            "image_text_review": {
+                "model": Config.IMAGE_TEXT_REVIEW_MODEL,
+                "reasoning": Config.IMAGE_TEXT_REVIEW_REASONING,
+            },
         },
     })
 
@@ -395,6 +441,8 @@ def list_extractions():
                 "error_code": run.error_code,
                 "has_artifacts": bool(run.artifacts_json),
                 "has_log": bool(run.log_s3_key),
+                "extract_images": bool(run.extract_images),
+                "review_images": bool(run.review_images),
             })
 
         return jsonify({
@@ -433,6 +481,9 @@ def submit_extraction():
         clear_cache_scope: Cache clear mode. One of:
                           "none" (default), "merge", "extraction", "all".
                           If omitted, clear_cache=true maps to "all".
+        extract_images:   "true" to extract Marker figures as image artifacts (default: false)
+        review_images:    optional. Defaults to true when extract_images=true; send "false"
+                          to skip text-only LLM image review.
         reference_curie:  Optional curie from upstream system
         mod_abbreviation: Optional MOD abbreviation from upstream system
 
@@ -462,6 +513,8 @@ def submit_extraction():
         clear_cache, clear_cache_scope = _parse_clear_cache_scope(request.form)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    extract_images = _parse_bool(request.form.get("extract_images"), default=False)
+    review_images = _parse_review_images(request.form, extract_images)
     reference_curie = request.form.get("reference_curie")
     mod_abbreviation = request.form.get("mod_abbreviation")
 
@@ -485,6 +538,8 @@ def submit_extraction():
                 "merge": merge,
                 "clear_cache": clear_cache,
                 "clear_cache_scope": clear_cache_scope,
+                "extract_images": extract_images,
+                "review_images": review_images,
                 "process_id": process_id,
                 "reference_curie": reference_curie,
                 "mod_abbreviation": mod_abbreviation,
@@ -498,15 +553,23 @@ def submit_extraction():
         return jsonify({"error": "Failed to enqueue extraction task. Is Redis available?"}), 503
 
     # Best effort: create queued DB row after successful enqueue.
-    _insert_queued_run(process_id, reference_curie, mod_abbreviation)
+    _insert_queued_run(
+        process_id,
+        reference_curie,
+        mod_abbreviation,
+        extract_images=extract_images,
+        review_images=review_images,
+    )
 
     logger.info(
-        "Queued extraction %s for %s (methods=%s, merge=%s, clear_cache_scope=%s, reference_curie=%s, mod=%s)",
+        "Queued extraction %s for %s (methods=%s, merge=%s, clear_cache_scope=%s, extract_images=%s, review_images=%s, reference_curie=%s, mod=%s)",
         process_id,
         filename,
         methods,
         merge,
         clear_cache_scope,
+        extract_images,
+        review_images,
         reference_curie,
         mod_abbreviation,
     )
@@ -517,6 +580,8 @@ def submit_extraction():
         "methods": methods,
         "merge": merge,
         "clear_cache_scope": clear_cache_scope,
+        "extract_images": extract_images,
+        "review_images": review_images,
         "reference_curie": reference_curie,
         "mod_abbreviation": mod_abbreviation,
     }), 202
@@ -543,6 +608,8 @@ def get_extraction_status(process_id):
             "reference_curie": run["reference_curie"],
             "mod_abbreviation": run["mod_abbreviation"],
             "source_pdf_md5": run["source_pdf_md5"],
+            "extract_images": run["extract_images"],
+            "review_images": run["review_images"],
             "started_at": run["started_at"],
             "ended_at": run["ended_at"],
             "log_s3_key": run["log_s3_key"],
@@ -568,6 +635,8 @@ def get_extraction_status(process_id):
                         response["ended_at"] = result.result.get("ended_at") or response["ended_at"]
                         response["log_s3_key"] = result.result.get("log_s3_key") or response["log_s3_key"]
                         response["artifacts_json"] = result.result.get("artifacts_json") or response["artifacts_json"]
+                        response["extract_images"] = result.result.get("extract_images", response["extract_images"])
+                        response["review_images"] = result.result.get("review_images", response["review_images"])
                         response["llm_usage_json"] = result.result.get("llm_usage_json") or response["llm_usage_json"]
                         response["llm_cost_usd"] = result.result.get("llm_cost_usd") or response["llm_cost_usd"]
                     return jsonify(response), 200
@@ -641,6 +710,8 @@ def get_extraction_status(process_id):
         }
         if isinstance(result.result, dict):
             payload["reference_curie"] = result.result.get("reference_curie")
+            payload["extract_images"] = result.result.get("extract_images", False)
+            payload["review_images"] = result.result.get("review_images", False)
             payload["started_at"] = result.result.get("started_at")
             payload["ended_at"] = result.result.get("ended_at")
             payload["log_s3_key"] = result.result.get("log_s3_key")
@@ -873,8 +944,73 @@ def list_job_images(process_id):
         return jsonify({"error": "Job not complete yet.", "status": run["status"]}), 409
 
     artifacts = run.get("artifacts_json") or {}
-    images = artifacts.get("images", [])
+    images = [
+        normalize_image_manifest_entry(image) for image in artifacts.get("images", [])
+    ]
+    images = [image for image in images if image]
     return jsonify({"process_id": process_id, "images": images, "source": "s3"}), 200
+
+
+@api.route("/extract/<process_id>/images/urls", methods=["GET"])
+def get_job_image_urls(process_id):
+    """Return a manifest of pre-signed S3 URLs for extracted images."""
+    run = _get_run_by_process_id(process_id)
+    if run is None:
+        return jsonify({"error": "process_id not found"}), 404
+
+    if run["status"] not in ("succeeded", "complete"):
+        return jsonify({"error": "Job not complete yet.", "status": run["status"]}), 409
+
+    expires_in = _image_url_ttl_seconds()
+    images = _get_image_artifacts(run.get("artifacts_json"))
+    if not images:
+        return jsonify({
+            "process_id": process_id,
+            "images": [],
+            "manifest_ttl_seconds": expires_in,
+            "image_retention_ttl_seconds": _image_retention_ttl_seconds(),
+        }), 200
+
+    s3_client = build_s3_client(current_app.config)
+    if not s3_client:
+        return jsonify({"error": "S3 client unavailable (check AWS credentials)"}), 503
+
+    bucket = current_app.config.get("AUDIT_S3_BUCKET")
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
+
+    manifest = []
+    for image in images:
+        s3_key = image["s3_key"]
+        try:
+            url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": s3_key},
+                ExpiresIn=expires_in,
+            )
+            manifest.append({
+                "filename": image["filename"],
+                "s3_key": s3_key,
+                "size_bytes": image.get("size_bytes"),
+                "url": url,
+                "expires_at": expires_at,
+            })
+            copy_image_metadata(image, manifest[-1])
+        except Exception as exc:
+            logger.warning("Failed to generate image URL for process_id=%s key=%s: %s", process_id, s3_key, exc)
+            manifest.append({
+                "filename": image["filename"],
+                "s3_key": s3_key,
+                "size_bytes": image.get("size_bytes"),
+                "error": "Unable to generate URL",
+            })
+            copy_image_metadata(image, manifest[-1])
+
+    return jsonify({
+        "process_id": process_id,
+        "images": manifest,
+        "manifest_ttl_seconds": expires_in,
+        "image_retention_ttl_seconds": _image_retention_ttl_seconds(),
+    }), 200
 
 
 @api.route("/extract/<process_id>/images/<filename>", methods=["GET"])

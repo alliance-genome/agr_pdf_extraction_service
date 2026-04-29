@@ -37,6 +37,7 @@ def test_openapi_includes_all_v1_paths(client):
         "/extract/{process_id}/cancel",
         "/extract/{process_id}/download/{method}",
         "/extract/{process_id}/images",
+        "/extract/{process_id}/images/urls",
         "/extract/{process_id}/images/{filename}",
         "/extract/{process_id}/logs",
         "/extract/{process_id}/artifacts",
@@ -54,6 +55,10 @@ def test_openapi_status_schema_includes_celery_success_result(client):
     properties = status_schema["properties"]
     assert "result" in properties
     assert properties["result"]["type"] == "object"
+    assert "extract_images" in properties
+    assert properties["extract_images"]["type"] == "boolean"
+    assert "review_images" in properties
+    assert properties["review_images"]["type"] == "boolean"
 
 
 def test_openapi_extract_request_includes_clear_cache_scope(client):
@@ -72,6 +77,54 @@ def test_openapi_extract_request_includes_clear_cache_scope(client):
     assert set(properties["clear_cache_scope"]["enum"]) == {
         "none", "merge", "extraction", "all"
     }
+
+
+def test_openapi_extract_request_includes_extract_images(client):
+    response = client.get("/openapi.yaml")
+    assert response.status_code == 200
+
+    spec = yaml.safe_load(response.data)
+    extract_schema = (
+        spec["paths"]["/extract"]["post"]["requestBody"]["content"]
+        ["multipart/form-data"]["schema"]
+    )
+    properties = extract_schema["properties"]
+
+    assert "extract_images" in properties
+    assert properties["extract_images"]["type"] == "boolean"
+    assert properties["extract_images"]["default"] is False
+    assert "review_images" in properties
+    assert properties["review_images"]["type"] == "boolean"
+    assert properties["review_images"]["default"] is True
+
+
+def test_openapi_image_schemas_include_figure_metadata(client):
+    response = client.get("/openapi.yaml")
+    assert response.status_code == 200
+
+    spec = yaml.safe_load(response.data)
+    image_metadata = spec["components"]["schemas"]["ImageMetadata"]["properties"]
+    image_url_entry = spec["components"]["schemas"]["ImageUrlEntry"]["properties"]
+
+    for properties in (image_metadata, image_url_entry):
+        assert properties["page_index"]["nullable"] is True
+        assert properties["marker_image_type"]["nullable"] is True
+        assert properties["marker_image_index"]["nullable"] is True
+        assert properties["block_id"]["nullable"] is True
+        assert properties["group_id"]["nullable"] is True
+        assert properties["bbox"]["nullable"] is True
+        assert properties["polygon"]["nullable"] is True
+        assert properties["image_width"]["nullable"] is True
+        assert properties["image_height"]["nullable"] is True
+        assert properties["is_likely_figure"]["nullable"] is True
+        assert properties["diagnostic_flags"]["type"] == "array"
+        assert properties["caption_text"]["nullable"] is True
+        assert properties["nearby_text"]["nullable"] is True
+        assert properties["figure_label"]["nullable"] is True
+        assert properties["figure_number"]["nullable"] is True
+        assert properties["figure_decision_source"]["nullable"] is True
+        assert properties["image_review_classification"]["nullable"] is True
+        assert properties["image_review_reason"]["nullable"] is True
 
 
 def test_openapi_cancel_response_enum_is_precise(client):

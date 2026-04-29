@@ -79,6 +79,27 @@ def test_upload_artifact_supports_subdir(mock_build_s3):
 
 
 @patch("app.services.audit_logger.build_s3_client")
+def test_upload_artifact_supports_tags(mock_build_s3):
+    mock_s3 = MagicMock()
+    mock_build_s3.return_value = mock_s3
+
+    audit = AuditLogger("process-654", DummyConfig)
+    key = audit.upload_artifact(
+        "figure1.png",
+        b"img-bytes",
+        subdir="images",
+        tags={
+            "pdfx-artifact-type": "extracted-image",
+            "pdfx-retention": "temporary",
+        },
+    )
+
+    assert key is not None
+    kwargs = mock_s3.put_object.call_args.kwargs
+    assert kwargs["Tagging"] == "pdfx-artifact-type=extracted-image&pdfx-retention=temporary"
+
+
+@patch("app.services.audit_logger.build_s3_client")
 def test_context_manager_flushes_on_exit(mock_build_s3):
     mock_s3 = MagicMock()
     mock_build_s3.return_value = mock_s3

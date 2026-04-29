@@ -6,6 +6,7 @@ Persists structured audit artifacts locally and optionally mirrors them to S3.
 import os
 import json
 import logging
+from urllib.parse import urlencode
 from datetime import datetime, timezone
 
 import boto3
@@ -114,7 +115,7 @@ class AuditLogger:
                 event[key] = value
         self._events.append(event)
 
-    def upload_artifact(self, filename, content, subdir=None):
+    def upload_artifact(self, filename, content, subdir=None, tags=None):
         if not self.enabled:
             return None
 
@@ -138,12 +139,20 @@ class AuditLogger:
         if isinstance(content, str):
             body = content.encode("utf-8")
 
+        put_kwargs = {
+            "Bucket": self.bucket,
+            "Key": artifact_key,
+            "Body": body,
+        }
+        if tags:
+            put_kwargs["Tagging"] = urlencode({
+                str(key): str(value)
+                for key, value in tags.items()
+                if value is not None
+            })
+
         try:
-            self.s3_client.put_object(
-                Bucket=self.bucket,
-                Key=artifact_key,
-                Body=body,
-            )
+            self.s3_client.put_object(**put_kwargs)
             return artifact_key
         except Exception as exc:
             logger.warning("Failed to upload audit artifact %s: %s", safe_filename, exc)

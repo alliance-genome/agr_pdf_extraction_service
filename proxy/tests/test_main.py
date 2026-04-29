@@ -112,13 +112,20 @@ class TestExtractEndpoint:
             "/api/v1/extract",
             headers={"Authorization": "Bearer test"},
             files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
-            data={"methods": "grobid,docling,marker", "merge": "true"},
+            data={
+                "methods": "grobid,docling,marker",
+                "merge": "true",
+                "extract_images": "true",
+            },
         )
         assert resp.status_code == 202
         data = resp.json()
         assert "process_id" in data
         assert data["state"] == "stopped"
         assert data["progress"]["stage"] == "ec2_starting"
+        queued_job = next(iter(main_mod.job_payload_cache.values()))
+        assert queued_job.form_fields["extract_images"] == "true"
+        assert "review_images" not in queued_job.form_fields
         main_mod.lifecycle.ensure_running.assert_called()
 
     def test_extract_requires_auth(self, client, monkeypatch):
@@ -205,6 +212,65 @@ class TestExtractEndpoint:
         assert resp.status_code == 429
         assert main_mod.job_payload_cache == {}
         assert main_mod.job_trackers == {}
+
+    def test_extract_forwards_image_flags_when_ready(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.READY
+
+        captured = {"form_fields": None}
+
+        async def _forward_capture(_process_id, _pdf_data, _filename, form_fields, **_kwargs):
+            captured["form_fields"] = form_fields
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=202, content={"process_id": "backend-1", "status": "queued"})
+
+        monkeypatch.setattr(main_mod, "_forward_extraction", _forward_capture)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
+            data={
+                "methods": "marker",
+                "merge": "false",
+                "extract_images": "true",
+            },
+        )
+
+        assert resp.status_code == 202
+        assert captured["form_fields"]["extract_images"] == "true"
+        assert "review_images" not in captured["form_fields"]
+
+    def test_extract_forwards_explicit_review_images_false_when_ready(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.READY
+
+        captured = {"form_fields": None}
+
+        async def _forward_capture(_process_id, _pdf_data, _filename, form_fields, **_kwargs):
+            captured["form_fields"] = form_fields
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=202, content={"process_id": "backend-1", "status": "queued"})
+
+        monkeypatch.setattr(main_mod, "_forward_extraction", _forward_capture)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
+            data={
+                "methods": "marker",
+                "merge": "false",
+                "extract_images": "true",
+                "review_images": "false",
+            },
+        )
+
+        assert resp.status_code == 202
+        assert captured["form_fields"]["extract_images"] == "true"
+        assert captured["form_fields"]["review_images"] == "false"
 
 
 class TestExtractStatusEndpoint:

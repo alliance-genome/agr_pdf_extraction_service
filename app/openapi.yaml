@@ -136,6 +136,17 @@ paths:
                   type: boolean
                   default: true
                   description: Whether to run merge output generation.
+                extract_images:
+                  type: boolean
+                  default: false
+                  description: Whether to extract Marker figure images and upload image artifacts.
+                review_images:
+                  type: boolean
+                  default: true
+                  description: >-
+                    Whether to run text-only LLM review over extracted image
+                    context. Defaults to true when extract_images=true; send
+                    false to skip review.
                 reference_curie:
                   type: string
                   nullable: true
@@ -296,6 +307,39 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/JobNotCompleteResponse"
+
+  /extract/{process_id}/images/urls:
+    get:
+      tags: [Downloads]
+      summary: Get pre-signed URLs for extracted images
+      operationId: getExtractionImageUrls
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+      responses:
+        "200":
+          description: Image URL manifest.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageUrlManifestResponse"
+        "404":
+          description: Process not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Job not complete.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobNotCompleteResponse"
+        "503":
+          description: S3 client unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /extract/{process_id}/images/{filename}:
     get:
@@ -519,6 +563,10 @@ components:
           type: boolean
         has_log:
           type: boolean
+        extract_images:
+          type: boolean
+        review_images:
+          type: boolean
 
     ExtractionListResponse:
       type: object
@@ -537,7 +585,7 @@ components:
 
     SubmitExtractionResponse:
       type: object
-      required: [process_id, status, methods, merge, clear_cache_scope]
+      required: [process_id, status, methods, merge, clear_cache_scope, extract_images, review_images]
       properties:
         process_id:
           type: string
@@ -551,6 +599,10 @@ components:
             type: string
             enum: [grobid, docling, marker]
         merge:
+          type: boolean
+        extract_images:
+          type: boolean
+        review_images:
           type: boolean
         clear_cache_scope:
           type: string
@@ -598,6 +650,10 @@ components:
         source_pdf_md5:
           type: string
           nullable: true
+        extract_images:
+          type: boolean
+        review_images:
+          type: boolean
         started_at:
           type: string
           format: date-time
@@ -724,6 +780,253 @@ components:
           type: string
         size_bytes:
           type: integer
+        page_index:
+          type: integer
+          nullable: true
+          description: Zero-based PDF page index parsed from Marker's generated filename, when available.
+        marker_image_type:
+          type: string
+          nullable: true
+          description: Marker image class parsed from the filename, such as Picture or Figure.
+        marker_image_index:
+          type: integer
+          nullable: true
+          description: Marker's internal image index from the filename; this is not the paper's figure number.
+        block_id:
+          type: string
+          nullable: true
+          description: Marker block id for the image, when available.
+        group_id:
+          type: string
+          nullable: true
+          description: Marker FigureGroup or PictureGroup id when the image is grouped with a caption.
+        bbox:
+          type: array
+          nullable: true
+          description: Marker image bounding box as [x1, y1, x2, y2] in PDF page coordinates.
+          items:
+            type: number
+        polygon:
+          type: array
+          nullable: true
+          description: Marker image polygon in PDF page coordinates.
+          items:
+            type: array
+            items:
+              type: number
+        image_width:
+          type: integer
+          nullable: true
+        image_height:
+          type: integer
+          nullable: true
+        is_likely_figure:
+          type: boolean
+          nullable: true
+          description: Conservative server-side heuristic for whether this artifact looks like a curation-relevant figure.
+        diagnostic_flags:
+          type: array
+          description: Non-fatal diagnostics such as small_image, no_caption, no_figure_label, or marker_picture_type.
+          items:
+            type: string
+        alt_text:
+          type: string
+          nullable: true
+        caption_text:
+          type: string
+          nullable: true
+          description: Caption text grouped with the image by Marker, when available.
+        nearby_text:
+          type: string
+          nullable: true
+          description: Raw text window following the image reference in Marker's Markdown output.
+        figure_label:
+          type: string
+          nullable: true
+          description: Author-facing figure label, such as Figure 1 or Fig. 2A, when resolved by text-only LLM review.
+        figure_number:
+          type: string
+          nullable: true
+          description: Author-facing figure number, when resolved by text-only LLM review.
+        heuristic_is_likely_figure:
+          type: boolean
+          nullable: true
+          description: Deterministic pre-LLM figure heuristic.
+        figure_decision_source:
+          type: string
+          nullable: true
+          enum: [heuristic, llm_text]
+          description: Source for is_likely_figure.
+        image_reviewed:
+          type: boolean
+        image_review_method:
+          type: string
+          nullable: true
+          enum: [llm_text]
+        image_review_model:
+          type: string
+          nullable: true
+        image_review_classification:
+          type: string
+          nullable: true
+          enum: [scientific_figure, table_or_equation, publisher_logo, badge_or_ui, cover_art, decorative, unknown]
+        image_review_is_scientific_figure:
+          type: boolean
+          nullable: true
+        image_review_confidence:
+          type: number
+          nullable: true
+        image_review_reason:
+          type: string
+          nullable: true
+        image_review_needs_vision:
+          type: boolean
+          nullable: true
+        image_review_error:
+          type: string
+          nullable: true
+
+    ImageUrlEntry:
+      type: object
+      required: [filename, s3_key]
+      properties:
+        filename:
+          type: string
+        s3_key:
+          type: string
+        size_bytes:
+          type: integer
+          nullable: true
+        url:
+          type: string
+          format: uri
+        expires_at:
+          type: string
+          format: date-time
+        error:
+          type: string
+        page_index:
+          type: integer
+          nullable: true
+          description: Zero-based PDF page index parsed from Marker's generated filename, when available.
+        marker_image_type:
+          type: string
+          nullable: true
+          description: Marker image class parsed from the filename, such as Picture or Figure.
+        marker_image_index:
+          type: integer
+          nullable: true
+          description: Marker's internal image index from the filename; this is not the paper's figure number.
+        block_id:
+          type: string
+          nullable: true
+          description: Marker block id for the image, when available.
+        group_id:
+          type: string
+          nullable: true
+          description: Marker FigureGroup or PictureGroup id when the image is grouped with a caption.
+        bbox:
+          type: array
+          nullable: true
+          description: Marker image bounding box as [x1, y1, x2, y2] in PDF page coordinates.
+          items:
+            type: number
+        polygon:
+          type: array
+          nullable: true
+          description: Marker image polygon in PDF page coordinates.
+          items:
+            type: array
+            items:
+              type: number
+        image_width:
+          type: integer
+          nullable: true
+        image_height:
+          type: integer
+          nullable: true
+        is_likely_figure:
+          type: boolean
+          nullable: true
+          description: Conservative server-side heuristic for whether this artifact looks like a curation-relevant figure.
+        diagnostic_flags:
+          type: array
+          description: Non-fatal diagnostics such as small_image, no_caption, no_figure_label, or marker_picture_type.
+          items:
+            type: string
+        alt_text:
+          type: string
+          nullable: true
+        caption_text:
+          type: string
+          nullable: true
+          description: Caption text grouped with the image by Marker, when available.
+        nearby_text:
+          type: string
+          nullable: true
+          description: Raw text window following the image reference in Marker's Markdown output.
+        figure_label:
+          type: string
+          nullable: true
+          description: Author-facing figure label, such as Figure 1 or Fig. 2A, when resolved by text-only LLM review.
+        figure_number:
+          type: string
+          nullable: true
+          description: Author-facing figure number, when resolved by text-only LLM review.
+        heuristic_is_likely_figure:
+          type: boolean
+          nullable: true
+          description: Deterministic pre-LLM figure heuristic.
+        figure_decision_source:
+          type: string
+          nullable: true
+          enum: [heuristic, llm_text]
+          description: Source for is_likely_figure.
+        image_reviewed:
+          type: boolean
+        image_review_method:
+          type: string
+          nullable: true
+          enum: [llm_text]
+        image_review_model:
+          type: string
+          nullable: true
+        image_review_classification:
+          type: string
+          nullable: true
+          enum: [scientific_figure, table_or_equation, publisher_logo, badge_or_ui, cover_art, decorative, unknown]
+        image_review_is_scientific_figure:
+          type: boolean
+          nullable: true
+        image_review_confidence:
+          type: number
+          nullable: true
+        image_review_reason:
+          type: string
+          nullable: true
+        image_review_needs_vision:
+          type: boolean
+          nullable: true
+        image_review_error:
+          type: string
+          nullable: true
+
+    ImageUrlManifestResponse:
+      type: object
+      required: [process_id, images, manifest_ttl_seconds, image_retention_ttl_seconds]
+      properties:
+        process_id:
+          type: string
+        images:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImageUrlEntry"
+        manifest_ttl_seconds:
+          type: integer
+          example: 3600
+        image_retention_ttl_seconds:
+          type: integer
+          example: 604800
 
     CallTypeConfig:
       type: object
@@ -756,6 +1059,7 @@ components:
             - general_rescue
             - numeric_rescue
             - header_hierarchy
+            - image_text_review
           properties:
             zone_resolution:
               $ref: "#/components/schemas/CallTypeConfig"
@@ -766,4 +1070,6 @@ components:
             numeric_rescue:
               $ref: "#/components/schemas/CallTypeConfig"
             header_hierarchy:
+              $ref: "#/components/schemas/CallTypeConfig"
+            image_text_review:
               $ref: "#/components/schemas/CallTypeConfig"

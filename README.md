@@ -603,6 +603,8 @@ Optional fields:
   - `extraction`: clear extractor caches (`grobid/docling/marker`), merged outputs, and images; preserves run logs
   - `all`: legacy full clear for this file hash (including run logs and images)
   - if omitted, `clear_cache=true` maps to `all`
+- `extract_images` -- `true` to have Marker extract figure images and upload image artifacts; defaults to `false`
+- `review_images` -- defaults to `true` when `extract_images=true`; send `false` to skip text-only LLM review
 
 #### Poll for Status
 
@@ -640,9 +642,10 @@ While the job is running (`status: "progress"`), the response includes a `progre
 | `docling` | Running Docling extraction | Conditional -- included if Docling is in methods |
 | `marker` | Running Marker extraction | Conditional -- included if Marker is in methods |
 | `llm_merge` | Merging extraction outputs with LLM | Conditional -- included if merge=true |
+| `image_review` | Reviewing extracted image context with LLM | Conditional -- included by default when extract_images=true; skipped only if review_images=false |
 | `finalizing` | Uploading artifacts and finalizing | Backend -- S3 upload and cleanup |
 
-The stage list is dynamic based on the `methods` and `merge` parameters submitted with the job. `stages_total`, `stages_completed`, and `stages_pending` reflect only the stages relevant to that specific job.
+The stage list is dynamic based on the `methods`, `merge`, and `review_images` parameters submitted with the job. `stages_total`, `stages_completed`, and `stages_pending` reflect only the stages relevant to that specific job.
 
 When the proxy is queuing a job while EC2 boots, it returns `status: "queued"` with `progress.stage: "ec2_starting"`. Once the backend picks up the job, stages transition through the extraction engines and merge.
 
@@ -670,6 +673,119 @@ curl http://localhost:5000/api/v1/extract/{process_id}/artifacts/urls
 
 Returns pre-signed S3 URLs (1-hour expiry) for all artifacts.
 
+#### Get Extracted Image URLs
+
+```bash
+curl http://localhost:5000/api/v1/extract/{process_id}/images/urls
+```
+
+Returns a manifest with one pre-signed S3 URL per extracted image, `manifest_ttl_seconds`, and `image_retention_ttl_seconds`. Image extraction is opt-in per request via `extract_images=true`; requests that omit it do not return image artifacts. Extracted images are reviewed by a text-only LLM by default; send `review_images=false` to skip that pass. The review uses raw Marker captions, alt text, and nearby Markdown context before considering any future vision review. Each image entry also includes nullable figure metadata fields:
+
+- `page_index` -- zero-based PDF page index parsed from Marker's generated filename
+- `marker_image_type` and `marker_image_index` -- Marker's image class and internal image index; this index is not the paper's figure number
+- `block_id`, `group_id`, `bbox`, and `polygon` -- Marker structured block provenance, including image coordinates when available
+- `caption_text` and `nearby_text` -- raw evidence from Marker grouped captions and Markdown text near the image reference; the server does not regex-derive figure numbers from these fields
+- `figure_label` and `figure_number` -- author-facing labels such as `Figure 1` or `Fig. 2A`, populated by the text-only LLM review when supported by supplied text
+- `is_likely_figure`, `heuristic_is_likely_figure`, `figure_decision_source`, and `diagnostic_flags` -- the consolidated figure decision, the deterministic pre-LLM image-shape/caption-presence signal, the source of the final decision, and non-fatal diagnostics
+- `image_review_*` -- optional text-only LLM review fields including classification, confidence, reason, model, and whether vision review would be helpful
+
+#### Test Image Extraction
+
+Use a scientific PDF with visible figures. For the fastest functional check, run
+Marker only and skip merge. Include `clear_cache_scope=extraction` when you want
+to force Marker to regenerate image artifacts after code or model changes.
+
+```bash
+BASE_URL=http://localhost:5000
+
+SUBMIT_JSON="$(
+  curl -sS -X POST "$BASE_URL/api/v1/extract" \
+    -F "file=@paper.pdf" \
+    -F "methods=marker" \
+    -F "merge=false" \
+    -F "clear_cache_scope=extraction" \
+    -F "extract_images=true"
+)"
+
+PROCESS_ID="$(
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["process_id"])' \
+    <<< "$SUBMIT_JSON"
+)"
+
+echo "$PROCESS_ID"
+```
+
+Poll until `status` is `complete`. The submission response and status response
+should show `extract_images: true` and, because review is now default-on for
+image extraction, `review_images: true`.
+
+```bash
+while true; do
+  STATUS_JSON="$(curl -sS "$BASE_URL/api/v1/extract/$PROCESS_ID")"
+  python3 -c 'import json,sys; p=json.load(sys.stdin); print(p.get("status"), (p.get("progress") or {}).get("stage"))' \
+    <<< "$STATUS_JSON"
+  python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "complete" else 1)' \
+    <<< "$STATUS_JSON" && break
+  sleep 5
+done
+```
+
+Fetch the image URL manifest and inspect the metadata. A successful reviewed
+figure should have `image_reviewed: true`, `figure_decision_source: "llm_text"`,
+a classification such as `scientific_figure`, and author-facing `figure_label`
+and `figure_number` values when the caption text supports them.
+
+```bash
+curl -sS "$BASE_URL/api/v1/extract/$PROCESS_ID/images/urls" \
+  > image-manifest.json
+
+python3 - <<'PY'
+import json
+with open("image-manifest.json", encoding="utf-8") as f:
+    payload = json.load(f)
+print("images:", len(payload.get("images") or []))
+for image in payload.get("images", []):
+    print(
+        image["filename"],
+        image.get("figure_label"),
+        image.get("figure_number"),
+        image.get("image_review_classification"),
+        image.get("is_likely_figure"),
+    )
+PY
+```
+
+To download one image for visual inspection, use the pre-signed `url` from the
+manifest:
+
+```bash
+python3 - <<'PY'
+import json
+from urllib.request import urlretrieve
+with open("image-manifest.json", encoding="utf-8") as f:
+    first = json.load(f)["images"][0]
+urlretrieve(first["url"], first["filename"])
+print(first["filename"])
+PY
+```
+
+To test the explicit opt-out path, submit the same request with
+`review_images=false`. The response should show `review_images: false`, skip the
+`image_review` stage, record no image-review LLM cost, and return heuristic image
+metadata without cached `image_review_*` decisions for that run.
+
+```bash
+curl -sS -X POST "$BASE_URL/api/v1/extract" \
+  -F "file=@paper.pdf" \
+  -F "methods=marker" \
+  -F "merge=false" \
+  -F "extract_images=true" \
+  -F "review_images=false"
+```
+
+If `OPENAI_API_KEY` is not configured, either set it before testing the default
+review path or send `review_images=false` while testing image extraction itself.
+
 ### API Endpoints Reference
 
 | Endpoint | Method | Description |
@@ -681,6 +797,7 @@ Returns pre-signed S3 URLs (1-hour expiry) for all artifacts.
 | `/api/v1/extract/{id}/cancel` | POST | Cancel an active extraction job |
 | `/api/v1/extract/{id}/download/{method}` | GET | Download output (grobid, docling, marker, merged, audit) |
 | `/api/v1/extract/{id}/images` | GET | List extracted images |
+| `/api/v1/extract/{id}/images/urls` | GET | Get pre-signed S3 URLs for extracted images |
 | `/api/v1/extract/{id}/images/{file}` | GET | Download a specific extracted image |
 | `/api/v1/extract/{id}/logs` | GET | Get pre-signed URL for the NDJSON audit log |
 | `/api/v1/extract/{id}/artifacts` | GET | Get artifact metadata |
@@ -702,13 +819,13 @@ cp .env.example .env
 # Edit .env -- set at minimum: OPENAI_API_KEY
 
 # 3a. Deploy (CPU only -- no GPU acceleration)
-cd deploy && ./deploy.sh
+cd deploy && GPU_MODE=off ./deploy.sh
 
 # 3b. Deploy (GPU -- recommended for production)
-docker compose -f deploy/docker-compose.gpu.yml -p pdfx up -d --build
+cd deploy && GPU_MODE=on ./deploy.sh
 ```
 
-**Note:** `deploy.sh` uses the CPU-only compose file (`docker-compose.yml`). For GPU-accelerated deployment (recommended -- significantly faster extraction), use the GPU compose command directly. On first run, Docling and Marker download ML models (~2-5 GB), which takes several minutes. These model assets are persisted under `data/model_cache`, `data/rapidocr_models`, and `data/models`, so normal container restarts should not re-download them.
+**Note:** `deploy.sh` auto-detects a GPU by default (`GPU_MODE=auto`) and switches to `docker-compose.gpu.yml` when one is available. Set `GPU_MODE=off` or `GPU_MODE=on` to force a specific stack. On first run, Docling and Marker download ML models (~2-5 GB), which takes several minutes. These model assets are persisted under `data/model_cache`, `data/rapidocr_models`, and `data/models`, so normal container restarts should not re-download them.
 
 **After deployment:**
 
@@ -785,12 +902,28 @@ All extraction outputs are stored in S3 via the audit trail, and tracked in the 
 | Extraction status and metadata | PostgreSQL | Permanent |
 | Markdown outputs and source PDFs | S3 (pre-signed URLs via API) | Permanent |
 | Run logs (NDJSON format) | S3 | Permanent |
-| Extracted images | S3 | Permanent |
+| Extracted images | S3 (pre-signed URLs via image manifest) | Temporary; default 7 days |
 | Local cache (fast access) | Bind-mounted host directory | Persists across container restarts; manual deletion required |
+
+Extracted image objects are uploaded under each run's `images/` artifact prefix with S3 object tags:
+
+- `pdfx-artifact-type=extracted-image`
+- `pdfx-retention=temporary`
+- `pdfx-retention-ttl-seconds=604800` by default
+
+The audit bucket should have an S3 lifecycle rule that expires objects tagged `pdfx-artifact-type=extracted-image` and `pdfx-retention=temporary` after the configured retention window. `IMAGE_RETENTION_TTL_SECONDS` documents the retention TTL returned by the manifest endpoint; keep it in sync with the bucket lifecycle rule.
+
+An example lifecycle configuration is provided at `deploy/aws/s3-image-lifecycle.json` and can be applied with:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$AUDIT_S3_BUCKET" \
+  --lifecycle-configuration file://deploy/aws/s3-image-lifecycle.json
+```
 
 **Prerequisites for durable storage:**
 
-1. **IAM role** -- The EC2 instance needs an IAM instance profile with `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` on the audit bucket, and `ssm:GetParameter` on `/pdfx/*`
+1. **IAM role** -- The EC2 instance needs an IAM instance profile with `s3:PutObject`, `s3:PutObjectTagging`, `s3:GetObject`, `s3:ListBucket` on the audit bucket, and `ssm:GetParameter` on `/pdfx/*`
 2. **IMDSv2 hop limit** -- Set to 2 so Docker containers can reach the EC2 metadata service for IAM credentials (`aws ec2 modify-instance-metadata-options --instance-id <id> --http-put-response-hop-limit 2`)
 3. **SSM parameter** -- Store the bucket name at `/pdfx/audit-s3-bucket` in Parameter Store
 4. **No AWS keys needed** -- The service uses the default boto3 credential chain (instance profile on EC2, env vars or config for local dev)
@@ -862,6 +995,8 @@ All settings live in `config.py` with sensible defaults. Override via environmen
 | `GROBID_URL` | GROBID server URL (default: `http://grobid:8070` in Docker) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `AUDIT_S3_BUCKET` | S3 bucket for durable artifact storage (optional — works without S3) |
+| `IMAGE_URL_TTL_SECONDS` | `3600` | Pre-signed URL TTL for image manifest entries |
+| `IMAGE_RETENTION_TTL_SECONDS` | `604800` | Retention TTL documented for temporary image objects |
 
 Everything below is optional and has sensible defaults.
 
@@ -881,7 +1016,6 @@ Everything below is optional and has sensible defaults.
 | `GROBID_INCLUDE_RAW_CITATIONS` | `false` | Include raw citation strings |
 | `DOCLING_DEVICE` | `cpu` | Docling device (`cpu` or `cuda` for GPU) |
 | `MARKER_DEVICE` | `cpu` | Marker device (`cpu` or `auto` for GPU) |
-| `MARKER_EXTRACT_IMAGES` | `true` | Extract images from PDFs |
 
 ### LLM Model Selection
 
@@ -897,6 +1031,8 @@ Everything below is optional and has sensible defaults.
 | `LLM_REASONING_NUMERIC_RESCUE` | `medium` | Reasoning effort for numeric rescue |
 | `LLM_MODEL_CONFLICT_BATCH` | `gpt-5.4-mini` | Model for batched conflict resolution |
 | `LLM_REASONING_CONFLICT_BATCH` | `medium` | Reasoning effort for batched conflicts |
+| `IMAGE_TEXT_REVIEW_MODEL` | `gpt-5.4-mini` | Model for text-only image artifact review |
+| `IMAGE_TEXT_REVIEW_REASONING` | `medium` | Reasoning effort for text-only image review |
 | `HIERARCHY_LLM_MODEL` | `gpt-5.4-mini` | Model for heading hierarchy resolution |
 | `HIERARCHY_LLM_REASONING` | `medium` | Reasoning effort for heading hierarchy |
 | `LLM_CONFLICT_BATCH_SIZE` | `500` | Number of conflicts per batch in batched resolution |
@@ -967,6 +1103,8 @@ Everything below is optional and has sensible defaults.
 | `AUDIT_S3_BUCKET` | _(empty)_ | S3 bucket for durable artifact storage; resolved from SSM if unset |
 | `AUDIT_S3_BUCKET_SSM_PARAM` | `/pdfx/audit-s3-bucket` | SSM parameter name for bucket resolution |
 | `AUDIT_S3_PREFIX` | `pdfx/audit` | S3 key prefix for audit artifacts |
+| `IMAGE_URL_TTL_SECONDS` | `3600` | Pre-signed URL TTL for image manifests |
+| `IMAGE_RETENTION_TTL_SECONDS` | `604800` | Image artifact retention TTL to mirror in S3 lifecycle policy |
 | `AWS_DEFAULT_REGION` | `us-east-1` | AWS region for SSM and S3 clients |
 
 ---
