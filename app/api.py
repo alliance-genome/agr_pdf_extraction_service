@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Blueprint, request, jsonify, send_file, current_app
 from werkzeug.utils import secure_filename
 
+from app.error_utils import summarize_error_message
 from app.image_metadata import copy_image_metadata, normalize_image_manifest_entry
 from app.models import ExtractionRun, get_session
 from app.services.audit_logger import build_s3_client
@@ -240,6 +241,20 @@ def _get_image_artifacts(artifacts_json):
         if normalized and normalized.get("s3_key"):
             artifacts.append(normalized)
     return artifacts
+
+
+def _count_images(payload):
+    if not isinstance(payload, dict):
+        return 0
+    images = payload.get("images")
+    if isinstance(images, list):
+        return len(images)
+    artifacts = payload.get("artifacts_json")
+    if isinstance(artifacts, dict):
+        artifact_images = artifacts.get("images")
+        if isinstance(artifact_images, list):
+            return len(artifact_images)
+    return 0
 
 
 def _image_url_ttl_seconds():
@@ -614,13 +629,14 @@ def get_extraction_status(process_id):
             "ended_at": run["ended_at"],
             "log_s3_key": run["log_s3_key"],
             "artifacts_json": run["artifacts_json"],
+            "image_count": _count_images(run["artifacts_json"]),
             "consensus_metrics_json": run["consensus_metrics_json"],
             "llm_cost_usd": run["llm_cost_usd"],
             "llm_usage_json": run["llm_usage_json"],
         }
         if run["error_code"] or run["error_message"]:
             response["error_code"] = run["error_code"]
-            response["error"] = run["error_message"]
+            response["error"] = summarize_error_message(run["error_message"])
 
         # For non-terminal DB states, reconcile with Celery truth to avoid stale "pending".
         if run["status"] in {"queued", "running"}:
@@ -635,6 +651,7 @@ def get_extraction_status(process_id):
                         response["ended_at"] = result.result.get("ended_at") or response["ended_at"]
                         response["log_s3_key"] = result.result.get("log_s3_key") or response["log_s3_key"]
                         response["artifacts_json"] = result.result.get("artifacts_json") or response["artifacts_json"]
+                        response["image_count"] = _count_images(result.result) or response["image_count"]
                         response["extract_images"] = result.result.get("extract_images", response["extract_images"])
                         response["review_images"] = result.result.get("review_images", response["review_images"])
                         response["llm_usage_json"] = result.result.get("llm_usage_json") or response["llm_usage_json"]
@@ -643,8 +660,8 @@ def get_extraction_status(process_id):
 
                 if result.state == "FAILURE":
                     response["status"] = "failed"
-                    response["error"] = str(result.info)
-                    return jsonify(response), 500
+                    response["error"] = summarize_error_message(result.info)
+                    return jsonify(response), 200
                 if result.state == "REVOKED":
                     response["status"] = "cancelled"
                     response["error"] = run.get("error_message") or "Extraction cancelled"
@@ -669,7 +686,7 @@ def get_extraction_status(process_id):
                 logger.debug("Could not fetch Celery state for %s: %s", process_id, exc)
 
         if run["status"] == "failed":
-            return jsonify(response), 500
+            return jsonify(response), 200
 
         return jsonify(response), 200
 
@@ -715,14 +732,15 @@ def get_extraction_status(process_id):
             payload["started_at"] = result.result.get("started_at")
             payload["ended_at"] = result.result.get("ended_at")
             payload["log_s3_key"] = result.result.get("log_s3_key")
+            payload["image_count"] = _count_images(result.result)
         return jsonify(payload), 200
 
     if result.state == "FAILURE":
         return jsonify({
             "process_id": process_id,
             "status": "failed",
-            "error": str(result.info),
-        }), 500
+            "error": summarize_error_message(result.info),
+        }), 200
     if result.state == "REVOKED":
         return jsonify({
             "process_id": process_id,

@@ -240,7 +240,13 @@ def test_get_extraction_status_prefers_db(client):
         started_at=datetime.now(timezone.utc),
         ended_at=datetime.now(timezone.utc),
         log_s3_key="pdfx/audit/2026/02/11/test.ndjson",
-        artifacts_json={"grobid": "pdfx/audit/2026/02/11/x/grobid.md"},
+        artifacts_json={
+            "grobid": "pdfx/audit/2026/02/11/x/grobid.md",
+            "images": [
+                {"filename": "fig1.png", "s3_key": "pdfx/audit/2026/02/11/x/images/fig1.png"},
+                {"filename": "fig2.png", "s3_key": "pdfx/audit/2026/02/11/x/images/fig2.png"},
+            ],
+        },
         consensus_metrics_json={
             "total_blocks": 100,
             "agree_exact": 90,
@@ -262,6 +268,7 @@ def test_get_extraction_status_prefers_db(client):
     assert payload["extract_images"] is True
     assert payload["log_s3_key"] == "pdfx/audit/2026/02/11/test.ndjson"
     assert "grobid" in payload["artifacts_json"]
+    assert payload["image_count"] == 2
     assert payload["consensus_metrics_json"]["total_blocks"] == 100
     assert payload["consensus_metrics_json"]["degradation_metrics"]["quality_score"] == 0.995
     assert mock_async.called is False
@@ -302,7 +309,12 @@ def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(c
         "started_at": "2026-02-25T12:00:00Z",
         "ended_at": "2026-02-25T12:10:00Z",
         "log_s3_key": "pdfx/audit/2026/02/25/test.ndjson",
-        "artifacts_json": {"merged": "pdfx/audit/2026/02/25/x/merged.md"},
+        "artifacts_json": {
+            "merged": "pdfx/audit/2026/02/25/x/merged.md",
+            "images": [
+                {"filename": "fig1.png", "s3_key": "pdfx/audit/2026/02/25/x/images/fig1.png"},
+            ],
+        },
         "extract_images": True,
         "llm_usage_json": {"total_tokens": 123},
         "llm_cost_usd": 0.42,
@@ -320,8 +332,79 @@ def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(c
     assert payload["log_s3_key"] == "pdfx/audit/2026/02/25/test.ndjson"
     assert payload["artifacts_json"]["merged"].endswith("merged.md")
     assert payload["extract_images"] is True
+    assert payload["image_count"] == 1
     assert payload["llm_usage_json"]["total_tokens"] == 123
     assert payload["llm_cost_usd"] == 0.42
+
+
+def test_get_extraction_status_returns_failed_job_as_poll_result(client):
+    process_id = str(uuid.uuid4())
+    long_error = "cuda exploded " + ("x" * 5000)
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="failed",
+        error_code="ConversionError",
+        error_message=long_error,
+    ))
+    session.commit()
+    session.close()
+
+    response = client.get(f"/api/v1/extract/{process_id}")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["process_id"] == process_id
+    assert payload["status"] == "failed"
+    assert payload["error_code"] == "ConversionError"
+    assert payload["error"].startswith("cuda exploded")
+    assert "[truncated " in payload["error"]
+    assert len(payload["error"]) < len(long_error)
+
+
+def test_get_extraction_status_maps_celery_failure_to_failed_poll_result(client):
+    process_id = str(uuid.uuid4())
+
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    ))
+    session.commit()
+    session.close()
+
+    mock_result = MagicMock()
+    mock_result.state = "FAILURE"
+    mock_result.info = RuntimeError("docling failed " + ("y" * 5000))
+
+    with patch("celery_app.celery.AsyncResult", return_value=mock_result):
+        response = client.get(f"/api/v1/extract/{process_id}")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["process_id"] == process_id
+    assert payload["status"] == "failed"
+    assert payload["error"].startswith("docling failed")
+    assert "[truncated " in payload["error"]
+
+
+def test_get_extraction_status_fallback_maps_celery_failure_to_failed_poll_result(client):
+    process_id = str(uuid.uuid4())
+
+    mock_result = MagicMock()
+    mock_result.state = "FAILURE"
+    mock_result.info = RuntimeError("worker failed")
+
+    with patch("celery_app.celery.AsyncResult", return_value=mock_result):
+        response = client.get(f"/api/v1/extract/{process_id}")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["process_id"] == process_id
+    assert payload["status"] == "failed"
+    assert payload["error"] == "worker failed"
 
 
 @patch("celery_app.celery.control.revoke")

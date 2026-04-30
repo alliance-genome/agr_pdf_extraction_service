@@ -63,8 +63,16 @@ RUN python3.11 -m pip install --no-cache-dir --ignore-installed -r requirements.
 RUN python3.11 -m pip uninstall -y onnxruntime 2>/dev/null; \
     python3.11 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu || true
 
-# Force numpy <2.4 for numba compatibility (numba 0.61.x doesn't support numpy 2.4+)
-RUN python3.11 -m pip install --no-cache-dir 'numpy<2.4'
+# Re-apply PyTorch from the CUDA 12.8 index after dependency installation.
+# Some transitive dependencies can otherwise upgrade torch to a CUDA wheel that
+# does not match this image's CUDA runtime libraries.
+RUN python3.11 -m pip install --no-cache-dir --force-reinstall \
+    torch \
+    torchvision \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# Force numpy/Pillow versions back into the ranges required by numba/Marker.
+RUN python3.11 -m pip install --no-cache-dir 'numpy<2.4' 'Pillow<11.0.0,>=10.2.0'
 
 # Copy application code
 COPY . .

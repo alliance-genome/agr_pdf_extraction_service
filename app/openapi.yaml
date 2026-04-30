@@ -203,12 +203,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExtractionStatusResponse"
-        "500":
-          description: Extraction failed.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ExtractionStatusResponse"
   /extract/{process_id}/cancel:
     post:
       tags: [Extractions]
@@ -669,6 +663,9 @@ components:
           type: object
           additionalProperties: true
           nullable: true
+        image_count:
+          type: integer
+          description: Number of extracted image artifacts recorded for this job.
         error_code:
           type: string
           nullable: true

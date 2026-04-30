@@ -11,6 +11,7 @@ from celery.signals import setup_logging as celery_setup_logging, worker_process
 from sqlalchemy.exc import IntegrityError
 
 from config import Config
+from app.error_utils import summarize_error_message
 from app.image_metadata import (
     IMAGE_MANIFEST_FILENAME,
     apply_text_image_review,
@@ -756,18 +757,19 @@ def extract_pdf(
 
     except Exception as exc:
         total_duration = round(time.monotonic() - total_start, 3)
+        error_message = summarize_error_message(exc)
         _safe_log_event(
             audit_logger,
             "finalize",
             "failed",
             error_code=exc.__class__.__name__,
-            detail=str(exc),
+            detail=error_message,
             total_duration_s=total_duration,
         )
 
         error_code = "timeout" if "SoftTimeLimitExceeded" in type(exc).__name__ else type(exc).__name__
         adapter.error(
-            "Job failed: %s", exc,
+            "Job failed: %s", error_message,
             extra={
                 "_event": "job_failed",
                 "_error_code": error_code,
@@ -794,7 +796,7 @@ def extract_pdf(
                 status="failed",
                 ended_at=_now_utc(),
                 error_code=exc.__class__.__name__,
-                error_message=str(exc),
+                error_message=error_message,
                 log_s3_key=audit_logger.get_log_s3_key() if audit_logger else None,
                 llm_usage_json=fail_llm_usage,
                 llm_cost_usd=fail_llm_cost,
@@ -901,13 +903,14 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
         )
     except Exception as exc:
         duration_s = round(time.monotonic() - started, 3)
+        error_message = summarize_error_message(exc)
         _safe_log_event(
             audit_logger, stage, "failed",
-            detail=str(exc),
+            detail=error_message,
             duration_s=duration_s,
         )
         log.error(
-            "%s extraction failed: %s", method, exc,
+            "%s extraction failed: %s", method, error_message,
             extra={
                 "_event": "extractor_complete",
                 "_extractor": method,
