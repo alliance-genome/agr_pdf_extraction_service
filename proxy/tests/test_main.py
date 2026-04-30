@@ -466,6 +466,137 @@ class TestExtractDownloadEndpoint:
         assert captured["url"].endswith("/api/v1/extract/backend-dl-9/download/merged")
 
 
+class TestExtractImageEndpoints:
+    def test_image_urls_use_mapped_backend_process_id(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.proxy_to_backend_process["proxy-img-1"] = "backend-img-9"
+
+        captured = {"url": None}
+
+        class _DummyResponse:
+            status_code = 200
+            content = b'{"process_id":"backend-img-9","images":[{"filename":"fig1.png"}]}'
+            headers = {"content-type": "application/json"}
+
+            def json(self):
+                return {"process_id": "backend-img-9", "images": [{"filename": "fig1.png"}]}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                captured["url"] = url
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            "/api/v1/extract/proxy-img-1/images/urls",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["url"].endswith("/api/v1/extract/backend-img-9/images/urls")
+        assert resp.json()["process_id"] == "proxy-img-1"
+        assert resp.json()["images"][0]["filename"] == "fig1.png"
+
+    def test_image_list_proxies_json(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+
+        captured = {"url": None}
+
+        class _DummyResponse:
+            status_code = 200
+            content = b'{"process_id":"proc-1","images":[]}'
+            headers = {"content-type": "application/json"}
+
+            def json(self):
+                return {"process_id": "proc-1", "images": []}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                captured["url"] = url
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            "/api/v1/extract/proc-1/images",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["url"].endswith("/api/v1/extract/proc-1/images")
+        assert resp.json()["images"] == []
+
+    def test_image_download_proxies_binary_content(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.proxy_to_backend_process["proxy-img-dl-1"] = "backend-img-dl-9"
+
+        captured = {"url": None, "follow_redirects": None}
+
+        class _DummyResponse:
+            status_code = 200
+            content = b"jpeg bytes"
+            headers = {
+                "content-type": "image/jpeg",
+                "content-disposition": "inline; filename=fig 1.jpeg",
+            }
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                captured["follow_redirects"] = kwargs.get("follow_redirects")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                captured["url"] = url
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            "/api/v1/extract/proxy-img-dl-1/images/fig 1.jpeg",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.content == b"jpeg bytes"
+        assert resp.headers["content-type"] == "image/jpeg"
+        assert "content-disposition" in resp.headers
+        assert captured["follow_redirects"] is True
+        assert captured["url"].endswith("/api/v1/extract/backend-img-dl-9/images/fig%201.jpeg")
+
+
 class TestExtractCancelEndpoint:
     def test_cancel_removes_queued_job(self, client, monkeypatch):
         import app.main as main_mod
