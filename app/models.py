@@ -2,7 +2,7 @@ import os
 import threading
 import logging
 
-from sqlalchemy import Column, DateTime, Integer, Numeric, String, Text, Index, create_engine, JSON
+from sqlalchemy import Boolean, Column, DateTime, Integer, Numeric, String, Text, Index, create_engine, JSON
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, scoped_session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -23,6 +23,8 @@ class ExtractionRun(Base):
     source_pdf_md5 = Column(String)
     source_referencefile_id = Column(Integer)
     config_version = Column(String)
+    extract_images = Column(Boolean, nullable=False, default=False)
+    review_images = Column(Boolean, nullable=False, default=False)
     status = Column(String, nullable=False, default="queued")
     started_at = Column(DateTime(timezone=True))
     ended_at = Column(DateTime(timezone=True))

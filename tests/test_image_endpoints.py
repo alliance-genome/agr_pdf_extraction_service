@@ -22,7 +22,6 @@ def client():
     app.config["GROBID_INCLUDE_RAW_CITATIONS"] = False
     app.config["DOCLING_DEVICE"] = "cpu"
     app.config["MARKER_DEVICE"] = "cpu"
-    app.config["MARKER_EXTRACT_IMAGES"] = True
     app.config["CONSENSUS_ENABLED"] = True
     app.config["CONSENSUS_NEAR_THRESHOLD"] = 0.92
     app.config["CONSENSUS_LEVENSHTEIN_THRESHOLD"] = 0.90

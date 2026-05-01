@@ -1,0 +1,740 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Test mirror for the PDF extraction service: GPU EC2 backend, Fargate proxy,
+  S3 audit bucket, environment-scoped SSM parameters, ALB routing, and DNS.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: test
+    Description: Short environment name used in resource names.
+    AllowedPattern: "[a-z0-9-]+"
+  SsmParameterPath:
+    Type: String
+    Default: pdfx-test
+    Description: SSM path without leading slash. Parameters are created under /<path>/*.
+    AllowedPattern: "[A-Za-z0-9_.-][A-Za-z0-9_.\\/-]*"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-55522232
+    Description: VPC that contains the shared ALB and PDFX backend.
+  BackendSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-af62dca3
+    Description: Public subnet for the GPU backend instance.
+  EcsSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: subnet-04262fc338f638054,subnet-0d4703177afb1797d
+    Description: Private subnets for the Fargate proxy tasks.
+  AlbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-072250ddfe2d82f3f
+    Description: Security group attached to the shared agr-services ALB.
+  DefaultSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-21ac675b
+    Description: Default VPC security group also attached to prod PDFX resources.
+  BackendVpnSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-006b41eff1820ad53
+    Description: Existing VPN security group attached to the production PDFX backend.
+  AlbHttpsListenerArn:
+    Type: String
+    Default: arn:aws:elasticloadbalancing:us-east-1:100225593120:listener/app/agr-services/e75691865c2bbfb1/c9cd61e1f8237d0e
+    Description: HTTPS listener ARN for the shared agr-services ALB.
+  AlbDnsName:
+    Type: String
+    Default: agr-services-1974539419.us-east-1.elb.amazonaws.com.
+    Description: DNS name for the shared agr-services ALB.
+  AlbCanonicalHostedZoneId:
+    Type: String
+    Default: Z35SXDOTRQ7X7K
+    Description: Canonical hosted zone ID for the shared ALB.
+  PublicHostedZoneId:
+    Type: String
+    Default: Z3IZ3D6V94JEC2
+    Description: Public Route 53 hosted zone ID for alliancegenome.org.
+  DomainName:
+    Type: String
+    Default: pdfx-test.alliancegenome.org
+    Description: Hostname routed to the test proxy.
+  ListenerRulePriority:
+    Type: Number
+    Default: 110
+    MinValue: 1
+    MaxValue: 50000
+    Description: Unique priority on the shared HTTPS listener.
+  BackendAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-00c6ddd550364d6c3
+    Description: Deep Learning Base OSS NVIDIA Driver GPU AMI used by prod.
+  BackendInstanceType:
+    Type: String
+    Default: g5.2xlarge
+    Description: GPU instance type for the backend.
+  BackendKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: pedro-benchmark-key
+    Description: EC2 key pair for emergency SSH access.
+  BackendPort:
+    Type: Number
+    Default: 5000
+    Description: Flask backend port reached by the proxy.
+  BackendAssociatePublicIp:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Whether to attach a public IP to the backend instance.
+  OperatorSshCidr:
+    Type: String
+    Default: 10.0.70.0/24
+    Description: CIDR allowed to SSH to the backend instance.
+  BackendRootVolumeSize:
+    Type: Number
+    Default: 200
+    MinValue: 80
+    Description: Root EBS volume size in GiB.
+  AuditBucketName:
+    Type: String
+    Default: agr-pdf-extraction-test
+    Description: S3 bucket for test audit logs, artifacts, images, and proxy queue.
+  AuditPrefix:
+    Type: String
+    Default: pdfx-test/audit
+    Description: S3 key prefix for backend audit logs and artifacts.
+  ImageRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Days to retain image artifacts tagged as temporary.
+  EcrRepositoryName:
+    Type: String
+    Default: agr_pdfx_proxy
+    Description: ECR repository that stores the proxy image.
+  ProxyImageTag:
+    Type: String
+    Default: latest
+    Description: Initial proxy image tag for the ECS service.
+  EcsClusterName:
+    Type: String
+    Default: pdfx-proxy-test
+    Description: ECS cluster name for the test proxy.
+  EcsServiceName:
+    Type: String
+    Default: pdfx-proxy-test
+    Description: ECS service, task family, and default container name for the test proxy.
+  ProxyDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 2
+  ProxyTaskCpu:
+    Type: String
+    Default: "256"
+  ProxyTaskMemory:
+    Type: String
+    Default: "512"
+  QueuePrefix:
+    Type: String
+    Default: pdfx-proxy-test-queue
+    Description: S3 prefix for durable proxy queue jobs.
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito user pool ID accepted by the proxy.
+  CognitoRegion:
+    Type: String
+    Default: us-east-1
+  CognitoRequiredScope:
+    Type: String
+    Default: pdfx-api/extract
+  CognitoAcceptedScopes:
+    Type: String
+    Default: "__PDFX_EMPTY__"
+    Description: Optional comma-separated accepted scopes; __PDFX_EMPTY__ disables.
+  CognitoAcceptedClientIds:
+    Type: String
+    Default: "__PDFX_EMPTY__"
+    Description: Optional comma-separated accepted client IDs; __PDFX_EMPTY__ disables.
+  IdleTimeoutMinutes:
+    Type: String
+    Default: "30"
+  StartupTimeoutMinutes:
+    Type: String
+    Default: "10"
+  MaxQueuedJobs:
+    Type: String
+    Default: "50"
+  AlwaysOnMode:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  DeployBackendOnBoot:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: If true, cloud-init clones the backend repo and runs deploy/deploy.sh.
+  BackendGitRepositoryUrl:
+    Type: String
+    Default: https://github.com/alliance-genome/agr_pdf_extraction_service.git
+  BackendGitRef:
+    Type: String
+    Default: main
+    Description: Branch, tag, or commit for backend bootstrap.
+  DockerComposeVersion:
+    Type: String
+    Default: v2.30.3
+
+Conditions:
+  AssociateBackendPublicIp: !Equals [!Ref BackendAssociatePublicIp, "true"]
+
+Resources:
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref AuditBucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: pdfx-expire-extracted-images
+            Status: Enabled
+            ExpirationInDays: !Ref ImageRetentionDays
+            TagFilters:
+              - Key: pdfx-artifact-type
+                Value: extracted-image
+              - Key: pdfx-retention
+                Value: temporary
+      Tags:
+        - Key: Project
+          Value: pdfx
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "PDFX ${EnvironmentName} proxy - ALB ingress on port 80"
+      GroupName: !Sub "pdfx-proxy-${EnvironmentName}"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroupId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "pdfx-proxy-${EnvironmentName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "PDFX ${EnvironmentName} GPU backend"
+      GroupName: !Sub "pdfx-backend-${EnvironmentName}"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref BackendPort
+          ToPort: !Ref BackendPort
+          SourceSecurityGroupId: !Ref ProxySecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref OperatorSshCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "pdfx-backend-${EnvironmentName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  BackendRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "pdfx-${EnvironmentName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: pdfx-s3-ssm-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3ListAuditBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${AuditBucket}"
+              - Sid: S3AuditObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::${AuditBucket}/*"
+              - Sid: SSMReadPdfxEnv
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SsmParameterPath}/*"
+
+  BackendInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "pdfx-${EnvironmentName}-ec2-profile"
+      Roles:
+        - !Ref BackendRole
+
+  BackendInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BackendAmiId
+      InstanceType: !Ref BackendInstanceType
+      KeyName: !Ref BackendKeyName
+      IamInstanceProfile: !Ref BackendInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref BackendRootVolumeSize
+            VolumeType: gp3
+            Iops: 3000
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          SubnetId: !Ref BackendSubnetId
+          GroupSet:
+            - !Ref BackendSecurityGroup
+            - !Ref DefaultSecurityGroupId
+            - !Ref BackendVpnSecurityGroupId
+          AssociatePublicIpAddress: !If [AssociateBackendPublicIp, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub "pdfx-backend-${EnvironmentName}"
+        - Key: Project
+          Value: pdfx
+        - Key: Environment
+          Value: !Ref EnvironmentName
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -euo pipefail
+            exec > >(tee /var/log/pdfx-bootstrap.log | logger -t pdfx-bootstrap -s 2>/dev/console) 2>&1
+
+            echo "Starting PDFX ${EnvironmentName} backend bootstrap"
+            dnf install -y docker git jq awscli
+            systemctl enable --now docker
+            usermod -aG docker ec2-user || true
+
+            if ! docker compose version >/dev/null 2>&1; then
+              mkdir -p /usr/local/lib/docker/cli-plugins
+              COMPOSE_VERSION="${DockerComposeVersion}"
+              curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+            fi
+
+            if ! docker info 2>/dev/null | grep -qi nvidia; then
+              echo "WARNING: Docker does not report an NVIDIA runtime yet; verify nvidia-container-toolkit before GPU deploy."
+            fi
+
+            DEPLOY_BACKEND_ON_BOOT="${DeployBackendOnBoot}"
+            if [ "$DEPLOY_BACKEND_ON_BOOT" != "true" ]; then
+              echo "DeployBackendOnBoot=false; backend host provisioned but app deploy skipped."
+              shutdown -h +1 "PDFX test backend bootstrap complete; DeployBackendOnBoot=false"
+              exit 0
+            fi
+
+            SERVICE_DIR=/home/ec2-user/agr_pdf_extraction_service
+            rm -rf "$SERVICE_DIR"
+            sudo -u ec2-user git clone "${BackendGitRepositoryUrl}" "$SERVICE_DIR"
+            sudo -u ec2-user git -C "$SERVICE_DIR" fetch --all --tags --prune
+            sudo -u ec2-user git -C "$SERVICE_DIR" checkout "${BackendGitRef}"
+            cd "$SERVICE_DIR"
+
+            if ! aws ssm get-parameter \
+              --region "${AWS::Region}" \
+              --with-decryption \
+              --name "/${SsmParameterPath}/backend-env" \
+              --query Parameter.Value \
+              --output text > .env; then
+              echo "ERROR: missing /${SsmParameterPath}/backend-env SecureString. Create it before enabling DeployBackendOnBoot."
+              exit 1
+            fi
+
+            # Scrub production storage values from copied env files before
+            # appending test-scoped S3 settings below.
+            grep -vE '^(AUDIT_S3_BUCKET|AUDIT_S3_BUCKET_SSM_PARAM|AUDIT_S3_PREFIX|IMAGE_URL_TTL_SECONDS|IMAGE_RETENTION_TTL_SECONDS|AWS_DEFAULT_REGION)=' .env > .env.scrubbed || true
+            mv .env.scrubbed .env
+
+            cat >> .env <<ENV_EOF
+            AUDIT_S3_BUCKET=${AuditBucket}
+            AUDIT_S3_BUCKET_SSM_PARAM=/${SsmParameterPath}/audit-s3-bucket
+            AUDIT_S3_PREFIX=${AuditPrefix}
+            AWS_DEFAULT_REGION=${AWS::Region}
+            IMAGE_URL_TTL_SECONDS=3600
+            IMAGE_RETENTION_TTL_SECONDS=$(( ${ImageRetentionDays} * 86400 ))
+            ENV_EOF
+
+            mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
+            chown -R ec2-user:ec2-user "$SERVICE_DIR"
+            cd deploy
+            GPU_MODE=on ./deploy.sh
+
+  ProxyExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "pdfx-${EnvironmentName}-proxy-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: pdfx-ssm-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SsmParameterPath}/*"
+
+  ProxyTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "pdfx-${EnvironmentName}-proxy-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pdfx-task-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EC2Lifecycle
+                Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${BackendInstance}"
+              - Sid: EC2Describe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: "*"
+              - Sid: SSMReadPdfxParams
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SsmParameterPath}/*"
+              - Sid: S3QueueListBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${AuditBucket}"
+              - Sid: S3QueueReadWriteObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub "arn:aws:s3:::${AuditBucket}/*"
+
+  SsmAwsAccountId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/aws-account-id"
+      Type: String
+      Value: !Ref AWS::AccountId
+  SsmEc2InstanceId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/ec2-instance-id"
+      Type: String
+      Value: !Ref BackendInstance
+  SsmEc2Region:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/ec2-region"
+      Type: String
+      Value: !Ref AWS::Region
+  SsmEc2Port:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/ec2-port"
+      Type: String
+      Value: !Sub "${BackendPort}"
+  SsmAuditBucket:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/audit-s3-bucket"
+      Type: String
+      Value: !Ref AuditBucket
+  SsmExecutionRoleName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/execution-role-name"
+      Type: String
+      Value: !Ref ProxyExecutionRole
+  SsmTaskRoleName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/task-role-name"
+      Type: String
+      Value: !Ref ProxyTaskRole
+  SsmCognitoUserPoolId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/cognito-user-pool-id"
+      Type: String
+      Value: !Ref CognitoUserPoolId
+  SsmCognitoRegion:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/cognito-region"
+      Type: String
+      Value: !Ref CognitoRegion
+  SsmCognitoRequiredScope:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/cognito-required-scope"
+      Type: String
+      Value: !Ref CognitoRequiredScope
+  SsmCognitoAcceptedScopes:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/cognito-accepted-scopes"
+      Type: String
+      Value: !Ref CognitoAcceptedScopes
+  SsmCognitoAcceptedClientIds:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/cognito-accepted-client-ids"
+      Type: String
+      Value: !Ref CognitoAcceptedClientIds
+  SsmIdleTimeout:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/idle-timeout-minutes"
+      Type: String
+      Value: !Ref IdleTimeoutMinutes
+  SsmStartupTimeout:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/startup-timeout-minutes"
+      Type: String
+      Value: !Ref StartupTimeoutMinutes
+  SsmMaxQueuedJobs:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/max-queued-jobs"
+      Type: String
+      Value: !Ref MaxQueuedJobs
+
+  ProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${EcsServiceName}"
+      RetentionInDays: 30
+
+  ProxyCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref EcsClusterName
+
+  ProxyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref EcsServiceName
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ProxyTaskCpu
+      Memory: !Ref ProxyTaskMemory
+      ExecutionRoleArn: !GetAtt ProxyExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProxyTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref EcsServiceName
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepositoryName}:${ProxyImageTag}"
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Environment:
+            - Name: QUEUE_BACKEND
+              Value: s3
+            - Name: QUEUE_S3_BUCKET
+              Value: !Ref AuditBucket
+            - Name: QUEUE_S3_PREFIX
+              Value: !Ref QueuePrefix
+            - Name: QUEUE_S3_REGION
+              Value: !Ref AWS::Region
+            - Name: MIN_UPTIME_MINUTES
+              Value: "20"
+            - Name: STUCK_PENDING_MINUTES
+              Value: "20"
+            - Name: RECONCILER_INTERVAL_SECONDS
+              Value: "60"
+            - Name: RECONCILER_REQUEUE_ONCE
+              Value: "false"
+            - Name: ALWAYS_ON_MODE
+              Value: !Ref AlwaysOnMode
+          Secrets:
+            - Name: EC2_INSTANCE_ID
+              ValueFrom: !Ref SsmEc2InstanceId
+            - Name: EC2_REGION
+              ValueFrom: !Ref SsmEc2Region
+            - Name: EC2_PORT
+              ValueFrom: !Ref SsmEc2Port
+            - Name: COGNITO_USER_POOL_ID
+              ValueFrom: !Ref SsmCognitoUserPoolId
+            - Name: COGNITO_REGION
+              ValueFrom: !Ref SsmCognitoRegion
+            - Name: COGNITO_REQUIRED_SCOPE
+              ValueFrom: !Ref SsmCognitoRequiredScope
+            - Name: COGNITO_ACCEPTED_SCOPES
+              ValueFrom: !Ref SsmCognitoAcceptedScopes
+            - Name: COGNITO_ACCEPTED_CLIENT_IDS
+              ValueFrom: !Ref SsmCognitoAcceptedClientIds
+            - Name: IDLE_TIMEOUT_MINUTES
+              ValueFrom: !Ref SsmIdleTimeout
+            - Name: STARTUP_TIMEOUT_MINUTES
+              ValueFrom: !Ref SsmStartupTimeout
+            - Name: MAX_QUEUED_JOBS
+              ValueFrom: !Ref SsmMaxQueuedJobs
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProxyLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: proxy
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:80/api/v1/health', timeout=3)\" || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          Essential: true
+
+  ProxyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Ref EcsServiceName
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /api/v1/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+
+  ProxyListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbHttpsListenerArn
+      Priority: !Ref ListenerRulePriority
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref DomainName
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ProxyTargetGroup
+
+  ProxyService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ProxyListenerRule
+    Properties:
+      ServiceName: !Ref EcsServiceName
+      Cluster: !Ref ProxyCluster
+      DesiredCount: !Ref ProxyDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      TaskDefinition: !Ref ProxyTaskDefinition
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref EcsSubnetIds
+          SecurityGroups:
+            - !Ref ProxySecurityGroup
+            - !Ref DefaultSecurityGroupId
+      LoadBalancers:
+        - TargetGroupArn: !Ref ProxyTargetGroup
+          ContainerName: !Ref EcsServiceName
+          ContainerPort: 80
+
+  ProxyDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PublicHostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: !Ref AlbCanonicalHostedZoneId
+        DNSName: !Ref AlbDnsName
+        EvaluateTargetHealth: true
+
+Outputs:
+  BackendInstanceId:
+    Value: !Ref BackendInstance
+  BackendPublicIp:
+    Value: !GetAtt BackendInstance.PublicIp
+  BackendPrivateIp:
+    Value: !GetAtt BackendInstance.PrivateIp
+  ProxyUrl:
+    Value: !Sub "https://${DomainName}"
+  AuditBucket:
+    Value: !Ref AuditBucket
+  SsmPrefix:
+    Value: !Sub "/${SsmParameterPath}"
+  ProxyCluster:
+    Value: !Ref ProxyCluster
+  ProxyService:
+    Value: !Ref ProxyService
+  ProxyDeployCommand:
+    Value: !Sub "cd proxy/deploy && ./deploy.sh --profile ctabone --region ${AWS::Region} --cluster ${EcsClusterName} --service ${EcsServiceName} --ssm-prefix /${SsmParameterPath}"

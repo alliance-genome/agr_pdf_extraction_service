@@ -254,6 +254,26 @@ class AlignmentTieBreakResponse(BaseModel):
     explanation: str = ""
 
 
+class ImageTextReviewResponse(BaseModel):
+    """Text-only review of one extracted image artifact."""
+
+    classification: Literal[
+        "scientific_figure",
+        "table_or_equation",
+        "publisher_logo",
+        "badge_or_ui",
+        "cover_art",
+        "decorative",
+        "unknown",
+    ]
+    is_scientific_figure: bool
+    confidence: float = 0.0
+    figure_label: str | None = None
+    figure_number: str | None = None
+    needs_vision_review: bool = False
+    reason: str = ""
+
+
 class LLM(PDFExtractor):
     def __init__(
         self,
@@ -282,6 +302,77 @@ class LLM(PDFExtractor):
         except ValueError:
             pass
         return None
+
+    def review_image_context(self, image: dict) -> ImageTextReviewResponse:
+        """Classify one extracted image using text/provenance only, not pixels."""
+        use_model = Config.IMAGE_TEXT_REVIEW_MODEL
+        use_reasoning = Config.IMAGE_TEXT_REVIEW_REASONING or self.reasoning_effort
+        payload = {
+            "filename": image.get("filename"),
+            "page_index": image.get("page_index"),
+            "marker_image_type": image.get("marker_image_type"),
+            "marker_image_index": image.get("marker_image_index"),
+            "block_id": image.get("block_id"),
+            "group_id": image.get("group_id"),
+            "bbox": image.get("bbox"),
+            "image_width": image.get("image_width"),
+            "image_height": image.get("image_height"),
+            "diagnostic_flags": image.get("diagnostic_flags") or [],
+            "alt_text": image.get("alt_text"),
+            "caption_text": image.get("caption_text"),
+            "nearby_text": image.get("nearby_text"),
+        }
+        system_msg = (
+            "You review metadata for one image artifact extracted from a scientific PDF. "
+            "You do not see the pixels. Classify whether this is an author-intended "
+            "scientific figure using only explicit text/provenance: captions, alt text, "
+            "nearby text, Marker block type, dimensions, and diagnostics. Treat publisher "
+            "logos, check-for-updates badges, UI badges, cover thumbnails, decorations, "
+            "and journal branding as not scientific figures. Do not use Marker's numeric "
+            "filename suffix as the paper's figure number. Return a figure_label and "
+            "figure_number only when they are explicitly present in the supplied text. "
+            "When present, figure_label is the full author-facing label including the "
+            "number or panel suffix, such as 'Fig. 2' or 'Figure 3A'; figure_number is "
+            "only the number or number+suffix portion, such as '2' or '3A'. "
+            "If text evidence is missing or ambiguous, prefer a conservative non-figure "
+            "or unknown classification and set needs_vision_review=true."
+        )
+
+        completion = self.client.chat.completions.parse(
+            model=use_model,
+            reasoning_effort=use_reasoning,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            response_format=ImageTextReviewResponse,
+        )
+
+        usage = completion.usage
+        self.usage.record(usage, "image_text_review", use_model)
+        if usage:
+            logger.info(
+                "LLM image text review: image=%s, model=%s, tokens=%d (prompt=%d, completion=%d)",
+                image.get("filename"),
+                use_model,
+                usage.total_tokens,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                extra={
+                    "_event": "llm_image_text_review_complete",
+                    "_llm_model": use_model,
+                    "_llm_tokens_used": usage.total_tokens,
+                    "_image_filename": image.get("filename"),
+                },
+            )
+
+        message = completion.choices[0].message
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            raise ValueError(f"Model refused image text review: {refusal}")
+        if not message.parsed:
+            raise ValueError("No parsed response from model for image text review")
+        return message.parsed
 
     def _resolve_conflict_batch(self, batch: list[dict]) -> tuple[dict[str, str], set[str]]:
         """Resolve one conflict batch, returning (resolved_map, unresolved_ids)."""

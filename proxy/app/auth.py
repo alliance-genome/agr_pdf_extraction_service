@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+DISABLED_OPTIONAL_AUTH_VALUE = "__PDFX_EMPTY__"
 
 JWKS_URL = (
     f"https://cognito-idp.{settings.COGNITO_REGION}.amazonaws.com"
@@ -20,7 +21,11 @@ ISSUER = (
 
 
 def _split_csv(value: str) -> set[str]:
-    return {item.strip() for item in (value or "").split(",") if item.strip()}
+    return {
+        item.strip()
+        for item in (value or "").split(",")
+        if item.strip() and item.strip() != DISABLED_OPTIONAL_AUTH_VALUE
+    }
 
 
 class CognitoAuth:

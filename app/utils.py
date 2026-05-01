@@ -5,6 +5,12 @@ from urllib.parse import quote
 
 from flask import current_app as app
 
+from app.image_metadata import (
+    IMAGE_MANIFEST_FILENAME,
+    list_image_directory,
+    list_manifest_images,
+)
+
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in app.config["ALLOWED_EXTENSIONS"]
@@ -41,12 +47,14 @@ def list_images(file_hash):
     images_dir = get_images_dir(file_hash)
     if not os.path.isdir(images_dir):
         return []
-    result = []
-    for f in sorted(os.listdir(images_dir)):
-        fpath = os.path.join(images_dir, f)
-        if os.path.isfile(fpath) and f.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
-            result.append({"filename": f, "size_bytes": os.path.getsize(fpath)})
-    return result
+    manifest_images = list_manifest_images(images_dir)
+    if manifest_images is not None:
+        return manifest_images
+    return list_image_directory(images_dir)
+
+
+def has_image_extraction_manifest(file_hash):
+    return os.path.exists(os.path.join(get_images_dir(file_hash), IMAGE_MANIFEST_FILENAME))
 
 
 def rewrite_image_paths(markdown, file_hash):

@@ -9,6 +9,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -442,6 +443,8 @@ async def submit_extraction(
     methods: str = Form("grobid,docling,marker"),
     merge: str = Form("true"),
     clear_cache: str = Form("false"),
+    extract_images: str = Form("false"),
+    review_images: str = Form(default=None),
     clear_cache_scope: str = Form(default=None),
     reference_curie: str = Form(default=None),
     mod_abbreviation: str = Form(default=None),
@@ -458,7 +461,10 @@ async def submit_extraction(
         "methods": methods,
         "merge": merge,
         "clear_cache": clear_cache,
+        "extract_images": extract_images,
     }
+    if review_images is not None:
+        form_fields["review_images"] = review_images
     if clear_cache_scope is not None:
         form_fields["clear_cache_scope"] = clear_cache_scope
     if reference_curie is not None:
@@ -789,7 +795,118 @@ async def download_extraction_output(
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
 
 
+@app.get("/api/v1/extract/{process_id}/images")
+async def list_extraction_images(
+    process_id: str,
+    authorization: str = Header(None),
+):
+    _require_auth(authorization)
+    lifecycle.touch()
+
+    return await _proxy_backend_json_get(
+        process_id,
+        f"/api/v1/extract/{{backend_process_id}}/images",
+        authorization=authorization,
+        error_context="image list",
+    )
+
+
+@app.get("/api/v1/extract/{process_id}/images/urls")
+async def get_extraction_image_urls(
+    process_id: str,
+    authorization: str = Header(None),
+):
+    _require_auth(authorization)
+    lifecycle.touch()
+
+    return await _proxy_backend_json_get(
+        process_id,
+        f"/api/v1/extract/{{backend_process_id}}/images/urls",
+        authorization=authorization,
+        error_context="image URL manifest",
+    )
+
+
+@app.get("/api/v1/extract/{process_id}/images/{filename}")
+async def download_extraction_image(
+    process_id: str,
+    filename: str,
+    authorization: str = Header(None),
+):
+    _require_auth(authorization)
+    lifecycle.touch()
+
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        raise HTTPException(status_code=503, detail="EC2 is not running")
+
+    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
+    image_url = (
+        f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}"
+        f"/images/{quote(filename, safe='')}"
+    )
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.FORWARD_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        ) as client:
+            if authorization:
+                try:
+                    upstream = await client.get(image_url, headers={"Authorization": authorization})
+                except TypeError:
+                    upstream = await client.get(image_url)
+            else:
+                upstream = await client.get(image_url)
+
+        response_headers = {
+            "content-type": upstream.headers.get("content-type", "application/octet-stream"),
+        }
+        content_disposition = upstream.headers.get("content-disposition")
+        if content_disposition:
+            response_headers["content-disposition"] = content_disposition
+
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=response_headers,
+        )
+    except Exception as exc:
+        logger.error("Failed to proxy image download request for %s/%s: %s", process_id, filename, exc)
+        raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
+
+
 # --- Proxy helpers ---
+
+
+async def _proxy_backend_json_get(
+    process_id: str,
+    path_template: str,
+    *,
+    authorization: str | None,
+    error_context: str,
+) -> JSONResponse:
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        raise HTTPException(status_code=503, detail="EC2 is not running")
+
+    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
+    backend_path = path_template.format(backend_process_id=backend_process_id)
+    backend_url = f"{lifecycle.ec2_base_url}{backend_path}"
+    try:
+        async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
+            if authorization:
+                try:
+                    upstream = await client.get(backend_url, headers={"Authorization": authorization})
+                except TypeError:
+                    upstream = await client.get(backend_url)
+            else:
+                upstream = await client.get(backend_url)
+
+        payload = _coerce_json_payload(upstream)
+        if isinstance(payload, dict) and backend_process_id != process_id:
+            payload["process_id"] = process_id
+        return JSONResponse(status_code=upstream.status_code, content=payload)
+    except Exception as exc:
+        logger.error("Failed to proxy %s request for %s: %s", error_context, process_id, exc)
+        raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
 
 
 def _coerce_json_payload(resp: httpx.Response) -> dict[str, Any]:

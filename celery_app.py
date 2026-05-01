@@ -11,6 +11,16 @@ from celery.signals import setup_logging as celery_setup_logging, worker_process
 from sqlalchemy.exc import IntegrityError
 
 from config import Config
+from app.error_utils import summarize_error_message
+from app.image_metadata import (
+    IMAGE_MANIFEST_FILENAME,
+    apply_text_image_review,
+    copy_image_metadata,
+    list_image_directory,
+    list_manifest_images,
+    strip_text_image_review,
+    write_image_manifest,
+)
 from app.models import ExtractionRun, get_session
 from app.services.audit_logger import AuditLogger
 from app.logging_config import setup_logging, MergingLoggerAdapter
@@ -144,12 +154,14 @@ def _list_images(file_hash):
     images_dir = _get_images_dir(file_hash)
     if not os.path.isdir(images_dir):
         return []
-    result = []
-    for f in sorted(os.listdir(images_dir)):
-        fpath = os.path.join(images_dir, f)
-        if os.path.isfile(fpath) and f.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
-            result.append({"filename": f, "size_bytes": os.path.getsize(fpath)})
-    return result
+    manifest_images = list_manifest_images(images_dir)
+    if manifest_images is not None:
+        return manifest_images
+    return list_image_directory(images_dir)
+
+
+def _has_image_extraction_manifest(file_hash):
+    return os.path.exists(os.path.join(_get_images_dir(file_hash), IMAGE_MANIFEST_FILENAME))
 
 
 def _rewrite_image_paths(markdown, file_hash):
@@ -170,6 +182,14 @@ def _rewrite_image_paths(markdown, file_hash):
 
 def _is_cached(file_hash, method):
     return os.path.exists(_cached_path(file_hash, method))
+
+
+def _is_extractor_cached(file_hash, method, extract_images=False):
+    if not _is_cached(file_hash, method):
+        return False
+    if method == "marker" and extract_images:
+        return _has_image_extraction_manifest(file_hash)
+    return True
 
 
 VALID_CACHE_CLEAR_SCOPES = {"none", "merge", "extraction", "all"}
@@ -286,6 +306,8 @@ def _upsert_extraction_run(
     source_pdf_md5=None,
     source_referencefile_id=None,
     config_version=None,
+    extract_images=None,
+    review_images=None,
     status=None,
     started_at=None,
     ended_at=None,
@@ -315,6 +337,10 @@ def _upsert_extraction_run(
         run.source_referencefile_id = source_referencefile_id
     if config_version is not None:
         run.config_version = config_version
+    if extract_images is not None:
+        run.extract_images = bool(extract_images)
+    if review_images is not None:
+        run.review_images = bool(review_images)
     if status is not None:
         run.status = status
     if started_at is not None:
@@ -448,13 +474,23 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
 
             try:
                 with open(image_path, "rb") as f:
-                    key = audit_logger.upload_artifact(filename, f.read(), subdir="images")
+                    key = audit_logger.upload_artifact(
+                        filename,
+                        f.read(),
+                        subdir="images",
+                        tags={
+                            "pdfx-artifact-type": "extracted-image",
+                            "pdfx-retention": "temporary",
+                            "pdfx-retention-ttl-seconds": Config.IMAGE_RETENTION_TTL_SECONDS,
+                        },
+                    )
                 if key:
-                    images.append({
+                    image_artifact = {
                         "filename": filename,
                         "s3_key": key,
                         "size_bytes": image.get("size_bytes"),
-                    })
+                    }
+                    images.append(copy_image_metadata(image, image_artifact))
             except Exception as exc:
                 logger.warning("Failed to upload image artifact %s: %s", filename, exc)
 
@@ -462,6 +498,67 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
         artifacts["images"] = images
 
     return artifacts
+
+
+def _build_llm(model=None, reasoning_effort=None):
+    from app.services.llm_service import LLM
+
+    return LLM(
+        api_key=Config.OPENAI_API_KEY,
+        model=model or Config.LLM_MODEL_ZONE_RESOLUTION,
+        reasoning_effort=reasoning_effort or Config.LLM_REASONING_EFFORT,
+        conflict_batch_size=Config.LLM_CONFLICT_BATCH_SIZE,
+        conflict_max_workers=Config.LLM_CONFLICT_MAX_WORKERS,
+        conflict_retry_rounds=Config.LLM_CONFLICT_RETRY_ROUNDS,
+    )
+
+
+def _review_images_with_text_context(images, llm, log=None):
+    """Apply optional text-only LLM review to image manifest entries."""
+    reviewed_images = []
+    log = log or logger
+    for image in images:
+        reviewed = dict(image)
+        try:
+            response = llm.review_image_context(reviewed)
+            if hasattr(response, "model_dump"):
+                review_payload = response.model_dump()
+            else:
+                review_payload = response.dict()
+            reviewed = apply_text_image_review(
+                reviewed,
+                review_payload,
+                model=Config.IMAGE_TEXT_REVIEW_MODEL,
+            )
+        except Exception as exc:
+            reviewed["image_reviewed"] = False
+            reviewed["image_review_method"] = "llm_text"
+            reviewed["image_review_model"] = Config.IMAGE_TEXT_REVIEW_MODEL
+            reviewed["image_review_error"] = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "Image text review failed for %s: %s",
+                reviewed.get("filename"),
+                exc,
+                extra={
+                    "_event": "image_text_review_failed",
+                    "_image_filename": reviewed.get("filename"),
+                    "_error_code": type(exc).__name__,
+                },
+            )
+        reviewed_images.append(reviewed)
+    return reviewed_images
+
+
+def _resolve_image_review_flags(extract_images=False, review_images=None):
+    """Resolve image extraction/review flags for API and direct Celery callers."""
+    extract_images = bool(extract_images)
+    if review_images is None:
+        review_images = extract_images
+    else:
+        review_images = bool(review_images)
+        if review_images:
+            extract_images = True
+    return extract_images, review_images
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +573,8 @@ def extract_pdf(
     merge=False,
     clear_cache=False,
     clear_cache_scope="none",
+    extract_images=False,
+    review_images=None,
     process_id=None,
     reference_curie=None,
     mod_abbreviation=None,
@@ -490,11 +589,15 @@ def extract_pdf(
         merge: Whether to run the LLM merge step after extraction.
         clear_cache: Legacy boolean full-clear flag (backward compatible).
         clear_cache_scope: Scoped cache clear mode: none|merge|extraction|all.
+        extract_images: Whether Marker should extract figure images.
+        review_images: Whether to classify extracted image entries using nearby text.
+                       Defaults to extract_images when omitted.
 
     Returns:
         dict with status, file_hash, per-method outputs, and optional merged output.
     """
     process_id = str(process_id or uuid.uuid4())
+    extract_images, review_images = _resolve_image_review_flags(extract_images, review_images)
     file_hash = None
     db_session = _get_db_session()
     audit_logger = None
@@ -565,8 +668,8 @@ def extract_pdf(
     _safe_log_event(audit_logger, "run", "queued", detail="Task accepted")
 
     adapter.info(
-        "Job accepted: methods=%s, merge=%s",
-        methods, merge,
+        "Job accepted: methods=%s, merge=%s, extract_images=%s, review_images=%s",
+        methods, merge, extract_images, review_images,
         extra={
             "_event": "job_accepted",
             "_stage": "init",
@@ -587,6 +690,8 @@ def extract_pdf(
             source_pdf_md5=file_hash,
             source_referencefile_id=source_referencefile_id,
             config_version=Config.EXTRACTION_CONFIG_VERSION,
+            extract_images=extract_images,
+            review_images=review_images,
             status="running",
             started_at=started_at,
         )
@@ -609,6 +714,8 @@ def extract_pdf(
             audit_logger=audit_logger,
             adapter=adapter,
             run_log_path=run_log_path if run_log_handler else None,
+            extract_images=extract_images,
+            review_images=review_images,
             _shared=_shared,
         )
 
@@ -650,18 +757,19 @@ def extract_pdf(
 
     except Exception as exc:
         total_duration = round(time.monotonic() - total_start, 3)
+        error_message = summarize_error_message(exc)
         _safe_log_event(
             audit_logger,
             "finalize",
             "failed",
             error_code=exc.__class__.__name__,
-            detail=str(exc),
+            detail=error_message,
             total_duration_s=total_duration,
         )
 
         error_code = "timeout" if "SoftTimeLimitExceeded" in type(exc).__name__ else type(exc).__name__
         adapter.error(
-            "Job failed: %s", exc,
+            "Job failed: %s", error_message,
             extra={
                 "_event": "job_failed",
                 "_error_code": error_code,
@@ -688,7 +796,7 @@ def extract_pdf(
                 status="failed",
                 ended_at=_now_utc(),
                 error_code=exc.__class__.__name__,
-                error_message=str(exc),
+                error_message=error_message,
                 log_s3_key=audit_logger.get_log_s3_key() if audit_logger else None,
                 llm_usage_json=fail_llm_usage,
                 llm_cost_usd=fail_llm_cost,
@@ -724,7 +832,7 @@ def extract_pdf(
             os.remove(pdf_path)
 
 
-def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, adapter=None):
+def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, adapter=None, extract_images=False):
     """Run one extractor and return (method, output_text, cached_flag).
 
     This is a standalone function so it can be dispatched to a ThreadPoolExecutor.
@@ -735,7 +843,9 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
     output_path = _cached_path(file_hash, method)
     stage = f"extract_{method}"
 
-    if _is_cached(file_hash, method):
+    extract_images = bool(extract_images)
+
+    if _is_extractor_cached(file_hash, method, extract_images=extract_images):
         _safe_log_event(audit_logger, stage, "cache_hit", detail=f"Using cached {method} output")
         log.info(
             "Cache hit for %s", method,
@@ -768,7 +878,7 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
             from app.services.marker_service import Marker
             extractor = Marker(
                 device=config.MARKER_DEVICE,
-                extract_images=config.MARKER_EXTRACT_IMAGES,
+                extract_images=extract_images,
             )
         else:
             raise ValueError(f"Unknown extraction method: {method}")
@@ -793,13 +903,14 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
         )
     except Exception as exc:
         duration_s = round(time.monotonic() - started, 3)
+        error_message = summarize_error_message(exc)
         _safe_log_event(
             audit_logger, stage, "failed",
-            detail=str(exc),
+            detail=error_message,
             duration_s=duration_s,
         )
         log.error(
-            "%s extraction failed: %s", method, exc,
+            "%s extraction failed: %s", method, error_message,
             extra={
                 "_event": "extractor_complete",
                 "_extractor": method,
@@ -814,12 +925,23 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
         return method, f.read(), False
 
 
-def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger=None, adapter=None, run_log_path=None, _shared=None):
+def _run_extraction(
+    self,
+    pdf_path,
+    methods,
+    merge,
+    file_hash=None,
+    audit_logger=None,
+    adapter=None,
+    run_log_path=None,
+    extract_images=False,
+    review_images=None,
+    _shared=None,
+):
     """Inner extraction logic, separated so caller can wrap with finally."""
 
-    from app.services.llm_service import LLM
-
     log = adapter or logger
+    extract_images, review_images = _resolve_image_review_flags(extract_images, review_images)
 
     if file_hash is None:
         file_hash = _get_file_hash(pdf_path)
@@ -829,11 +951,20 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
     cached_methods = []
 
     # --- Stage tracking for granular progress reporting -----------------------
-    all_stages = ["initializing"] + list(methods) + (["llm_merge"] if merge else []) + ["finalizing"]
+    all_stages = (
+        ["initializing"]
+        + list(methods)
+        + (["llm_merge"] if merge else [])
+        + (["image_review"] if review_images else [])
+        + ["finalizing"]
+    )
     completed_stages = []
 
     # Determine parallel execution strategy
-    non_cached = [m for m in methods if not _is_cached(file_hash, m)]
+    non_cached = [
+        m for m in methods
+        if not _is_extractor_cached(file_hash, m, extract_images=extract_images)
+    ]
     has_grobid_work = "grobid" in non_cached
     cpu_methods = [m for m in non_cached if m != "grobid"]
     use_parallel = has_grobid_work and len(cpu_methods) > 0
@@ -866,7 +997,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
         errors = []
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="grobid") as pool:
             grobid_future = pool.submit(
-                _run_single_extractor, "grobid", pdf_path, file_hash, Config, audit_logger, adapter,
+                _run_single_extractor, "grobid", pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
             )
 
             # Run CPU extractors sequentially in the main thread
@@ -874,7 +1005,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                 try:
                     _emit_progress(method, f"Running {method.upper()} extraction")
                     m, text, was_cached = _run_single_extractor(
-                        method, pdf_path, file_hash, Config, audit_logger, adapter,
+                        method, pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
                     )
                     extractions[m] = text
                     methods_used.append(m)
@@ -897,9 +1028,9 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
 
         # Also pick up any cached-only methods not in non_cached
         for method in methods:
-            if method not in methods_used and _is_cached(file_hash, method):
+            if method not in methods_used and _is_extractor_cached(file_hash, method, extract_images=extract_images):
                 m, text, _ = _run_single_extractor(
-                    method, pdf_path, file_hash, Config, audit_logger, adapter,
+                    method, pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
                 )
                 extractions[m] = text
                 methods_used.append(m)
@@ -914,7 +1045,7 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
         for method in methods:
             _emit_progress(method, f"Running {method.upper()} extraction")
             m, text, was_cached = _run_single_extractor(
-                method, pdf_path, file_hash, Config, audit_logger, adapter,
+                method, pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
             )
             extractions[m] = text
             methods_used.append(m)
@@ -955,13 +1086,9 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
         else:
             _emit_progress("llm_merge", "Merging extraction outputs with LLM")
 
-            llm = LLM(
-                api_key=Config.OPENAI_API_KEY,
+            llm = _build_llm(
                 model=Config.LLM_MODEL_ZONE_RESOLUTION,
                 reasoning_effort=Config.LLM_REASONING_EFFORT,
-                conflict_batch_size=Config.LLM_CONFLICT_BATCH_SIZE,
-                conflict_max_workers=Config.LLM_CONFLICT_MAX_WORKERS,
-                conflict_retry_rounds=Config.LLM_CONFLICT_RETRY_ROUNDS,
             )
             if _shared is not None:
                 _shared["llm"] = llm
@@ -1035,6 +1162,44 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
                 )
                 raise
 
+    # --- Optional text-only image review -------------------------------------
+
+    images = _list_images(file_hash) if extract_images else []
+    if review_images:
+        stage = "image_review"
+        if not images:
+            _safe_log_event(audit_logger, stage, "skipped", detail="No extracted images to review")
+            completed_stages.append("image_review")
+        else:
+            if not Config.OPENAI_API_KEY:
+                raise ValueError("review_images=true but OPENAI_API_KEY is not set")
+            if llm is None:
+                llm = _build_llm(
+                    model=Config.IMAGE_TEXT_REVIEW_MODEL,
+                    reasoning_effort=Config.IMAGE_TEXT_REVIEW_REASONING,
+                )
+                if _shared is not None:
+                    _shared["llm"] = llm
+
+            _emit_progress("image_review", "Reviewing extracted image context with LLM")
+            started = time.monotonic()
+            _safe_log_event(audit_logger, stage, "started", image_count=len(images))
+            images = _review_images_with_text_context(images, llm, log=log)
+            try:
+                write_image_manifest(_get_images_dir(file_hash), images)
+            except Exception as exc:
+                log.warning("Failed to update image manifest after text review: %s", exc)
+            _safe_log_event(
+                audit_logger,
+                stage,
+                "completed",
+                duration_s=round(time.monotonic() - started, 3),
+                image_count=len(images),
+            )
+            completed_stages.append("image_review")
+    elif images:
+        images = [strip_text_image_review(image) for image in images]
+
     # --- Compute LLM cost tracking -------------------------------------------
     llm_cost_usd = None
     llm_usage_json = None
@@ -1059,11 +1224,10 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
     # Rewrite image paths in merged output preview at response time
     merged_preview = merged_md
     if merged_preview:
-        merged_preview = _rewrite_image_paths(merged_preview, file_hash)
+        if extract_images:
+            merged_preview = _rewrite_image_paths(merged_preview, file_hash)
         if len(merged_preview) > 1000:
             merged_preview = merged_preview[:1000] + "..."
-
-    images = _list_images(file_hash)
 
     _emit_progress("finalizing", "Uploading artifacts and finalizing")
 
@@ -1078,6 +1242,8 @@ def _run_extraction(self, pdf_path, methods, merge, file_hash=None, audit_logger
         "merged_cache_path": merged_cache_path,
         "download_paths": {m: _cached_path(file_hash, m) for m in methods_used},
         "run_log_path": run_log_path,
+        "extract_images": extract_images,
+        "review_images": review_images,
         "images": images,
         "has_images": bool(images),
     }

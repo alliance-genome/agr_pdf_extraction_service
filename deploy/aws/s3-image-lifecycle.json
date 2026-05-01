@@ -1,0 +1,28 @@
+{
+  "Rules": [
+    {
+      "ID": "pdfx-expire-extracted-images",
+      "Status": "Enabled",
+      "Filter": {
+        "And": {
+          "Tags": [
+            {
+              "Key": "pdfx-artifact-type",
+              "Value": "extracted-image"
+            },
+            {
+              "Key": "pdfx-retention",
+              "Value": "temporary"
+            }
+          ]
+        }
+      },
+      "Expiration": {
+        "Days": 7
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 7
+      }
+    }
+  ]
+}

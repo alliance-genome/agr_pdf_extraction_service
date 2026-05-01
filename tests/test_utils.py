@@ -5,7 +5,7 @@ from flask import Flask
 
 from app.utils import (
     allowed_file, get_file_hash, get_cached_path, is_extraction_cached,
-    get_images_dir, list_images, rewrite_image_paths,
+    get_images_dir, has_image_extraction_manifest, list_images, rewrite_image_paths,
 )
 
 @pytest.fixture
@@ -96,6 +96,75 @@ def test_list_images_with_images(app_context):
     assert all("size_bytes" in r for r in result)
 
 
+def test_list_images_uses_manifest_metadata(app_context):
+    file_hash = "manifestimages"
+    images_dir = get_images_dir(file_hash)
+    os.makedirs(images_dir, exist_ok=True)
+
+    with open(os.path.join(images_dir, "_page_1_Figure_3.jpeg"), "wb") as f:
+        f.write(b"\x89PNG")
+    with open(os.path.join(images_dir, ".pdfx-images.json"), "w", encoding="utf-8") as f:
+        f.write(
+            '{"images":[{"filename":"_page_1_Figure_3.jpeg",'
+            '"figure_label":"Figure 2","figure_number":"2","alt_text":"Figure 2"}]}'
+        )
+
+    result = list_images(file_hash)
+    assert len(result) == 1
+    expected = {
+        "filename": "_page_1_Figure_3.jpeg",
+        "size_bytes": 4,
+        "page_index": 1,
+        "marker_image_type": "Figure",
+        "marker_image_index": 3,
+        "block_id": None,
+        "group_id": None,
+        "bbox": None,
+        "polygon": None,
+        "image_width": None,
+        "image_height": None,
+        "is_likely_figure": True,
+        "diagnostic_flags": ["no_caption"],
+        "alt_text": "Figure 2",
+        "caption_text": None,
+        "figure_label": "Figure 2",
+        "figure_number": "2",
+    }
+    for key, value in expected.items():
+        assert result[0][key] == value
+    assert result[0]["figure_decision_source"] == "heuristic"
+    assert result[0]["heuristic_is_likely_figure"] is True
+
+
+def test_list_images_supports_legacy_manifest_strings(app_context):
+    file_hash = "legacymanifest"
+    images_dir = get_images_dir(file_hash)
+    os.makedirs(images_dir, exist_ok=True)
+
+    with open(os.path.join(images_dir, "_page_0_Picture_1.jpeg"), "wb") as f:
+        f.write(b"\x89PNG")
+    with open(os.path.join(images_dir, ".pdfx-images.json"), "w", encoding="utf-8") as f:
+        f.write('{"images":["_page_0_Picture_1.jpeg"]}')
+
+    result = list_images(file_hash)
+    assert result[0]["filename"] == "_page_0_Picture_1.jpeg"
+    assert result[0]["marker_image_type"] == "Picture"
+    assert result[0]["figure_number"] is None
+
+
+def test_list_images_honors_empty_manifest(app_context):
+    file_hash = "emptymanifest"
+    images_dir = get_images_dir(file_hash)
+    os.makedirs(images_dir, exist_ok=True)
+
+    with open(os.path.join(images_dir, "stale.png"), "wb") as f:
+        f.write(b"\x89PNG")
+    with open(os.path.join(images_dir, ".pdfx-images.json"), "w", encoding="utf-8") as f:
+        f.write('{"images":[]}')
+
+    assert list_images(file_hash) == []
+
+
 def test_list_images_filters_non_images(app_context):
     """Non-image files (.txt, .md) should be excluded."""
     file_hash = "filtertest"
@@ -112,6 +181,19 @@ def test_list_images_filters_non_images(app_context):
     result = list_images(file_hash)
     assert len(result) == 1
     assert result[0]["filename"] == "figure.png"
+
+
+def test_has_image_extraction_manifest(app_context):
+    file_hash = "manifesttest"
+    images_dir = get_images_dir(file_hash)
+    os.makedirs(images_dir, exist_ok=True)
+
+    assert has_image_extraction_manifest(file_hash) is False
+
+    with open(os.path.join(images_dir, ".pdfx-images.json"), "w", encoding="utf-8") as f:
+        f.write('{"images":[]}')
+
+    assert has_image_extraction_manifest(file_hash) is True
 
 
 def test_rewrite_image_paths_rewrites_existing(app_context):

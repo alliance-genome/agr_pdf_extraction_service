@@ -206,7 +206,7 @@ The proxy is deployed as an ECS Fargate service behind an ALB.
 - ECR repository for the proxy image
 - ECS cluster with Fargate capacity
 - Cognito user pool with a resource server and `pdfx-api/extract` scope
-- SSM parameters under `/pdfx/*` for configuration values
+- SSM parameters under the target environment prefix (`/pdfx/*` for prod)
 - IAM roles: execution role (ECR pull + SSM read + CloudWatch Logs) and task role (EC2 start/stop/describe + SSM read)
 
 ### Build and Deploy
@@ -220,7 +220,7 @@ docker build -t agr_pdfx_proxy .
 docker tag agr_pdfx_proxy:latest <account>.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_proxy:latest
 docker push <account>.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_proxy:latest
 
-# Register the ECS task definition and roll ECS service (reads SSM parameters automatically)
+# Register the ECS task definition and roll ECS service (reads /pdfx SSM parameters automatically)
 cd deploy
 ./deploy.sh --profile <profile>
 
@@ -234,6 +234,27 @@ cd deploy
 ./deploy.sh --profile <profile> --no-update-service
 ```
 
+### Deploying to a non-prod mirror
+
+For a test mirror with separate SSM parameters and ECS resources, pass the
+environment-specific names explicitly:
+
+```bash
+cd proxy/deploy
+./deploy.sh \
+  --profile ctabone \
+  --region us-east-1 \
+  --cluster pdfx-proxy-test \
+  --service pdfx-proxy-test \
+  --ssm-prefix /pdfx-test \
+  --image-tag <image-tag>
+```
+
+By default the task family, container name, log group, and queue prefix follow
+`--service`. Override them with `--task-family`, `--container-name`,
+`--log-group`, or `--queue-prefix` only when the ECS service was provisioned
+with different names.
+
 ### GitHub Actions auto-deploy
 
 The repo-level workflow at `.github/workflows/main-build-and-deploy.yml`
@@ -241,8 +262,8 @@ automates the manual steps above when a PR is merged into `main`.
 
 - Trigger: `pull_request.closed` on `main`, guarded by `github.event.pull_request.merged == true`
 - Escape hatch: add the `no-deploy` label to the PR to skip the deployment job
-- Target: a single `prod` environment (there is no separate dev or stage
-  PDFX environment today; a future ticket covers adding a stage environment)
+- Target: a single `prod` environment. The `pdfx-test` mirror is deployed
+  manually so production releases remain approval-gated and single-purpose.
 - Approval gate: the `deploy-prod` job is attached to the GitHub Actions
   `prod` environment, so required reviewers can block production rollout
   until explicitly approved
@@ -275,20 +296,21 @@ out to prod — if ECS rollout fails, `:latest` does not move.
 The assumed AWS role needs enough access to:
 
 - authenticate to and push images into the `agr_pdfx_proxy` ECR repository
-- read `/pdfx/*` from SSM Parameter Store
+- read the target SSM prefix from Parameter Store (`/pdfx/*` for prod)
 - register ECS task definitions and update the `pdfx-proxy` ECS service
 - pass the ECS execution and task roles referenced by the task definition
 
 If you want `deploy.sh` to auto-create the optional
-`/pdfx/cognito-accepted-scopes` and `/pdfx/cognito-accepted-client-ids`
-placeholders when missing, also grant `ssm:PutParameter` on `/pdfx/*`.
+`/<ssm-prefix>/cognito-accepted-scopes` and
+`/<ssm-prefix>/cognito-accepted-client-ids` placeholders when missing, also
+grant `ssm:PutParameter` on the selected prefix.
 
 ### IAM Permissions (Task Role)
 
 The task role needs:
 - `ec2:StartInstances` / `ec2:StopInstances` — scoped to the managed instance
 - `ec2:DescribeInstances` — for state polling
-- `ssm:GetParameters` — scoped to `/pdfx/*`
+- `ssm:GetParameters` — scoped to the selected SSM prefix
 
 See `deploy/iam-policy.template.json` for the full policy.
 
@@ -363,12 +385,13 @@ only the authorization check (scope vs. client_id) is relaxed.
 ### Provisioning per environment
 
 Both settings are injected into the ECS task via the task definition's
-`secrets` block, sourced from these SSM parameters:
+`secrets` block, sourced from these SSM parameters in the selected
+environment prefix:
 
 | SSM parameter | Maps to env var |
 |---------------|-----------------|
-| `/pdfx/cognito-accepted-scopes` | `COGNITO_ACCEPTED_SCOPES` |
-| `/pdfx/cognito-accepted-client-ids` | `COGNITO_ACCEPTED_CLIENT_IDS` |
+| `/<ssm-prefix>/cognito-accepted-scopes` | `COGNITO_ACCEPTED_SCOPES` |
+| `/<ssm-prefix>/cognito-accepted-client-ids` | `COGNITO_ACCEPTED_CLIENT_IDS` |
 
 `deploy.sh` ensures both parameters exist before registering the task
 definition: if either is missing it creates a String parameter with a
@@ -376,9 +399,9 @@ single-space placeholder (SSM does not allow empty String values; the
 proxy's config layer `.strip()`s the placeholder back to `""`, leaving
 the allow-list inactive). Existing values are never overwritten.
 
-This means the operator running `deploy.sh` needs `ssm:PutParameter` on
-`/pdfx/*` in addition to `ssm:GetParameter` (the ECS task execution role
-only needs `ssm:GetParameters`, which is already granted by
+This means the operator running `deploy.sh` needs `ssm:PutParameter` on the
+selected SSM prefix in addition to `ssm:GetParameter` (the ECS task execution
+role only needs `ssm:GetParameters`, which is already granted by
 `iam-policy.template.json`).
 
 To enable shared M2M access, populate the parameter and redeploy:
@@ -392,6 +415,9 @@ aws ssm put-parameter \
 
 cd proxy/deploy && ./deploy.sh --profile <profile>
 ```
+
+Use `/pdfx-test/cognito-accepted-client-ids` and
+`./deploy.sh --ssm-prefix /pdfx-test ...` for the test mirror.
 
 ## Operational Fallbacks
 

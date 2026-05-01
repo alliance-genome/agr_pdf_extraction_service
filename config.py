@@ -27,6 +27,8 @@ class Config:
     AUDIT_S3_BUCKET = os.environ.get("AUDIT_S3_BUCKET", "")
     AUDIT_S3_PREFIX = os.environ.get("AUDIT_S3_PREFIX", "pdfx/audit")
     AUDIT_S3_BUCKET_SSM_PARAM = os.environ.get("AUDIT_S3_BUCKET_SSM_PARAM", "/pdfx/audit-s3-bucket")
+    IMAGE_URL_TTL_SECONDS = int(os.environ.get("IMAGE_URL_TTL_SECONDS", 3600))
+    IMAGE_RETENTION_TTL_SECONDS = int(os.environ.get("IMAGE_RETENTION_TTL_SECONDS", 7 * 24 * 60 * 60))
     AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
     # ---- GROBID --------------------------------------------------------------
@@ -40,7 +42,6 @@ class Config:
 
     # ---- Marker --------------------------------------------------------------
     MARKER_DEVICE = os.environ.get("MARKER_DEVICE", "cpu")
-    MARKER_EXTRACT_IMAGES = os.environ.get("MARKER_EXTRACT_IMAGES", "true").lower() == "true"
 
     # ---- LLM (merge) ---------------------------------------------------------
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -61,6 +62,8 @@ class Config:
     LLM_REASONING_NUMERIC_RESCUE = os.environ.get("LLM_REASONING_NUMERIC_RESCUE", "medium")
     LLM_MODEL_CONFLICT_BATCH = os.environ.get("LLM_MODEL_CONFLICT_BATCH", "gpt-5.4-mini")
     LLM_REASONING_CONFLICT_BATCH = os.environ.get("LLM_REASONING_CONFLICT_BATCH", "medium")
+    IMAGE_TEXT_REVIEW_MODEL = os.environ.get("IMAGE_TEXT_REVIEW_MODEL", "gpt-5.4-mini")
+    IMAGE_TEXT_REVIEW_REASONING = os.environ.get("IMAGE_TEXT_REVIEW_REASONING", "medium")
 
     # ---- LLM pricing (USD per 1M tokens) ------------------------------------
     LLM_PRICING = {

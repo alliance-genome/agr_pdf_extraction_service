@@ -1,6 +1,32 @@
-# AWS OOM Alerts (IaC)
+# AWS Infrastructure
 
-This folder provides a parameterized, redeployable OOM alerting setup for the PDF extraction service.
+This folder contains AWS infrastructure for the PDF extraction service.
+
+## Test Mirror
+
+`pdfx-test-mirror-stack.yaml` creates a production-shaped test environment:
+GPU EC2 backend, Fargate proxy, S3 audit bucket, environment-scoped SSM
+parameters, ALB routing, and DNS.
+
+Start with the runbook in `deploy/aws/pdfx-test-mirror.md`.
+
+The proxy deployer supports this environment with:
+
+```bash
+cd proxy/deploy
+./deploy.sh \
+  --profile ctabone \
+  --region us-east-1 \
+  --cluster pdfx-proxy-test \
+  --service pdfx-proxy-test \
+  --ssm-prefix /pdfx-test \
+  --image-tag <image-tag>
+```
+
+## AWS OOM Alerts (IaC)
+
+This folder also provides a parameterized, redeployable OOM alerting setup for
+the PDF extraction service.
 
 ## What It Creates
 

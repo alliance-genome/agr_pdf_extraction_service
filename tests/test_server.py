@@ -20,7 +20,6 @@ def client():
     app.config['GROBID_INCLUDE_RAW_CITATIONS'] = False
     app.config['DOCLING_DEVICE'] = "cpu"
     app.config['MARKER_DEVICE'] = "cpu"
-    app.config['MARKER_EXTRACT_IMAGES'] = True
     app.config['CONSENSUS_ENABLED'] = True
     app.config['CONSENSUS_NEAR_THRESHOLD'] = 0.92
     app.config['CONSENSUS_LEVENSHTEIN_THRESHOLD'] = 0.90
@@ -129,6 +128,33 @@ def test_process_pdf_merge(
     response = client.post('/process', data=data, content_type='multipart/form-data')
     assert response.status_code == 200
     assert b'merged output' in response.data
+
+
+@patch('app.server.Marker')
+@patch('app.server.get_file_hash', return_value='dummyhash')
+@patch('app.server.get_cached_path', side_effect=lambda h, m: os.path.join(tempfile.gettempdir(), f"v1_{h}_{m}.md"))
+@patch('app.server.is_extraction_cached', return_value=False)
+@patch('app.server.list_images', return_value=[{"filename": "fig1.png", "size_bytes": 5}])
+def test_process_pdf_extract_images_opt_in(
+    mock_list_images, mock_is_cached, mock_get_cached_path, mock_get_file_hash,
+    mock_marker, client
+):
+    marker_instance = MagicMock()
+    marker_instance.extract.side_effect = lambda pdf, out: open(out, 'w').write("marker output")
+    mock_marker.return_value = marker_instance
+
+    data = {
+        'file': (io.BytesIO(b'%PDF-1.4'), 'test.pdf'),
+        'methods': ['marker'],
+        'merge': 'false',
+        'extract_images': 'on',
+    }
+    response = client.post('/process', data=data, content_type='multipart/form-data')
+    assert response.status_code == 200
+    json_data = response.get_json()
+    assert json_data["has_images"] is True
+    assert json_data["images"][0]["filename"] == "fig1.png"
+    mock_marker.assert_called_once_with(device="cpu", extract_images=True)
 
 def test_download_extraction_invalid_method(client):
     response = client.get('/download/dummyhash/invalid')

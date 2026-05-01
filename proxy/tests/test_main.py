@@ -112,13 +112,20 @@ class TestExtractEndpoint:
             "/api/v1/extract",
             headers={"Authorization": "Bearer test"},
             files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
-            data={"methods": "grobid,docling,marker", "merge": "true"},
+            data={
+                "methods": "grobid,docling,marker",
+                "merge": "true",
+                "extract_images": "true",
+            },
         )
         assert resp.status_code == 202
         data = resp.json()
         assert "process_id" in data
         assert data["state"] == "stopped"
         assert data["progress"]["stage"] == "ec2_starting"
+        queued_job = next(iter(main_mod.job_payload_cache.values()))
+        assert queued_job.form_fields["extract_images"] == "true"
+        assert "review_images" not in queued_job.form_fields
         main_mod.lifecycle.ensure_running.assert_called()
 
     def test_extract_requires_auth(self, client, monkeypatch):
@@ -205,6 +212,65 @@ class TestExtractEndpoint:
         assert resp.status_code == 429
         assert main_mod.job_payload_cache == {}
         assert main_mod.job_trackers == {}
+
+    def test_extract_forwards_image_flags_when_ready(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.READY
+
+        captured = {"form_fields": None}
+
+        async def _forward_capture(_process_id, _pdf_data, _filename, form_fields, **_kwargs):
+            captured["form_fields"] = form_fields
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=202, content={"process_id": "backend-1", "status": "queued"})
+
+        monkeypatch.setattr(main_mod, "_forward_extraction", _forward_capture)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
+            data={
+                "methods": "marker",
+                "merge": "false",
+                "extract_images": "true",
+            },
+        )
+
+        assert resp.status_code == 202
+        assert captured["form_fields"]["extract_images"] == "true"
+        assert "review_images" not in captured["form_fields"]
+
+    def test_extract_forwards_explicit_review_images_false_when_ready(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.READY
+
+        captured = {"form_fields": None}
+
+        async def _forward_capture(_process_id, _pdf_data, _filename, form_fields, **_kwargs):
+            captured["form_fields"] = form_fields
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=202, content={"process_id": "backend-1", "status": "queued"})
+
+        monkeypatch.setattr(main_mod, "_forward_extraction", _forward_capture)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
+            data={
+                "methods": "marker",
+                "merge": "false",
+                "extract_images": "true",
+                "review_images": "false",
+            },
+        )
+
+        assert resp.status_code == 202
+        assert captured["form_fields"]["extract_images"] == "true"
+        assert captured["form_fields"]["review_images"] == "false"
 
 
 class TestExtractStatusEndpoint:
@@ -398,6 +464,137 @@ class TestExtractDownloadEndpoint:
         )
         assert resp.status_code == 200
         assert captured["url"].endswith("/api/v1/extract/backend-dl-9/download/merged")
+
+
+class TestExtractImageEndpoints:
+    def test_image_urls_use_mapped_backend_process_id(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.proxy_to_backend_process["proxy-img-1"] = "backend-img-9"
+
+        captured = {"url": None}
+
+        class _DummyResponse:
+            status_code = 200
+            content = b'{"process_id":"backend-img-9","images":[{"filename":"fig1.png"}]}'
+            headers = {"content-type": "application/json"}
+
+            def json(self):
+                return {"process_id": "backend-img-9", "images": [{"filename": "fig1.png"}]}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                captured["url"] = url
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            "/api/v1/extract/proxy-img-1/images/urls",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["url"].endswith("/api/v1/extract/backend-img-9/images/urls")
+        assert resp.json()["process_id"] == "proxy-img-1"
+        assert resp.json()["images"][0]["filename"] == "fig1.png"
+
+    def test_image_list_proxies_json(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+
+        captured = {"url": None}
+
+        class _DummyResponse:
+            status_code = 200
+            content = b'{"process_id":"proc-1","images":[]}'
+            headers = {"content-type": "application/json"}
+
+            def json(self):
+                return {"process_id": "proc-1", "images": []}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                captured["url"] = url
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            "/api/v1/extract/proc-1/images",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["url"].endswith("/api/v1/extract/proc-1/images")
+        assert resp.json()["images"] == []
+
+    def test_image_download_proxies_binary_content(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.proxy_to_backend_process["proxy-img-dl-1"] = "backend-img-dl-9"
+
+        captured = {"url": None, "follow_redirects": None}
+
+        class _DummyResponse:
+            status_code = 200
+            content = b"jpeg bytes"
+            headers = {
+                "content-type": "image/jpeg",
+                "content-disposition": "inline; filename=fig 1.jpeg",
+            }
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                captured["follow_redirects"] = kwargs.get("follow_redirects")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                captured["url"] = url
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            "/api/v1/extract/proxy-img-dl-1/images/fig 1.jpeg",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.content == b"jpeg bytes"
+        assert resp.headers["content-type"] == "image/jpeg"
+        assert "content-disposition" in resp.headers
+        assert captured["follow_redirects"] is True
+        assert captured["url"].endswith("/api/v1/extract/backend-img-dl-9/images/fig%201.jpeg")
 
 
 class TestExtractCancelEndpoint:

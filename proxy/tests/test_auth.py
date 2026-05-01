@@ -157,6 +157,27 @@ class TestCognitoAuth:
 
     @patch("app.auth.jwt.decode")
     @patch("app.auth.jwt.PyJWKClient")
+    def test_disabled_optional_auth_placeholder_is_ignored(
+        self, mock_jwk_cls, mock_decode, monkeypatch
+    ):
+        """CloudFormation-safe placeholders must not become accepted auth values."""
+        monkeypatch.setattr(settings, "COGNITO_ACCEPTED_SCOPES", "__PDFX_EMPTY__")
+        monkeypatch.setattr(settings, "COGNITO_ACCEPTED_CLIENT_IDS", "__PDFX_EMPTY__")
+        mock_key = MagicMock()
+        mock_jwk_cls.return_value.get_signing_key_from_jwt.return_value = mock_key
+        mock_decode.return_value = {
+            "client_id": "__PDFX_EMPTY__",
+            "scope": "__PDFX_EMPTY__",
+            "exp": time.time() + 3600,
+        }
+
+        auth = CognitoAuth()
+        with pytest.raises(HTTPException) as exc:
+            auth.validate_token("Bearer placeholder.token")
+        assert exc.value.status_code == 403
+
+    @patch("app.auth.jwt.decode")
+    @patch("app.auth.jwt.PyJWKClient")
     def test_token_with_no_scope_claim_is_rejected(self, mock_jwk_cls, mock_decode):
         """A token missing the 'scope' claim entirely should be rejected (403)."""
         mock_key = MagicMock()
