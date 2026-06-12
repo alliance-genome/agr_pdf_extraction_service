@@ -1036,7 +1036,7 @@ Everything below is optional and has sensible defaults.
 | `HIERARCHY_LLM_MODEL` | `gpt-5.4-mini` | Model for heading hierarchy resolution |
 | `HIERARCHY_LLM_REASONING` | `medium` | Reasoning effort for heading hierarchy |
 | `LLM_CONFLICT_BATCH_SIZE` | `500` | Number of conflicts per batch in batched resolution |
-| `LLM_CONFLICT_MAX_WORKERS` | `100` | Max parallel workers for batched conflict resolution |
+| `LLM_CONFLICT_MAX_WORKERS` | `100` | Max parallel workers for batched conflict resolution. The GPU production compose caps this to 16 on the single-worker host. |
 | `LLM_CONFLICT_RETRY_ROUNDS` | `2` | Number of retry rounds for unresolved micro-conflicts |
 
 ### Consensus Pipeline
@@ -1084,6 +1084,7 @@ Everything below is optional and has sensible defaults.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MICRO_CONFLICT_CONTEXT_CAP` | `30` | Max context tokens to include before/after each micro-conflict span |
+| `MICRO_CONFLICT_MAX_WORKERS` | `0` | Max parallel word-level conflict extraction workers; 0 means auto/CPU count. The GPU production compose caps this to 2 on the single-worker host. |
 | `MICRO_CONFLICT_HIGH_DIVERGENCE_RATIO_THRESHOLD` | `0.40` | If majority-agree ratio is below this, treat segment as fully divergent |
 | `MICRO_CONFLICT_HIGH_DIVERGENCE_SPAN_THRESHOLD` | `12` | If the number of micro-conflict spans exceeds this count, coalesce into larger spans |
 | `MICRO_CONFLICT_COALESCE_GAP` | `8` | Merge nearby micro-conflicts within this many tokens of each other |
@@ -1103,6 +1104,7 @@ Everything below is optional and has sensible defaults.
 | `AUDIT_S3_BUCKET` | _(empty)_ | S3 bucket for durable artifact storage; resolved from SSM if unset |
 | `AUDIT_S3_BUCKET_SSM_PARAM` | `/pdfx/audit-s3-bucket` | SSM parameter name for bucket resolution |
 | `AUDIT_S3_PREFIX` | `pdfx/audit` | S3 key prefix for audit artifacts |
+| `AUDIT_FLUSH_ON_EVENT` | `false` | Upload the NDJSON audit log after every audit event so OOM-killed runs leave partial stage evidence. The GPU production compose enables this. |
 | `IMAGE_URL_TTL_SECONDS` | `3600` | Pre-signed URL TTL for image manifests |
 | `IMAGE_RETENTION_TTL_SECONDS` | `604800` | Image artifact retention TTL to mirror in S3 lifecycle policy |
 | `AWS_DEFAULT_REGION` | `us-east-1` | AWS region for SSM and S3 clients |
@@ -1169,8 +1171,8 @@ agr_pdf_extraction_service/
 
 ## Deployment Target
 
-Currently deployed on **AWS EC2** (g5.2xlarge):
-- NVIDIA A10G GPU (24 GB VRAM), 8 vCPU, 32 GB RAM
+Currently deployed on **AWS EC2** (g5.4xlarge):
+- NVIDIA A10G GPU (24 GB VRAM), 16 vCPU, 64 GB RAM
 - CUDA 12.8 runtime + Python 3.11
 - Docker + Docker Compose with NVIDIA Container Toolkit
 - GPU-accelerated Docling (CUDA) and Marker (auto-detect) inference

@@ -27,6 +27,7 @@ class Config:
     AUDIT_S3_BUCKET = os.environ.get("AUDIT_S3_BUCKET", "")
     AUDIT_S3_PREFIX = os.environ.get("AUDIT_S3_PREFIX", "pdfx/audit")
     AUDIT_S3_BUCKET_SSM_PARAM = os.environ.get("AUDIT_S3_BUCKET_SSM_PARAM", "/pdfx/audit-s3-bucket")
+    AUDIT_FLUSH_ON_EVENT = os.environ.get("AUDIT_FLUSH_ON_EVENT", "false").lower() == "true"
     IMAGE_URL_TTL_SECONDS = int(os.environ.get("IMAGE_URL_TTL_SECONDS", 3600))
     IMAGE_RETENTION_TTL_SECONDS = int(os.environ.get("IMAGE_RETENTION_TTL_SECONDS", 7 * 24 * 60 * 60))
     AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -137,6 +138,7 @@ class Config:
 
     # ---- Micro-conflict extraction --------------------------------------------
     MICRO_CONFLICT_CONTEXT_CAP = int(os.environ.get("MICRO_CONFLICT_CONTEXT_CAP", 30))
+    MICRO_CONFLICT_MAX_WORKERS = int(os.environ.get("MICRO_CONFLICT_MAX_WORKERS", 0))
     MICRO_CONFLICT_HIGH_DIVERGENCE_RATIO_THRESHOLD = float(
         os.environ.get("MICRO_CONFLICT_HIGH_DIVERGENCE_RATIO_THRESHOLD", 0.40),
     )

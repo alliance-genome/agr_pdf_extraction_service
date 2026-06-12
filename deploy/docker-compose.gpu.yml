@@ -1,5 +1,5 @@
 # docker-compose.gpu.yml for agr_pdf_extraction_service
-# GPU-accelerated deployment on g5.2xlarge (A10G 24GB VRAM)
+# GPU-accelerated deployment on an A10G-class host
 #
 # Usage:
 #   docker build -t pdfx-gpu -f deploy/Dockerfile.gpu .
@@ -17,7 +17,9 @@ x-shared-env: &shared-env
   TORCH_HOME: /app/data/models
   GELF_HOST: logs.alliancegenome.org
   GELF_PORT: "12201"
-  GELF_ENABLED: "true"
+  # App/worker use Docker GELF for stdout/stderr so crash-adjacent output is
+  # centralized. Keep in-process GELF off there to avoid duplicate records.
+  GELF_ENABLED: "false"
 
 x-shared-volumes: &shared-volumes
   - ../data/cache:/app/data/cache
@@ -66,6 +68,10 @@ services:
       CUDA_VISIBLE_DEVICES: ""
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
+      # Keep synchronous web UI runs within the same safety envelope as Celery.
+      MICRO_CONFLICT_MAX_WORKERS: "2"
+      LLM_CONFLICT_MAX_WORKERS: "16"
+      AUDIT_FLUSH_ON_EVENT: "true"
     volumes: *shared-volumes
     depends_on:
       redis:
@@ -80,6 +86,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s
+    logging:
+      driver: gelf
+      options:
+        gelf-address: "udp://logs.alliancegenome.org:12201"
+        tag: "pdfx-app"
     command: >
       python3.11 -m gunicorn -w 2 -b 0.0.0.0:5000
       --timeout 600
@@ -105,11 +116,15 @@ services:
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
-      # --- Thread settings (8 vCPU host) ---
+      # --- Thread settings (single-GPU backend) ---
       OMP_NUM_THREADS: "8"
       MKL_NUM_THREADS: "8"
       NUMEXPR_NUM_THREADS: "8"
       DOCLING_NUM_THREADS: "8"
+      # --- Consensus/observability safety on the single-GPU backend ---
+      MICRO_CONFLICT_MAX_WORKERS: "2"
+      LLM_CONFLICT_MAX_WORKERS: "16"
+      AUDIT_FLUSH_ON_EVENT: "true"
     volumes: *shared-volumes
     depends_on:
       redis:
@@ -130,6 +145,11 @@ services:
       --loglevel=info
       --pool=solo
       -Q default
+    logging:
+      driver: gelf
+      options:
+        gelf-address: "udp://logs.alliancegenome.org:12201"
+        tag: "pdfx-worker"
 
   grobid:
     image: grobid/grobid:0.8.2-crf

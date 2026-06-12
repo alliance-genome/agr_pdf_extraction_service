@@ -484,9 +484,16 @@ def extract_micro_conflicts(
     if not eligible:
         return {}
 
+    from config import Config
+
     # Process segments in parallel — Numba-JIT kernel releases the GIL
     # so threads achieve true parallelism on the CPU-bound DP work.
-    max_workers = min(len(eligible), os.cpu_count() or 4)
+    configured_workers = _micro_cfg_int(getattr(Config, "MICRO_CONFLICT_MAX_WORKERS", 0), 0)
+    auto_workers = os.cpu_count() or 4
+    if configured_workers > 0:
+        max_workers = min(len(eligible), configured_workers)
+    else:
+        max_workers = min(len(eligible), auto_workers)
     results: dict[str, MicroConflictResult] = {}
 
     def _process_one(triple: AlignedTriple) -> tuple[str, MicroConflictResult]:
