@@ -1,5 +1,6 @@
 """Tests for the selective LLM merge consensus pipeline."""
 
+from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1443,6 +1444,35 @@ class TestMicroConflictExtraction:
         )
         result = extract_micro_conflicts_for_segment(triple)
         assert isinstance(result.conflicts, list)
+
+    def test_extract_micro_conflicts_honors_worker_cap(self, monkeypatch):
+        from app.services import consensus_micro_conflicts as micro_module
+        from config import Config
+
+        seen_workers = []
+
+        class RecordingThreadPoolExecutor(RealThreadPoolExecutor):
+            def __init__(self, max_workers=None, *args, **kwargs):
+                seen_workers.append(max_workers)
+                super().__init__(max_workers=max_workers, *args, **kwargs)
+
+        triples = [
+            self._make_triple(
+                f"seg_cap_{idx}", CONFLICT,
+                grobid_text=f"The value was {idx}.",
+                docling_text=f"The value was {idx + 1}.",
+                marker_text=f"The value was {idx + 2}.",
+            )
+            for idx in range(3)
+        ]
+
+        monkeypatch.setattr(Config, "MICRO_CONFLICT_MAX_WORKERS", 1)
+        monkeypatch.setattr(micro_module, "ThreadPoolExecutor", RecordingThreadPoolExecutor)
+
+        results = extract_micro_conflicts(triples)
+
+        assert seen_workers == [1]
+        assert set(results) == {triple.segment_id for triple in triples}
 
     def test_context_sentence_boundary(self):
         tokens = tokenize_for_diff("Sentence one. Sentence two with conflict. Sentence three.")

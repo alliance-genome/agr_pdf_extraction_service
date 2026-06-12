@@ -3,7 +3,7 @@
 This runbook creates a test sibling for the production PDF extraction service
 without reusing production mutable state. It mirrors the runtime shape:
 
-- GPU backend on EC2 (`g5.2xlarge`, same Deep Learning GPU AMI family)
+- GPU backend on EC2 (`g5.4xlarge`, same Deep Learning GPU AMI family)
 - Docker Compose backend stack on the EC2 host
 - Fargate proxy in front of the backend
 - S3-backed durable proxy queue
@@ -30,7 +30,7 @@ as template defaults so the test stack can be a direct mirror:
 | ALB HTTPS listener | `arn:aws:elasticloadbalancing:us-east-1:100225593120:listener/app/agr-services/e75691865c2bbfb1/c9cd61e1f8237d0e` |
 | Public hosted zone | `Z3IZ3D6V94JEC2` (`alliancegenome.org`) |
 | Backend AMI | `ami-00c6ddd550364d6c3` |
-| Backend instance type | `g5.2xlarge` |
+| Backend instance type | `g5.4xlarge` |
 | EC2 key pair | `pedro-benchmark-key` |
 
 The test stack intentionally does not clone the production EBS volume or reuse

@@ -1,5 +1,5 @@
 # Dockerfile.gpu for agr_pdf_extraction_service
-# GPU-accelerated deployment on NVIDIA A10G (g5.2xlarge)
+# GPU-accelerated deployment on NVIDIA A10G hosts
 #
 # Uses CUDA 12.8 runtime + Python 3.11 for PyTorch GPU inference.
 # Marker/Surya and Docling both benefit from GPU acceleration.

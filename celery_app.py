@@ -343,6 +343,18 @@ def _upsert_extraction_run(
         run.review_images = bool(review_images)
     if status is not None:
         run.status = status
+        if status in {"queued", "running"}:
+            run.ended_at = None
+            run.error_code = None
+            run.error_message = None
+            run.artifacts_json = None
+            run.consensus_metrics_json = None
+            run.log_s3_key = None
+            run.llm_usage_json = None
+            run.llm_cost_usd = None
+        elif status == "succeeded":
+            run.error_code = None
+            run.error_message = None
     if started_at is not None:
         run.started_at = started_at
     if ended_at is not None:
@@ -643,7 +655,8 @@ def extract_pdf(
             )
 
     try:
-        audit_logger = AuditLogger(process_id, Config)
+        attempt_id = f"attempt-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        audit_logger = AuditLogger(process_id, Config, attempt_id=attempt_id)
     except Exception as exc:
         adapter.warning("Failed to initialize audit logger: %s", exc)
 
@@ -694,6 +707,7 @@ def extract_pdf(
             review_images=review_images,
             status="running",
             started_at=started_at,
+            log_s3_key=audit_logger.get_log_s3_key() if audit_logger else None,
         )
         if not ok:
             _safe_close_session(db_session)

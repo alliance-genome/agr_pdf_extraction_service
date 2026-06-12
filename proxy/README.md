@@ -4,7 +4,7 @@ A lightweight FastAPI proxy that sits in front of the GPU-based PDF Extraction S
 
 ## Why a Proxy?
 
-The PDF extraction backend runs on a GPU instance (g5.2xlarge) that costs ~$1/hour. Leaving it running 24/7 is wasteful when jobs arrive intermittently. The proxy solves this by:
+The PDF extraction backend runs on a GPU instance (currently g5.4xlarge). Leaving it running 24/7 is wasteful when jobs arrive intermittently. The proxy solves this by:
 
 1. Running cheaply on Fargate (256 CPU / 512 MB — pennies/hour)
 2. Auto-starting the GPU instance when a job arrives
@@ -33,7 +33,7 @@ Callers talk to the proxy at a stable endpoint and never need to know whether th
                                 │ HTTP (private IP)
                      ┌──────────▼───────────┐
                      │   GPU Backend         │
-                     │   (EC2 g5.2xlarge)    │
+                    │   (EC2 g5.4xlarge)    │
                      │                      │
                      │  - GROBID / Docling   │
                      │  - Marker / LLM Merge │

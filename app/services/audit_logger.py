@@ -6,6 +6,7 @@ Persists structured audit artifacts locally and optionally mirrors them to S3.
 import os
 import json
 import logging
+import threading
 from urllib.parse import urlencode
 from datetime import datetime, timezone
 
@@ -20,6 +21,15 @@ def _cfg(config, key, default=None):
     if isinstance(config, dict):
         return config.get(key, default)
     return getattr(config, key, default)
+
+
+def _cfg_bool(config, key, default=False):
+    value = _cfg(config, key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 
@@ -74,9 +84,10 @@ def build_s3_client(config=None):
 
 
 class AuditLogger:
-    def __init__(self, process_id, config):
+    def __init__(self, process_id, config, attempt_id=None):
         self.process_id = str(process_id)
         self.config = config
+        self.attempt_id = str(attempt_id or "attempt-0")
         self.bucket = _resolve_bucket_name(config)
         self.prefix = (_cfg(config, "AUDIT_S3_PREFIX", "pdfx/audit") or "pdfx/audit").strip("/")
 
@@ -85,11 +96,15 @@ class AuditLogger:
 
         self._events = []
         self._flushed = False
+        self._last_flushed_event_count = 0
+        self._flush_on_event = _cfg_bool(config, "AUDIT_FLUSH_ON_EVENT", False)
+        self._lock = threading.RLock()
 
-        self._log_s3_key = "{prefix}/{date}/{process_id}.ndjson".format(
+        self._log_s3_key = "{prefix}/{date}/{process_id}/{attempt_id}.ndjson".format(
             prefix=self.prefix,
             date=self._date_path,
             process_id=self.process_id,
+            attempt_id=self.attempt_id,
         )
         self._artifact_prefix = "{prefix}/{date}/{process_id}".format(
             prefix=self.prefix,
@@ -105,15 +120,18 @@ class AuditLogger:
             self.enabled = False
 
     def log(self, stage, status, **kwargs):
-        event = {
-            "ts": utc_now_iso(),
-            "stage": stage,
-            "status": status,
-        }
-        for key, value in kwargs.items():
-            if value is not None:
-                event[key] = value
-        self._events.append(event)
+        with self._lock:
+            event = {
+                "ts": utc_now_iso(),
+                "stage": stage,
+                "status": status,
+            }
+            for key, value in kwargs.items():
+                if value is not None:
+                    event[key] = value
+            self._events.append(event)
+            if self._flush_on_event:
+                self.flush()
 
     def upload_artifact(self, filename, content, subdir=None, tags=None):
         if not self.enabled:
@@ -159,28 +177,31 @@ class AuditLogger:
             return None
 
     def flush(self):
-        if self._flushed:
-            return
+        with self._lock:
+            if self._last_flushed_event_count == len(self._events):
+                return
 
-        if not self.enabled:
-            self._flushed = True
-            return
+            if not self.enabled:
+                self._flushed = True
+                self._last_flushed_event_count = len(self._events)
+                return
 
-        try:
-            lines = [json.dumps(event, separators=(",", ":")) for event in self._events]
-            payload = "\n".join(lines)
-            if payload:
-                payload += "\n"
+            try:
+                lines = [json.dumps(event, separators=(",", ":")) for event in self._events]
+                payload = "\n".join(lines)
+                if payload:
+                    payload += "\n"
 
-            self.s3_client.put_object(
-                Bucket=self.bucket,
-                Key=self._log_s3_key,
-                Body=payload.encode("utf-8"),
-                ContentType="application/x-ndjson",
-            )
-            self._flushed = True
-        except Exception as exc:
-            logger.warning("Failed to flush audit log to S3 key %s: %s", self._log_s3_key, exc)
+                self.s3_client.put_object(
+                    Bucket=self.bucket,
+                    Key=self._log_s3_key,
+                    Body=payload.encode("utf-8"),
+                    ContentType="application/x-ndjson",
+                )
+                self._flushed = True
+                self._last_flushed_event_count = len(self._events)
+            except Exception as exc:
+                logger.warning("Failed to flush audit log to S3 key %s: %s", self._log_s3_key, exc)
 
     def get_log_s3_key(self):
         return self._log_s3_key

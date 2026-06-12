@@ -70,7 +70,7 @@ Parameters:
     Description: Deep Learning Base OSS NVIDIA Driver GPU AMI used by prod.
   BackendInstanceType:
     Type: String
-    Default: g5.2xlarge
+    Default: g5.4xlarge
     Description: GPU instance type for the backend.
   BackendKeyName:
     Type: AWS::EC2::KeyPair::KeyName
