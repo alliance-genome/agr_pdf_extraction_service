@@ -103,10 +103,12 @@ class _ModelType:
 
 class _LangDet:
     CH = _EnumValue("ch")
+    EN = _EnumValue("en")
 
 
 class _LangRec:
     CH = _EnumValue("ch")
+    EN = _EnumValue("en")
 
 
 rapidocr_typings.EngineType = _EngineType
@@ -217,6 +219,8 @@ def test_docling_converter_pins_rapidocr_onnxruntime_cpu(monkeypatch):
     monkeypatch.setattr("app.services.docling_service.DocumentConverter", _CapturingConverter)
     monkeypatch.setenv("DOCLING_RAPIDOCR_BACKEND", "onnxruntime")
     monkeypatch.setenv("DOCLING_RAPIDOCR_MODEL_TYPE", "medium")
+    monkeypatch.setenv("DOCLING_RAPIDOCR_DET_LANG", "en")
+    monkeypatch.setenv("DOCLING_RAPIDOCR_REC_LANG", "en")
     monkeypatch.setenv("DOCLING_RAPIDOCR_USE_CUDA", "false")
     _cached_converters.clear()
 
@@ -230,3 +234,5 @@ def test_docling_converter_pins_rapidocr_onnxruntime_cpu(monkeypatch):
     assert rapidocr_params["EngineConfig.onnxruntime.use_cuda"] is False
     assert rapidocr_params["Det.model_type"].value == "medium"
     assert rapidocr_params["Rec.model_type"].value == "medium"
+    assert rapidocr_params["Det.lang_type"].value == "en"
+    assert rapidocr_params["Rec.lang_type"].value == "en"

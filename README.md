@@ -1017,6 +1017,8 @@ Everything below is optional and has sensible defaults.
 | `DOCLING_DEVICE` | `cpu` | Docling device (`cpu` or `cuda` for GPU) |
 | `DOCLING_RAPIDOCR_BACKEND` | `onnxruntime` | RapidOCR backend used by Docling OCR |
 | `DOCLING_RAPIDOCR_MODEL_TYPE` | `medium` | PP-OCRv6 model size for Docling OCR (`small` or `medium`) |
+| `DOCLING_RAPIDOCR_DET_LANG` | `en` | PP-OCRv6 detector language family for Docling OCR (`en` or `ch`) |
+| `DOCLING_RAPIDOCR_REC_LANG` | `en` | PP-OCRv6 recognizer language family for Docling OCR (`en` or `ch`) |
 | `DOCLING_RAPIDOCR_USE_CUDA` | `false` | Run RapidOCR ONNXRuntime on CUDA; keep `false` unless the image includes a matching ONNXRuntime GPU wheel |
 | `MARKER_DEVICE` | `cpu` | Marker device (`cpu` or `auto` for GPU) |
 
