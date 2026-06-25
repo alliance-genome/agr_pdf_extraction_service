@@ -1,0 +1,76 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcrAuth",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrPushPullProxyRepo",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:CompleteLayerUpload",
+        "ecr:DescribeImages",
+        "ecr:DescribeRepositories",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:ListImages",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart"
+      ],
+      "Resource": "arn:aws:ecr:us-east-1:100225593120:repository/agr_pdfx_proxy"
+    },
+    {
+      "Sid": "SsmReadPdfxParams",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath"
+      ],
+      "Resource": "arn:aws:ssm:us-east-1:100225593120:parameter/pdfx/*"
+    },
+    {
+      "Sid": "SsmPutPdfxPlaceholders",
+      "Effect": "Allow",
+      "Action": "ssm:PutParameter",
+      "Resource": "arn:aws:ssm:us-east-1:100225593120:parameter/pdfx/*"
+    },
+    {
+      "Sid": "EcsRegisterTaskDefinition",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterTaskDefinition",
+        "ecs:DescribeTaskDefinition"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcsRollProxyService",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeServices",
+        "ecs:UpdateService"
+      ],
+      "Resource": "arn:aws:ecs:us-east-1:100225593120:service/pdfx-proxy/pdfx-proxy"
+    },
+    {
+      "Sid": "PassEcsRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::100225593120:role/pdfx-proxy-execution-role",
+        "arn:aws:iam::100225593120:role/pdfx-proxy-task-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

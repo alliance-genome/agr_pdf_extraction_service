@@ -21,8 +21,10 @@ def test_test_mirror_stack_uses_separate_environment_resources():
     assert "BackendAutoScalingGroup:" in template
     assert "Type: AWS::EC2::LaunchTemplate" in template
     assert "Type: AWS::AutoScaling::AutoScalingGroup" in template
-    assert "HealthCheckType: EC2,EBS" in template
+    assert "HealthCheckType: EBS" in template
     assert "MaxSize: !Ref BackendMaxSize" in template
+    assert "StartupTimeoutMinutes:" in template
+    assert 'Default: "30"' in template
     assert "Name: !Sub \"/${SsmParameterPath}/ec2-instance-id\"" in template
     assert "Name: !Sub \"/${SsmParameterPath}/backend-asg-name\"" in template
     assert "Name: !Sub \"/${SsmParameterPath}/asg-startup-replacement-attempts\"" in template
@@ -32,6 +34,9 @@ def test_test_mirror_stack_uses_separate_environment_resources():
     assert "BackendInstance:" not in template
     assert "/pdfx/ec2-instance-id" not in template
     assert "agr-pdf-extraction-benchmark" not in template
+    assert "MinimumHealthyPercent: 100" in template
+    assert "DeploymentCircuitBreaker:" in template
+    assert "Rollback: true" in template
 
 
 def test_test_mirror_stack_supports_image_retention_and_tagged_uploads():

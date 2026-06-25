@@ -27,7 +27,7 @@ class Settings:
 
     IDLE_TIMEOUT_MINUTES: int = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "30"))
     MIN_UPTIME_MINUTES: int = int(os.environ.get("MIN_UPTIME_MINUTES", "20"))
-    STARTUP_TIMEOUT_MINUTES: int = int(os.environ.get("STARTUP_TIMEOUT_MINUTES", "10"))
+    STARTUP_TIMEOUT_MINUTES: int = int(os.environ.get("STARTUP_TIMEOUT_MINUTES", "30"))
     ASG_STARTUP_REPLACEMENT_ATTEMPTS: int = int(os.environ.get("ASG_STARTUP_REPLACEMENT_ATTEMPTS", "1"))
     HEALTH_POLL_INTERVAL_SECONDS: int = int(os.environ.get("HEALTH_POLL_INTERVAL_SECONDS", "15"))
     MAX_QUEUED_JOBS: int = int(os.environ.get("MAX_QUEUED_JOBS", "10"))
