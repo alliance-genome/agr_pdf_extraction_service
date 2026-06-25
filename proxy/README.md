@@ -137,7 +137,7 @@ The proxy forwards the request to EC2 and returns the backend's response verbati
 
 Extraction stages are dynamic based on the `methods` parameter. `llm_merge` only appears when `merge=true`.
 
-## EC2 Lifecycle State Machine
+## Backend Lifecycle State Machine
 
 ```
   STOPPED ──(job arrives)──> STARTING ──(health check OK)──> READY
@@ -149,9 +149,9 @@ Extraction stages are dynamic based on the `methods` parameter. `llm_merge` only
 
 | State | Meaning |
 |-------|---------|
-| `STOPPED` | EC2 is off. Jobs trigger a start. |
-| `STARTING` | EC2 is booting. Jobs are queued in memory. |
-| `READY` | EC2 is healthy. Requests are forwarded. |
+| `STOPPED` | Backend capacity is off. Jobs trigger EC2 start or ASG desired capacity 1. |
+| `STARTING` | Backend is booting. Jobs are queued in memory or durable S3. |
+| `READY` | Backend is healthy. Requests are forwarded. |
 | `BUSY` | At least one job is in flight. Idle timer is paused. |
 
 The idle monitor checks every 60 seconds. The worker is only eligible for stop when all guards pass:
@@ -161,9 +161,11 @@ The idle monitor checks every 60 seconds. The worker is only eligible for stop w
 - minimum uptime (`MIN_UPTIME_MINUTES`) has elapsed
 - `ALWAYS_ON_MODE` is disabled
 
-When guards pass and idle exceeds `IDLE_TIMEOUT_MINUTES`, the instance is stopped automatically.
+When guards pass and idle exceeds `IDLE_TIMEOUT_MINUTES`, the backend is stopped automatically. In legacy mode this calls `StopInstances`; in Auto Scaling mode it sets the backend ASG desired capacity to `0`.
 
 On proxy startup, `sync_state_from_ec2()` checks the actual EC2 state so the proxy's internal state matches reality.
+
+Preferred production mode is `BACKEND_ASG_NAME`. The proxy scales the ASG to desired capacity `1` on wake and discovers the current healthy instance private IP from the ASG. If the backend fails to become healthy before `STARTUP_TIMEOUT_MINUTES`, the proxy marks the current ASG instance `Unhealthy` so EC2 Auto Scaling replaces it from the launch template, then keeps queued replay waiting for up to `ASG_STARTUP_REPLACEMENT_ATTEMPTS` replacement attempts. Keep the ASG `MaxSize` at `1` for strict cost control, or `2` only when deliberately testing launch-before-terminate behavior.
 
 ## Configuration
 
@@ -171,7 +173,8 @@ All settings come from environment variables. In production, values are injected
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `EC2_INSTANCE_ID` | Yes | — | The managed GPU instance ID |
+| `BACKEND_ASG_NAME` | Conditional | — | Preferred managed backend Auto Scaling group name. Required unless `EC2_INSTANCE_ID` is set |
+| `EC2_INSTANCE_ID` | Conditional | — | Legacy managed GPU instance ID. Required unless `BACKEND_ASG_NAME` is set |
 | `COGNITO_USER_POOL_ID` | Yes | — | Cognito user pool for JWT validation |
 | `EC2_REGION` | No | `us-east-1` | AWS region for EC2 API calls |
 | `EC2_PORT` | No | `5000` | Port the backend listens on |
@@ -182,6 +185,7 @@ All settings come from environment variables. In production, values are injected
 | `IDLE_TIMEOUT_MINUTES` | No | `30` | Minutes of inactivity before EC2 is stopped |
 | `MIN_UPTIME_MINUTES` | No | `20` | Minimum uptime after wake before idle stop is allowed |
 | `STARTUP_TIMEOUT_MINUTES` | No | `10` | Max minutes to wait for EC2 health check |
+| `ASG_STARTUP_REPLACEMENT_ATTEMPTS` | No | `1` | Extra ASG replacement attempts to wait through after startup timeout |
 | `HEALTH_POLL_INTERVAL_SECONDS` | No | `15` | Seconds between EC2 health polls during startup |
 | `MAX_QUEUED_JOBS` | No | `10` | Max jobs to hold in memory during startup |
 | `FORWARD_TIMEOUT_SECONDS` | No | `600` | Timeout for forwarded HTTP requests to EC2 |
@@ -207,7 +211,7 @@ The proxy is deployed as an ECS Fargate service behind an ALB.
 - ECS cluster with Fargate capacity
 - Cognito user pool with a resource server and `pdfx-api/extract` scope
 - SSM parameters under the target environment prefix (`/pdfx/*` for prod)
-- IAM roles: execution role (ECR pull + SSM read + CloudWatch Logs) and task role (EC2 start/stop/describe + SSM read)
+- IAM roles: execution role (ECR pull + SSM read + CloudWatch Logs) and task role (Auto Scaling lifecycle + EC2 describe + SSM read). Legacy single-instance deployments also need EC2 start/stop on the managed instance.
 
 ### Build and Deploy
 
@@ -301,6 +305,7 @@ The assumed AWS role needs enough access to:
 - pass the ECS execution and task roles referenced by the task definition
 
 If you want `deploy.sh` to auto-create the optional
+`/<ssm-prefix>/backend-asg-name`,
 `/<ssm-prefix>/cognito-accepted-scopes` and
 `/<ssm-prefix>/cognito-accepted-client-ids` placeholders when missing, also
 grant `ssm:PutParameter` on the selected prefix.
@@ -308,7 +313,10 @@ grant `ssm:PutParameter` on the selected prefix.
 ### IAM Permissions (Task Role)
 
 The task role needs:
-- `ec2:StartInstances` / `ec2:StopInstances` — scoped to the managed instance
+- `autoscaling:SetDesiredCapacity` — scale backend ASG desired capacity between 0 and 1
+- `autoscaling:SetInstanceHealth` — mark failed-startup backend instances unhealthy for replacement
+- `autoscaling:DescribeAutoScalingGroups` — discover the current backend instance
+- `ec2:StartInstances` / `ec2:StopInstances` — legacy single-instance mode only, scoped to the configured instance ARN
 - `ec2:DescribeInstances` — for state polling
 - `ssm:GetParameters` — scoped to the selected SSM prefix
 
@@ -322,7 +330,7 @@ proxy/
 │   ├── main.py            # FastAPI routes (health, status, wake, extract, poll, download)
 │   ├── config.py           # Settings from environment variables
 │   ├── auth.py             # Cognito JWT validation
-│   ├── ec2_manager.py      # EC2 start/stop/describe via boto3
+│   ├── ec2_manager.py      # Backend lifecycle via EC2 or Auto Scaling APIs
 │   ├── state_machine.py    # InstanceState enum + LifecycleManager
 │   └── job_queue.py        # Queue backends (in-memory + optional durable S3)
 ├── tests/
@@ -356,13 +364,13 @@ All tests use mocked singletons (no real AWS calls or Cognito validation).
 ```bash
 cd proxy
 cp .env.example .env
-# Fill in EC2_INSTANCE_ID and COGNITO_USER_POOL_ID
+# Fill in BACKEND_ASG_NAME or EC2_INSTANCE_ID, plus COGNITO_USER_POOL_ID
 
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8080
 ```
 
-The proxy will sync with the actual EC2 instance state on startup.
+The proxy will sync with the actual backend state on startup.
 
 ## Accepting Shared M2M Admin Tokens
 

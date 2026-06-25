@@ -5,10 +5,17 @@ This folder contains AWS infrastructure for the PDF extraction service.
 ## Test Mirror
 
 `pdfx-test-mirror-stack.yaml` creates a production-shaped test environment:
-GPU EC2 backend, Fargate proxy, S3 audit bucket, environment-scoped SSM
-parameters, ALB routing, and DNS.
+GPU backend launch template and capped Auto Scaling Group, Fargate proxy, S3
+audit bucket, environment-scoped SSM parameters, CloudWatch alarms, ALB routing,
+and DNS.
 
 Start with the runbook in `deploy/aws/pdfx-test-mirror.md`.
+
+The backend ASG defaults to `MinSize=0`, `DesiredCapacity=0`, and `MaxSize=1`.
+The proxy scales it to one instance on demand and marks failed-startup
+instances unhealthy so Auto Scaling replaces them from the launch template.
+An optional stopped warm pool can be enabled with `BackendWarmPoolMinSize=1`
+when lower wake latency is worth the idle EBS cost.
 
 The proxy deployer supports this environment with:
 

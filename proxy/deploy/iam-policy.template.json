@@ -8,7 +8,22 @@
         "ec2:StartInstances",
         "ec2:StopInstances"
       ],
-      "Resource": "arn:aws:ec2:${REGION}:${AWS_ACCOUNT_ID}:instance/${EC2_INSTANCE_ID}"
+      "Resource": "arn:aws:ec2:${REGION}:${AWS_ACCOUNT_ID}:instance/${EC2_INSTANCE_RESOURCE}"
+    },
+    {
+      "Sid": "AutoScalingLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:SetInstanceHealth",
+        "autoscaling:SetDesiredCapacity"
+      ],
+      "Resource": "arn:aws:autoscaling:${REGION}:${AWS_ACCOUNT_ID}:autoScalingGroup:*:autoScalingGroupName/${BACKEND_ASG_RESOURCE}"
+    },
+    {
+      "Sid": "AutoScalingDescribe",
+      "Effect": "Allow",
+      "Action": "autoscaling:DescribeAutoScalingGroups",
+      "Resource": "*"
     },
     {
       "Sid": "EC2Describe",

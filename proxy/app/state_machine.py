@@ -35,6 +35,8 @@ class LifecycleManager:
         self._stop_guard: Optional[Callable[[], bool]] = None
         self._stop_events_total: int = 0
         self._stop_blocked_total: int = 0
+        self._startup_timeout_total: int = 0
+        self._replacement_requests_total: int = 0
 
     @property
     def state(self) -> InstanceState:
@@ -65,6 +67,14 @@ class LifecycleManager:
     @property
     def stop_blocked_total(self) -> int:
         return self._stop_blocked_total
+
+    @property
+    def startup_timeout_total(self) -> int:
+        return self._startup_timeout_total
+
+    @property
+    def replacement_requests_total(self) -> int:
+        return self._replacement_requests_total
 
     def set_stop_guard(self, guard: Callable[[], bool]) -> None:
         """Register callback that must return True before EC2 can stop."""
@@ -118,31 +128,65 @@ class LifecycleManager:
         deadline = time.time() + settings.STARTUP_TIMEOUT_MINUTES * 60
         poll_interval = settings.HEALTH_POLL_INTERVAL_SECONDS
         start_requested = False
+        replacement_attempts = 0
 
-        while time.time() < deadline:
+        while True:
+            while time.time() < deadline:
+                try:
+                    ec2_state, ip = self._ec2.get_instance_state()
+                    if ec2_state == "stopped" and not start_requested:
+                        # If the first observed state was "stopping", issue start once
+                        # after AWS transitions to fully "stopped".
+                        logger.info("EC2 reached stopped during startup poll; issuing start request.")
+                        self._ec2.start_instance()
+                        start_requested = True
+                    if ip:
+                        self._private_ip = ip
+                    if ec2_state == "running" and ip:
+                        if await self._check_health():
+                            logger.info("EC2 instance healthy at %s", ip)
+                            self._state = InstanceState.READY
+                            self._ready_since = time.time()
+                            self._start_idle_monitor()
+                            return
+                except Exception as exc:
+                    logger.debug("Health poll error (expected during startup): %s", exc)
+
+                await asyncio.sleep(poll_interval)
+
+            logger.error("EC2 startup timed out after %d minutes", settings.STARTUP_TIMEOUT_MINUTES)
+            self._startup_timeout_total += 1
+            can_wait_for_replacement = replacement_attempts < settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS
+            replacement_requested = False
+
+            if can_wait_for_replacement:
+                try:
+                    replacement_requested = self._ec2.mark_unhealthy()
+                    if replacement_requested:
+                        self._replacement_requests_total += 1
+                except Exception as exc:
+                    logger.error("Failed to request backend replacement after startup timeout: %s", exc)
+
+            if replacement_requested:
+                replacement_attempts += 1
+                logger.warning(
+                    "Waiting for ASG backend replacement attempt %d/%d",
+                    replacement_attempts,
+                    settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS,
+                )
+                self._state = InstanceState.STARTING
+                self._private_ip = None
+                self._ready_since = None
+                start_requested = False
+                deadline = time.time() + settings.STARTUP_TIMEOUT_MINUTES * 60
+                continue
+
             try:
-                ec2_state, ip = self._ec2.get_instance_state()
-                if ec2_state == "stopped" and not start_requested:
-                    # If the first observed state was "stopping", issue start once
-                    # after AWS transitions to fully "stopped".
-                    logger.info("EC2 reached stopped during startup poll; issuing start request.")
-                    self._ec2.start_instance()
-                    start_requested = True
-                if ip:
-                    self._private_ip = ip
-                if ec2_state == "running" and ip:
-                    if await self._check_health():
-                        logger.info("EC2 instance healthy at %s", ip)
-                        self._state = InstanceState.READY
-                        self._ready_since = time.time()
-                        self._start_idle_monitor()
-                        return
+                self._ec2.stop_instance()
             except Exception as exc:
-                logger.debug("Health poll error (expected during startup): %s", exc)
+                logger.error("Failed to stop backend after terminal startup failure: %s", exc)
+            break
 
-            await asyncio.sleep(poll_interval)
-
-        logger.error("EC2 startup timed out after %d minutes", settings.STARTUP_TIMEOUT_MINUTES)
         self._state = InstanceState.STOPPED
         self._private_ip = None
         self._ready_since = None

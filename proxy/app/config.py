@@ -9,7 +9,8 @@ import os
 
 
 class Settings:
-    EC2_INSTANCE_ID: str = os.environ["EC2_INSTANCE_ID"]
+    EC2_INSTANCE_ID: str = os.environ.get("EC2_INSTANCE_ID", "").strip()
+    BACKEND_ASG_NAME: str = os.environ.get("BACKEND_ASG_NAME", "").strip()
     EC2_REGION: str = os.environ.get("EC2_REGION", "us-east-1")
     EC2_PORT: int = int(os.environ.get("EC2_PORT", "5000"))
 
@@ -27,6 +28,7 @@ class Settings:
     IDLE_TIMEOUT_MINUTES: int = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "30"))
     MIN_UPTIME_MINUTES: int = int(os.environ.get("MIN_UPTIME_MINUTES", "20"))
     STARTUP_TIMEOUT_MINUTES: int = int(os.environ.get("STARTUP_TIMEOUT_MINUTES", "10"))
+    ASG_STARTUP_REPLACEMENT_ATTEMPTS: int = int(os.environ.get("ASG_STARTUP_REPLACEMENT_ATTEMPTS", "1"))
     HEALTH_POLL_INTERVAL_SECONDS: int = int(os.environ.get("HEALTH_POLL_INTERVAL_SECONDS", "15"))
     MAX_QUEUED_JOBS: int = int(os.environ.get("MAX_QUEUED_JOBS", "10"))
 
@@ -49,3 +51,6 @@ class Settings:
 
 
 settings = Settings()
+
+if not settings.EC2_INSTANCE_ID and not settings.BACKEND_ASG_NAME:
+    raise RuntimeError("Set EC2_INSTANCE_ID for legacy mode or BACKEND_ASG_NAME for Auto Scaling mode")

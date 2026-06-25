@@ -35,6 +35,8 @@ def test_deploy_script_supports_environment_scoped_resources():
     assert 'AWS_CMD=(aws --region "$REGION")' in script
     assert 'AWS_CMD=(aws --profile "$PROFILE" --region "$REGION")' in script
     assert '"${AWS_CMD[@]}" ssm get-parameter' in script
+    assert "read_optional_param()" in script
+    assert 'ensure_ssm_param "${SSM_PREFIX}/asg-startup-replacement-attempts" "1"' in script
     assert 'if $DRY_RUN; then' in script
     assert "Would create placeholder SSM parameter" in script
 
@@ -50,6 +52,11 @@ def test_task_definition_is_environment_parameterized():
     assert {"name": "QUEUE_S3_PREFIX", "value": "${QUEUE_S3_PREFIX}"} in container["environment"]
     assert {"name": "QUEUE_S3_REGION", "value": "${QUEUE_S3_REGION}"} in container["environment"]
     assert container["secrets"][0]["valueFrom"].startswith("${SSM_PREFIX}/")
+    assert {"name": "BACKEND_ASG_NAME", "valueFrom": "${SSM_PREFIX}/backend-asg-name"} in container["secrets"]
+    assert {
+        "name": "ASG_STARTUP_REPLACEMENT_ATTEMPTS",
+        "valueFrom": "${SSM_PREFIX}/asg-startup-replacement-attempts",
+    } in container["secrets"]
     assert container["logConfiguration"]["options"]["awslogs-group"] == "${LOG_GROUP}"
 
 
@@ -59,6 +66,11 @@ def test_iam_policy_is_environment_parameterized_and_allows_image_tags():
     template = json.loads(template_text)
 
     assert "parameter/${SSM_PARAMETER_RESOURCE}/*" in template_text
+    assert "autoscaling:SetDesiredCapacity" in template_text
+    assert "autoscaling:SetInstanceHealth" in template_text
+    assert "autoscaling:DescribeAutoScalingGroups" in template_text
+    assert "instance/${EC2_INSTANCE_RESOURCE}" in template_text
+    assert "autoScalingGroupName/${BACKEND_ASG_RESOURCE}" in template_text
 
     object_statement = next(
         statement

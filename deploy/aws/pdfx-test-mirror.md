@@ -3,13 +3,14 @@
 This runbook creates a test sibling for the production PDF extraction service
 without reusing production mutable state. It mirrors the runtime shape:
 
-- GPU backend on EC2 (`g5.4xlarge`, same Deep Learning GPU AMI family)
+- GPU backend managed by an EC2 Auto Scaling Group (`g5.4xlarge`, same Deep Learning GPU AMI family)
 - Docker Compose backend stack on the EC2 host
 - Fargate proxy in front of the backend
 - S3-backed durable proxy queue
 - S3 audit/artifact bucket with tagged temporary image lifecycle
 - Cognito-protected public hostname through the shared `agr-services` ALB
 - environment-scoped SSM parameters under `/pdfx-test/*`
+- CloudWatch alarms for backend startup timeouts and ASG replacement requests
 
 The template is `deploy/aws/pdfx-test-mirror-stack.yaml`.
 
@@ -75,10 +76,10 @@ COGNITO_USER_POOL_ID="$(
 
 ## Deploy The Mirror Stack
 
-This creates the test EC2 instance, proxy service, S3 bucket, IAM roles, ALB
-rule, DNS record, and `/pdfx-test/*` parameters. It does not modify production
-resources other than adding a new host rule to the shared ALB and a new DNS
-record.
+This creates the test backend launch template and Auto Scaling Group, proxy
+service, S3 bucket, IAM roles, ALB rule, DNS record, CloudWatch alarms, and
+`/pdfx-test/*` parameters. It does not modify production resources other than
+adding a new host rule to the shared ALB and a new DNS record.
 
 ```bash
 aws cloudformation deploy \
@@ -90,13 +91,26 @@ aws cloudformation deploy \
   --parameter-overrides \
     CognitoUserPoolId="$COGNITO_USER_POOL_ID" \
     DeployBackendOnBoot=true \
+    BackendMaxSize=1 \
     BackendGitRef=main
 ```
 
 For testing a feature branch, push the branch first and set
-`BackendGitRef=<branch-or-sha>`. If you want to create the infrastructure
-without immediately building the backend image, omit `DeployBackendOnBoot=true`;
-the instance will provision host basics and then stop itself.
+`BackendGitRef=<branch-or-sha>`.
+
+The backend ASG defaults to `BackendMinSize=0`, `BackendDesiredCapacity=0`,
+and `BackendMaxSize=1`. The proxy scales desired capacity to `1` on wake and
+back to `0` after idle shutdown. Keep `BackendMaxSize=1` for strict cost
+control. Use `BackendMaxSize=2` only for controlled testing of
+launch-before-terminate behavior.
+
+The proxy's bounded replacement wait defaults to
+`AsgStartupReplacementAttempts=1`, published to
+`/<ssm-prefix>/asg-startup-replacement-attempts`.
+
+If cold boot time becomes too expensive, set `BackendWarmPoolMinSize=1`.
+That keeps one pre-initialized backend instance in the ASG warm pool in
+`Stopped` state, so you pay for EBS while idle but not for running GPU compute.
 
 ## Deploy Proxy Changes To Test
 
@@ -122,29 +136,46 @@ The CloudFormation stack uses `__PDFX_EMPTY__` as the disabled placeholder for
 optional auth allow-lists because SSM String parameters cannot be empty; the
 proxy ignores that exact placeholder.
 
-## Backend Host Operations
+## Backend ASG Operations
 
-Get the test instance ID and start it when needed:
+Get the backend ASG name and scale it up manually when needed:
 
 ```bash
-TEST_INSTANCE_ID="$(
+TEST_BACKEND_ASG="$(
   aws ssm get-parameter \
     --profile ctabone \
     --region us-east-1 \
-    --name /pdfx-test/ec2-instance-id \
+    --name /pdfx-test/backend-asg-name \
     --query Parameter.Value \
     --output text
 )"
 
-aws ec2 start-instances \
+aws autoscaling update-auto-scaling-group \
   --profile ctabone \
   --region us-east-1 \
-  --instance-ids "$TEST_INSTANCE_ID"
+  --auto-scaling-group-name "$TEST_BACKEND_ASG" \
+  --desired-capacity 1
 ```
 
-Check the bootstrap log:
+Find the current instance and check the bootstrap log:
 
 ```bash
+TEST_INSTANCE_ID="$(
+  aws autoscaling describe-auto-scaling-groups \
+    --profile ctabone \
+    --region us-east-1 \
+    --auto-scaling-group-names "$TEST_BACKEND_ASG" \
+    --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService` || starts_with(LifecycleState, `Pending`)].InstanceId | [0]' \
+    --output text
+)"
+
+aws ec2 describe-instances \
+  --profile ctabone \
+  --region us-east-1 \
+  --instance-ids "$TEST_INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' \
+  --output text
+
 ssh ec2-user@<test-public-ip> 'sudo tail -n 200 /var/log/pdfx-bootstrap.log'
 ```
 
@@ -158,6 +189,40 @@ git pull --ff-only || true
 cd deploy
 GPU_MODE=on ./deploy.sh
 ```
+
+If a backend startup fails, the proxy marks the ASG instance unhealthy with
+`SetInstanceHealth`. Auto Scaling then terminates it and launches a replacement
+from the launch template while respecting `BackendMaxSize`. The proxy keeps
+queued replay waiting for `ASG_STARTUP_REPLACEMENT_ATTEMPTS` replacement
+attempts before failing queued work.
+
+Scale the backend back down when testing is complete:
+
+```bash
+aws autoscaling update-auto-scaling-group \
+  --profile ctabone \
+  --region us-east-1 \
+  --auto-scaling-group-name "$TEST_BACKEND_ASG" \
+  --desired-capacity 0
+```
+
+## Promote The Pattern To Production
+
+1. Deploy this stack to the test mirror first and validate `/api/v1/health`,
+   `/api/v1/health/deep`, and a small extraction.
+2. Create a production CloudFormation stack using the same launch template,
+   ASG, SSM, IAM, alarm, and proxy resources, with production values:
+   `EnvironmentName=prod`, `SsmParameterPath=pdfx`,
+   `AuditBucketName=agr-pdf-extraction-benchmark`, and
+   `DomainName=pdfx.alliancegenome.org`.
+3. Keep production `BackendMinSize=0`, `BackendDesiredCapacity=0`,
+   `BackendMaxSize=1` unless a planned maintenance window explicitly tests
+   `BackendMaxSize=2`.
+4. Roll the production proxy image after `/pdfx/backend-asg-name` exists.
+   The legacy `/pdfx/ec2-instance-id` parameter can stay as a blank
+   placeholder for rollback compatibility.
+5. Validate from AI Curation using its configured Cognito auth path, then run
+   a small PDF extraction smoke.
 
 ## Image Artifact Retention Notes
 

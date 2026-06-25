@@ -768,6 +768,25 @@ class TestExtractCancelEndpoint:
         second_process_id = "race-b" if first_call_process_id == "race-a" else "race-a"
         assert second_process_id in first_call_inflight
 
+    def test_replay_keeps_queue_while_asg_replacement_is_starting(self, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.STARTING
+        main_mod.job_queue.enqueue("asg-replacement-job", b"pdf", {})
+
+        async def _sleep_once(_seconds):
+            main_mod.lifecycle.state = InstanceState.READY
+
+        forward_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_once)
+        monkeypatch.setattr(main_mod.settings, "STARTUP_TIMEOUT_MINUTES", 1)
+        monkeypatch.setattr(main_mod.settings, "ASG_STARTUP_REPLACEMENT_ATTEMPTS", 1)
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward_mock)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        forward_mock.assert_awaited_once()
+        assert main_mod.job_queue.size == 0
+
     def test_local_cancel_cache_is_bounded(self, monkeypatch):
         import app.main as main_mod
         main_mod.cancelled_jobs.clear()
