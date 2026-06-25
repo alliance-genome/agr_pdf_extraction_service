@@ -30,6 +30,14 @@ cd proxy/deploy
   --image-tag <image-tag>
 ```
 
+## GitHub Actions Deploy Policy
+
+`github-actions-deploy-policy.json` mirrors the managed IAM policy attached to
+the production GitHub Actions deploy role. The deploy workflow must be able to
+write `/pdfx/*` placeholder parameters before it registers a new proxy task
+definition, because ASG-aware proxy revisions require both the legacy EC2
+instance parameter and the backend ASG parameter to exist.
+
 ## AWS OOM Alerts (IaC)
 
 This folder also provides a parameterized, redeployable OOM alerting setup for
