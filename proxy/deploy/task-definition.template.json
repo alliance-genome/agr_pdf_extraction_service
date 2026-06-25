@@ -25,6 +25,8 @@
         {"name": "STUCK_PENDING_MINUTES", "value": "20"},
         {"name": "RECONCILER_INTERVAL_SECONDS", "value": "60"},
         {"name": "RECONCILER_REQUEUE_ONCE", "value": "false"},
+        {"name": "PROXY_BACKEND_READY_TIMEOUT_SECONDS", "value": "30"},
+        {"name": "PROXY_BACKEND_READY_POLL_SECONDS", "value": "2"},
         {"name": "ALWAYS_ON_MODE", "value": "false"}
       ],
       "secrets": [

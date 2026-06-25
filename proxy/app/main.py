@@ -183,6 +183,49 @@ def _can_stop_ec2() -> bool:
 lifecycle.set_stop_guard(_can_stop_ec2)
 
 
+def _backend_ready_for_proxy() -> bool:
+    return lifecycle.state in (InstanceState.READY, InstanceState.BUSY) and bool(lifecycle.private_ip)
+
+
+async def _ensure_backend_ready_for_proxy(error_context: str) -> None:
+    """Refresh/wake the backend before artifact proxy routes fail fast."""
+    if _backend_ready_for_proxy():
+        return
+
+    try:
+        await lifecycle.sync_state_from_ec2()
+    except Exception:
+        logger.debug("sync_state_from_ec2 failed before proxying %s", error_context, exc_info=True)
+
+    if _backend_ready_for_proxy():
+        return
+
+    await lifecycle.ensure_running()
+
+    timeout_seconds = max(0, settings.PROXY_BACKEND_READY_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + timeout_seconds
+    poll_seconds = max(1, settings.PROXY_BACKEND_READY_POLL_SECONDS)
+    while time.monotonic() < deadline:
+        if _backend_ready_for_proxy():
+            return
+        await asyncio.sleep(poll_seconds)
+        try:
+            await lifecycle.sync_state_from_ec2()
+        except Exception:
+            logger.debug("sync_state_from_ec2 failed while waiting to proxy %s", error_context, exc_info=True)
+
+    if _backend_ready_for_proxy():
+        return
+
+    logger.warning(
+        "Backend not ready for %s after %ss; state=%s",
+        error_context,
+        timeout_seconds,
+        lifecycle.state.value,
+    )
+    raise HTTPException(status_code=503, detail="EC2 is starting; retry shortly")
+
+
 def _progress_payload(stage: str, stage_display: str, percent: int = 0) -> dict[str, Any]:
     return {
         "stage": stage,
@@ -763,8 +806,7 @@ async def download_extraction_output(
     _require_auth(authorization)
     lifecycle.touch()
 
-    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
-        raise HTTPException(status_code=503, detail="EC2 is not running")
+    await _ensure_backend_ready_for_proxy("artifact download")
 
     backend_process_id = proxy_to_backend_process.get(process_id, process_id)
     download_url = f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}/download/{method}"
@@ -838,8 +880,7 @@ async def download_extraction_image(
     _require_auth(authorization)
     lifecycle.touch()
 
-    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
-        raise HTTPException(status_code=503, detail="EC2 is not running")
+    await _ensure_backend_ready_for_proxy("image download")
 
     backend_process_id = proxy_to_backend_process.get(process_id, process_id)
     image_url = (
@@ -886,8 +927,7 @@ async def _proxy_backend_json_get(
     authorization: str | None,
     error_context: str,
 ) -> JSONResponse:
-    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
-        raise HTTPException(status_code=503, detail="EC2 is not running")
+    await _ensure_backend_ready_for_proxy(error_context)
 
     backend_process_id = proxy_to_backend_process.get(process_id, process_id)
     backend_path = path_template.format(backend_process_id=backend_process_id)

@@ -380,17 +380,65 @@ class TestExtractDownloadEndpoint:
     def test_download_returns_503_when_ec2_not_running(self, client, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.STOPPED
+        monkeypatch.setattr(main_mod.settings, "PROXY_BACKEND_READY_TIMEOUT_SECONDS", 0)
 
         resp = client.get(
             "/api/v1/extract/proc-1/download/grobid",
             headers={"Authorization": "Bearer test"},
         )
         assert resp.status_code == 503
+        assert resp.json()["detail"] == "EC2 is starting; retry shortly"
+        main_mod.lifecycle.sync_state_from_ec2.assert_called()
+        main_mod.lifecycle.ensure_running.assert_called_once()
+
+    def test_download_syncs_stale_lifecycle_before_proxying(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.lifecycle.private_ip = None
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+
+        async def _sync_state_from_ec2():
+            main_mod.lifecycle.state = InstanceState.READY
+            main_mod.lifecycle.private_ip = "172.31.1.100"
+
+        main_mod.lifecycle.sync_state_from_ec2 = AsyncMock(side_effect=_sync_state_from_ec2)
+
+        class _DummyResponse:
+            status_code = 200
+            content = b"# recovered markdown\n"
+            headers = {"content-type": "text/markdown; charset=utf-8"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            "/api/v1/extract/proc-1/download/grobid",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.text == "# recovered markdown\n"
+        main_mod.lifecycle.sync_state_from_ec2.assert_called_once()
+        main_mod.lifecycle.ensure_running.assert_not_called()
 
     def test_download_proxies_content_when_ready(self, client, monkeypatch):
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
         main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
 
         class _DummyResponse:
@@ -432,6 +480,7 @@ class TestExtractDownloadEndpoint:
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
         main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
         main_mod.proxy_to_backend_process["proxy-dl-1"] = "backend-dl-9"
 
@@ -471,6 +520,7 @@ class TestExtractImageEndpoints:
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
         main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
         main_mod.proxy_to_backend_process["proxy-img-1"] = "backend-img-9"
 
@@ -514,6 +564,7 @@ class TestExtractImageEndpoints:
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
         main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
 
         captured = {"url": None}
@@ -555,6 +606,7 @@ class TestExtractImageEndpoints:
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
         main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
         main_mod.proxy_to_backend_process["proxy-img-dl-1"] = "backend-img-dl-9"
 
