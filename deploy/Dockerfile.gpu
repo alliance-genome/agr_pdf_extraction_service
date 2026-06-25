@@ -49,9 +49,6 @@ RUN python3.11 -m pip install --no-cache-dir \
     torchvision \
     --index-url https://download.pytorch.org/whl/cu128
 
-# Install onnxruntime-gpu (Docling needs this for GPU layout detection)
-RUN python3.11 -m pip install --no-cache-dir onnxruntime-gpu
-
 # Install production server and task queue
 RUN python3.11 -m pip install --no-cache-dir \
     gunicorn \
@@ -62,9 +59,12 @@ RUN python3.11 -m pip install --no-cache-dir \
 COPY requirements.txt .
 RUN python3.11 -m pip install --no-cache-dir --ignore-installed -r requirements.txt
 
-# Force onnxruntime-gpu over any CPU version pulled in by dependencies
-RUN python3.11 -m pip uninstall -y onnxruntime 2>/dev/null; \
-    python3.11 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu || true
+# RapidOCR OCR runs on CPU ONNXRuntime while Docling/Marker keep CUDA-backed
+# torch acceleration. The onnxruntime-gpu wheel currently targets newer CUDA
+# runtime libraries than this CUDA 12.8 image, and its import failure can make
+# Docling auto-select RapidOCR's torch backend, which does not support PP-OCRv6.
+RUN python3.11 -m pip uninstall -y onnxruntime-gpu 2>/dev/null || true; \
+    python3.11 -m pip install --no-cache-dir --force-reinstall 'onnxruntime>=1.18,<2'
 
 # Re-apply PyTorch from the CUDA 12.8 index after dependency installation.
 # Some transitive dependencies can otherwise upgrade torch to a CUDA wheel that
@@ -91,6 +91,9 @@ ENV NVIDIA_VISIBLE_DEVICES="all"
 ENV NVIDIA_DRIVER_CAPABILITIES="compute,utility"
 ENV TORCH_DEVICE="auto"
 ENV DOCLING_DEVICE="cuda"
+ENV DOCLING_RAPIDOCR_BACKEND="onnxruntime"
+ENV DOCLING_RAPIDOCR_MODEL_TYPE="medium"
+ENV DOCLING_RAPIDOCR_USE_CUDA="false"
 ENV MARKER_DEVICE="auto"
 ENV OMP_NUM_THREADS="8"
 ENV MKL_NUM_THREADS="8"
