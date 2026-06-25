@@ -94,6 +94,67 @@ class TestLifecycleManager:
         assert mgr.state == InstanceState.READY
         assert mgr.private_ip == "10.0.0.5"
 
+    def test_poll_until_healthy_stops_backend_after_terminal_timeout(self, monkeypatch):
+        mgr, ec2 = self._make_manager(InstanceState.STARTING)
+        ec2.get_instance_state.return_value = ("running", "10.0.0.5")
+        ec2.mark_unhealthy.return_value = True
+        mgr._check_health = AsyncMock(return_value=False)
+
+        monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 0)
+        monkeypatch.setattr("app.state_machine.settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS", 0)
+
+        asyncio.run(mgr._poll_until_healthy())
+
+        ec2.mark_unhealthy.assert_not_called()
+        ec2.stop_instance.assert_called_once()
+        assert mgr.state == InstanceState.STOPPED
+        assert mgr.startup_timeout_total == 1
+        assert mgr.replacement_requests_total == 0
+
+    def test_poll_until_healthy_waits_for_asg_replacement_after_timeout(self, monkeypatch):
+        mgr, ec2 = self._make_manager(InstanceState.STARTING)
+        ec2.get_instance_state.return_value = ("running", "10.0.0.5")
+        ec2.mark_unhealthy.return_value = True
+        mgr._check_health = AsyncMock(return_value=True)
+        mgr._start_idle_monitor = MagicMock()
+
+        times = iter([0.0, 2.0, 2.0, 2.1, 2.2])
+        monkeypatch.setattr("app.state_machine.time.time", lambda: next(times, 2.2))
+        monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 1 / 60)
+        monkeypatch.setattr("app.state_machine.settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS", 1)
+
+        asyncio.run(mgr._poll_until_healthy())
+
+        ec2.mark_unhealthy.assert_called_once()
+        assert mgr.state == InstanceState.READY
+        assert mgr.startup_timeout_total == 1
+        assert mgr.replacement_requests_total == 1
+        ec2.stop_instance.assert_not_called()
+
+    def test_poll_until_healthy_stops_backend_after_exhausted_replacement(self, monkeypatch):
+        mgr, ec2 = self._make_manager(InstanceState.STARTING)
+        ec2.get_instance_state.return_value = ("running", "10.0.0.5")
+        ec2.mark_unhealthy.return_value = True
+        mgr._check_health = AsyncMock(return_value=False)
+
+        fake_time = {"now": -1.0}
+
+        def _advancing_time():
+            fake_time["now"] += 1.0
+            return fake_time["now"]
+
+        monkeypatch.setattr("app.state_machine.time.time", _advancing_time)
+        monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 1 / 60)
+        monkeypatch.setattr("app.state_machine.settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS", 1)
+
+        asyncio.run(mgr._poll_until_healthy())
+
+        ec2.mark_unhealthy.assert_called_once()
+        ec2.stop_instance.assert_called_once()
+        assert mgr.state == InstanceState.STOPPED
+        assert mgr.startup_timeout_total == 2
+        assert mgr.replacement_requests_total == 1
+
     def test_check_health_requires_active_workers(self, monkeypatch):
         mgr, _ = self._make_manager()
         mgr._private_ip = "10.0.0.5"

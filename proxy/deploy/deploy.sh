@@ -75,6 +75,26 @@ read_param() {
     "${AWS_CMD[@]}" ssm get-parameter --name "$1" --query "Parameter.Value" --output text
 }
 
+read_optional_param() {
+    local name="$1"
+    local err_file
+    err_file=$(mktemp)
+    if value=$("${AWS_CMD[@]}" ssm get-parameter --name "$name" --query "Parameter.Value" --output text 2>"$err_file"); then
+        rm -f "$err_file"
+        echo "$value"
+        return 0
+    fi
+    if grep -q 'ParameterNotFound' "$err_file"; then
+        rm -f "$err_file"
+        echo ""
+        return 0
+    fi
+    echo "ERROR: failed to read optional SSM parameter ${name}:" >&2
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return 1
+}
+
 # Idempotently ensure an SSM String parameter exists so the ECS task
 # definition's `secrets` block can resolve it. Existing values are never
 # touched (no --overwrite). Created with a single space because SSM rejects
@@ -88,6 +108,7 @@ read_param() {
 # "param missing → create".
 ensure_ssm_param() {
     local name="$1"
+    local value="${2:- }"
     local err_file
     err_file=$(mktemp)
     if "${AWS_CMD[@]}" ssm get-parameter --name "$name" >/dev/null 2>"$err_file"; then
@@ -109,7 +130,7 @@ ensure_ssm_param() {
     "${AWS_CMD[@]}" ssm put-parameter \
         --name "$name" \
         --type "String" \
-        --value " " \
+        --value "$value" \
         >/dev/null
 }
 
@@ -119,14 +140,21 @@ EXECUTION_ROLE_NAME=$(read_param "${SSM_PREFIX}/execution-role-name")
 TASK_ROLE_NAME=$(read_param "${SSM_PREFIX}/task-role-name")
 QUEUE_S3_BUCKET=$(read_param "${SSM_PREFIX}/audit-s3-bucket")
 
-# Ensure optional auth allow-list parameters exist so the task definition's
-# `secrets` references resolve on first deploy. Operator must have
+# Ensure optional parameters exist so the task definition's `secrets`
+# references resolve on first deploy. Operator must have
 # ssm:PutParameter for the environment's SSM prefix (in addition to
-# ssm:GetParameter) for these
-# placeholder writes; populate real values via `aws ssm put-parameter
-# --overwrite` per environment when the allow-list should be enabled.
+# ssm:GetParameter) for these placeholder writes; populate real values via
+# `aws ssm put-parameter --overwrite` per environment when enabled.
+ensure_ssm_param "${SSM_PREFIX}/backend-asg-name"
 ensure_ssm_param "${SSM_PREFIX}/cognito-accepted-scopes"
 ensure_ssm_param "${SSM_PREFIX}/cognito-accepted-client-ids"
+ensure_ssm_param "${SSM_PREFIX}/asg-startup-replacement-attempts" "1"
+
+BACKEND_ASG_NAME=$(read_optional_param "${SSM_PREFIX}/backend-asg-name")
+EC2_INSTANCE_RESOURCE="${EC2_INSTANCE_ID//[[:space:]]/}"
+BACKEND_ASG_RESOURCE="${BACKEND_ASG_NAME//[[:space:]]/}"
+EC2_INSTANCE_RESOURCE="${EC2_INSTANCE_RESOURCE:-i-00000000000000000}"
+BACKEND_ASG_RESOURCE="${BACKEND_ASG_RESOURCE:-__pdfx-no-backend-asg-configured__}"
 
 EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}"
 TASK_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${TASK_ROLE_NAME}"
@@ -134,6 +162,7 @@ ECR_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/agr_pdfx_proxy:${IM
 
 echo "    Account:        ${AWS_ACCOUNT_ID}"
 echo "    EC2 Instance:   ${EC2_INSTANCE_ID}"
+echo "    Backend ASG:    ${BACKEND_ASG_NAME}"
 echo "    Execution Role: ${EXECUTION_ROLE_ARN}"
 echo "    Task Role:      ${TASK_ROLE_ARN}"
 echo "    ECR Image:      ${ECR_IMAGE}"
@@ -167,7 +196,8 @@ TASK_DEF=$(sed \
 echo "==> Generating IAM policy..."
 IAM_POLICY=$(sed \
     -e "s|\${AWS_ACCOUNT_ID}|${AWS_ACCOUNT_ID}|g" \
-    -e "s|\${EC2_INSTANCE_ID}|${EC2_INSTANCE_ID}|g" \
+    -e "s|\${EC2_INSTANCE_RESOURCE}|${EC2_INSTANCE_RESOURCE}|g" \
+    -e "s|\${BACKEND_ASG_RESOURCE}|${BACKEND_ASG_RESOURCE}|g" \
     -e "s|\${QUEUE_S3_BUCKET}|${QUEUE_S3_BUCKET}|g" \
     -e "s|\${REGION}|${REGION}|g" \
     -e "s|\${SSM_PARAMETER_RESOURCE}|${SSM_PARAMETER_RESOURCE}|g" \

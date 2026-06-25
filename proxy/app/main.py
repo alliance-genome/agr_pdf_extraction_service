@@ -397,6 +397,8 @@ async def metrics():
         "active_backend_jobs": _active_backend_jobs(),
         "ec2_stop_events_total": lifecycle.stop_events_total,
         "ec2_stop_blocked_total": lifecycle.stop_blocked_total,
+        "ec2_startup_timeout_total": lifecycle.startup_timeout_total,
+        "ec2_replacement_requests_total": lifecycle.replacement_requests_total,
         "canary": canary_state,
     }
 
@@ -976,7 +978,13 @@ def _ensure_replay_task() -> None:
 
 async def _replay_when_ready():
     """Wait for EC2 to become ready, then replay all queued jobs."""
-    deadline = asyncio.get_event_loop().time() + settings.STARTUP_TIMEOUT_MINUTES * 60
+    startup_attempts = 1 + max(0, settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS)
+    replay_wait_seconds = (
+        settings.STARTUP_TIMEOUT_MINUTES * 60 * startup_attempts
+        + settings.HEALTH_POLL_INTERVAL_SECONDS
+        + 5
+    )
+    deadline = asyncio.get_event_loop().time() + replay_wait_seconds
     while asyncio.get_event_loop().time() < deadline:
         if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
             break

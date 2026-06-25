@@ -17,8 +17,19 @@ def test_test_mirror_stack_uses_separate_environment_resources():
     assert "Default: pdfx-proxy-test" in template
     assert "Default: sg-21ac675b" in template
     assert "Default: sg-006b41eff1820ad53" in template
+    assert "BackendLaunchTemplate:" in template
+    assert "BackendAutoScalingGroup:" in template
+    assert "Type: AWS::EC2::LaunchTemplate" in template
+    assert "Type: AWS::AutoScaling::AutoScalingGroup" in template
+    assert "HealthCheckType: EC2,EBS" in template
+    assert "MaxSize: !Ref BackendMaxSize" in template
     assert "Name: !Sub \"/${SsmParameterPath}/ec2-instance-id\"" in template
+    assert "Name: !Sub \"/${SsmParameterPath}/backend-asg-name\"" in template
+    assert "Name: !Sub \"/${SsmParameterPath}/asg-startup-replacement-attempts\"" in template
     assert "ValueFrom: !Ref SsmEc2InstanceId" in template
+    assert "ValueFrom: !Ref SsmBackendAsgName" in template
+    assert "ValueFrom: !Ref SsmAsgStartupReplacementAttempts" in template
+    assert "BackendInstance:" not in template
     assert "/pdfx/ec2-instance-id" not in template
     assert "agr-pdf-extraction-benchmark" not in template
 
@@ -59,10 +70,21 @@ def test_test_mirror_runbook_documents_safe_bootstrap_path():
     runbook = RUNBOOK_PATH.read_text()
 
     assert "/pdfx-test/backend-env" in runbook
+    assert "/pdfx-test/backend-asg-name" in runbook
     assert "remove legacy toggles such as `MARKER_EXTRACT_IMAGES`" in runbook
     assert "DeployBackendOnBoot=true" in runbook
     assert "--ssm-prefix /pdfx-test" in runbook
     assert "does not clone the production EBS volume" in runbook
+
+
+def test_test_mirror_stack_has_backend_resilience_alarms():
+    template = STACK_PATH.read_text()
+
+    assert "ProxyStartupTimeoutMetricFilter" in template
+    assert "ProxyBackendReplacementMetricFilter" in template
+    assert "pdfx-${EnvironmentName}-startup-timeouts" in template
+    assert "pdfx-${EnvironmentName}-backend-replacements" in template
+    assert "AlarmSnsTopicArn" in template
 
 
 def test_gpu_compose_builds_local_image_for_test_backend():

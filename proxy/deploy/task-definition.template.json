@@ -29,6 +29,7 @@
       ],
       "secrets": [
         {"name": "EC2_INSTANCE_ID", "valueFrom": "${SSM_PREFIX}/ec2-instance-id"},
+        {"name": "BACKEND_ASG_NAME", "valueFrom": "${SSM_PREFIX}/backend-asg-name"},
         {"name": "EC2_REGION", "valueFrom": "${SSM_PREFIX}/ec2-region"},
         {"name": "EC2_PORT", "valueFrom": "${SSM_PREFIX}/ec2-port"},
         {"name": "COGNITO_USER_POOL_ID", "valueFrom": "${SSM_PREFIX}/cognito-user-pool-id"},
@@ -38,6 +39,7 @@
         {"name": "COGNITO_ACCEPTED_CLIENT_IDS", "valueFrom": "${SSM_PREFIX}/cognito-accepted-client-ids"},
         {"name": "IDLE_TIMEOUT_MINUTES", "valueFrom": "${SSM_PREFIX}/idle-timeout-minutes"},
         {"name": "STARTUP_TIMEOUT_MINUTES", "valueFrom": "${SSM_PREFIX}/startup-timeout-minutes"},
+        {"name": "ASG_STARTUP_REPLACEMENT_ATTEMPTS", "valueFrom": "${SSM_PREFIX}/asg-startup-replacement-attempts"},
         {"name": "MAX_QUEUED_JOBS", "valueFrom": "${SSM_PREFIX}/max-queued-jobs"}
       ],
       "logConfiguration": {

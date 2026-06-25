@@ -85,6 +85,30 @@ Parameters:
     Default: "true"
     AllowedValues: ["true", "false"]
     Description: Whether to attach a public IP to the backend instance.
+  BackendMinSize:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1
+    Description: Minimum backend ASG size. Keep 0 so idle scale-down can remove running GPU cost.
+  BackendDesiredCapacity:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1
+    Description: Initial backend ASG desired capacity. The proxy scales this to 1 on demand.
+  BackendMaxSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 2
+    Description: Hard cap for backend GPU instances. Use 1 for strict cost control, 2 for launch-before-terminate experiments.
+  BackendWarmPoolMinSize:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1
+    Description: Optional stopped warm-pool backend count for faster wake without running GPU cost.
   OperatorSshCidr:
     Type: String
     Default: 10.0.70.0/24
@@ -161,9 +185,17 @@ Parameters:
   StartupTimeoutMinutes:
     Type: String
     Default: "10"
+  AsgStartupReplacementAttempts:
+    Type: String
+    Default: "1"
+    Description: Extra ASG backend replacement attempts the proxy waits through after startup timeout.
   MaxQueuedJobs:
     Type: String
     Default: "50"
+  AlarmSnsTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic ARN for PDFX proxy alarms. Leave empty to create alarms without actions.
   AlwaysOnMode:
     Type: String
     Default: "false"
@@ -186,6 +218,8 @@ Parameters:
 
 Conditions:
   AssociateBackendPublicIp: !Equals [!Ref BackendAssociatePublicIp, "true"]
+  EnableBackendWarmPool: !Not [!Equals [!Ref BackendWarmPoolMinSize, 0]]
+  HasAlarmActions: !Not [!Equals [!Ref AlarmSnsTopicArn, ""]]
 
 Resources:
   AuditBucket:
@@ -298,106 +332,152 @@ Resources:
       Roles:
         - !Ref BackendRole
 
-  BackendInstance:
-    Type: AWS::EC2::Instance
+  BackendLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
     Properties:
-      ImageId: !Ref BackendAmiId
-      InstanceType: !Ref BackendInstanceType
-      KeyName: !Ref BackendKeyName
-      IamInstanceProfile: !Ref BackendInstanceProfile
-      BlockDeviceMappings:
-        - DeviceName: /dev/xvda
-          Ebs:
-            VolumeSize: !Ref BackendRootVolumeSize
-            VolumeType: gp3
-            Iops: 3000
-            Encrypted: true
-            DeleteOnTermination: true
-      MetadataOptions:
-        HttpEndpoint: enabled
-        HttpTokens: required
-        HttpPutResponseHopLimit: 2
-      NetworkInterfaces:
-        - DeviceIndex: 0
-          SubnetId: !Ref BackendSubnetId
-          GroupSet:
-            - !Ref BackendSecurityGroup
-            - !Ref DefaultSecurityGroupId
-            - !Ref BackendVpnSecurityGroupId
-          AssociatePublicIpAddress: !If [AssociateBackendPublicIp, true, false]
+      LaunchTemplateName: !Sub "pdfx-backend-${EnvironmentName}"
+      LaunchTemplateData:
+        ImageId: !Ref BackendAmiId
+        InstanceType: !Ref BackendInstanceType
+        KeyName: !Ref BackendKeyName
+        IamInstanceProfile:
+          Arn: !GetAtt BackendInstanceProfile.Arn
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref BackendRootVolumeSize
+              VolumeType: gp3
+              Iops: 3000
+              Encrypted: true
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            Groups:
+              - !Ref BackendSecurityGroup
+              - !Ref DefaultSecurityGroupId
+              - !Ref BackendVpnSecurityGroupId
+            AssociatePublicIpAddress: !If [AssociateBackendPublicIp, true, false]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "pdfx-backend-${EnvironmentName}"
+              - Key: Project
+                Value: pdfx
+              - Key: Environment
+                Value: !Ref EnvironmentName
+          - ResourceType: volume
+            Tags:
+              - Key: Project
+                Value: pdfx
+              - Key: Environment
+                Value: !Ref EnvironmentName
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              set -euo pipefail
+              exec > >(tee /var/log/pdfx-bootstrap.log | logger -t pdfx-bootstrap -s 2>/dev/console) 2>&1
+
+              echo "Starting PDFX ${EnvironmentName} backend bootstrap"
+              dnf install -y docker git jq awscli
+              systemctl enable --now docker
+              usermod -aG docker ec2-user || true
+
+              if ! docker compose version >/dev/null 2>&1; then
+                mkdir -p /usr/local/lib/docker/cli-plugins
+                COMPOSE_VERSION="${DockerComposeVersion}"
+                curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+                  -o /usr/local/lib/docker/cli-plugins/docker-compose
+                chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+              fi
+
+              if ! docker info 2>/dev/null | grep -qi nvidia; then
+                echo "WARNING: Docker does not report an NVIDIA runtime yet; verify nvidia-container-toolkit before GPU deploy."
+              fi
+
+              DEPLOY_BACKEND_ON_BOOT="${DeployBackendOnBoot}"
+              if [ "$DEPLOY_BACKEND_ON_BOOT" != "true" ]; then
+                echo "DeployBackendOnBoot=false; backend host provisioned but app deploy skipped."
+                shutdown -h +1 "PDFX test backend bootstrap complete; DeployBackendOnBoot=false"
+                exit 0
+              fi
+
+              SERVICE_DIR=/home/ec2-user/agr_pdf_extraction_service
+              rm -rf "$SERVICE_DIR"
+              sudo -u ec2-user git clone "${BackendGitRepositoryUrl}" "$SERVICE_DIR"
+              sudo -u ec2-user git -C "$SERVICE_DIR" fetch --all --tags --prune
+              sudo -u ec2-user git -C "$SERVICE_DIR" checkout "${BackendGitRef}"
+              cd "$SERVICE_DIR"
+
+              if ! aws ssm get-parameter \
+                --region "${AWS::Region}" \
+                --with-decryption \
+                --name "/${SsmParameterPath}/backend-env" \
+                --query Parameter.Value \
+                --output text > .env; then
+                echo "ERROR: missing /${SsmParameterPath}/backend-env SecureString. Create it before enabling DeployBackendOnBoot."
+                exit 1
+              fi
+
+              # Scrub production storage values from copied env files before
+              # appending test-scoped S3 settings below.
+              grep -vE '^(AUDIT_S3_BUCKET|AUDIT_S3_BUCKET_SSM_PARAM|AUDIT_S3_PREFIX|IMAGE_URL_TTL_SECONDS|IMAGE_RETENTION_TTL_SECONDS|AWS_DEFAULT_REGION)=' .env > .env.scrubbed || true
+              mv .env.scrubbed .env
+
+              cat >> .env <<ENV_EOF
+              AUDIT_S3_BUCKET=${AuditBucket}
+              AUDIT_S3_BUCKET_SSM_PARAM=/${SsmParameterPath}/audit-s3-bucket
+              AUDIT_S3_PREFIX=${AuditPrefix}
+              AWS_DEFAULT_REGION=${AWS::Region}
+              IMAGE_URL_TTL_SECONDS=3600
+              IMAGE_RETENTION_TTL_SECONDS=$(( ${ImageRetentionDays} * 86400 ))
+              ENV_EOF
+
+              mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
+              chown -R ec2-user:ec2-user "$SERVICE_DIR"
+              cd deploy
+              GPU_MODE=on ./deploy.sh
+
+  BackendAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "pdfx-backend-${EnvironmentName}"
+      MinSize: !Ref BackendMinSize
+      MaxSize: !Ref BackendMaxSize
+      DesiredCapacity: !Ref BackendDesiredCapacity
+      HealthCheckType: EC2,EBS
+      HealthCheckGracePeriod: 900
+      VPCZoneIdentifier:
+        - !Ref BackendSubnetId
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BackendLaunchTemplate
+        Version: !GetAtt BackendLaunchTemplate.LatestVersionNumber
       Tags:
         - Key: Name
           Value: !Sub "pdfx-backend-${EnvironmentName}"
+          PropagateAtLaunch: true
         - Key: Project
           Value: pdfx
+          PropagateAtLaunch: true
         - Key: Environment
           Value: !Ref EnvironmentName
-      UserData:
-        Fn::Base64:
-          Fn::Sub: |
-            #!/bin/bash
-            set -euo pipefail
-            exec > >(tee /var/log/pdfx-bootstrap.log | logger -t pdfx-bootstrap -s 2>/dev/console) 2>&1
+          PropagateAtLaunch: true
 
-            echo "Starting PDFX ${EnvironmentName} backend bootstrap"
-            dnf install -y docker git jq awscli
-            systemctl enable --now docker
-            usermod -aG docker ec2-user || true
-
-            if ! docker compose version >/dev/null 2>&1; then
-              mkdir -p /usr/local/lib/docker/cli-plugins
-              COMPOSE_VERSION="${DockerComposeVersion}"
-              curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
-                -o /usr/local/lib/docker/cli-plugins/docker-compose
-              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-            fi
-
-            if ! docker info 2>/dev/null | grep -qi nvidia; then
-              echo "WARNING: Docker does not report an NVIDIA runtime yet; verify nvidia-container-toolkit before GPU deploy."
-            fi
-
-            DEPLOY_BACKEND_ON_BOOT="${DeployBackendOnBoot}"
-            if [ "$DEPLOY_BACKEND_ON_BOOT" != "true" ]; then
-              echo "DeployBackendOnBoot=false; backend host provisioned but app deploy skipped."
-              shutdown -h +1 "PDFX test backend bootstrap complete; DeployBackendOnBoot=false"
-              exit 0
-            fi
-
-            SERVICE_DIR=/home/ec2-user/agr_pdf_extraction_service
-            rm -rf "$SERVICE_DIR"
-            sudo -u ec2-user git clone "${BackendGitRepositoryUrl}" "$SERVICE_DIR"
-            sudo -u ec2-user git -C "$SERVICE_DIR" fetch --all --tags --prune
-            sudo -u ec2-user git -C "$SERVICE_DIR" checkout "${BackendGitRef}"
-            cd "$SERVICE_DIR"
-
-            if ! aws ssm get-parameter \
-              --region "${AWS::Region}" \
-              --with-decryption \
-              --name "/${SsmParameterPath}/backend-env" \
-              --query Parameter.Value \
-              --output text > .env; then
-              echo "ERROR: missing /${SsmParameterPath}/backend-env SecureString. Create it before enabling DeployBackendOnBoot."
-              exit 1
-            fi
-
-            # Scrub production storage values from copied env files before
-            # appending test-scoped S3 settings below.
-            grep -vE '^(AUDIT_S3_BUCKET|AUDIT_S3_BUCKET_SSM_PARAM|AUDIT_S3_PREFIX|IMAGE_URL_TTL_SECONDS|IMAGE_RETENTION_TTL_SECONDS|AWS_DEFAULT_REGION)=' .env > .env.scrubbed || true
-            mv .env.scrubbed .env
-
-            cat >> .env <<ENV_EOF
-            AUDIT_S3_BUCKET=${AuditBucket}
-            AUDIT_S3_BUCKET_SSM_PARAM=/${SsmParameterPath}/audit-s3-bucket
-            AUDIT_S3_PREFIX=${AuditPrefix}
-            AWS_DEFAULT_REGION=${AWS::Region}
-            IMAGE_URL_TTL_SECONDS=3600
-            IMAGE_RETENTION_TTL_SECONDS=$(( ${ImageRetentionDays} * 86400 ))
-            ENV_EOF
-
-            mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
-            chown -R ec2-user:ec2-user "$SERVICE_DIR"
-            cd deploy
-            GPU_MODE=on ./deploy.sh
+  BackendWarmPool:
+    Type: AWS::AutoScaling::WarmPool
+    Condition: EnableBackendWarmPool
+    Properties:
+      AutoScalingGroupName: !Ref BackendAutoScalingGroup
+      PoolState: Stopped
+      MinSize: !Ref BackendWarmPoolMinSize
+      MaxGroupPreparedCapacity: !Ref BackendMaxSize
+      InstanceReusePolicy:
+        ReuseOnScaleIn: true
 
   ProxyExecutionRole:
     Type: AWS::IAM::Role
@@ -439,12 +519,17 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: EC2Lifecycle
+              - Sid: AutoScalingLifecycle
                 Effect: Allow
                 Action:
-                  - ec2:StartInstances
-                  - ec2:StopInstances
-                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${BackendInstance}"
+                  - autoscaling:SetInstanceHealth
+                  - autoscaling:SetDesiredCapacity
+                Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${BackendAutoScalingGroup}"
+              - Sid: AutoScalingDescribe
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                Resource: "*"
               - Sid: EC2Describe
                 Effect: Allow
                 Action:
@@ -482,7 +567,13 @@ Resources:
     Properties:
       Name: !Sub "/${SsmParameterPath}/ec2-instance-id"
       Type: String
-      Value: !Ref BackendInstance
+      Value: " "
+  SsmBackendAsgName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/backend-asg-name"
+      Type: String
+      Value: !Ref BackendAutoScalingGroup
   SsmEc2Region:
     Type: AWS::SSM::Parameter
     Properties:
@@ -555,6 +646,12 @@ Resources:
       Name: !Sub "/${SsmParameterPath}/startup-timeout-minutes"
       Type: String
       Value: !Ref StartupTimeoutMinutes
+  SsmAsgStartupReplacementAttempts:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/asg-startup-replacement-attempts"
+      Type: String
+      Value: !Ref AsgStartupReplacementAttempts
   SsmMaxQueuedJobs:
     Type: AWS::SSM::Parameter
     Properties:
@@ -567,6 +664,56 @@ Resources:
     Properties:
       LogGroupName: !Sub "/ecs/${EcsServiceName}"
       RetentionInDays: 30
+
+  ProxyStartupTimeoutMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProxyLogGroup
+      FilterPattern: '"EC2 startup timed out"'
+      MetricTransformations:
+        - MetricNamespace: PDFX/Proxy
+          MetricName: !Sub "${EnvironmentName}-startup-timeouts"
+          MetricValue: "1"
+
+  ProxyBackendReplacementMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProxyLogGroup
+      FilterPattern: '"Marking ASG backend instance" "unhealthy"'
+      MetricTransformations:
+        - MetricNamespace: PDFX/Proxy
+          MetricName: !Sub "${EnvironmentName}-backend-replacements"
+          MetricValue: "1"
+
+  ProxyStartupTimeoutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "pdfx-${EnvironmentName}-startup-timeouts"
+      AlarmDescription: PDFX backend failed to become healthy before queued replay timeout.
+      Namespace: PDFX/Proxy
+      MetricName: !Sub "${EnvironmentName}-startup-timeouts"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmActions, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+
+  ProxyBackendReplacementAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "pdfx-${EnvironmentName}-backend-replacements"
+      AlarmDescription: PDFX proxy asked Auto Scaling to replace an unhealthy backend instance.
+      Namespace: PDFX/Proxy
+      MetricName: !Sub "${EnvironmentName}-backend-replacements"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmActions, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
 
   ProxyCluster:
     Type: AWS::ECS::Cluster
@@ -612,6 +759,8 @@ Resources:
           Secrets:
             - Name: EC2_INSTANCE_ID
               ValueFrom: !Ref SsmEc2InstanceId
+            - Name: BACKEND_ASG_NAME
+              ValueFrom: !Ref SsmBackendAsgName
             - Name: EC2_REGION
               ValueFrom: !Ref SsmEc2Region
             - Name: EC2_PORT
@@ -630,6 +779,8 @@ Resources:
               ValueFrom: !Ref SsmIdleTimeout
             - Name: STARTUP_TIMEOUT_MINUTES
               ValueFrom: !Ref SsmStartupTimeout
+            - Name: ASG_STARTUP_REPLACEMENT_ATTEMPTS
+              ValueFrom: !Ref SsmAsgStartupReplacementAttempts
             - Name: MAX_QUEUED_JOBS
               ValueFrom: !Ref SsmMaxQueuedJobs
           LogConfiguration:
@@ -720,12 +871,10 @@ Resources:
         EvaluateTargetHealth: true
 
 Outputs:
-  BackendInstanceId:
-    Value: !Ref BackendInstance
-  BackendPublicIp:
-    Value: !GetAtt BackendInstance.PublicIp
-  BackendPrivateIp:
-    Value: !GetAtt BackendInstance.PrivateIp
+  BackendAutoScalingGroupName:
+    Value: !Ref BackendAutoScalingGroup
+  BackendLaunchTemplateId:
+    Value: !Ref BackendLaunchTemplate
   ProxyUrl:
     Value: !Sub "https://${DomainName}"
   AuditBucket:
