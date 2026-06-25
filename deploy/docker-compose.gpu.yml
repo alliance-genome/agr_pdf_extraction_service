@@ -65,6 +65,7 @@ services:
     environment:
       <<: *shared-env
       TORCH_DEVICE: cpu
+      DOCLING_DEVICE: cpu
       CUDA_VISIBLE_DEVICES: ""
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
@@ -113,9 +114,6 @@ services:
       TORCH_DEVICE: "auto"
       MARKER_DEVICE: "auto"
       DOCLING_DEVICE: "cuda"
-      DOCLING_RAPIDOCR_BACKEND: "onnxruntime"
-      DOCLING_RAPIDOCR_MODEL_TYPE: "medium"
-      DOCLING_RAPIDOCR_USE_CUDA: "false"
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"

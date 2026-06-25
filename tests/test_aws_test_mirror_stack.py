@@ -94,7 +94,27 @@ def test_gpu_compose_builds_local_image_for_test_backend():
     assert "dockerfile: deploy/Dockerfile.gpu" in compose
 
 
+def test_gpu_compose_keeps_web_app_cpu_only_and_worker_ocr_overridable():
+    compose = GPU_COMPOSE_PATH.read_text()
+
+    app_section = compose.split("  app:", 1)[1].split("  worker:", 1)[0]
+    worker_section = compose.split("  worker:", 1)[1].split("  grobid:", 1)[0]
+
+    assert "DOCLING_DEVICE: cpu" in app_section
+    assert 'CUDA_VISIBLE_DEVICES: ""' in app_section
+    assert 'DOCLING_DEVICE: "cuda"' in worker_section
+    assert "DOCLING_RAPIDOCR_BACKEND:" not in worker_section
+    assert "DOCLING_RAPIDOCR_MODEL_TYPE:" not in worker_section
+    assert "DOCLING_RAPIDOCR_USE_CUDA:" not in worker_section
+
+
 def test_marker_requirement_uses_modern_converter_api_version():
     requirements = REQUIREMENTS_PATH.read_text()
 
     assert "marker-pdf>=1.10.2,<1.11" in requirements
+
+
+def test_docling_ocr_backend_has_cpu_onnxruntime_requirement():
+    requirements = REQUIREMENTS_PATH.read_text()
+
+    assert "onnxruntime>=1.18,<2" in requirements

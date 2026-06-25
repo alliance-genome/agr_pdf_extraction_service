@@ -4,6 +4,7 @@ flask
 # PDF extraction tools
 requests
 docling[vlm]
+onnxruntime>=1.18,<2  # RapidOCR/Docling OCR backend; CPU wheel is intentional even in GPU deployments
 marker-pdf>=1.10.2,<1.11
 
 # LLM
