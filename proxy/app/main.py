@@ -316,6 +316,12 @@ def _require_auth(authorization: str | None) -> dict:
 
 # --- Health (no auth) ---
 
+@app.get("/api/v1/health/live")
+async def health_live():
+    """Container liveness probe that does not depend on EC2/backend readiness."""
+    return {"proxy": "ok", "status": "live"}
+
+
 @app.get("/api/v1/health")
 async def health():
     ec2_state = lifecycle.state.value

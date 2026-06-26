@@ -11,6 +11,7 @@ def test_task_definition_healthcheck_uses_python_not_curl():
 
     assert "python -c" in health_cmd
     assert "urllib.request.urlopen" in health_cmd
+    assert "/api/v1/health/live" in health_cmd
     assert "curl" not in health_cmd
 
 
