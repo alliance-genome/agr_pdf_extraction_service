@@ -189,6 +189,8 @@ All settings come from environment variables. In production, values are injected
 | `HEALTH_POLL_INTERVAL_SECONDS` | No | `15` | Seconds between EC2 health polls during startup |
 | `MAX_QUEUED_JOBS` | No | `10` | Max jobs to hold in memory during startup |
 | `FORWARD_TIMEOUT_SECONDS` | No | `600` | Timeout for forwarded HTTP requests to EC2 |
+| `PROXY_BACKEND_READY_TIMEOUT_SECONDS` | No | `30` | Max seconds artifact/image proxy routes wait for a refreshed or waking backend before returning 503 |
+| `PROXY_BACKEND_READY_POLL_SECONDS` | No | `2` | Seconds between backend readiness checks while artifact/image proxy routes wait |
 | `ALWAYS_ON_MODE` | No | `false` | Emergency mode that disables idle auto-stop |
 | `QUEUE_BACKEND` | No | `memory` | Queue backend: `memory` or `s3` |
 | `QUEUE_S3_BUCKET` | No | — | S3 bucket for durable queue (`QUEUE_BACKEND=s3`) |

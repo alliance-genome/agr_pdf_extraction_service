@@ -1015,6 +1015,11 @@ Everything below is optional and has sensible defaults.
 | `GROBID_INCLUDE_COORDINATES` | `false` | Include coordinate data in GROBID output |
 | `GROBID_INCLUDE_RAW_CITATIONS` | `false` | Include raw citation strings |
 | `DOCLING_DEVICE` | `cpu` | Docling device (`cpu` or `cuda` for GPU) |
+| `DOCLING_RAPIDOCR_BACKEND` | `onnxruntime` | RapidOCR backend used by Docling OCR |
+| `DOCLING_RAPIDOCR_MODEL_TYPE` | `medium` | PP-OCRv6 model size for Docling OCR (`small` or `medium`) |
+| `DOCLING_RAPIDOCR_DET_LANG` | `en` | PP-OCRv6 detector language family for Docling OCR (`en` or `ch`) |
+| `DOCLING_RAPIDOCR_REC_LANG` | `en` | PP-OCRv6 recognizer language family for Docling OCR (`en` or `ch`) |
+| `DOCLING_RAPIDOCR_USE_CUDA` | `false` | Run RapidOCR ONNXRuntime on CUDA; keep `false` unless the image includes a matching ONNXRuntime GPU wheel |
 | `MARKER_DEVICE` | `cpu` | Marker device (`cpu` or `auto` for GPU) |
 
 ### LLM Model Selection
@@ -1100,7 +1105,7 @@ Everything below is optional and has sensible defaults.
 | `UPLOAD_FOLDER` | `./uploaded_pdfs` | Upload directory |
 | `CACHE_FOLDER` | `./extraction_cache` | Local cache directory |
 | `MAX_CONTENT_LENGTH` | `104857600` | Max upload size in bytes (100 MB) |
-| `EXTRACTION_CONFIG_VERSION` | `4` | Bump to invalidate cached outputs |
+| `EXTRACTION_CONFIG_VERSION` | `6` | Bump to invalidate cached outputs |
 | `AUDIT_S3_BUCKET` | _(empty)_ | S3 bucket for durable artifact storage; resolved from SSM if unset |
 | `AUDIT_S3_BUCKET_SSM_PARAM` | `/pdfx/audit-s3-bucket` | SSM parameter name for bucket resolution |
 | `AUDIT_S3_PREFIX` | `pdfx/audit` | S3 key prefix for audit artifacts |

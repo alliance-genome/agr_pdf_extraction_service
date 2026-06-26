@@ -33,6 +33,8 @@ class Settings:
     MAX_QUEUED_JOBS: int = int(os.environ.get("MAX_QUEUED_JOBS", "10"))
 
     FORWARD_TIMEOUT_SECONDS: int = int(os.environ.get("FORWARD_TIMEOUT_SECONDS", "600"))
+    PROXY_BACKEND_READY_TIMEOUT_SECONDS: int = int(os.environ.get("PROXY_BACKEND_READY_TIMEOUT_SECONDS", "30"))
+    PROXY_BACKEND_READY_POLL_SECONDS: int = int(os.environ.get("PROXY_BACKEND_READY_POLL_SECONDS", "2"))
     ALWAYS_ON_MODE: bool = os.environ.get("ALWAYS_ON_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
     QUEUE_BACKEND: str = os.environ.get("QUEUE_BACKEND", "memory").strip().lower()

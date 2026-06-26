@@ -22,10 +22,23 @@ def _install_docling_stubs():
 
     class _PdfFormatOption:
         def __init__(self, *args, **kwargs):
-            pass
+            self.args = args
+            self.kwargs = kwargs
 
     class _PdfPipelineOptions:
         def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.accelerator_options = kwargs.get("accelerator_options")
+            self.ocr_batch_size = kwargs.get("ocr_batch_size")
+            self.layout_batch_size = kwargs.get("layout_batch_size")
+            self.do_ocr = None
+            self.ocr_options = None
+
+    class _RapidOcrOptions:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
             pass
 
     class _ThreadedPdfPipelineOptions(_PdfPipelineOptions):
@@ -33,7 +46,10 @@ def _install_docling_stubs():
 
     class _AcceleratorOptions:
         def __init__(self, *args, **kwargs):
-            pass
+            self.args = args
+            self.kwargs = kwargs
+            self.device = kwargs.get("device")
+            self.num_threads = None
 
     class _AcceleratorDevice:
         CPU = "cpu"
@@ -47,6 +63,7 @@ def _install_docling_stubs():
     document_converter.PdfFormatOption = _PdfFormatOption
     base_models.InputFormat = _InputFormat
     pipeline_options.PdfPipelineOptions = _PdfPipelineOptions
+    pipeline_options.RapidOcrOptions = _RapidOcrOptions
     pipeline_options.ThreadedPdfPipelineOptions = _ThreadedPdfPipelineOptions
     accelerator_options.AcceleratorOptions = _AcceleratorOptions
     accelerator_options.AcceleratorDevice = _AcceleratorDevice
@@ -61,7 +78,49 @@ def _install_docling_stubs():
 
 _install_docling_stubs()
 
-from app.services.docling_service import Docling
+rapidocr_pkg = types.ModuleType("rapidocr")
+rapidocr_utils = types.ModuleType("rapidocr.utils")
+rapidocr_typings = types.ModuleType("rapidocr.utils.typings")
+
+
+class _EnumValue:
+    def __init__(self, value):
+        self.value = value
+
+
+class _EngineType:
+    ONNXRUNTIME = _EnumValue("onnxruntime")
+
+
+class _OCRVersion:
+    PPOCRV6 = _EnumValue("PP-OCRv6")
+
+
+class _ModelType:
+    SMALL = _EnumValue("small")
+    MEDIUM = _EnumValue("medium")
+
+
+class _LangDet:
+    CH = _EnumValue("ch")
+    EN = _EnumValue("en")
+
+
+class _LangRec:
+    CH = _EnumValue("ch")
+    EN = _EnumValue("en")
+
+
+rapidocr_typings.EngineType = _EngineType
+rapidocr_typings.OCRVersion = _OCRVersion
+rapidocr_typings.ModelType = _ModelType
+rapidocr_typings.LangDet = _LangDet
+rapidocr_typings.LangRec = _LangRec
+sys.modules["rapidocr"] = rapidocr_pkg
+sys.modules["rapidocr.utils"] = rapidocr_utils
+sys.modules["rapidocr.utils.typings"] = rapidocr_typings
+
+from app.services.docling_service import Docling, _cached_converters, _get_converter
 
 
 class _FakeDocument:
@@ -148,3 +207,32 @@ def test_docling_extract_requires_page_no_support(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="missing export_to_markdown\\(page_no=...\\)"):
         docling.extract(str(pdf_path), str(output_path))
+
+
+def test_docling_converter_pins_rapidocr_onnxruntime_cpu(monkeypatch):
+    created = {}
+
+    class _CapturingConverter:
+        def __init__(self, format_options):
+            created["format_options"] = format_options
+
+    monkeypatch.setattr("app.services.docling_service.DocumentConverter", _CapturingConverter)
+    monkeypatch.setenv("DOCLING_RAPIDOCR_BACKEND", "onnxruntime")
+    monkeypatch.setenv("DOCLING_RAPIDOCR_MODEL_TYPE", "medium")
+    monkeypatch.setenv("DOCLING_RAPIDOCR_DET_LANG", "en")
+    monkeypatch.setenv("DOCLING_RAPIDOCR_REC_LANG", "en")
+    monkeypatch.setenv("DOCLING_RAPIDOCR_USE_CUDA", "false")
+    _cached_converters.clear()
+
+    _get_converter("cuda", num_threads=8)
+
+    pipeline_options = created["format_options"]["pdf"].kwargs["pipeline_options"]
+    assert pipeline_options.accelerator_options.device == "cuda"
+    assert pipeline_options.do_ocr is True
+    assert pipeline_options.ocr_options.kwargs["backend"] == "onnxruntime"
+    rapidocr_params = pipeline_options.ocr_options.kwargs["rapidocr_params"]
+    assert rapidocr_params["EngineConfig.onnxruntime.use_cuda"] is False
+    assert rapidocr_params["Det.model_type"].value == "medium"
+    assert rapidocr_params["Rec.model_type"].value == "medium"
+    assert rapidocr_params["Det.lang_type"].value == "en"
+    assert rapidocr_params["Rec.lang_type"].value == "en"

@@ -65,6 +65,7 @@ services:
     environment:
       <<: *shared-env
       TORCH_DEVICE: cpu
+      DOCLING_DEVICE: cpu
       CUDA_VISIBLE_DEVICES: ""
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
