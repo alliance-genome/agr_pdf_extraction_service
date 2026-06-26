@@ -38,6 +38,47 @@ write `/pdfx/*` placeholder parameters before it registers a new proxy task
 definition, because ASG-aware proxy revisions require both the legacy EC2
 instance parameter and the backend ASG parameter to exist.
 
+## GPU Idle Guard Alerts
+
+`pdfx-idle-guard-stack.yaml` creates a scheduled Lambda and CloudWatch alarms
+that alert if the GPU backend ASG stays running longer than expected. The
+guard checks the backend ASG plus the public proxy `/api/v1/metrics` endpoint.
+It publishes custom metrics under `PDFX/IdleGuard` and sends alarm/OK
+notifications to an SNS topic.
+
+Default production-oriented behavior:
+
+- check every 5 minutes
+- track continuous backend ASG runtime in SSM Parameter Store, so the clock
+  does not reset if Auto Scaling replaces an EC2 instance
+- alert after 45 minutes of continuous backend runtime with no queued,
+  replaying, or active backend work
+- alert after 240 minutes of continuous backend runtime regardless of apparent
+  work
+- alert if the guard Lambda errors, is throttled, or misses two consecutive
+  `GuardCheckSucceeded` heartbeats
+- treat proxy metrics fetch failures as idle, so a running backend plus a
+  broken metrics endpoint does not silently hide spend
+
+The existing `pdfx-dev-oom-alerts` SNS topic is already subscribed to
+`ctabone@morgan.harvard.edu` and can be reused for email delivery:
+
+```bash
+deploy/aws/deploy_idle_guard.sh \
+  --profile ctabone \
+  --region us-east-1 \
+  --project pdfx \
+  --env prod \
+  --backend-asg-name pdfx-backend-test \
+  --proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics \
+  --artifact-bucket agr-pdf-extraction-benchmark \
+  --alarm-topic-arn arn:aws:sns:us-east-1:100225593120:pdfx-dev-oom-alerts
+```
+
+For Slack delivery, connect the same SNS topic to the team's AWS Chatbot Slack
+channel configuration, or add that topic ARN to an existing Chatbot
+configuration. Keep email subscribed as the fallback path.
+
 ## AWS OOM Alerts (IaC)
 
 This folder also provides a parameterized, redeployable OOM alerting setup for
