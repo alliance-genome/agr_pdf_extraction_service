@@ -226,6 +226,26 @@ async def _ensure_backend_ready_for_proxy(error_context: str) -> None:
     raise HTTPException(status_code=503, detail="EC2 is starting; retry shortly")
 
 
+async def _ensure_queued_jobs_replaying(reason: str, *, known_queued: bool = False) -> None:
+    """Start durable queued-job replay after restarts or queued-job polls."""
+    try:
+        queued_count = job_queue.size
+    except Exception:
+        logger.exception("Failed to inspect queued jobs for replay (%s)", reason)
+        return
+
+    if not known_queued and queued_count <= 0:
+        return
+
+    if queued_count <= 0:
+        return
+
+    logger.info("Ensuring queued-job replay is active (%s); queue_depth=%d", reason, queued_count)
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        await lifecycle.ensure_running()
+    _ensure_replay_task()
+
+
 def _progress_payload(stage: str, stage_display: str, percent: int = 0) -> dict[str, Any]:
     return {
         "stage": stage,
@@ -269,6 +289,7 @@ async def lifespan(app: FastAPI):
     global reconciler_task, canary_task
 
     sync_task = asyncio.create_task(lifecycle.sync_state_from_ec2())
+    queue_replay_task = asyncio.create_task(_ensure_queued_jobs_replaying("startup"))
     reconciler_task = asyncio.create_task(_reconciler_loop())
     if settings.CANARY_INTERVAL_SECONDS > 0:
         canary_task = asyncio.create_task(_canary_loop())
@@ -277,7 +298,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task in (sync_task, reconciler_task, canary_task):
+        for task in (sync_task, queue_replay_task, reconciler_task, canary_task):
             if task and not task.done():
                 task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -604,6 +625,7 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
 
     # If the job is still queued locally, report that.
     if job_queue.has_job(process_id):
+        await _ensure_queued_jobs_replaying("queued status poll", known_queued=True)
         if lifecycle.state == InstanceState.STARTING:
             stage, display = "ec2_starting", "Spinning up GPU instance"
             status_value = "queued"

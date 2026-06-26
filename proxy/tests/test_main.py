@@ -375,6 +375,30 @@ class TestExtractStatusEndpoint:
         assert "backend unavailable" in data["error"]
         assert data["progress"]["stage"] == "failed"
 
+    def test_status_for_queued_job_restarts_replay_after_proxy_restart(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.enqueue(
+            "queued-after-restart",
+            b"%PDF-1.4",
+            {"methods": "grobid,docling,marker", "merge": "true"},
+            filename="queued.pdf",
+            authorization="Bearer test",
+        )
+        replay_mock = MagicMock()
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", replay_mock)
+
+        resp = client.get(
+            "/api/v1/extract/queued-after-restart",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "queued"
+        main_mod.lifecycle.ensure_running.assert_called_once()
+        replay_mock.assert_called_once()
+
 
 class TestExtractDownloadEndpoint:
     def test_download_returns_503_when_ec2_not_running(self, client, monkeypatch):
@@ -838,6 +862,19 @@ class TestExtractCancelEndpoint:
 
         forward_mock.assert_awaited_once()
         assert main_mod.job_queue.size == 0
+
+    def test_ensure_queued_jobs_replaying_starts_replay_for_durable_leftovers(self, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.job_queue.enqueue("leftover-job", b"pdf", {})
+        replay_mock = MagicMock()
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", replay_mock)
+
+        asyncio.run(main_mod._ensure_queued_jobs_replaying("test startup"))
+
+        main_mod.lifecycle.ensure_running.assert_not_called()
+        replay_mock.assert_called_once()
 
     def test_local_cancel_cache_is_bounded(self, monkeypatch):
         import app.main as main_mod
