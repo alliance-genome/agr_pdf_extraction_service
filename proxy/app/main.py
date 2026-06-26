@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from app.auth import CognitoAuth
@@ -152,6 +152,13 @@ def _active_backend_jobs() -> int:
         if tracker.status in ACTIVE_JOB_STATUSES:
             count += 1
     return count
+
+
+def _is_locally_active_process(process_id: str) -> bool:
+    if process_id in replay_submission_errors:
+        return False
+    tracker = job_trackers.get(process_id)
+    return bool(tracker and tracker.status in ACTIVE_JOB_STATUSES)
 
 
 def _oldest_pending_age_seconds() -> float:
@@ -476,12 +483,17 @@ async def metrics():
 # --- Status (auth required) ---
 
 @app.get("/api/v1/status")
-async def status(authorization: str = Header(None)):
+async def status(
+    authorization: str = Header(None),
+    wake: bool = Query(False, description="Start the backend if it is currently stopped."),
+):
     _require_auth(authorization)
-    lifecycle.touch()
 
     warming = False
-    if lifecycle.state == InstanceState.STOPPED:
+    if wake:
+        lifecycle.touch()
+
+    if wake and lifecycle.state == InstanceState.STOPPED:
         await lifecycle.ensure_running()
         warming = True
 
@@ -615,9 +627,12 @@ async def submit_extraction(
 # --- Extract: poll status (auth required, proxied to EC2) ---
 
 @app.get("/api/v1/extract/{process_id}")
-async def get_extraction_status(process_id: str, authorization: str = Header(None)):
+async def get_extraction_status(
+    process_id: str,
+    authorization: str = Header(None),
+    wake: bool = Query(False, description="Start the backend for this status check if it is not ready."),
+):
     _require_auth(authorization)
-    lifecycle.touch()
 
     if process_id in cancelled_jobs:
         reason = cancelled_jobs[process_id]
@@ -631,6 +646,7 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
 
     # If the job is still queued locally, report that.
     if job_queue.has_job(process_id):
+        lifecycle.touch()
         await _ensure_queued_jobs_replaying("queued status poll", known_queued=True)
         if lifecycle.state == InstanceState.STARTING:
             stage, display = "ec2_starting", "Spinning up GPU instance"
@@ -652,6 +668,7 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
         }
 
     if process_id in replay_inflight_jobs:
+        lifecycle.touch()
         if process_id in pending_cancel_requests:
             display = "Cancellation requested while submitting queued job"
             status_value = "cancel_requested"
@@ -678,8 +695,22 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
             "progress": _progress_payload("failed", "Queued job submission failed", 0),
         }
 
-    # On status checks while asleep/stopped, wake instance and return warming state.
+    # Only known active jobs, or explicit wake requests, may wake the backend.
+    # Unknown/stale status polling must not keep the GPU instance warm forever.
     if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        should_wake = wake or _is_locally_active_process(process_id)
+        if not should_wake:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "process_id": process_id,
+                    "status": "unknown",
+                    "state": lifecycle.state.value,
+                    "message": "Job is not queued locally and backend is not ready.",
+                    "progress": _progress_payload("unknown", "Job not found", 0),
+                },
+            )
+        lifecycle.touch()
         await lifecycle.ensure_running()
         _record_job_event(process_id, "warming_up")
         return {
@@ -710,6 +741,9 @@ async def get_extraction_status(process_id: str, authorization: str = Header(Non
                 # Keep caller-visible process_id stable when replay rewrites backend IDs.
                 payload["process_id"] = process_id
             _update_tracker_from_payload(process_id, payload)
+            status_value = str(payload.get("status", "")).strip().lower()
+            if status_value in ACTIVE_JOB_STATUSES:
+                lifecycle.touch()
             _mark_terminal_cleanup_if_needed(process_id, payload)
 
         return JSONResponse(status_code=resp.status_code, content=payload)

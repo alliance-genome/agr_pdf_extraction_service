@@ -15,6 +15,14 @@ def test_task_definition_healthcheck_uses_python_not_curl():
     assert "curl" not in health_cmd
 
 
+def test_cloudformation_healthcheck_uses_proxy_liveness():
+    template_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-test-mirror-stack.yaml"
+    template_text = template_path.read_text()
+
+    assert "urlopen('http://localhost:80/api/v1/health/live', timeout=3)" in template_text
+    assert "urlopen('http://localhost:80/api/v1/health', timeout=3)" not in template_text
+
+
 def test_deploy_script_supports_explicit_image_tag():
     script_path = Path(__file__).resolve().parents[1] / "deploy" / "deploy.sh"
     script = script_path.read_text()

@@ -792,7 +792,7 @@ Resources:
           HealthCheck:
             Command:
               - CMD-SHELL
-              - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:80/api/v1/health', timeout=3)\" || exit 1"
+              - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:80/api/v1/health/live', timeout=3)\" || exit 1"
             Interval: 30
             Timeout: 5
             Retries: 3

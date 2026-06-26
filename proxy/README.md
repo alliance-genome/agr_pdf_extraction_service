@@ -43,14 +43,16 @@ Callers talk to the proxy at a stable endpoint and never need to know whether th
 
 ## API Endpoints
 
-All endpoints except `/api/v1/health`, `/api/v1/health/deep`, and `/api/v1/metrics` require a Cognito Bearer token.
+All endpoints except `/api/v1/health/live`, `/api/v1/health`, `/api/v1/health/deep`, and `/api/v1/metrics` require a Cognito Bearer token.
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
+| `/api/v1/health/live` | GET | No | Proxy-only container liveness probe |
 | `/api/v1/health` | GET | No | Proxy health + EC2 state (degraded unless worker is ready) |
 | `/api/v1/health/deep` | GET | No | Deep probe: proxy auth validation + downstream status round-trip |
 | `/api/v1/metrics` | GET | No | Queue/replay/lifecycle/canary metrics for alerting |
-| `/api/v1/status` | GET | Yes | EC2 state, idle time, active/queued job counts |
+| `/api/v1/status` | GET | Yes | Passive EC2 state, idle time, active/queued job counts |
+| `/api/v1/status?wake=true` | GET | Yes | Status plus explicit backend wake if stopped |
 | `/api/v1/wake` | POST | Yes | Start the GPU instance (idempotent) |
 | `/api/v1/extract` | POST | Yes | Submit a PDF for extraction |
 | `/api/v1/extract/{id}` | GET | Yes | Poll job status with granular progress |
