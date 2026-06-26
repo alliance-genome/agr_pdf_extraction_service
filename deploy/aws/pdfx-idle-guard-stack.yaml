@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Scheduled guardrail alerts when the PDFX GPU backend stays running too long"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: pdfx
+    Description: Project short name used in resource names and metric dimensions.
+  EnvironmentName:
+    Type: String
+    Default: prod
+    Description: Environment name used in resource names and metric dimensions.
+    AllowedPattern: "[a-z0-9-]+"
+  BackendAsgName:
+    Type: String
+    Default: pdfx-backend-test
+    Description: Backend GPU Auto Scaling Group to monitor.
+  ProxyMetricsUrl:
+    Type: String
+    Default: https://pdfx.alliancegenome.org/api/v1/metrics
+    Description: Public proxy metrics endpoint used to detect queued or active work.
+  IdleAlertAfterMinutes:
+    Type: Number
+    Default: 45
+    MinValue: 1
+    Description: Alert when the backend has been running this long with no queued/replay/active work.
+  AbsoluteAlertAfterMinutes:
+    Type: Number
+    Default: 240
+    MinValue: 0
+    Description: Alert when the backend has been running this long even if work appears active; 0 disables this alarm.
+  ScheduleExpression:
+    Type: String
+    Default: rate(5 minutes)
+    Description: EventBridge schedule for guard checks.
+  MetricsTimeoutSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 30
+    Description: Timeout for fetching the proxy metrics endpoint.
+  TreatMetricsFetchFailureAsIdle:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: If true, metrics fetch failure plus a running backend can trip the idle alarm.
+  AlarmSnsTopicArn:
+    Type: String
+    Description: SNS topic ARN for idle guard alarms.
+  LambdaArtifactBucket:
+    Type: String
+    Description: S3 bucket containing the packaged idle guard Lambda zip.
+  LambdaArtifactKey:
+    Type: String
+    Description: S3 key for the packaged idle guard Lambda zip.
+
+Conditions:
+  EnableAbsoluteRuntimeAlarm: !Not [!Equals [!Ref AbsoluteAlertAfterMinutes, 0]]
+
+Resources:
+  IdleGuardLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${EnvironmentName}-idle-guard"
+      RetentionInDays: 30
+
+  IdleGuardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvironmentName}-idle-guard-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-${EnvironmentName}-idle-guard"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${EnvironmentName}-idle-guard*"
+              - Sid: ReadBackendState
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - ec2:DescribeInstances
+                Resource: "*"
+              - Sid: PublishIdleGuardMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: PDFX/IdleGuard
+              - Sid: ManageIdleGuardState
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${EnvironmentName}/idle-guard/*"
+
+  IdleGuardFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - IdleGuardLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvironmentName}-idle-guard"
+      Description: !Sub "Alerts if ${BackendAsgName} stays running past idle guard thresholds."
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt IdleGuardRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+          BACKEND_ASG_NAME: !Ref BackendAsgName
+          RUNNING_SINCE_PARAMETER_NAME: !Sub "/${ProjectName}/${EnvironmentName}/idle-guard/asg-running-since"
+          PROXY_METRICS_URL: !Ref ProxyMetricsUrl
+          IDLE_ALERT_AFTER_MINUTES: !Sub "${IdleAlertAfterMinutes}"
+          ABSOLUTE_ALERT_AFTER_MINUTES: !Sub "${AbsoluteAlertAfterMinutes}"
+          METRICS_TIMEOUT_SECONDS: !Sub "${MetricsTimeoutSeconds}"
+          TREAT_METRICS_FETCH_FAILURE_AS_IDLE: !Ref TreatMetricsFetchFailureAsIdle
+      Code:
+        S3Bucket: !Ref LambdaArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+
+  IdleGuardSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-idle-guard"
+      Description: !Sub "Run ${ProjectName} ${EnvironmentName} GPU idle guard."
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IdleGuardFunction.Arn
+          Id: IdleGuardLambda
+
+  IdleGuardInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleGuardFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IdleGuardSchedule.Arn
+
+  IdleRunningTooLongAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvironmentName}-idle-running-too-long"
+      AlarmDescription: !Sub "${BackendAsgName} has stayed running with no queued/replay/active work beyond ${IdleAlertAfterMinutes} minutes."
+      Namespace: PDFX/IdleGuard
+      MetricName: IdleRunningTooLong
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Name: Environment
+          Value: !Ref EnvironmentName
+        - Name: BackendAsgName
+          Value: !Ref BackendAsgName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      OKActions:
+        - !Ref AlarmSnsTopicArn
+
+  IdleGuardHeartbeatMissingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvironmentName}-idle-guard-heartbeat-missing"
+      AlarmDescription: !Sub "${ProjectName} ${EnvironmentName} idle guard has stopped publishing successful checks."
+      Namespace: PDFX/IdleGuard
+      MetricName: GuardCheckSucceeded
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Name: Environment
+          Value: !Ref EnvironmentName
+        - Name: BackendAsgName
+          Value: !Ref BackendAsgName
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      OKActions:
+        - !Ref AlarmSnsTopicArn
+
+  IdleGuardLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvironmentName}-idle-guard-lambda-errors"
+      AlarmDescription: !Sub "${ProjectName} ${EnvironmentName} idle guard Lambda is failing."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IdleGuardFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      OKActions:
+        - !Ref AlarmSnsTopicArn
+
+  IdleGuardLambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvironmentName}-idle-guard-lambda-throttles"
+      AlarmDescription: !Sub "${ProjectName} ${EnvironmentName} idle guard Lambda is being throttled."
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IdleGuardFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      OKActions:
+        - !Ref AlarmSnsTopicArn
+
+  AbsoluteRunningTooLongAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAbsoluteRuntimeAlarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvironmentName}-absolute-running-too-long"
+      AlarmDescription: !Sub "${BackendAsgName} has stayed running beyond ${AbsoluteAlertAfterMinutes} minutes regardless of work state."
+      Namespace: PDFX/IdleGuard
+      MetricName: AbsoluteRunningTooLong
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Name: Environment
+          Value: !Ref EnvironmentName
+        - Name: BackendAsgName
+          Value: !Ref BackendAsgName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      OKActions:
+        - !Ref AlarmSnsTopicArn
+
+Outputs:
+  IdleGuardFunctionName:
+    Description: Scheduled Lambda that publishes idle guard metrics.
+    Value: !Ref IdleGuardFunction
+  IdleRunningTooLongAlarmName:
+    Description: CloudWatch alarm for idle backend runtime beyond threshold.
+    Value: !Ref IdleRunningTooLongAlarm
+  AbsoluteRunningTooLongAlarmName:
+    Condition: EnableAbsoluteRuntimeAlarm
+    Description: CloudWatch alarm for absolute backend runtime beyond threshold.
+    Value: !Ref AbsoluteRunningTooLongAlarm
+  IdleGuardHeartbeatMissingAlarmName:
+    Description: CloudWatch alarm for missing idle guard heartbeat.
+    Value: !Ref IdleGuardHeartbeatMissingAlarm
+  IdleGuardLambdaErrorsAlarmName:
+    Description: CloudWatch alarm for idle guard Lambda errors.
+    Value: !Ref IdleGuardLambdaErrorsAlarm

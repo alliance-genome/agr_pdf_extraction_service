@@ -37,6 +37,7 @@ The service runs three independent extraction engines on each PDF, then merges t
   - [Management Commands](#management-commands)
   - [Durable Storage](#durable-storage)
   - [OOM Alerts (AWS IaC)](#oom-alerts-aws-iac)
+  - [GPU Idle Guard Alerts (AWS IaC)](#gpu-idle-guard-alerts-aws-iac)
 - [Configuration Reference](#configuration-reference)
 - [Project Structure](#project-structure)
 
@@ -980,6 +981,34 @@ Notes:
 
 - No application secrets are required for SNS email alerts. The host watcher reads non-sensitive config from SSM Parameter Store.
 - For future non-email channels (e.g., webhook/chatops), store credentials in AWS Secrets Manager and pass only the secret ARN through SSM.
+
+### GPU Idle Guard Alerts (AWS IaC)
+
+Use `deploy/aws/pdfx-idle-guard-stack.yaml` for a scheduled Lambda and
+CloudWatch alarms that email when the GPU backend ASG stays running too long.
+The guard checks the backend ASG and proxy `/api/v1/metrics`, then publishes
+`PDFX/IdleGuard` metrics. It is intentionally separate from the proxy's own
+idle shutdown logic. It stores the continuous ASG running-since timestamp in
+SSM Parameter Store, so replacement EC2 instances do not reset the runtime
+clock, and it has heartbeat/error/throttle alarms for the guard Lambda itself.
+
+Production example:
+
+```bash
+deploy/aws/deploy_idle_guard.sh \
+  --profile ctabone \
+  --region us-east-1 \
+  --project pdfx \
+  --env prod \
+  --backend-asg-name pdfx-backend-test \
+  --proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics \
+  --artifact-bucket agr-pdf-extraction-benchmark \
+  --alarm-topic-arn arn:aws:sns:us-east-1:100225593120:pdfx-dev-oom-alerts
+```
+
+The current SNS topic above emails `ctabone@morgan.harvard.edu`. For Slack,
+attach the same SNS topic to the team's AWS Chatbot Slack channel
+configuration, while keeping email as the fallback.
 
 ---
 

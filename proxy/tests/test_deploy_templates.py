@@ -23,6 +23,26 @@ def test_cloudformation_healthcheck_uses_proxy_liveness():
     assert "urlopen('http://localhost:80/api/v1/health', timeout=3)" not in template_text
 
 
+def test_idle_guard_stack_has_email_alarm_path_and_schedule():
+    template_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-idle-guard-stack.yaml"
+    template_text = template_path.read_text()
+
+    assert "AWS::Lambda::Function" in template_text
+    assert "AWS::Events::Rule" in template_text
+    assert "IdleRunningTooLongAlarm" in template_text
+    assert "AbsoluteRunningTooLongAlarm" in template_text
+    assert "IdleGuardHeartbeatMissingAlarm" in template_text
+    assert "IdleGuardLambdaErrorsAlarm" in template_text
+    assert "IdleGuardLambdaThrottlesAlarm" in template_text
+    assert "GuardCheckSucceeded" in template_text
+    assert "RUNNING_SINCE_PARAMETER_NAME" in template_text
+    assert "ssm:GetParameter" in template_text
+    assert "AlarmSnsTopicArn" in template_text
+    assert "PDFX/IdleGuard" in template_text
+    assert "TreatMissingData: breaching" in template_text
+    assert "TreatMissingData: notBreaching" in template_text
+
+
 def test_deploy_script_supports_explicit_image_tag():
     script_path = Path(__file__).resolve().parents[1] / "deploy" / "deploy.sh"
     script = script_path.read_text()

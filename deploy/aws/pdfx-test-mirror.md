@@ -11,6 +11,7 @@ without reusing production mutable state. It mirrors the runtime shape:
 - Cognito-protected public hostname through the shared `agr-services` ALB
 - environment-scoped SSM parameters under `/pdfx-test/*`
 - CloudWatch alarms for backend startup timeouts and ASG replacement requests
+- optional GPU idle guard alerts from `deploy/aws/pdfx-idle-guard-stack.yaml`
 
 The template is `deploy/aws/pdfx-test-mirror-stack.yaml`.
 
@@ -107,6 +108,30 @@ launch-before-terminate behavior.
 The proxy's bounded replacement wait defaults to
 `AsgStartupReplacementAttempts=1`, published to
 `/<ssm-prefix>/asg-startup-replacement-attempts`.
+
+## Deploy Idle Guard Alerts
+
+Use `deploy/aws/pdfx-idle-guard-stack.yaml` when you want a separate
+belt-and-suspenders alert if a backend ASG stays running after it should have
+scaled down. The guard stores the continuous ASG runtime in SSM Parameter Store,
+emits a `GuardCheckSucceeded` heartbeat, and alarms if the guard itself stops
+checking. For the test mirror:
+
+```bash
+deploy/aws/deploy_idle_guard.sh \
+  --profile ctabone \
+  --region us-east-1 \
+  --project pdfx \
+  --env test \
+  --backend-asg-name pdfx-backend-test \
+  --proxy-metrics-url https://pdfx-test.alliancegenome.org/api/v1/metrics \
+  --artifact-bucket agr-pdf-extraction-test \
+  --alarm-topic-arn <sns-topic-arn>
+```
+
+For production, use the production proxy metrics URL and a confirmed SNS topic
+such as `pdfx-dev-oom-alerts`, which currently emails
+`ctabone@morgan.harvard.edu`.
 
 If cold boot time becomes too expensive, set `BackendWarmPoolMinSize=1`.
 That keeps one pre-initialized backend instance in the ASG warm pool in
