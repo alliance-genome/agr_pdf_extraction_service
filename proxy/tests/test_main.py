@@ -55,6 +55,15 @@ def client():
 
 
 class TestHealthEndpoint:
+    def test_health_live_returns_ok(self, client):
+        resp = client.get("/api/v1/health/live")
+        assert resp.status_code == 200
+        assert resp.json() == {"proxy": "ok", "status": "live"}
+
+    def test_health_live_no_auth_required(self, client):
+        resp = client.get("/api/v1/health/live")
+        assert resp.status_code == 200
+
     def test_health_returns_ok(self, client, monkeypatch):
         resp = client.get("/api/v1/health")
         assert resp.status_code == 200
