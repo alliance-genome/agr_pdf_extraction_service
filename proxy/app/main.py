@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from app.auth import CognitoAuth
@@ -476,12 +476,17 @@ async def metrics():
 # --- Status (auth required) ---
 
 @app.get("/api/v1/status")
-async def status(authorization: str = Header(None)):
+async def status(
+    authorization: str = Header(None),
+    wake: bool = Query(False, description="Start the backend if it is currently stopped."),
+):
     _require_auth(authorization)
-    lifecycle.touch()
 
     warming = False
-    if lifecycle.state == InstanceState.STOPPED:
+    if wake:
+        lifecycle.touch()
+
+    if wake and lifecycle.state == InstanceState.STOPPED:
         await lifecycle.ensure_running()
         warming = True
 

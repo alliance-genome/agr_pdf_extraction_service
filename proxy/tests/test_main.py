@@ -86,6 +86,22 @@ class TestStatusEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert data["state"] == "stopped"
+        assert data["warming_up"] is False
+        main_mod.lifecycle.touch.assert_not_called()
+        main_mod.lifecycle.ensure_running.assert_not_called()
+
+    def test_status_wake_query_starts_stopped_backend(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.lifecycle.idle_seconds = 120.0
+        main_mod.lifecycle.active_jobs = 0
+        resp = client.get("/api/v1/status?wake=true", headers={"Authorization": "Bearer test"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["state"] == "stopped"
+        assert data["warming_up"] is True
+        main_mod.lifecycle.touch.assert_called_once()
+        main_mod.lifecycle.ensure_running.assert_called_once()
 
     def test_status_requires_auth(self, client, monkeypatch):
         import app.main as main_mod
