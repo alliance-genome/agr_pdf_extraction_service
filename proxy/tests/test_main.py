@@ -342,8 +342,38 @@ class TestExtractStatusEndpoint:
             "/api/v1/extract/nonexistent",
             headers={"Authorization": "Bearer test"},
         )
+        assert resp.status_code == 404
+        assert resp.json()["status"] == "unknown"
+        main_mod.lifecycle.touch.assert_not_called()
+        main_mod.lifecycle.ensure_running.assert_not_called()
+
+    def test_unknown_job_when_ec2_stopped_can_explicitly_wake(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.STOPPED
+
+        resp = client.get(
+            "/api/v1/extract/nonexistent?wake=true",
+            headers={"Authorization": "Bearer test"},
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "warming_up"
+        main_mod.lifecycle.touch.assert_called_once()
+        main_mod.lifecycle.ensure_running.assert_called_once()
+
+    def test_known_active_job_when_ec2_stopped_wakes(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        tracker = main_mod._ensure_tracker("active-123")
+        tracker.status = "running"
+
+        resp = client.get(
+            "/api/v1/extract/active-123",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "warming_up"
+        main_mod.lifecycle.touch.assert_called_once()
+        main_mod.lifecycle.ensure_running.assert_called_once()
 
     def test_status_uses_mapped_backend_process_id(self, client, monkeypatch):
         import app.main as main_mod
@@ -384,6 +414,7 @@ class TestExtractStatusEndpoint:
         assert captured["url"].endswith("/api/v1/extract/backend-456")
         assert resp.json()["process_id"] == "proxy-123"
         assert resp.json()["status"] == "running"
+        main_mod.lifecycle.touch.assert_called_once()
 
     def test_replay_submission_error_returns_failed(self, client, monkeypatch):
         import app.main as main_mod
