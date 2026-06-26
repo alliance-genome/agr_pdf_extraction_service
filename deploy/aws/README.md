@@ -51,8 +51,9 @@ Default production-oriented behavior:
 - check every 5 minutes
 - track continuous backend ASG runtime in SSM Parameter Store, so the clock
   does not reset if Auto Scaling replaces an EC2 instance
-- alert after 45 minutes of continuous backend runtime with no queued,
-  replaying, or active backend work
+- track continuous backend idle time separately, so real extraction work does
+  not count against the idle alarm
+- alert after 45 minutes with no queued, replaying, or active backend work
 - alert after 240 minutes of continuous backend runtime regardless of apparent
   work
 - alert if the guard Lambda errors, is throttled, or misses two consecutive

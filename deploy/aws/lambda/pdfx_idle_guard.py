@@ -103,8 +103,8 @@ def _parse_iso_datetime(value: str) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _running_since(parameter_name: str, backend_running: bool, now: datetime) -> datetime | None:
-    if not backend_running:
+def _state_since(parameter_name: str, state_active: bool, now: datetime) -> datetime | None:
+    if not state_active:
         try:
             ssm.delete_parameter(Name=parameter_name)
         except ssm.exceptions.ParameterNotFound:
@@ -148,6 +148,7 @@ def _run_check() -> dict[str, Any]:
     env = os.environ["ENVIRONMENT_NAME"]
     asg_name = os.environ["BACKEND_ASG_NAME"]
     running_since_parameter = os.environ["RUNNING_SINCE_PARAMETER_NAME"]
+    idle_since_parameter = os.environ["IDLE_SINCE_PARAMETER_NAME"]
     metrics_url = os.environ["PROXY_METRICS_URL"]
     idle_threshold = _env_int("IDLE_ALERT_AFTER_MINUTES", 45)
     absolute_threshold = _env_int("ABSOLUTE_ALERT_AFTER_MINUTES", 240)
@@ -180,13 +181,20 @@ def _run_check() -> dict[str, Any]:
         has_active_work = False
 
     backend_running = desired > 0 or bool(instance_ids)
-    running_since = _running_since(running_since_parameter, backend_running, now)
+    backend_idle = backend_running and not has_active_work
+    running_since = _state_since(running_since_parameter, backend_running, now)
+    idle_since = _state_since(idle_since_parameter, backend_idle, now)
     continuous_age = (
         max((now - running_since).total_seconds() / 60.0, 0.0)
         if running_since
         else 0.0
     )
-    idle_too_long = backend_running and not has_active_work and continuous_age >= idle_threshold
+    idle_age = (
+        max((now - idle_since).total_seconds() / 60.0, 0.0)
+        if idle_since
+        else 0.0
+    )
+    idle_too_long = backend_idle and idle_age >= idle_threshold
     absolute_too_long = (
         backend_running and absolute_threshold > 0 and continuous_age >= absolute_threshold
     )
@@ -200,6 +208,7 @@ def _run_check() -> dict[str, Any]:
             "BackendDesiredCapacity": desired,
             "BackendOldestInstanceAgeMinutes": oldest_age,
             "BackendContinuousRunningAgeMinutes": continuous_age,
+            "BackendContinuousIdleAgeMinutes": idle_age,
         },
         dimensions,
     )
@@ -210,7 +219,9 @@ def _run_check() -> dict[str, Any]:
         "active_instance_ids": instance_ids,
         "oldest_instance_age_minutes": round(oldest_age, 2),
         "continuous_running_age_minutes": round(continuous_age, 2),
+        "continuous_idle_age_minutes": round(idle_age, 2),
         "running_since": running_since.isoformat() if running_since else None,
+        "idle_since": idle_since.isoformat() if idle_since else None,
         "metrics_error": metrics_error,
         "has_active_work": has_active_work,
         "idle_too_long": idle_too_long,

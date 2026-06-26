@@ -127,6 +127,7 @@ Resources:
           ENVIRONMENT_NAME: !Ref EnvironmentName
           BACKEND_ASG_NAME: !Ref BackendAsgName
           RUNNING_SINCE_PARAMETER_NAME: !Sub "/${ProjectName}/${EnvironmentName}/idle-guard/asg-running-since"
+          IDLE_SINCE_PARAMETER_NAME: !Sub "/${ProjectName}/${EnvironmentName}/idle-guard/asg-idle-since"
           PROXY_METRICS_URL: !Ref ProxyMetricsUrl
           IDLE_ALERT_AFTER_MINUTES: !Sub "${IdleAlertAfterMinutes}"
           ABSOLUTE_ALERT_AFTER_MINUTES: !Sub "${AbsoluteAlertAfterMinutes}"
