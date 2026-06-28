@@ -100,10 +100,12 @@ For testing a feature branch, push the branch first and set
 `BackendGitRef=<branch-or-sha>`.
 
 The backend ASG defaults to `BackendMinSize=0`, `BackendDesiredCapacity=0`,
-and `BackendMaxSize=1`. The proxy scales desired capacity to `1` on wake and
-back to `0` after idle shutdown. Keep `BackendMaxSize=1` for strict cost
-control. Use `BackendMaxSize=2` only for controlled testing of
-launch-before-terminate behavior.
+`BackendMaxSize=1`, and `BackendWarmPoolMinSize=1`. The proxy scales desired
+capacity to `1` on wake and back to `0` after idle shutdown. The warm pool keeps
+one stopped, already-bootstrapped backend instance so Docker images and ML model
+caches survive idle shutdown without paying for a running GPU. Keep
+`BackendMaxSize=1` for strict cost control. Use `BackendMaxSize=2` only for
+controlled testing of launch-before-terminate behavior.
 
 The proxy's bounded replacement wait defaults to
 `AsgStartupReplacementAttempts=1`, published to
@@ -212,8 +214,12 @@ git fetch --all --prune
 git checkout <branch-or-sha>
 git pull --ff-only || true
 cd deploy
-GPU_MODE=on ./deploy.sh
+PDFX_DEPLOY_BUILD_MODE=rebuild GPU_MODE=on ./deploy.sh
 ```
+
+Use `PDFX_DEPLOY_BUILD_MODE=rebuild` only when dependencies or the Dockerfile
+changed. The default `auto` mode lets Docker Compose reuse the existing image
+and build only if the image is missing.
 
 If a backend startup fails, the proxy marks the ASG instance unhealthy with
 `SetInstanceHealth`. Auto Scaling then terminates it and launches a replacement

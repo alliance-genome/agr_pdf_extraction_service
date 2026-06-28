@@ -105,7 +105,7 @@ Parameters:
     Description: Hard cap for backend GPU instances. Use 1 for strict cost control, 2 for launch-before-terminate experiments.
   BackendWarmPoolMinSize:
     Type: Number
-    Default: 0
+    Default: 1
     MinValue: 0
     MaxValue: 1
     Description: Optional stopped warm-pool backend count for faster wake without running GPU cost.
@@ -408,10 +408,21 @@ Resources:
               fi
 
               SERVICE_DIR=/home/ec2-user/agr_pdf_extraction_service
-              rm -rf "$SERVICE_DIR"
-              sudo -u ec2-user git clone "${BackendGitRepositoryUrl}" "$SERVICE_DIR"
+              if [ -d "$SERVICE_DIR/.git" ]; then
+                echo "Reusing existing backend checkout at $SERVICE_DIR"
+                sudo -u ec2-user git -C "$SERVICE_DIR" remote set-url origin "${BackendGitRepositoryUrl}" || true
+              else
+                echo "Creating backend checkout at $SERVICE_DIR"
+                rm -rf "$SERVICE_DIR"
+                sudo -u ec2-user git clone "${BackendGitRepositoryUrl}" "$SERVICE_DIR"
+              fi
               sudo -u ec2-user git -C "$SERVICE_DIR" fetch --all --tags --prune
               sudo -u ec2-user git -C "$SERVICE_DIR" checkout "${BackendGitRef}"
+              if sudo -u ec2-user git -C "$SERVICE_DIR" rev-parse --verify "origin/${BackendGitRef}" >/dev/null 2>&1; then
+                sudo -u ec2-user git -C "$SERVICE_DIR" reset --hard "origin/${BackendGitRef}"
+              else
+                sudo -u ec2-user git -C "$SERVICE_DIR" reset --hard "${BackendGitRef}"
+              fi
               cd "$SERVICE_DIR"
 
               if ! aws ssm get-parameter \
@@ -441,7 +452,7 @@ Resources:
               mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
               chown -R ec2-user:ec2-user "$SERVICE_DIR"
               cd deploy
-              GPU_MODE=on ./deploy.sh
+              PDFX_DEPLOY_BUILD_MODE=auto GPU_MODE=on ./deploy.sh
 
   BackendAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup

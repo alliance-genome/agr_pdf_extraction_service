@@ -34,6 +34,8 @@ def test_test_mirror_stack_uses_separate_environment_resources():
     assert "BackendInstance:" not in template
     assert "/pdfx/ec2-instance-id" not in template
     assert "agr-pdf-extraction-benchmark" not in template
+    assert "BackendWarmPoolMinSize:" in template
+    assert "Default: 1" in template
     assert "MinimumHealthyPercent: 100" in template
     assert "DeploymentCircuitBreaker:" in template
     assert "Rollback: true" in template
@@ -66,9 +68,22 @@ def test_test_mirror_bootstrap_supports_branch_tag_or_sha_checkout():
     assert "dnf install -y docker git jq awscli curl" not in template
     assert "docker compose version" in template
     assert 'git clone "${BackendGitRepositoryUrl}" "$SERVICE_DIR"' in template
+    assert 'Reusing existing backend checkout at $SERVICE_DIR' in template
     assert 'git -C "$SERVICE_DIR" fetch --all --tags --prune' in template
     assert 'git -C "$SERVICE_DIR" checkout "${BackendGitRef}"' in template
+    assert 'git -C "$SERVICE_DIR" reset --hard "origin/${BackendGitRef}"' in template
+    assert "PDFX_DEPLOY_BUILD_MODE=auto GPU_MODE=on ./deploy.sh" in template
     assert 'git clone --branch "${BackendGitRef}"' not in template
+
+
+def test_deploy_script_does_not_force_rebuild_by_default():
+    deploy_script = (Path(__file__).resolve().parents[1] / "deploy" / "deploy.sh").read_text()
+
+    assert 'PDFX_DEPLOY_BUILD_MODE="${PDFX_DEPLOY_BUILD_MODE:-auto}"' in deploy_script
+    assert "rebuild)" in deploy_script
+    assert "BUILD_ARGS=(--build)" in deploy_script
+    assert 'docker compose "${COMPOSE_ARGS[@]}" up -d "${BUILD_ARGS[@]}"' in deploy_script
+    assert 'up -d --build' not in deploy_script
 
 
 def test_test_mirror_runbook_documents_safe_bootstrap_path():
@@ -97,6 +112,8 @@ def test_gpu_compose_builds_local_image_for_test_backend():
 
     assert "image: pdfx-gpu" in compose
     assert "dockerfile: deploy/Dockerfile.gpu" in compose
+    assert "/usr/local/lib/python3.11/site-packages/rapidocr/models" in compose
+    assert "/usr/local/lib/python3.11/dist-packages/rapidocr/models" in compose
 
 
 def test_gpu_compose_keeps_web_app_cpu_only_and_worker_ocr_overridable():

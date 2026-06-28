@@ -27,6 +27,7 @@ x-shared-volumes: &shared-volumes
   - ../data/models:/app/data/models
   - ../data/model_cache:/root/.cache
   - ../data/rapidocr_models:/usr/local/lib/python3.11/site-packages/rapidocr/models
+  - ../data/rapidocr_models:/usr/local/lib/python3.11/dist-packages/rapidocr/models
   - ../logs:/app/logs
   - ../app:/app/app:ro
   - ../celery_app.py:/app/celery_app.py:ro
