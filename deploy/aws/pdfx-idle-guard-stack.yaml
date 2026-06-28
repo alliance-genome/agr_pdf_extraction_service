@@ -13,7 +13,7 @@ Parameters:
     AllowedPattern: "[a-z0-9-]+"
   BackendAsgName:
     Type: String
-    Default: pdfx-backend-test
+    Default: pdfx-backend
     Description: Backend GPU Auto Scaling Group to monitor.
   ProxyMetricsUrl:
     Type: String

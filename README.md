@@ -1002,7 +1002,7 @@ deploy/aws/deploy_idle_guard.sh \
   --region us-east-1 \
   --project pdfx \
   --env prod \
-  --backend-asg-name pdfx-backend-test \
+  --backend-asg-name pdfx-backend \
   --proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics \
   --artifact-bucket agr-pdf-extraction-benchmark \
   --alarm-topic-arn arn:aws:sns:us-east-1:100225593120:pdfx-dev-oom-alerts

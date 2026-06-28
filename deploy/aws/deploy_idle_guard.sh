@@ -9,7 +9,7 @@ Usage:
   deploy/aws/deploy_idle_guard.sh \
     --alarm-topic-arn <sns-topic-arn> \
     --artifact-bucket <s3-bucket> \
-    [--backend-asg-name pdfx-backend-test] \
+    [--backend-asg-name pdfx-backend] \
     [--proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics] \
     [--idle-alert-after-minutes 45] \
     [--absolute-alert-after-minutes 240] \
@@ -29,7 +29,7 @@ ENV_NAME="prod"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_PROFILE="${AWS_PROFILE:-}"
 STACK_NAME=""
-BACKEND_ASG_NAME="pdfx-backend-test"
+BACKEND_ASG_NAME="pdfx-backend"
 PROXY_METRICS_URL="https://pdfx.alliancegenome.org/api/v1/metrics"
 IDLE_ALERT_AFTER_MINUTES="45"
 ABSOLUTE_ALERT_AFTER_MINUTES="240"

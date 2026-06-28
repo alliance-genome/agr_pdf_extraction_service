@@ -1,20 +1,21 @@
-"""Tests for the PDFX AWS test mirror template."""
+"""Tests for the PDFX AWS stack template."""
 
 from pathlib import Path
 
 
-STACK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx-test-mirror-stack.yaml"
-RUNBOOK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx-test-mirror.md"
+STACK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx-stack.yaml"
+RUNBOOK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx.md"
 GPU_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.gpu.yml"
 REQUIREMENTS_PATH = Path(__file__).resolve().parents[1] / "requirements.txt"
 
 
-def test_test_mirror_stack_uses_separate_environment_resources():
+def test_pdfx_stack_uses_canonical_resources():
     template = STACK_PATH.read_text()
 
-    assert "Default: pdfx-test" in template
-    assert "Default: agr-pdf-extraction-test" in template
-    assert "Default: pdfx-proxy-test" in template
+    assert "Default: pdfx" in template
+    assert "Default: pdfx-backend" in template
+    assert "Default: agr-pdf-extraction-benchmark" in template
+    assert "Default: pdfx-proxy" in template
     assert "Default: sg-21ac675b" in template
     assert "Default: sg-006b41eff1820ad53" in template
     assert "BackendLaunchTemplate:" in template
@@ -32,8 +33,6 @@ def test_test_mirror_stack_uses_separate_environment_resources():
     assert "ValueFrom: !Ref SsmBackendAsgName" in template
     assert "ValueFrom: !Ref SsmAsgStartupReplacementAttempts" in template
     assert "BackendInstance:" not in template
-    assert "/pdfx/ec2-instance-id" not in template
-    assert "agr-pdf-extraction-benchmark" not in template
     assert "BackendWarmPoolMinSize:" in template
     assert "Default: 1" in template
     assert "MinimumHealthyPercent: 100" in template
@@ -41,7 +40,7 @@ def test_test_mirror_stack_uses_separate_environment_resources():
     assert "Rollback: true" in template
 
 
-def test_test_mirror_stack_supports_image_retention_and_tagged_uploads():
+def test_pdfx_stack_supports_image_retention_and_tagged_uploads():
     template = STACK_PATH.read_text()
 
     assert "pdfx-expire-extracted-images" in template
@@ -52,7 +51,7 @@ def test_test_mirror_stack_supports_image_retention_and_tagged_uploads():
     assert template.count("s3:PutObjectTagging") >= 2
 
 
-def test_test_mirror_bootstrap_scrubs_prod_storage_env():
+def test_pdfx_bootstrap_scrubs_storage_env():
     template = STACK_PATH.read_text()
 
     assert "Scrub production storage values" in template
@@ -61,7 +60,7 @@ def test_test_mirror_bootstrap_scrubs_prod_storage_env():
     assert "AUDIT_S3_BUCKET_SSM_PARAM=/${SsmParameterPath}/audit-s3-bucket" in template
 
 
-def test_test_mirror_bootstrap_supports_branch_tag_or_sha_checkout():
+def test_pdfx_bootstrap_supports_branch_tag_or_sha_checkout():
     template = STACK_PATH.read_text()
 
     assert "dnf install -y docker git jq awscli" in template
@@ -86,28 +85,28 @@ def test_deploy_script_does_not_force_rebuild_by_default():
     assert 'up -d --build' not in deploy_script
 
 
-def test_test_mirror_runbook_documents_safe_bootstrap_path():
+def test_pdfx_runbook_documents_safe_bootstrap_path():
     runbook = RUNBOOK_PATH.read_text()
 
-    assert "/pdfx-test/backend-env" in runbook
-    assert "/pdfx-test/backend-asg-name" in runbook
+    assert "/pdfx/backend-env" in runbook
+    assert "/pdfx/backend-asg-name" in runbook
     assert "remove legacy toggles such as `MARKER_EXTRACT_IMAGES`" in runbook
     assert "DeployBackendOnBoot=true" in runbook
-    assert "--ssm-prefix /pdfx-test" in runbook
-    assert "does not clone the production EBS volume" in runbook
+    assert "--ssm-prefix /pdfx" in runbook
+    assert "of cloning an EBS volume" in runbook
 
 
-def test_test_mirror_stack_has_backend_resilience_alarms():
+def test_pdfx_stack_has_backend_resilience_alarms():
     template = STACK_PATH.read_text()
 
     assert "ProxyStartupTimeoutMetricFilter" in template
     assert "ProxyBackendReplacementMetricFilter" in template
-    assert "pdfx-${EnvironmentName}-startup-timeouts" in template
-    assert "pdfx-${EnvironmentName}-backend-replacements" in template
+    assert "pdfx-startup-timeouts" in template
+    assert "pdfx-backend-replacements" in template
     assert "AlarmSnsTopicArn" in template
 
 
-def test_gpu_compose_builds_local_image_for_test_backend():
+def test_gpu_compose_builds_local_image_for_backend():
     compose = GPU_COMPOSE_PATH.read_text()
 
     assert "image: pdfx-gpu" in compose

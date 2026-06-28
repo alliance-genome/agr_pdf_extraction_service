@@ -242,19 +242,19 @@ cd deploy
 ./deploy.sh --profile <profile> --no-update-service
 ```
 
-### Deploying to a non-prod mirror
+### Deploying with explicit names
 
-For a test mirror with separate SSM parameters and ECS resources, pass the
-environment-specific names explicitly:
+To override the default PDFX SSM parameters or ECS resources, pass the names
+explicitly:
 
 ```bash
 cd proxy/deploy
 ./deploy.sh \
   --profile ctabone \
   --region us-east-1 \
-  --cluster pdfx-proxy-test \
-  --service pdfx-proxy-test \
-  --ssm-prefix /pdfx-test \
+  --cluster pdfx-proxy \
+  --service pdfx-proxy \
+  --ssm-prefix /pdfx \
   --image-tag <image-tag>
 ```
 
@@ -270,8 +270,7 @@ automates the manual steps above when a PR is merged into `main`.
 
 - Trigger: `pull_request.closed` on `main`, guarded by `github.event.pull_request.merged == true`
 - Escape hatch: add the `no-deploy` label to the PR to skip the deployment job
-- Target: a single `prod` environment. The `pdfx-test` mirror is deployed
-  manually so production releases remain approval-gated and single-purpose.
+- Target: the canonical `pdfx` environment.
 - Approval gate: the `deploy-prod` job is attached to the GitHub Actions
   `prod` environment, so required reviewers can block production rollout
   until explicitly approved
@@ -428,8 +427,8 @@ aws ssm put-parameter \
 cd proxy/deploy && ./deploy.sh --profile <profile>
 ```
 
-Use `/pdfx-test/cognito-accepted-client-ids` and
-`./deploy.sh --ssm-prefix /pdfx-test ...` for the test mirror.
+Use `/pdfx/cognito-accepted-client-ids` and
+`./deploy.sh --ssm-prefix /pdfx ...` for the PDFX stack.
 
 ## Operational Fallbacks
 

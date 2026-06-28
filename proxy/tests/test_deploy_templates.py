@@ -16,7 +16,7 @@ def test_task_definition_healthcheck_uses_python_not_curl():
 
 
 def test_cloudformation_healthcheck_uses_proxy_liveness():
-    template_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-test-mirror-stack.yaml"
+    template_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-stack.yaml"
     template_text = template_path.read_text()
 
     assert "urlopen('http://localhost:80/api/v1/health/live', timeout=3)" in template_text
