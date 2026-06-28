@@ -826,7 +826,7 @@ cd deploy && GPU_MODE=off ./deploy.sh
 cd deploy && GPU_MODE=on ./deploy.sh
 ```
 
-**Note:** `deploy.sh` auto-detects a GPU by default (`GPU_MODE=auto`) and switches to `docker-compose.gpu.yml` when one is available. Set `GPU_MODE=off` or `GPU_MODE=on` to force a specific stack. On first run, Docling and Marker download ML models (~2-5 GB), which takes several minutes. These model assets are persisted under `data/model_cache`, `data/rapidocr_models`, and `data/models`, so normal container restarts should not re-download them.
+**Note:** `deploy.sh` auto-detects a GPU by default (`GPU_MODE=auto`) and switches to `docker-compose.gpu.yml` when one is available. Set `GPU_MODE=off` or `GPU_MODE=on` to force a specific stack. By default, `PDFX_DEPLOY_BUILD_MODE=auto` lets Docker Compose reuse an existing image and build only if the image is missing; set `PDFX_DEPLOY_BUILD_MODE=rebuild` when dependencies or Dockerfiles changed. On first run, Docling and Marker download ML models (~2-5 GB), which takes several minutes. These model assets are persisted under `data/model_cache`, `data/rapidocr_models`, and `data/models`, so normal container restarts should not re-download them.
 
 **After deployment:**
 
@@ -1002,7 +1002,7 @@ deploy/aws/deploy_idle_guard.sh \
   --region us-east-1 \
   --project pdfx \
   --env prod \
-  --backend-asg-name pdfx-backend-test \
+  --backend-asg-name pdfx-backend \
   --proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics \
   --artifact-bucket agr-pdf-extraction-benchmark \
   --alarm-topic-arn arn:aws:sns:us-east-1:100225593120:pdfx-dev-oom-alerts

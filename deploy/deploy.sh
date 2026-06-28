@@ -16,6 +16,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PROJECT_NAME="pdfx"
 GPU_MODE="${GPU_MODE:-auto}" # auto|on|off
+PDFX_DEPLOY_BUILD_MODE="${PDFX_DEPLOY_BUILD_MODE:-auto}" # auto|rebuild|never
 
 detect_gpu() {
     command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
@@ -51,6 +52,23 @@ if ! COMPOSE_FILE="$(select_compose_file)"; then
     exit 1
 fi
 COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
+BUILD_ARGS=()
+
+case "${PDFX_DEPLOY_BUILD_MODE}" in
+    auto)
+        # Let Docker Compose build only when the local image is missing.
+        ;;
+    rebuild)
+        BUILD_ARGS=(--build)
+        ;;
+    never)
+        BUILD_ARGS=(--no-build)
+        ;;
+    *)
+        echo "ERROR: Invalid PDFX_DEPLOY_BUILD_MODE='${PDFX_DEPLOY_BUILD_MODE}'. Use auto|rebuild|never." >&2
+        exit 1
+        ;;
+esac
 
 if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
     GROBID_HEALTH_PORT="8070"
@@ -103,9 +121,9 @@ mkdir -p "$REPO_ROOT/logs"
 echo "Stopping existing services..."
 docker compose "${COMPOSE_ARGS[@]}" down 2>/dev/null || true
 
-# Step 4: Build and start services
-echo "Building and starting services..."
-docker compose "${COMPOSE_ARGS[@]}" up -d --build
+# Step 4: Start services
+echo "Starting services (build mode: ${PDFX_DEPLOY_BUILD_MODE})..."
+docker compose "${COMPOSE_ARGS[@]}" up -d "${BUILD_ARGS[@]}"
 
 # Step 5: Wait for services to start
 echo "Waiting for services to start..."

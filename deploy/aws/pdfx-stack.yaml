@@ -1,19 +1,29 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Test mirror for the PDF extraction service: GPU EC2 backend, Fargate proxy,
-  S3 audit bucket, environment-scoped SSM parameters, ALB routing, and DNS.
+  PDFX service stack: GPU EC2 backend, Fargate proxy, S3 audit bucket,
+  SSM parameters, ALB routing, and DNS.
 
 Parameters:
   EnvironmentName:
     Type: String
-    Default: test
-    Description: Short environment name used in resource names.
+    Default: pdfx
+    Description: Environment tag value.
     AllowedPattern: "[a-z0-9-]+"
   SsmParameterPath:
     Type: String
-    Default: pdfx-test
+    Default: pdfx
     Description: SSM path without leading slash. Parameters are created under /<path>/*.
     AllowedPattern: "[A-Za-z0-9_.-][A-Za-z0-9_.\\/-]*"
+  BackendResourceName:
+    Type: String
+    Default: pdfx-backend
+    Description: Name for the backend security group, launch template, and Auto Scaling Group.
+    AllowedPattern: "[A-Za-z0-9_.-]+"
+  ProxyResourceName:
+    Type: String
+    Default: pdfx-proxy
+    Description: Name for the proxy security group and ECS resources.
+    AllowedPattern: "[A-Za-z0-9_.-]+"
   VpcId:
     Type: AWS::EC2::VPC::Id
     Default: vpc-55522232
@@ -56,8 +66,8 @@ Parameters:
     Description: Public Route 53 hosted zone ID for alliancegenome.org.
   DomainName:
     Type: String
-    Default: pdfx-test.alliancegenome.org
-    Description: Hostname routed to the test proxy.
+    Default: pdfx.alliancegenome.org
+    Description: Hostname routed to the PDFX proxy.
   ListenerRulePriority:
     Type: Number
     Default: 110
@@ -105,7 +115,7 @@ Parameters:
     Description: Hard cap for backend GPU instances. Use 1 for strict cost control, 2 for launch-before-terminate experiments.
   BackendWarmPoolMinSize:
     Type: Number
-    Default: 0
+    Default: 1
     MinValue: 0
     MaxValue: 1
     Description: Optional stopped warm-pool backend count for faster wake without running GPU cost.
@@ -120,11 +130,11 @@ Parameters:
     Description: Root EBS volume size in GiB.
   AuditBucketName:
     Type: String
-    Default: agr-pdf-extraction-test
-    Description: S3 bucket for test audit logs, artifacts, images, and proxy queue.
+    Default: agr-pdf-extraction-benchmark
+    Description: S3 bucket for PDFX audit logs, artifacts, images, and proxy queue.
   AuditPrefix:
     Type: String
-    Default: pdfx-test/audit
+    Default: pdfx/audit
     Description: S3 key prefix for backend audit logs and artifacts.
   ImageRetentionDays:
     Type: Number
@@ -141,12 +151,12 @@ Parameters:
     Description: Initial proxy image tag for the ECS service.
   EcsClusterName:
     Type: String
-    Default: pdfx-proxy-test
-    Description: ECS cluster name for the test proxy.
+    Default: pdfx-proxy
+    Description: ECS cluster name for the PDFX proxy.
   EcsServiceName:
     Type: String
-    Default: pdfx-proxy-test
-    Description: ECS service, task family, and default container name for the test proxy.
+    Default: pdfx-proxy
+    Description: ECS service, task family, and default container name for the PDFX proxy.
   ProxyDesiredCount:
     Type: Number
     Default: 1
@@ -160,7 +170,7 @@ Parameters:
     Default: "512"
   QueuePrefix:
     Type: String
-    Default: pdfx-proxy-test-queue
+    Default: pdfx-proxy-queue
     Description: S3 prefix for durable proxy queue jobs.
   CognitoUserPoolId:
     Type: String
@@ -245,8 +255,8 @@ Resources:
   ProxySecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub "PDFX ${EnvironmentName} proxy - ALB ingress on port 80"
-      GroupName: !Sub "pdfx-proxy-${EnvironmentName}"
+      GroupDescription: PDFX proxy - ALB ingress on port 80
+      GroupName: !Ref ProxyResourceName
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -258,15 +268,15 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
-          Value: !Sub "pdfx-proxy-${EnvironmentName}"
+          Value: !Ref ProxyResourceName
         - Key: Environment
           Value: !Ref EnvironmentName
 
   BackendSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub "PDFX ${EnvironmentName} GPU backend"
-      GroupName: !Sub "pdfx-backend-${EnvironmentName}"
+      GroupDescription: PDFX GPU backend
+      GroupName: !Ref BackendResourceName
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -282,14 +292,14 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
-          Value: !Sub "pdfx-backend-${EnvironmentName}"
+          Value: !Ref BackendResourceName
         - Key: Environment
           Value: !Ref EnvironmentName
 
   BackendRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "pdfx-${EnvironmentName}-ec2-role"
+      RoleName: pdfx-ec2-role
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -328,14 +338,14 @@ Resources:
   BackendInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      InstanceProfileName: !Sub "pdfx-${EnvironmentName}-ec2-profile"
+      InstanceProfileName: pdfx-ec2-profile
       Roles:
         - !Ref BackendRole
 
   BackendLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
-      LaunchTemplateName: !Sub "pdfx-backend-${EnvironmentName}"
+      LaunchTemplateName: !Ref BackendResourceName
       LaunchTemplateData:
         ImageId: !Ref BackendAmiId
         InstanceType: !Ref BackendInstanceType
@@ -365,7 +375,7 @@ Resources:
           - ResourceType: instance
             Tags:
               - Key: Name
-                Value: !Sub "pdfx-backend-${EnvironmentName}"
+                Value: !Ref BackendResourceName
               - Key: Project
                 Value: pdfx
               - Key: Environment
@@ -383,7 +393,7 @@ Resources:
               set -euo pipefail
               exec > >(tee /var/log/pdfx-bootstrap.log | logger -t pdfx-bootstrap -s 2>/dev/console) 2>&1
 
-              echo "Starting PDFX ${EnvironmentName} backend bootstrap"
+              echo "Starting PDFX backend bootstrap"
               dnf install -y docker git jq awscli
               systemctl enable --now docker
               usermod -aG docker ec2-user || true
@@ -403,15 +413,26 @@ Resources:
               DEPLOY_BACKEND_ON_BOOT="${DeployBackendOnBoot}"
               if [ "$DEPLOY_BACKEND_ON_BOOT" != "true" ]; then
                 echo "DeployBackendOnBoot=false; backend host provisioned but app deploy skipped."
-                shutdown -h +1 "PDFX test backend bootstrap complete; DeployBackendOnBoot=false"
+                shutdown -h +1 "PDFX backend bootstrap complete; DeployBackendOnBoot=false"
                 exit 0
               fi
 
               SERVICE_DIR=/home/ec2-user/agr_pdf_extraction_service
-              rm -rf "$SERVICE_DIR"
-              sudo -u ec2-user git clone "${BackendGitRepositoryUrl}" "$SERVICE_DIR"
+              if [ -d "$SERVICE_DIR/.git" ]; then
+                echo "Reusing existing backend checkout at $SERVICE_DIR"
+                sudo -u ec2-user git -C "$SERVICE_DIR" remote set-url origin "${BackendGitRepositoryUrl}" || true
+              else
+                echo "Creating backend checkout at $SERVICE_DIR"
+                rm -rf "$SERVICE_DIR"
+                sudo -u ec2-user git clone "${BackendGitRepositoryUrl}" "$SERVICE_DIR"
+              fi
               sudo -u ec2-user git -C "$SERVICE_DIR" fetch --all --tags --prune
               sudo -u ec2-user git -C "$SERVICE_DIR" checkout "${BackendGitRef}"
+              if sudo -u ec2-user git -C "$SERVICE_DIR" rev-parse --verify "origin/${BackendGitRef}" >/dev/null 2>&1; then
+                sudo -u ec2-user git -C "$SERVICE_DIR" reset --hard "origin/${BackendGitRef}"
+              else
+                sudo -u ec2-user git -C "$SERVICE_DIR" reset --hard "${BackendGitRef}"
+              fi
               cd "$SERVICE_DIR"
 
               if ! aws ssm get-parameter \
@@ -425,7 +446,7 @@ Resources:
               fi
 
               # Scrub production storage values from copied env files before
-              # appending test-scoped S3 settings below.
+              # appending mirror-scoped S3 settings below.
               grep -vE '^(AUDIT_S3_BUCKET|AUDIT_S3_BUCKET_SSM_PARAM|AUDIT_S3_PREFIX|IMAGE_URL_TTL_SECONDS|IMAGE_RETENTION_TTL_SECONDS|AWS_DEFAULT_REGION)=' .env > .env.scrubbed || true
               mv .env.scrubbed .env
 
@@ -441,12 +462,12 @@ Resources:
               mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
               chown -R ec2-user:ec2-user "$SERVICE_DIR"
               cd deploy
-              GPU_MODE=on ./deploy.sh
+              PDFX_DEPLOY_BUILD_MODE=auto GPU_MODE=on ./deploy.sh
 
   BackendAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      AutoScalingGroupName: !Sub "pdfx-backend-${EnvironmentName}"
+      AutoScalingGroupName: !Ref BackendResourceName
       MinSize: !Ref BackendMinSize
       MaxSize: !Ref BackendMaxSize
       DesiredCapacity: !Ref BackendDesiredCapacity
@@ -459,7 +480,7 @@ Resources:
         Version: !GetAtt BackendLaunchTemplate.LatestVersionNumber
       Tags:
         - Key: Name
-          Value: !Sub "pdfx-backend-${EnvironmentName}"
+          Value: !Ref BackendResourceName
           PropagateAtLaunch: true
         - Key: Project
           Value: pdfx
@@ -482,7 +503,7 @@ Resources:
   ProxyExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "pdfx-${EnvironmentName}-proxy-execution-role"
+      RoleName: pdfx-proxy-execution-role
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -506,7 +527,7 @@ Resources:
   ProxyTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "pdfx-${EnvironmentName}-proxy-task-role"
+      RoleName: pdfx-proxy-task-role
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -672,7 +693,7 @@ Resources:
       FilterPattern: '"EC2 startup timed out"'
       MetricTransformations:
         - MetricNamespace: PDFX/Proxy
-          MetricName: !Sub "${EnvironmentName}-startup-timeouts"
+          MetricName: pdfx-startup-timeouts
           MetricValue: "1"
 
   ProxyBackendReplacementMetricFilter:
@@ -682,16 +703,16 @@ Resources:
       FilterPattern: '"Marking ASG backend instance" "unhealthy"'
       MetricTransformations:
         - MetricNamespace: PDFX/Proxy
-          MetricName: !Sub "${EnvironmentName}-backend-replacements"
+          MetricName: pdfx-backend-replacements
           MetricValue: "1"
 
   ProxyStartupTimeoutAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub "pdfx-${EnvironmentName}-startup-timeouts"
+      AlarmName: pdfx-startup-timeouts
       AlarmDescription: PDFX backend failed to become healthy before queued replay timeout.
       Namespace: PDFX/Proxy
-      MetricName: !Sub "${EnvironmentName}-startup-timeouts"
+      MetricName: pdfx-startup-timeouts
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -703,10 +724,10 @@ Resources:
   ProxyBackendReplacementAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub "pdfx-${EnvironmentName}-backend-replacements"
+      AlarmName: pdfx-backend-replacements
       AlarmDescription: PDFX proxy asked Auto Scaling to replace an unhealthy backend instance.
       Namespace: PDFX/Proxy
-      MetricName: !Sub "${EnvironmentName}-backend-replacements"
+      MetricName: pdfx-backend-replacements
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

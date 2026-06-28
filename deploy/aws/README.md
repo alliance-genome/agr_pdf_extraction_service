@@ -2,14 +2,17 @@
 
 This folder contains AWS infrastructure for the PDF extraction service.
 
-## Test Mirror
+## PDFX Stack
 
-`pdfx-test-mirror-stack.yaml` creates a production-shaped test environment:
+`pdfx-stack.yaml` creates the canonical PDFX environment:
 GPU backend launch template and capped Auto Scaling Group, Fargate proxy, S3
-audit bucket, environment-scoped SSM parameters, CloudWatch alarms, ALB routing,
-and DNS.
+audit bucket, SSM parameters, CloudWatch alarms, ALB routing, and DNS.
 
-Start with the runbook in `deploy/aws/pdfx-test-mirror.md`.
+Start with the runbook in `deploy/aws/pdfx.md`.
+
+In the current AWS account, some canonical `pdfx` resources predate this
+template. Do not deploy the stack as a blind create over those names; follow the
+runbook's migration note and import or reference existing resources first.
 
 The backend ASG defaults to `MinSize=0`, `DesiredCapacity=0`, and `MaxSize=1`.
 The proxy scales it to one instance on demand and marks failed-startup
@@ -24,9 +27,9 @@ cd proxy/deploy
 ./deploy.sh \
   --profile ctabone \
   --region us-east-1 \
-  --cluster pdfx-proxy-test \
-  --service pdfx-proxy-test \
-  --ssm-prefix /pdfx-test \
+  --cluster pdfx-proxy \
+  --service pdfx-proxy \
+  --ssm-prefix /pdfx \
   --image-tag <image-tag>
 ```
 
@@ -70,7 +73,7 @@ deploy/aws/deploy_idle_guard.sh \
   --region us-east-1 \
   --project pdfx \
   --env prod \
-  --backend-asg-name pdfx-backend-test \
+  --backend-asg-name pdfx-backend \
   --proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics \
   --artifact-bucket agr-pdf-extraction-benchmark \
   --alarm-topic-arn arn:aws:sns:us-east-1:100225593120:pdfx-dev-oom-alerts
