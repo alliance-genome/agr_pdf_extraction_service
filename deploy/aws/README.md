@@ -10,6 +10,10 @@ audit bucket, SSM parameters, CloudWatch alarms, ALB routing, and DNS.
 
 Start with the runbook in `deploy/aws/pdfx.md`.
 
+In the current AWS account, some canonical `pdfx` resources predate this
+template. Do not deploy the stack as a blind create over those names; follow the
+runbook's migration note and import or reference existing resources first.
+
 The backend ASG defaults to `MinSize=0`, `DesiredCapacity=0`, and `MaxSize=1`.
 The proxy scales it to one instance on demand and marks failed-startup
 instances unhealthy so Auto Scaling replaces them from the launch template.

@@ -38,6 +38,21 @@ The PDFX stack intentionally recreates backend instances from user data instead
 of cloning an EBS volume. Warm-pool reuse preserves Docker images and model
 caches across idle shutdowns.
 
+## Current Account Migration Note
+
+In the current AWS account, several canonical `pdfx` resources already exist
+outside this CloudFormation template, including the S3 audit bucket, proxy ECS
+cluster/service, proxy target group, proxy security group, and canonical IAM
+roles/profile. A first deploy of this template as a new `pdfx` stack would
+collide with those existing names unless the resources are imported into the
+stack or the template is adapted to reference them as existing inputs.
+
+Use this template as the canonical shape for new environments and for planned
+CloudFormation adoption. For the current account migration, create or import the
+backend resources carefully, update `/pdfx/backend-asg-name` and the proxy task
+role policy together, then retire the old suffixed resources after
+`https://pdfx.alliancegenome.org/api/v1/health/deep` is healthy.
+
 ## Before Deploying
 
 Create the backend environment file as a SecureString. Start from the current
@@ -79,6 +94,9 @@ COGNITO_USER_POOL_ID="$(
 This creates the backend launch template and Auto Scaling Group, proxy
 service, S3 bucket, IAM roles, ALB rule, DNS record, CloudWatch alarms, and
 `/pdfx/*` parameters.
+
+Only run this as a create/update when those named resources are either absent,
+already managed by the same stack, or part of a planned CloudFormation import.
 
 ```bash
 aws cloudformation deploy \
