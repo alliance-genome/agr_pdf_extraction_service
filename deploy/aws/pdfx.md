@@ -120,6 +120,10 @@ The backend ASG defaults to `BackendMinSize=0`, `BackendDesiredCapacity=0`,
 capacity to `1` on wake and back to `0` after idle shutdown. The warm pool keeps
 one stopped, already-bootstrapped backend instance so Docker images and ML model
 caches survive idle shutdown without paying for a running GPU. Keep
+in mind that the stopped warm-pool instance also retains its bootstrapped git
+ref and Docker image; after dependency or Dockerfile changes, terminate the warm
+instance so a fresh one bootstraps and rebuilds instead of relying on an `auto`
+wake. Keep
 `BackendMaxSize=1` for strict cost control. Use `BackendMaxSize=2` only for
 controlled testing of launch-before-terminate behavior.
 

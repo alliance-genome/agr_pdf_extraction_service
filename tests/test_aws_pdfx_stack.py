@@ -93,6 +93,8 @@ def test_pdfx_runbook_documents_safe_bootstrap_path():
     assert "Current Account Migration Note" in runbook
     assert "first deploy of this template as a new `pdfx` stack" in runbook
     assert "collide with those existing names" in runbook
+    assert "retains its bootstrapped git" in runbook
+    assert "fresh one bootstraps and rebuilds" in runbook
     assert "remove legacy toggles such as `MARKER_EXTRACT_IMAGES`" in runbook
     assert "DeployBackendOnBoot=true" in runbook
     assert "--ssm-prefix /pdfx" in runbook
