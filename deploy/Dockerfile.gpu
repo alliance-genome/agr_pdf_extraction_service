@@ -55,6 +55,11 @@ RUN python3.11 -m pip install --no-cache-dir \
     celery[redis] \
     redis
 
+# Ubuntu's Python image dependencies include an old distutils-managed blinker
+# package. Install a wheel copy first so Flask's dependency does not try to
+# uninstall the distro package during the main requirements layer.
+RUN python3.11 -m pip install --no-cache-dir --ignore-installed 'blinker>=1.9.0'
+
 # Install application dependencies
 COPY requirements.txt deploy/gpu-constraints.txt ./
 RUN python3.11 -m pip install --no-cache-dir \
