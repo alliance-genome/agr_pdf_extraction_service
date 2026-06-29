@@ -125,14 +125,16 @@ def test_gpu_compose_builds_local_image_for_backend():
 def test_gpu_dockerfile_preserves_cuda_pytorch_layer():
     dockerfile = GPU_DOCKERFILE_PATH.read_text()
     constraints = GPU_CONSTRAINTS_PATH.read_text()
+    requirements_install = dockerfile.split("COPY requirements.txt deploy/gpu-constraints.txt ./", 1)[1]
 
     assert "deploy/gpu-constraints.txt" in dockerfile
     assert "torch==2.11.0+cu128" in dockerfile
     assert "torchvision==0.26.0+cu128" in dockerfile
-    assert "-c gpu-constraints.txt" in dockerfile
-    assert "--extra-index-url https://download.pytorch.org/whl/cu128" in dockerfile
-    assert "--ignore-installed" not in dockerfile
-    assert "--force-reinstall \\\n    torch" not in dockerfile
+    assert "--ignore-installed 'blinker>=1.9.0'" in dockerfile
+    assert "-c gpu-constraints.txt" in requirements_install
+    assert "--extra-index-url https://download.pytorch.org/whl/cu128" in requirements_install
+    assert "--ignore-installed" not in requirements_install
+    assert "--force-reinstall \\\n    torch" not in requirements_install
     assert "torch==2.11.0+cu128" in constraints
     assert "torchvision==0.26.0+cu128" in constraints
 
