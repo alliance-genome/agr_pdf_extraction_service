@@ -1,0 +1,5 @@
+# Keep the GPU image on the CUDA 12.8 PyTorch stack installed in Dockerfile.gpu.
+# Without these constraints, transitive marker/docling dependencies can resolve
+# a newer PyTorch build and pull another full CUDA runtime during image builds.
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128

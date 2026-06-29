@@ -45,8 +45,8 @@ WORKDIR /app
 
 # Install PyTorch with CUDA 12.8 support
 RUN python3.11 -m pip install --no-cache-dir \
-    torch \
-    torchvision \
+    torch==2.11.0+cu128 \
+    torchvision==0.26.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128
 
 # Install production server and task queue
@@ -56,8 +56,11 @@ RUN python3.11 -m pip install --no-cache-dir \
     redis
 
 # Install application dependencies
-COPY requirements.txt .
-RUN python3.11 -m pip install --no-cache-dir --ignore-installed -r requirements.txt
+COPY requirements.txt deploy/gpu-constraints.txt ./
+RUN python3.11 -m pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
+    -c gpu-constraints.txt \
+    -r requirements.txt
 
 # RapidOCR OCR runs on CPU ONNXRuntime while Docling/Marker keep CUDA-backed
 # torch acceleration. The onnxruntime-gpu wheel currently targets newer CUDA
@@ -65,14 +68,6 @@ RUN python3.11 -m pip install --no-cache-dir --ignore-installed -r requirements.
 # Docling auto-select RapidOCR's torch backend, which does not support PP-OCRv6.
 RUN python3.11 -m pip uninstall -y onnxruntime-gpu 2>/dev/null || true; \
     python3.11 -m pip install --no-cache-dir --force-reinstall 'onnxruntime>=1.18,<2'
-
-# Re-apply PyTorch from the CUDA 12.8 index after dependency installation.
-# Some transitive dependencies can otherwise upgrade torch to a CUDA wheel that
-# does not match this image's CUDA runtime libraries.
-RUN python3.11 -m pip install --no-cache-dir --force-reinstall \
-    torch \
-    torchvision \
-    --index-url https://download.pytorch.org/whl/cu128
 
 # Force numpy/Pillow versions back into the ranges required by numba/Marker.
 RUN python3.11 -m pip install --no-cache-dir 'numpy<2.4' 'Pillow<11.0.0,>=10.2.0'
