@@ -6,6 +6,8 @@ from pathlib import Path
 STACK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx-stack.yaml"
 RUNBOOK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx.md"
 GPU_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.gpu.yml"
+GPU_DOCKERFILE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "Dockerfile.gpu"
+GPU_CONSTRAINTS_PATH = Path(__file__).resolve().parents[1] / "deploy" / "gpu-constraints.txt"
 REQUIREMENTS_PATH = Path(__file__).resolve().parents[1] / "requirements.txt"
 
 
@@ -118,6 +120,21 @@ def test_gpu_compose_builds_local_image_for_backend():
     assert "dockerfile: deploy/Dockerfile.gpu" in compose
     assert "/usr/local/lib/python3.11/site-packages/rapidocr/models" in compose
     assert "/usr/local/lib/python3.11/dist-packages/rapidocr/models" in compose
+
+
+def test_gpu_dockerfile_preserves_cuda_pytorch_layer():
+    dockerfile = GPU_DOCKERFILE_PATH.read_text()
+    constraints = GPU_CONSTRAINTS_PATH.read_text()
+
+    assert "deploy/gpu-constraints.txt" in dockerfile
+    assert "torch==2.11.0+cu128" in dockerfile
+    assert "torchvision==0.26.0+cu128" in dockerfile
+    assert "-c gpu-constraints.txt" in dockerfile
+    assert "--extra-index-url https://download.pytorch.org/whl/cu128" in dockerfile
+    assert "--ignore-installed" not in dockerfile
+    assert "--force-reinstall \\\n    torch" not in dockerfile
+    assert "torch==2.11.0+cu128" in constraints
+    assert "torchvision==0.26.0+cu128" in constraints
 
 
 def test_gpu_compose_keeps_web_app_cpu_only_and_worker_ocr_overridable():
