@@ -990,9 +990,10 @@ The guard checks the backend ASG and proxy `/api/v1/metrics`, then publishes
 `PDFX/IdleGuard` metrics. It is intentionally separate from the proxy's own
 idle shutdown logic. It stores the continuous ASG running-since timestamp in
 SSM Parameter Store, so replacement EC2 instances do not reset the runtime
-clock. It tracks idle-since separately so active extraction time does not count
-against the idle alarm, and it has heartbeat/error/throttle alarms for the
-guard Lambda itself.
+clock, but it resets the stored clock if a real ASG scale-to-zero happened
+between scheduled guard checks. It tracks idle-since separately so active
+extraction time does not count against the idle alarm, and it has
+heartbeat/error/throttle alarms for the guard Lambda itself.
 
 Production example:
 

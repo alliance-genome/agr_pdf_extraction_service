@@ -21,7 +21,7 @@ Parameters:
     Description: Public proxy metrics endpoint used to detect queued or active work.
   IdleAlertAfterMinutes:
     Type: Number
-    Default: 45
+    Default: 60
     MinValue: 1
     Description: Alert when the backend has been running this long with no queued/replay/active work.
   AbsoluteAlertAfterMinutes:
@@ -91,6 +91,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeScalingActivities
                   - ec2:DescribeInstances
                 Resource: "*"
               - Sid: PublishIdleGuardMetrics

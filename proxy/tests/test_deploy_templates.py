@@ -38,6 +38,7 @@ def test_idle_guard_stack_has_email_alarm_path_and_schedule():
     assert "RUNNING_SINCE_PARAMETER_NAME" in template_text
     assert "IDLE_SINCE_PARAMETER_NAME" in template_text
     assert "ssm:GetParameter" in template_text
+    assert "autoscaling:DescribeScalingActivities" in template_text
     assert "AlarmSnsTopicArn" in template_text
     assert "PDFX/IdleGuard" in template_text
     assert "TreatMissingData: breaching" in template_text
