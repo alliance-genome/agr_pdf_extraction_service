@@ -111,12 +111,19 @@ def _record_job_event(process_id: str, event: str, *, reason: str | None = None)
 
 def _mark_job_failed(process_id: str, reason: str) -> None:
     replay_submission_errors[process_id] = reason
+    _cleanup_cached_payload(process_id, delete_remote=True)
     _record_job_event(process_id, "failed", reason=reason)
+
+
+def _cleanup_cached_payload(process_id: str, *, delete_remote: bool = False) -> None:
+    job = job_payload_cache.pop(process_id, None)
+    if job:
+        job.cleanup(delete_remote=delete_remote)
 
 
 def _clear_terminal_state(process_id: str) -> None:
     replay_submission_errors.pop(process_id, None)
-    job_payload_cache.pop(process_id, None)
+    _cleanup_cached_payload(process_id, delete_remote=True)
     pending_cancel_requests.pop(process_id, None)
 
 
@@ -589,7 +596,6 @@ async def submit_extraction(
     lifecycle.touch()
 
     process_id = str(uuid.uuid4())
-    pdf_data = await file.read()
     filename = file.filename or "upload.pdf"
 
     form_fields = {
@@ -607,23 +613,16 @@ async def submit_extraction(
     if mod_abbreviation is not None:
         form_fields["mod_abbreviation"] = mod_abbreviation
 
-    queued_job = QueuedJob(
-        job_id=process_id,
-        pdf_data=pdf_data,
-        form_fields=form_fields,
-        filename=filename,
-        authorization=authorization,
-    )
-    job_payload_cache[process_id] = queued_job
     _record_job_event(process_id, "queued")
 
     # If EC2 is ready, forward immediately.
     # If forwarding fails due transient startup/transport issue, queue and recover.
     if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
         try:
+            await file.seek(0)
             return await _forward_extraction(
                 process_id,
-                pdf_data,
+                file.file,
                 filename,
                 form_fields,
                 authorization=authorization,
@@ -642,13 +641,14 @@ async def submit_extraction(
             except Exception:
                 logger.debug("sync_state_from_ec2 failed during forward recovery", exc_info=True)
             try:
-                job_queue.enqueue(
+                queued_job = await job_queue.enqueue_upload(
                     process_id,
-                    pdf_data,
+                    file,
                     form_fields,
                     filename,
                     authorization=authorization,
                 )
+                job_payload_cache[process_id] = queued_job
             except QueueFullError:
                 _drop_submission_state(process_id)
                 raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
@@ -658,13 +658,14 @@ async def submit_extraction(
 
     # Otherwise, queue the job and ensure EC2 is starting.
     try:
-        job_queue.enqueue(
+        queued_job = await job_queue.enqueue_upload(
             process_id,
-            pdf_data,
+            file,
             form_fields,
             filename,
             authorization=authorization,
         )
+        job_payload_cache[process_id] = queued_job
     except QueueFullError:
         _drop_submission_state(process_id)
         raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
@@ -1081,7 +1082,7 @@ def _coerce_json_payload(resp: httpx.Response) -> dict[str, Any]:
 
 async def _forward_extraction(
     process_id: str,
-    pdf_data: bytes,
+    pdf_data: bytes | Any,
     filename: str,
     form_fields: dict,
     *,
@@ -1166,14 +1167,16 @@ async def _replay_when_ready():
 
     for job in jobs:
         _record_job_event(job.job_id, "replayed")
+        job_payload_cache[job.job_id] = job
         try:
-            await _forward_extraction(
-                job.job_id,
-                job.pdf_data,
-                job.filename,
-                job.form_fields,
-                authorization=job.authorization,
-            )
+            with job.open_pdf() as pdf_source:
+                await _forward_extraction(
+                    job.job_id,
+                    pdf_source,
+                    job.filename,
+                    job.form_fields,
+                    authorization=job.authorization,
+                )
             if job.job_id in pending_cancel_requests:
                 reason = pending_cancel_requests.pop(job.job_id)
                 try:
@@ -1189,6 +1192,7 @@ async def _replay_when_ready():
             logger.error("Failed to replay job %s: %s", job.job_id, exc)
             _mark_job_failed(job.job_id, str(exc))
         finally:
+            job.cleanup()
             replay_inflight_jobs.discard(job.job_id)
 
 
@@ -1217,17 +1221,23 @@ async def _reconciler_loop():
                 logger.warning("Reconciler requeueing stale job %s after %.0fs", process_id, age)
                 try:
                     if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
-                        await _forward_extraction(
-                            process_id,
-                            job.pdf_data,
-                            job.filename,
-                            job.form_fields,
-                            authorization=job.authorization,
-                        )
+                        with job.open_pdf() as pdf_source:
+                            await _forward_extraction(
+                                process_id,
+                                pdf_source,
+                                job.filename,
+                                job.form_fields,
+                                authorization=job.authorization,
+                            )
                     else:
+                        with job.open_pdf() as pdf_source:
+                            if isinstance(pdf_source, (bytes, bytearray)):
+                                pdf_data = bytes(pdf_source)
+                            else:
+                                pdf_data = pdf_source.read()
                         job_queue.enqueue(
                             process_id,
-                            job.pdf_data,
+                            pdf_data,
                             job.form_fields,
                             job.filename,
                             authorization=job.authorization,

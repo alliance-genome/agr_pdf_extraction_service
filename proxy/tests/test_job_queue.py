@@ -1,7 +1,11 @@
 """Tests for in-memory job queue during EC2 startup."""
 
+import asyncio
+import io
+import json
+
 import pytest
-from app.job_queue import JobQueue, QueueFullError, S3JobQueue
+from app.job_queue import JobQueue, QueuedJob, QueueFullError, S3JobQueue
 
 
 class TestJobQueue:
@@ -90,6 +94,100 @@ class TestJobQueue:
 
 
 class TestS3JobQueue:
+    def test_s3_pointer_job_open_pdf_downloads_lazily_and_cleans_remote(self, monkeypatch):
+        class _FakeS3Client:
+            def __init__(self):
+                self.deleted = []
+
+            def download_fileobj(self, bucket, key, fileobj):
+                assert bucket == "test-bucket"
+                assert key == "prefix/payloads/job-lazy.pdf"
+                fileobj.write(b"%PDF lazy")
+
+            def delete_object(self, Bucket, Key):
+                self.deleted.append((Bucket, Key))
+
+        fake_client = _FakeS3Client()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: fake_client)
+
+        job = QueuedJob(
+            job_id="job-lazy",
+            pdf_data=None,
+            form_fields={},
+            pdf_s3_bucket="test-bucket",
+            pdf_s3_key="prefix/payloads/job-lazy.pdf",
+        )
+
+        with job.open_pdf() as pdf_file:
+            assert pdf_file.read() == b"%PDF lazy"
+
+        assert job.pdf_file_path is not None
+        job.cleanup(delete_remote=True)
+        assert job.pdf_file_path is None
+        assert job.pdf_s3_key is None
+        assert fake_client.deleted == [("test-bucket", "prefix/payloads/job-lazy.pdf")]
+
+    def test_enqueue_upload_stores_pdf_as_separate_s3_object(self, monkeypatch):
+        class _Paginator:
+            def paginate(self, **kwargs):
+                return []
+
+        class _Upload:
+            def __init__(self):
+                self.file = io.BytesIO(b"%PDF large-ish")
+
+            async def seek(self, offset):
+                self.file.seek(offset)
+
+        class _FakeS3Client:
+            def __init__(self):
+                self.uploaded = {}
+                self.metadata = {}
+
+            def get_paginator(self, name):
+                assert name == "list_objects_v2"
+                return _Paginator()
+
+            def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None):
+                self.uploaded[(bucket, key)] = {
+                    "body": fileobj.read(),
+                    "extra": ExtraArgs,
+                }
+
+            def put_object(self, Bucket, Key, Body, **kwargs):
+                self.metadata[(Bucket, Key)] = {
+                    "body": Body,
+                    "kwargs": kwargs,
+                }
+
+            def delete_object(self, Bucket, Key):
+                raise AssertionError("metadata write should not fail in this test")
+
+        fake_client = _FakeS3Client()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: fake_client)
+
+        q = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        job = asyncio.run(
+            q.enqueue_upload(
+                "job-large",
+                _Upload(),
+                {"merge": "true"},
+                filename="large.pdf",
+                authorization="Bearer token",
+            )
+        )
+
+        assert job.pdf_data is None
+        assert job.pdf_s3_key == "prefix/payloads/job-large.pdf"
+        assert fake_client.uploaded[("test-bucket", "prefix/payloads/job-large.pdf")]["body"] == b"%PDF large-ish"
+
+        [(bucket, metadata_key)] = fake_client.metadata.keys()
+        assert bucket == "test-bucket"
+        assert metadata_key.endswith("_job-large.json")
+        metadata_payload = json.loads(fake_client.metadata[(bucket, metadata_key)]["body"])
+        assert metadata_payload["pdf_s3_key"] == "prefix/payloads/job-large.pdf"
+        assert "pdf_data_b64" not in metadata_payload
+
     def test_remove_job_deletes_matching_object(self, monkeypatch):
         class _Paginator:
             def paginate(self, **kwargs):
@@ -110,12 +208,30 @@ class TestS3JobQueue:
                 assert name == "list_objects_v2"
                 return _Paginator()
 
+            def get_object(self, Bucket, Key):
+                payload = {
+                    "job_id": "job-b",
+                    "filename": "paper.pdf",
+                    "form_fields": {},
+                    "queued_at": 1,
+                    "pdf_s3_bucket": Bucket,
+                    "pdf_s3_key": "prefix/payloads/job-b.pdf",
+                }
+                return {"Body": io.BytesIO(json.dumps(payload).encode("utf-8"))}
+
             def delete_object(self, Bucket, Key):
                 self.deleted.append((Bucket, Key))
+
+            def delete_objects(self, Bucket, Delete):
+                for item in Delete["Objects"]:
+                    self.deleted.append((Bucket, item["Key"]))
 
         fake_client = _FakeS3Client()
         monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: fake_client)
 
         q = S3JobQueue(bucket="test-bucket", prefix="prefix")
         assert q.remove_job("job-b") is True
-        assert fake_client.deleted == [("test-bucket", "prefix/jobs/0000000000002_job-b.json")]
+        assert fake_client.deleted == [
+            ("test-bucket", "prefix/jobs/0000000000002_job-b.json"),
+            ("test-bucket", "prefix/payloads/job-b.pdf"),
+        ]

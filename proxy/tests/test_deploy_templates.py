@@ -78,6 +78,7 @@ def test_task_definition_is_environment_parameterized():
     template = json.loads(template_text)
 
     assert template["family"] == "${TASK_FAMILY}"
+    assert int(template["memory"]) >= 2048
     container = template["containerDefinitions"][0]
     assert container["name"] == "${CONTAINER_NAME}"
     assert {"name": "QUEUE_S3_PREFIX", "value": "${QUEUE_S3_PREFIX}"} in container["environment"]

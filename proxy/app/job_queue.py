@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import base64
+import asyncio
+import contextlib
 import json
 import logging
+import os
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 import boto3
 
@@ -26,11 +30,14 @@ class QueuedJob:
     """Serialized queue payload for replay."""
 
     job_id: str
-    pdf_data: bytes
+    pdf_data: bytes | None
     form_fields: dict[str, Any]
     filename: str = "upload.pdf"
     authorization: str | None = None
     queued_at: float = field(default_factory=time.time)
+    pdf_s3_bucket: str | None = None
+    pdf_s3_key: str | None = None
+    pdf_file_path: str | None = None
 
     def to_json(self) -> str:
         payload = {
@@ -39,21 +46,78 @@ class QueuedJob:
             "authorization": self.authorization,
             "form_fields": self.form_fields,
             "queued_at": self.queued_at,
-            "pdf_data_b64": base64.b64encode(self.pdf_data).decode("ascii"),
         }
+        if self.pdf_s3_key:
+            payload["pdf_s3_bucket"] = self.pdf_s3_bucket
+            payload["pdf_s3_key"] = self.pdf_s3_key
+        elif self.pdf_data is not None:
+            # Backward-compatible memory queue / legacy S3 payload shape.
+            payload["pdf_data_b64"] = base64.b64encode(self.pdf_data).decode("ascii")
+        else:
+            raise ValueError("QueuedJob requires either pdf_data or pdf_s3_key")
         return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
     @classmethod
     def from_json(cls, raw: str) -> "QueuedJob":
         payload = json.loads(raw)
+        pdf_data = None
+        if "pdf_data_b64" in payload:
+            pdf_data = base64.b64decode(payload["pdf_data_b64"])
         return cls(
             job_id=str(payload["job_id"]),
             filename=str(payload.get("filename") or "upload.pdf"),
             authorization=payload.get("authorization"),
             form_fields=dict(payload.get("form_fields") or {}),
             queued_at=float(payload.get("queued_at") or time.time()),
-            pdf_data=base64.b64decode(payload["pdf_data_b64"]),
+            pdf_data=pdf_data,
+            pdf_s3_bucket=payload.get("pdf_s3_bucket"),
+            pdf_s3_key=payload.get("pdf_s3_key"),
         )
+
+    @contextlib.contextmanager
+    def open_pdf(self) -> Iterator[bytes | Any]:
+        if self.pdf_file_path:
+            with open(self.pdf_file_path, "rb") as pdf_file:
+                yield pdf_file
+            return
+        if self.pdf_data is not None:
+            yield self.pdf_data
+            return
+        if self.pdf_s3_key:
+            self._download_pdf_from_s3()
+            with open(self.pdf_file_path, "rb") as pdf_file:
+                yield pdf_file
+            return
+        raise ValueError("QueuedJob PDF payload is not materialized")
+
+    def _download_pdf_from_s3(self) -> None:
+        if not self.pdf_s3_key:
+            raise ValueError("QueuedJob has no S3 PDF payload")
+        bucket = self.pdf_s3_bucket
+        if not bucket:
+            raise ValueError("QueuedJob S3 payload is missing a bucket")
+
+        tmp = tempfile.NamedTemporaryFile(prefix=f"pdfx-{self.job_id}-", suffix=".pdf", delete=False)
+        try:
+            with tmp:
+                boto3.client("s3").download_fileobj(bucket, self.pdf_s3_key, tmp)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp.name)
+            raise
+        self.pdf_file_path = tmp.name
+
+    def cleanup(self, *, delete_remote: bool = False) -> None:
+        if self.pdf_file_path:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.pdf_file_path)
+            self.pdf_file_path = None
+        if delete_remote and self.pdf_s3_key:
+            bucket = self.pdf_s3_bucket
+            if bucket:
+                boto3.client("s3").delete_object(Bucket=bucket, Key=self.pdf_s3_key)
+            self.pdf_s3_key = None
+            self.pdf_s3_bucket = None
 
 
 class BaseJobQueue:
@@ -72,6 +136,25 @@ class BaseJobQueue:
         authorization: str | None = None,
     ) -> None:
         raise NotImplementedError
+
+    async def enqueue_upload(
+        self,
+        job_id: str,
+        upload_file: Any,
+        form_fields: dict,
+        filename: str = "upload.pdf",
+        authorization: str | None = None,
+    ) -> QueuedJob:
+        await upload_file.seek(0)
+        pdf_data = await upload_file.read()
+        self.enqueue(job_id, pdf_data, form_fields, filename, authorization=authorization)
+        return QueuedJob(
+            job_id=job_id,
+            pdf_data=pdf_data,
+            form_fields=form_fields,
+            filename=filename,
+            authorization=authorization,
+        )
 
     def dequeue(self) -> QueuedJob:
         raise NotImplementedError
@@ -114,15 +197,36 @@ class InMemoryJobQueue(BaseJobQueue):
     ) -> None:
         if len(self._queue) >= self._max_size:
             raise QueueFullError(f"Queue full ({self._max_size} jobs max)")
-        self._queue.append(
-            QueuedJob(
-                job_id=job_id,
-                pdf_data=pdf_data,
-                form_fields=form_fields,
-                filename=filename,
-                authorization=authorization,
-            )
+        self._queue.append(self._build_job(job_id, pdf_data, form_fields, filename, authorization))
+
+    def _build_job(
+        self,
+        job_id: str,
+        pdf_data: bytes,
+        form_fields: dict,
+        filename: str = "upload.pdf",
+        authorization: str | None = None,
+    ) -> QueuedJob:
+        return QueuedJob(
+            job_id=job_id,
+            pdf_data=pdf_data,
+            form_fields=form_fields,
+            filename=filename,
+            authorization=authorization,
         )
+
+    async def enqueue_upload(
+        self,
+        job_id: str,
+        upload_file: Any,
+        form_fields: dict,
+        filename: str = "upload.pdf",
+        authorization: str | None = None,
+    ) -> QueuedJob:
+        await upload_file.seek(0)
+        pdf_data = await upload_file.read()
+        self.enqueue(job_id, pdf_data, form_fields, filename, authorization=authorization)
+        return self._build_job(job_id, pdf_data, form_fields, filename, authorization)
 
     def dequeue(self) -> QueuedJob:
         return self._queue.popleft()
@@ -173,9 +277,15 @@ class S3JobQueue(BaseJobQueue):
     def _queue_prefix(self) -> str:
         return f"{self._prefix}/jobs/"
 
+    def _payload_prefix(self) -> str:
+        return f"{self._prefix}/payloads/"
+
     def _build_key(self, job: QueuedJob) -> str:
         ts_ms = int(job.queued_at * 1000)
         return f"{self._queue_prefix()}{ts_ms:013d}_{job.job_id}.json"
+
+    def _build_payload_key(self, job_id: str) -> str:
+        return f"{self._payload_prefix()}{job_id}.pdf"
 
     def _iter_keys(self) -> list[str]:
         paginator = self._client.get_paginator("list_objects_v2")
@@ -202,13 +312,69 @@ class S3JobQueue(BaseJobQueue):
     ) -> None:
         if self.size >= self._max_size:
             raise QueueFullError(f"Queue full ({self._max_size} jobs max)")
+        payload_key = self._build_payload_key(job_id)
+        self._client.put_object(
+            Bucket=self._bucket,
+            Key=payload_key,
+            Body=pdf_data,
+            ContentType="application/pdf",
+            ServerSideEncryption="AES256",
+        )
         job = QueuedJob(
             job_id=job_id,
-            pdf_data=pdf_data,
+            pdf_data=None,
             form_fields=form_fields,
             filename=filename,
             authorization=authorization,
+            pdf_s3_bucket=self._bucket,
+            pdf_s3_key=payload_key,
         )
+        try:
+            self._put_job_metadata(job)
+        except Exception:
+            self._client.delete_object(Bucket=self._bucket, Key=payload_key)
+            raise
+
+    async def enqueue_upload(
+        self,
+        job_id: str,
+        upload_file: Any,
+        form_fields: dict,
+        filename: str = "upload.pdf",
+        authorization: str | None = None,
+    ) -> QueuedJob:
+        if self.size >= self._max_size:
+            raise QueueFullError(f"Queue full ({self._max_size} jobs max)")
+
+        payload_key = self._build_payload_key(job_id)
+        await upload_file.seek(0)
+        await asyncio.to_thread(
+            self._client.upload_fileobj,
+            upload_file.file,
+            self._bucket,
+            payload_key,
+            ExtraArgs={
+                "ContentType": "application/pdf",
+                "ServerSideEncryption": "AES256",
+            },
+        )
+        job = QueuedJob(
+            job_id=job_id,
+            pdf_data=None,
+            form_fields=form_fields,
+            filename=filename,
+            authorization=authorization,
+            pdf_s3_bucket=self._bucket,
+            pdf_s3_key=payload_key,
+        )
+        try:
+            self._put_job_metadata(job)
+        except Exception:
+            self._client.delete_object(Bucket=self._bucket, Key=payload_key)
+            raise
+        return job
+
+    def _put_job_metadata(self, job: QueuedJob) -> None:
         self._client.put_object(
             Bucket=self._bucket,
             Key=self._build_key(job),
@@ -222,10 +388,9 @@ class S3JobQueue(BaseJobQueue):
         if not keys:
             raise IndexError("dequeue from empty queue")
         key = keys[0]
-        obj = self._client.get_object(Bucket=self._bucket, Key=key)
-        raw = obj["Body"].read().decode("utf-8")
-        self._client.delete_object(Bucket=self._bucket, Key=key)
-        return QueuedJob.from_json(raw)
+        job = self._load_job(key)
+        self._delete_job_metadata(key)
+        return job
 
     def drain(self) -> list[QueuedJob]:
         keys = self._iter_keys()
@@ -234,18 +399,47 @@ class S3JobQueue(BaseJobQueue):
             return jobs
 
         for key in keys:
-            obj = self._client.get_object(Bucket=self._bucket, Key=key)
-            raw = obj["Body"].read().decode("utf-8")
-            jobs.append(QueuedJob.from_json(raw))
+            jobs.append(self._load_job(key))
 
         # Delete in batches of 1000 (S3 limit).
+        self._delete_s3_keys(list(keys))
+        return jobs
+
+    def _load_job(self, key: str) -> QueuedJob:
+        obj = self._client.get_object(Bucket=self._bucket, Key=key)
+        raw = obj["Body"].read().decode("utf-8")
+        job = QueuedJob.from_json(raw)
+        if job.pdf_s3_key:
+            bucket = job.pdf_s3_bucket or self._bucket
+            tmp = tempfile.NamedTemporaryFile(prefix=f"pdfx-{job.job_id}-", suffix=".pdf", delete=False)
+            try:
+                with tmp:
+                    self._client.download_fileobj(bucket, job.pdf_s3_key, tmp)
+            except Exception:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp.name)
+                raise
+            job.pdf_file_path = tmp.name
+        return job
+
+    def _delete_s3_keys(self, keys: list[str]) -> None:
         for i in range(0, len(keys), 1000):
             chunk = keys[i : i + 1000]
+            if not chunk:
+                continue
             self._client.delete_objects(
                 Bucket=self._bucket,
                 Delete={"Objects": [{"Key": key} for key in chunk], "Quiet": True},
             )
-        return jobs
+
+    def _delete_job_metadata(self, metadata_key: str) -> None:
+        self._delete_s3_keys([metadata_key])
+
+    def _delete_job_objects(self, metadata_key: str, job: QueuedJob) -> None:
+        keys = [metadata_key]
+        if job.pdf_s3_key:
+            keys.append(job.pdf_s3_key)
+        self._delete_s3_keys(keys)
 
     def has_job(self, job_id: str) -> bool:
         suffix = f"_{job_id}.json"
@@ -255,7 +449,10 @@ class S3JobQueue(BaseJobQueue):
         suffix = f"_{job_id}.json"
         for key in self._iter_keys():
             if key.endswith(suffix):
-                self._client.delete_object(Bucket=self._bucket, Key=key)
+                obj = self._client.get_object(Bucket=self._bucket, Key=key)
+                raw = obj["Body"].read().decode("utf-8")
+                job = QueuedJob.from_json(raw)
+                self._delete_job_objects(key, job)
                 return True
         return False
 
