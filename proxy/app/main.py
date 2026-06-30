@@ -286,6 +286,15 @@ def _backend_accepting_but_worker_busy() -> bool:
     )
 
 
+async def _refresh_backend_health_snapshot_for_queue() -> None:
+    if not _backend_ready_for_proxy():
+        return
+    try:
+        await lifecycle.refresh_health_snapshot()
+    except Exception:
+        logger.debug("Failed to refresh backend health snapshot for queued job", exc_info=True)
+
+
 def _queued_response(process_id: str, status_value: str = "queued") -> JSONResponse:
     """Standard queued/warming response payload for startup buffering."""
     backend_busy = _backend_accepting_but_worker_busy()
@@ -690,6 +699,7 @@ async def get_extraction_status(
     if job_queue.has_job(process_id):
         lifecycle.touch()
         await _ensure_queued_jobs_replaying("queued status poll", known_queued=True)
+        await _refresh_backend_health_snapshot_for_queue()
         if _backend_accepting_but_worker_busy():
             stage, display = "queued", "PDFX worker busy; job waiting in queue"
             status_value = "queued"

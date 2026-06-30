@@ -62,6 +62,18 @@ class TestLifecycleManager:
         mgr._private_ip = "172.31.1.100"
         assert mgr.ec2_base_url == "http://172.31.1.100:5000"
 
+    def test_refresh_health_snapshot_only_when_backend_ready(self):
+        mgr, _ = self._make_manager(InstanceState.STARTING)
+        mgr._private_ip = "10.0.0.5"
+        mgr._check_health = AsyncMock(return_value=True)
+
+        assert asyncio.run(mgr.refresh_health_snapshot()) is False
+        mgr._check_health.assert_not_awaited()
+
+        mgr._state = InstanceState.READY
+        assert asyncio.run(mgr.refresh_health_snapshot()) is True
+        mgr._check_health.assert_awaited_once()
+
     def test_ensure_running_noop_when_ready(self):
         mgr, ec2 = self._make_manager(InstanceState.READY)
         asyncio.run(mgr.ensure_running())

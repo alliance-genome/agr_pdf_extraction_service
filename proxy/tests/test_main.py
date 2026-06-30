@@ -30,6 +30,7 @@ def _patch_singletons(monkeypatch):
     mock_lifecycle.private_ip = None
     mock_lifecycle.ensure_running = AsyncMock()
     mock_lifecycle.sync_state_from_ec2 = AsyncMock()
+    mock_lifecycle.refresh_health_snapshot = AsyncMock(return_value=True)
     mock_lifecycle.touch = MagicMock()
     monkeypatch.setattr("app.main.lifecycle", mock_lifecycle)
 
@@ -396,6 +397,45 @@ class TestExtractStatusEndpoint:
         assert data["status"] == "queued"
         assert data["progress"]["stage"] == "queued"
         assert "worker busy" in data["progress"]["stage_display"].lower()
+
+    def test_queued_job_refreshes_health_snapshot_before_busy_message(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.job_queue.enqueue("refresh-test-123", b"pdf", {})
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.last_health_status_code = 200
+        main_mod.lifecycle.last_health_reason = None
+        main_mod.lifecycle.last_health_checks = {
+            "grobid": "ok",
+            "redis": "ok",
+            "workers": 1,
+        }
+
+        async def _refresh_health_snapshot():
+            main_mod.lifecycle.last_health_status_code = 200
+            main_mod.lifecycle.last_health_reason = "worker_busy_or_unresponsive"
+            main_mod.lifecycle.last_health_checks = {
+                "grobid": "ok",
+                "redis": "ok",
+                "active_runs": 1,
+                "fresh_active_runs": 1,
+                "broker_unacked": 1,
+                "worker_state": "busy_or_unresponsive",
+            }
+            return True
+
+        main_mod.lifecycle.refresh_health_snapshot = AsyncMock(side_effect=_refresh_health_snapshot)
+
+        resp = client.get(
+            "/api/v1/extract/refresh-test-123",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["progress"]["stage"] == "queued"
+        assert "worker busy" in data["progress"]["stage_display"].lower()
+        main_mod.lifecycle.refresh_health_snapshot.assert_awaited_once()
 
     def test_stale_busy_snapshot_does_not_hide_startup_language(self, client, monkeypatch):
         import app.main as main_mod

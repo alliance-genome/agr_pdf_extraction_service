@@ -119,6 +119,12 @@ class LifecycleManager:
     def ec2_base_url(self) -> str:
         return f"http://{self._private_ip}:{settings.EC2_PORT}"
 
+    async def refresh_health_snapshot(self) -> bool:
+        """Refresh cached backend health details without changing EC2 state."""
+        if self._state not in (InstanceState.READY, InstanceState.BUSY) or not self._private_ip:
+            return False
+        return await self._check_health()
+
     async def ensure_running(self) -> None:
         """Start EC2 if stopped. Idempotent if already starting/running."""
         if self._state in (InstanceState.READY, InstanceState.BUSY):
