@@ -171,7 +171,12 @@ def _should_reset_after_missed_stop(
     if not running_since or not current_run_started_at:
         return False, None
 
-    latest_scale_to_zero = _latest_scale_to_zero_start(asg_name, running_since)
+    try:
+        latest_scale_to_zero = _latest_scale_to_zero_start(asg_name, running_since)
+    except Exception as exc:  # noqa: BLE001 - skip only the missed-stop enhancement
+        print(json.dumps({"scaling_activities_error": str(exc)}, sort_keys=True))
+        return False, None
+
     if latest_scale_to_zero and current_run_started_at > latest_scale_to_zero:
         return True, latest_scale_to_zero
 

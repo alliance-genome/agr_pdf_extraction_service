@@ -43,8 +43,9 @@ class FakeSSM:
 
 
 class FakeASG:
-    def __init__(self, activities: list[dict[str, Any]]):
+    def __init__(self, activities: list[dict[str, Any]], activities_error: Exception | None = None):
         self.activities = activities
+        self.activities_error = activities_error
 
     def describe_auto_scaling_groups(self, AutoScalingGroupNames: list[str]) -> dict[str, Any]:
         return {
@@ -68,6 +69,8 @@ class FakeASG:
         AutoScalingGroupName: str,
         MaxRecords: int,
     ) -> dict[str, Any]:
+        if self.activities_error:
+            raise self.activities_error
         return {"Activities": self.activities[:MaxRecords]}
 
 
@@ -216,5 +219,32 @@ def test_idle_guard_does_not_reset_for_instance_replacement_without_scale_to_zer
     assert result["reset_after_missed_stop"] is False
     assert result["idle_too_long"] is True
     assert cw.value_for("IdleRunningTooLong") == 1.0
+    assert ssm.parameters[running_param] == _iso(stored_since)
+    assert ssm.parameters[idle_param] == _iso(stored_since)
+
+
+def test_idle_guard_still_publishes_metrics_when_activity_lookup_fails(monkeypatch):
+    now = datetime.now(timezone.utc)
+    stored_since = now - timedelta(minutes=10)
+    current_launch = now - timedelta(minutes=9)
+    running_param = "/pdfx/prod/idle-guard/asg-running-since"
+    idle_param = "/pdfx/prod/idle-guard/asg-idle-since"
+    ssm = FakeSSM({running_param: _iso(stored_since), idle_param: _iso(stored_since)})
+    cw = FakeCloudWatch()
+    clients = {
+        "autoscaling": FakeASG([], activities_error=RuntimeError("throttled")),
+        "cloudwatch": cw,
+        "ec2": FakeEC2(current_launch),
+        "ssm": ssm,
+    }
+    module = _load_guard(monkeypatch, clients)
+
+    result = module._run_check()
+
+    assert result["reset_after_missed_stop"] is False
+    assert result["missed_scale_to_zero_at"] is None
+    assert result["idle_too_long"] is False
+    assert cw.value_for("GuardCheckSucceeded") == 1.0
+    assert cw.value_for("IdleRunningTooLong") == 0.0
     assert ssm.parameters[running_param] == _iso(stored_since)
     assert ssm.parameters[idle_param] == _iso(stored_since)
