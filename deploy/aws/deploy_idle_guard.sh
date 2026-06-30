@@ -11,7 +11,7 @@ Usage:
     --artifact-bucket <s3-bucket> \
     [--backend-asg-name pdfx-backend] \
     [--proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics] \
-    [--idle-alert-after-minutes 45] \
+    [--idle-alert-after-minutes 60] \
     [--absolute-alert-after-minutes 240] \
     [--project pdfx] \
     [--env prod] \
@@ -31,7 +31,7 @@ AWS_PROFILE="${AWS_PROFILE:-}"
 STACK_NAME=""
 BACKEND_ASG_NAME="pdfx-backend"
 PROXY_METRICS_URL="https://pdfx.alliancegenome.org/api/v1/metrics"
-IDLE_ALERT_AFTER_MINUTES="45"
+IDLE_ALERT_AFTER_MINUTES="60"
 ABSOLUTE_ALERT_AFTER_MINUTES="240"
 SCHEDULE_EXPRESSION="rate(5 minutes)"
 METRICS_TIMEOUT_SECONDS="5"
