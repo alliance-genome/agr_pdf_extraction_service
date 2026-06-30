@@ -167,6 +167,81 @@ def _get_run_by_process_id(process_id):
             pass
 
 
+def _count_runs_by_status(statuses):
+    db_session = _get_db_session()
+    if not db_session:
+        return "unknown"
+
+    try:
+        return int(
+            db_session.query(ExtractionRun)
+            .filter(ExtractionRun.status.in_(statuses))
+            .count()
+        )
+    except Exception as exc:
+        logger.warning("Failed to count extraction_run rows for statuses %s: %s", statuses, exc)
+        return "unknown"
+    finally:
+        try:
+            db_session.close()
+        except Exception:
+            pass
+
+
+def _count_fresh_running_runs():
+    db_session = _get_db_session()
+    if not db_session:
+        return "unknown"
+
+    try:
+        max_age_seconds = int(current_app.config.get("HEALTH_BUSY_RUN_MAX_AGE_SECONDS", 6 * 60 * 60))
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, max_age_seconds))
+        return int(
+            db_session.query(ExtractionRun)
+            .filter(ExtractionRun.status == "running")
+            .filter(ExtractionRun.started_at.isnot(None))
+            .filter(ExtractionRun.started_at >= cutoff)
+            .count()
+        )
+    except Exception as exc:
+        logger.warning("Failed to count fresh running extraction_run rows: %s", exc)
+        return "unknown"
+    finally:
+        try:
+            db_session.close()
+        except Exception:
+            pass
+
+
+def _redis_key_count(redis_client, command, key):
+    try:
+        return int(getattr(redis_client, command)(key))
+    except Exception:
+        return "unknown"
+
+
+def _redis_unacked_count(redis_client):
+    """Return Celery Redis broker in-flight task count when available."""
+    counts = []
+    saw_unknown = False
+    for command, key in (("hlen", "unacked"), ("zcard", "unacked_index")):
+        count = _redis_key_count(redis_client, command, key)
+        if count == "unknown":
+            saw_unknown = True
+            continue
+        counts.append(count)
+    if not counts:
+        return "unknown"
+    highest = max(counts)
+    if saw_unknown and highest == 0:
+        return "unknown"
+    return highest
+
+
+def _redis_default_queue_depth(redis_client):
+    return _redis_key_count(redis_client, "llen", "default")
+
+
 def _collect_artifact_keys(value, path="$"):
     """Collect S3 keys from artifact JSON, filtering out non-S3 strings like filenames."""
     keys = []
@@ -321,8 +396,12 @@ def health():
         r = redis.from_url(current_app.config["CELERY_BROKER_URL"])
         r.ping()
         checks["redis"] = "ok"
+        checks["broker_queued"] = _redis_default_queue_depth(r)
+        checks["broker_unacked"] = _redis_unacked_count(r)
     except Exception:
         checks["redis"] = "unavailable"
+        checks["broker_queued"] = "unknown"
+        checks["broker_unacked"] = "unknown"
 
     # Celery workers
     try:
@@ -335,6 +414,10 @@ def health():
     except Exception:
         checks["workers"] = "unknown"
 
+    checks["active_runs"] = _count_runs_by_status(["running"])
+    checks["fresh_active_runs"] = _count_fresh_running_runs()
+    checks["queued_runs"] = _count_runs_by_status(["queued"])
+
     overall = "ok"
     if checks["grobid"] != "ok" or checks["redis"] != "ok":
         overall = "degraded"
@@ -343,7 +426,24 @@ def health():
     if checks["redis"] == "unavailable":
         overall = "unhealthy"
     if isinstance(checks["workers"], int) and checks["workers"] <= 0:
-        overall = "unhealthy"
+        dependencies_accept_submissions = (
+            checks["grobid"] == "ok" and checks["redis"] == "ok"
+        )
+        busy_solo_worker = (
+            dependencies_accept_submissions
+            and isinstance(checks["fresh_active_runs"], int)
+            and checks["fresh_active_runs"] > 0
+            and isinstance(checks["broker_unacked"], int)
+            and checks["broker_unacked"] > 0
+        )
+        if busy_solo_worker:
+            # Solo Celery workers cannot respond to inspect while processing a
+            # PDF. Redis still accepts queued work, and the unacked broker task
+            # confirms the running DB row is not merely stale.
+            checks["worker_state"] = "busy_or_unresponsive"
+            overall = "degraded"
+        else:
+            overall = "unhealthy"
 
     status_code = 200 if overall != "unhealthy" else 503
     return jsonify({"status": overall, "checks": checks}), status_code

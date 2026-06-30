@@ -1,7 +1,7 @@
 import io
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -288,6 +288,156 @@ def test_get_extraction_status_falls_back_to_celery_when_db_row_missing(client):
     payload = response.get_json()
     assert payload["process_id"] == unknown_id
     assert payload["status"] == "pending"
+
+
+def test_health_reports_busy_solo_worker_as_degraded(client):
+    process_id = str(uuid.uuid4())
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    ))
+    session.commit()
+    session.close()
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 2
+    redis_client.hlen.return_value = 1
+    redis_client.zcard.return_value = 1
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = None
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "degraded"
+    assert payload["checks"]["workers"] == 0
+    assert payload["checks"]["active_runs"] == 1
+    assert payload["checks"]["fresh_active_runs"] == 1
+    assert payload["checks"]["queued_runs"] == 0
+    assert payload["checks"]["broker_queued"] == 2
+    assert payload["checks"]["broker_unacked"] == 1
+    assert payload["checks"]["worker_state"] == "busy_or_unresponsive"
+
+
+def test_health_stays_unhealthy_for_stale_running_row_without_unacked_task(client):
+    process_id = str(uuid.uuid4())
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    ))
+    session.commit()
+    session.close()
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 0
+    redis_client.hlen.return_value = 0
+    redis_client.zcard.return_value = 0
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = None
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "unhealthy"
+    assert payload["checks"]["active_runs"] == 1
+    assert payload["checks"]["fresh_active_runs"] == 1
+    assert payload["checks"]["broker_unacked"] == 0
+    assert "worker_state" not in payload["checks"]
+
+
+def test_health_stays_unhealthy_for_old_running_row_with_unacked_task(client):
+    process_id = str(uuid.uuid4())
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="running",
+        started_at=datetime.now(timezone.utc) - timedelta(seconds=21601),
+    ))
+    session.commit()
+    session.close()
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 0
+    redis_client.hlen.return_value = 1
+    redis_client.zcard.return_value = 1
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = None
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "unhealthy"
+    assert payload["checks"]["active_runs"] == 1
+    assert payload["checks"]["fresh_active_runs"] == 0
+    assert payload["checks"]["broker_unacked"] == 1
+    assert "worker_state" not in payload["checks"]
+
+
+def test_health_stays_unhealthy_when_redis_unavailable_with_active_run(client):
+    process_id = str(uuid.uuid4())
+    session = get_session()
+    session.add(ExtractionRun(
+        process_id=process_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    ))
+    session.commit()
+    session.close()
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", side_effect=RuntimeError("redis down")),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = None
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "unhealthy"
+    assert payload["checks"]["redis"] == "unavailable"
+    assert payload["checks"]["active_runs"] == 1
+    assert "worker_state" not in payload["checks"]
 
 
 def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(client):
