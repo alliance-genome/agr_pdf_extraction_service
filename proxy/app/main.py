@@ -265,13 +265,39 @@ def _progress_payload(stage: str, stage_display: str, percent: int = 0) -> dict[
     }
 
 
+def _backend_accepting_but_worker_busy() -> bool:
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY) or not lifecycle.private_ip:
+        return False
+    checks = getattr(lifecycle, "last_health_checks", {}) or {}
+    reason = getattr(lifecycle, "last_health_reason", None)
+    fresh_active_runs = checks.get("fresh_active_runs")
+    broker_unacked = checks.get("broker_unacked")
+    worker_state = checks.get("worker_state")
+    return (
+        reason == "worker_busy_or_unresponsive"
+        and getattr(lifecycle, "last_health_status_code", None) == 200
+        and checks.get("redis") == "ok"
+        and checks.get("grobid") == "ok"
+        and isinstance(fresh_active_runs, int)
+        and fresh_active_runs > 0
+        and isinstance(broker_unacked, int)
+        and broker_unacked > 0
+        and worker_state == "busy_or_unresponsive"
+    )
+
+
 def _queued_response(process_id: str, status_value: str = "queued") -> JSONResponse:
     """Standard queued/warming response payload for startup buffering."""
-    is_starting = lifecycle.state in (InstanceState.STARTING, InstanceState.STOPPED)
+    backend_busy = _backend_accepting_but_worker_busy()
+    is_starting = lifecycle.state in (InstanceState.STARTING, InstanceState.STOPPED) and not backend_busy
     if is_starting:
         stage = "ec2_starting"
         display = "Spinning up GPU instance"
         message = "GPU worker is waking up. Job queued. Poll GET /api/v1/extract/{process_id} for status."
+    elif backend_busy:
+        stage = "queued"
+        display = "PDFX worker busy; job waiting in queue"
+        message = "PDFX worker is already processing another job. This job is queued and will start automatically."
     else:
         stage = "queued"
         display = "Job queued"
@@ -368,10 +394,26 @@ async def health():
                 result["gpu_workers"] = checks.get("workers")
                 result["gpu_redis"] = checks.get("redis")
                 result["gpu_grobid"] = checks.get("grobid")
+                result["gpu_active_runs"] = checks.get("active_runs")
+                result["gpu_fresh_active_runs"] = checks.get("fresh_active_runs")
+                result["gpu_queued_runs"] = checks.get("queued_runs")
+                result["gpu_broker_unacked"] = checks.get("broker_unacked")
+                result["gpu_worker_state"] = checks.get("worker_state")
 
-        result["status"] = "healthy" if resp.status_code == 200 else "degraded"
+        gpu_status = str(result.get("gpu_status") or "").strip().lower()
+        backend_busy = (
+            resp.status_code == 200
+            and gpu_status == "degraded"
+            and result.get("gpu_worker_state") == "busy_or_unresponsive"
+        )
+        result["gpu_healthy"] = resp.status_code == 200 and gpu_status == "ok"
+        result["gpu_busy"] = backend_busy
+        result["gpu_accepting_submissions"] = resp.status_code == 200 and gpu_status in {"ok", "degraded"}
+        result["status"] = "healthy" if result["gpu_healthy"] else "degraded"
+        if gpu_status and gpu_status != "ok":
+            result["reason"] = result.get("reason") or f"downstream_health_{gpu_status}"
         if resp.status_code != 200:
-            result["reason"] = f"downstream_health_status_{resp.status_code}"
+            result["reason"] = result.get("reason") or f"downstream_health_status_{resp.status_code}"
             logger.error("Proxy health returned degraded; downstream health status=%s", resp.status_code)
     except Exception as exc:  # pragma: no cover - defensive log path
         result["gpu_healthy"] = False
@@ -648,7 +690,10 @@ async def get_extraction_status(
     if job_queue.has_job(process_id):
         lifecycle.touch()
         await _ensure_queued_jobs_replaying("queued status poll", known_queued=True)
-        if lifecycle.state == InstanceState.STARTING:
+        if _backend_accepting_but_worker_busy():
+            stage, display = "queued", "PDFX worker busy; job waiting in queue"
+            status_value = "queued"
+        elif lifecycle.state == InstanceState.STARTING:
             stage, display = "ec2_starting", "Spinning up GPU instance"
             status_value = "queued"
         elif lifecycle.state in (InstanceState.READY, InstanceState.BUSY):

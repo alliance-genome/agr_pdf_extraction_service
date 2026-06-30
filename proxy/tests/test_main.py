@@ -75,6 +75,63 @@ class TestHealthEndpoint:
         resp = client.get("/api/v1/health")
         assert resp.status_code == 200
 
+    def test_health_reports_degraded_when_backend_worker_busy(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+
+        class _DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "status": "degraded",
+                    "checks": {
+                        "service": "ok",
+                        "grobid": "ok",
+                        "redis": "ok",
+                        "workers": 0,
+                        "active_runs": 1,
+                        "fresh_active_runs": 1,
+                        "queued_runs": 2,
+                        "broker_unacked": 1,
+                        "worker_state": "busy_or_unresponsive",
+                    },
+                }
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get("/api/v1/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["reason"] == "downstream_health_degraded"
+        assert data["gpu_workers"] == 0
+        assert data["gpu_active_runs"] == 1
+        assert data["gpu_fresh_active_runs"] == 1
+        assert data["gpu_queued_runs"] == 2
+        assert data["gpu_broker_unacked"] == 1
+        assert data["gpu_worker_state"] == "busy_or_unresponsive"
+        assert data["gpu_healthy"] is False
+        assert data["gpu_busy"] is True
+        assert data["gpu_accepting_submissions"] is True
+
 
 class TestStatusEndpoint:
     def test_status_returns_state(self, client, monkeypatch):
@@ -312,6 +369,56 @@ class TestExtractStatusEndpoint:
         data = resp.json()
         assert data["status"] == "queued"
         assert "progress" in data
+        assert data["progress"]["stage"] == "ec2_starting"
+
+    def test_queued_job_reports_busy_backend_without_startup_language(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.job_queue.enqueue("busy-test-123", b"pdf", {})
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.last_health_status_code = 200
+        main_mod.lifecycle.last_health_reason = "worker_busy_or_unresponsive"
+        main_mod.lifecycle.last_health_checks = {
+            "grobid": "ok",
+            "redis": "ok",
+            "active_runs": 1,
+            "fresh_active_runs": 1,
+            "broker_unacked": 1,
+            "worker_state": "busy_or_unresponsive",
+        }
+
+        resp = client.get(
+            "/api/v1/extract/busy-test-123",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["progress"]["stage"] == "queued"
+        assert "worker busy" in data["progress"]["stage_display"].lower()
+
+    def test_stale_busy_snapshot_does_not_hide_startup_language(self, client, monkeypatch):
+        import app.main as main_mod
+        main_mod.job_queue.enqueue("startup-test-123", b"pdf", {})
+        main_mod.lifecycle.state = InstanceState.STARTING
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.last_health_status_code = 200
+        main_mod.lifecycle.last_health_reason = "worker_busy_or_unresponsive"
+        main_mod.lifecycle.last_health_checks = {
+            "grobid": "ok",
+            "redis": "ok",
+            "fresh_active_runs": 1,
+            "broker_unacked": 1,
+            "worker_state": "busy_or_unresponsive",
+        }
+
+        resp = client.get(
+            "/api/v1/extract/startup-test-123",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "queued"
         assert data["progress"]["stage"] == "ec2_starting"
 
     def test_queued_job_progress_has_correct_shape(self, client, monkeypatch):

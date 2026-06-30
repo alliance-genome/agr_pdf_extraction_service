@@ -37,6 +37,9 @@ class LifecycleManager:
         self._stop_blocked_total: int = 0
         self._startup_timeout_total: int = 0
         self._replacement_requests_total: int = 0
+        self._last_health_status_code: Optional[int] = None
+        self._last_health_checks: dict = {}
+        self._last_health_reason: Optional[str] = None
 
     @property
     def state(self) -> InstanceState:
@@ -75,6 +78,23 @@ class LifecycleManager:
     @property
     def replacement_requests_total(self) -> int:
         return self._replacement_requests_total
+
+    @property
+    def last_health_status_code(self) -> Optional[int]:
+        return self._last_health_status_code
+
+    @property
+    def last_health_checks(self) -> dict:
+        return dict(self._last_health_checks)
+
+    @property
+    def last_health_reason(self) -> Optional[str]:
+        return self._last_health_reason
+
+    def _clear_health_snapshot(self) -> None:
+        self._last_health_status_code = None
+        self._last_health_checks = {}
+        self._last_health_reason = None
 
     def set_stop_guard(self, guard: Callable[[], bool]) -> None:
         """Register callback that must return True before EC2 can stop."""
@@ -121,6 +141,7 @@ class LifecycleManager:
             self._ec2.start_instance()
 
         self._state = InstanceState.STARTING
+        self._clear_health_snapshot()
         self._startup_task = asyncio.create_task(self._poll_until_healthy())
 
     async def _poll_until_healthy(self) -> None:
@@ -177,6 +198,7 @@ class LifecycleManager:
                 self._state = InstanceState.STARTING
                 self._private_ip = None
                 self._ready_since = None
+                self._clear_health_snapshot()
                 start_requested = False
                 deadline = time.time() + settings.STARTUP_TIMEOUT_MINUTES * 60
                 continue
@@ -190,40 +212,87 @@ class LifecycleManager:
         self._state = InstanceState.STOPPED
         self._private_ip = None
         self._ready_since = None
+        self._clear_health_snapshot()
 
     async def _check_health(self) -> bool:
-        """Hit the EC2 Flask health endpoint and validate worker readiness."""
+        """Hit the EC2 Flask health endpoint and validate backend availability.
+
+        A solo Celery worker can be too busy to answer inspect/ping while it is
+        processing a PDF. If the backend reports healthy dependencies plus a
+        broker-unacked running task, treat it as available for submissions so
+        queued work is reported honestly instead of as a startup failure.
+        """
         if not self._private_ip:
+            self._last_health_status_code = None
+            self._last_health_checks = {}
+            self._last_health_reason = "missing_private_ip"
             return False
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{self.ec2_base_url}/api/v1/health")
-                if resp.status_code != 200:
-                    return False
+            self._last_health_status_code = resp.status_code
 
-                payload = resp.json()
-                if not isinstance(payload, dict):
-                    return False
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                self._last_health_checks = {}
+                self._last_health_reason = "invalid_health_payload"
+                return False
 
-                checks = payload.get("checks")
-                if not isinstance(checks, dict):
-                    return False
+            checks = payload.get("checks")
+            if not isinstance(checks, dict):
+                self._last_health_checks = {}
+                self._last_health_reason = "missing_health_checks"
+                return False
 
-                workers = checks.get("workers")
-                if not isinstance(workers, int) or workers <= 0:
-                    logger.debug("EC2 health not ready: workers=%r", workers)
-                    return False
+            self._last_health_checks = dict(checks)
 
-                if checks.get("redis") != "ok":
-                    logger.debug("EC2 health not ready: redis=%r", checks.get("redis"))
-                    return False
+            if checks.get("redis") != "ok":
+                self._last_health_reason = "redis_not_ready"
+                logger.debug("EC2 health not ready: redis=%r", checks.get("redis"))
+                return False
 
-                if checks.get("grobid") != "ok":
-                    logger.debug("EC2 health not ready: grobid=%r", checks.get("grobid"))
-                    return False
+            if checks.get("grobid") != "ok":
+                self._last_health_reason = "grobid_not_ready"
+                logger.debug("EC2 health not ready: grobid=%r", checks.get("grobid"))
+                return False
 
+            if resp.status_code != 200:
+                self._last_health_reason = f"downstream_health_status_{resp.status_code}"
+                logger.debug("EC2 health not ready: status=%s", resp.status_code)
+                return False
+
+            workers = checks.get("workers")
+            if isinstance(workers, int) and workers > 0:
+                self._last_health_reason = None
                 return True
+
+            fresh_active_runs = checks.get("fresh_active_runs")
+            broker_unacked = checks.get("broker_unacked")
+            if (
+                isinstance(fresh_active_runs, int)
+                and fresh_active_runs > 0
+                and isinstance(broker_unacked, int)
+                and broker_unacked > 0
+                and checks.get("service") == "ok"
+                and checks.get("worker_state") == "busy_or_unresponsive"
+            ):
+                self._last_health_reason = "worker_busy_or_unresponsive"
+                logger.info(
+                    "EC2 backend accepts submissions but worker inspect is not responsive: "
+                    "workers=%r fresh_active_runs=%r broker_unacked=%r",
+                    workers,
+                    fresh_active_runs,
+                    broker_unacked,
+                )
+                return True
+
+            self._last_health_reason = "no_ready_workers"
+            logger.debug("EC2 health not ready: workers=%r", workers)
+            return False
         except Exception:
+            self._last_health_status_code = None
+            self._last_health_checks = {}
+            self._last_health_reason = "downstream_unreachable"
             return False
 
     def _start_idle_monitor(self) -> None:
@@ -268,6 +337,7 @@ class LifecycleManager:
                 self._state = InstanceState.STOPPED
                 self._private_ip = None
                 self._ready_since = None
+                self._clear_health_snapshot()
                 return
 
     async def sync_state_from_ec2(self) -> None:
@@ -289,11 +359,14 @@ class LifecycleManager:
                 self._state = InstanceState.STARTING
                 self._startup_task = asyncio.create_task(self._poll_until_healthy())
                 self._ready_since = None
+                self._clear_health_snapshot()
             else:
                 self._state = InstanceState.STOPPED
                 self._ready_since = None
+                self._clear_health_snapshot()
                 logger.info("Synced: EC2 is stopped")
         except Exception as exc:
             logger.warning("Failed to sync EC2 state: %s", exc)
             self._state = InstanceState.STOPPED
             self._ready_since = None
+            self._clear_health_snapshot()

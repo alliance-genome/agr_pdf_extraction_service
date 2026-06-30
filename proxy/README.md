@@ -105,6 +105,19 @@ Returns granular progress through the extraction pipeline:
 }
 ```
 
+**While the backend worker is busy with another PDF:**
+```json
+{
+  "process_id": "...",
+  "status": "queued",
+  "progress": {
+    "stage": "queued",
+    "stage_display": "PDFX worker busy; job waiting in queue",
+    "percent": 0
+  }
+}
+```
+
 **Once the backend is processing:**
 
 The proxy forwards the request to EC2 and returns the backend's response verbatim, which includes stage-by-stage progress:
@@ -130,6 +143,7 @@ The proxy forwards the request to EC2 and returns the backend's response verbati
 | Stage | Display Text | Source |
 |-------|-------------|--------|
 | `ec2_starting` | Spinning up GPU instance | Proxy |
+| `queued` | PDFX worker busy; job waiting in queue | Proxy |
 | `initializing` | Initializing extraction job | Backend |
 | `grobid` | Running GROBID extraction | Backend (conditional) |
 | `docling` | Running Docling extraction | Backend (conditional) |
