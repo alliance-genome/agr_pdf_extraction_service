@@ -190,6 +190,7 @@ class TestExtractEndpoint:
     def test_extract_queues_when_stopped(self, client, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.STOPPED
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", lambda: None)
 
         resp = client.post(
             "/api/v1/extract",
@@ -1078,6 +1079,51 @@ class TestExtractCancelEndpoint:
 
         main_mod.lifecycle.ensure_running.assert_not_called()
         replay_mock.assert_called_once()
+
+    def test_reconciler_requeues_memory_job_when_backend_not_ready(self, monkeypatch):
+        from app.job_queue import QueuedJob
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        process_id = "stale-memory-job"
+        main_mod.job_payload_cache[process_id] = QueuedJob(
+            job_id=process_id,
+            pdf_data=b"%PDF memory",
+            form_fields={"merge": "true"},
+            filename="memory.pdf",
+            authorization="Bearer test",
+        )
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="running",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_at=0,
+        )
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", MagicMock())
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", True)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert main_mod.job_queue.has_job(process_id) is True
+        job = main_mod.job_queue.dequeue()
+        assert job.pdf_data == b"%PDF memory"
+        assert job.form_fields == {"merge": "true"}
+        assert job.filename == "memory.pdf"
+        main_mod.lifecycle.ensure_running.assert_awaited_once()
+        main_mod._ensure_replay_task.assert_called_once()
 
     def test_local_cancel_cache_is_bounded(self, monkeypatch):
         import app.main as main_mod

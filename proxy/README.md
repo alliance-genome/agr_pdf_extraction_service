@@ -6,7 +6,7 @@ A lightweight FastAPI proxy that sits in front of the GPU-based PDF Extraction S
 
 The PDF extraction backend runs on a GPU instance (currently g5.4xlarge). Leaving it running 24/7 is wasteful when jobs arrive intermittently. The proxy solves this by:
 
-1. Running cheaply on Fargate (256 CPU / 512 MB — pennies/hour)
+1. Running cheaply on Fargate (256 CPU / 2048 MB — pennies/hour)
 2. Auto-starting the GPU instance when a job arrives
 3. Queuing jobs while EC2 boots (~2-3 minutes), with optional durable S3 queue
 4. Replaying queued jobs once the backend is healthy
@@ -87,6 +87,14 @@ Accepts the same multipart form fields as the backend (`file`, `methods`, `merge
 ```
 
 Once EC2 is healthy, all queued jobs are automatically replayed to the backend. Replay failures are marked as explicit `failed` states (no infinite pending loop).
+
+In S3 queue mode, the proxy stores the PDF upload as a separate object under
+`<QUEUE_S3_PREFIX>/payloads/` and stores only small job metadata under
+`<QUEUE_S3_PREFIX>/jobs/`. This avoids base64-encoding large PDFs into queue
+JSON and keeps Fargate memory bounded while the GPU instance wakes up.
+Jobs that stream directly to an already-ready backend are not retained for
+later reconciler requeue; `RECONCILER_REQUEUE_ONCE` applies to jobs whose
+payload has entered the proxy queue/cache.
 
 ### Poll Status (`GET /api/v1/extract/{id}`)
 
@@ -203,14 +211,14 @@ All settings come from environment variables. In production, values are injected
 | `STARTUP_TIMEOUT_MINUTES` | No | `30` | Max minutes to wait for EC2 health check |
 | `ASG_STARTUP_REPLACEMENT_ATTEMPTS` | No | `1` | Extra ASG replacement attempts to wait through after startup timeout |
 | `HEALTH_POLL_INTERVAL_SECONDS` | No | `15` | Seconds between EC2 health polls during startup |
-| `MAX_QUEUED_JOBS` | No | `10` | Max jobs to hold in memory during startup |
+| `MAX_QUEUED_JOBS` | No | `10` | Max queued jobs during startup |
 | `FORWARD_TIMEOUT_SECONDS` | No | `600` | Timeout for forwarded HTTP requests to EC2 |
 | `PROXY_BACKEND_READY_TIMEOUT_SECONDS` | No | `30` | Max seconds artifact/image proxy routes wait for a refreshed or waking backend before returning 503 |
 | `PROXY_BACKEND_READY_POLL_SECONDS` | No | `2` | Seconds between backend readiness checks while artifact/image proxy routes wait |
 | `ALWAYS_ON_MODE` | No | `false` | Emergency mode that disables idle auto-stop |
 | `QUEUE_BACKEND` | No | `memory` | Queue backend: `memory` or `s3` |
 | `QUEUE_S3_BUCKET` | No | — | S3 bucket for durable queue (`QUEUE_BACKEND=s3`) |
-| `QUEUE_S3_PREFIX` | No | `pdfx-proxy-queue` | S3 prefix for durable queue jobs |
+| `QUEUE_S3_PREFIX` | No | `pdfx-proxy-queue` | S3 prefix for durable queue metadata and PDF payload objects |
 | `QUEUE_S3_REGION` | No | — | Optional S3 region override |
 | `STUCK_PENDING_MINUTES` | No | `20` | Age threshold for stale pending/running jobs |
 | `RECONCILER_INTERVAL_SECONDS` | No | `60` | Background reconciler interval |
