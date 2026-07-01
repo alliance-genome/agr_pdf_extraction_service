@@ -143,6 +143,13 @@ the new tag. Keep `BackendMaxSize=1` for strict cost control. Use
 `BackendMaxSize=2` only for controlled validation of launch-before-terminate
 behavior.
 
+The launch template installs a resume-safe systemd bootstrap service
+(`pdfx-backend-bootstrap.service`) before doing any long-running package,
+checkout, image pull, or deploy work. This matters for stopped warm-pool
+instances: AWS can stop a newly prepared instance while cloud-init is still
+running. On the next real start, cloud-init may not rerun user data, but the
+enabled systemd service starts again and completes the idempotent deploy.
+
 Durable proxy queue metadata and PDF payload objects live under `QueuePrefix`
 in the audit bucket and expire after `QueueRetentionDays` as a safety net.
 Normal replay, cancellation, and failure paths should delete queue payloads

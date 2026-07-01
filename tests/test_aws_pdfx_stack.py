@@ -92,6 +92,9 @@ def test_pdfx_bootstrap_scrubs_storage_env():
 def test_pdfx_bootstrap_supports_branch_tag_or_sha_checkout():
     template = STACK_PATH.read_text()
 
+    assert "pdfx-backend-bootstrap.service" in template
+    assert "/usr/local/sbin/pdfx-backend-bootstrap.sh" in template
+    assert "systemctl start --no-block pdfx-backend-bootstrap.service" in template
     assert "dnf install -y docker git jq awscli" in template
     assert "dnf install -y docker git jq awscli curl" not in template
     assert "docker compose version" in template
@@ -132,6 +135,7 @@ def test_pdfx_runbook_documents_safe_bootstrap_path():
     assert "--ssm-prefix /pdfx" in runbook
     assert "prebuilt `agr_pdfx_backend` ECR image" in runbook
     assert "docker-compose.gpu.prebuilt.yml" in runbook
+    assert "resume-safe systemd bootstrap service" in runbook
 
 
 def test_pdfx_stack_has_backend_resilience_alarms():

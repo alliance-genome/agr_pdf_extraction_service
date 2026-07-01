@@ -432,7 +432,13 @@ Resources:
               set -euo pipefail
               exec > >(tee /var/log/pdfx-bootstrap.log | logger -t pdfx-bootstrap -s 2>/dev/console) 2>&1
 
-              echo "Starting PDFX backend bootstrap"
+              echo "Installing PDFX backend bootstrap service"
+              cat > /usr/local/sbin/pdfx-backend-bootstrap.sh <<'BOOTSTRAP_SCRIPT'
+              #!/bin/bash
+              set -euo pipefail
+              exec > >(tee /var/log/pdfx-backend-bootstrap.log | logger -t pdfx-backend-bootstrap -s 2>/dev/console) 2>&1
+
+              echo "Starting PDFX backend bootstrap with prebuilt image ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}:${BackendImageTag}"
               dnf install -y docker git jq awscli
               systemctl enable --now docker
               usermod -aG docker ec2-user || true
@@ -509,6 +515,29 @@ Resources:
                 PDFX_DEPLOY_PULL_IMAGES=auto \
                 GPU_MODE=on \
                 ./deploy.sh
+              BOOTSTRAP_SCRIPT
+
+              chmod +x /usr/local/sbin/pdfx-backend-bootstrap.sh
+              cat > /etc/systemd/system/pdfx-backend-bootstrap.service <<'UNIT_EOF'
+              [Unit]
+              Description=PDFX backend bootstrap and deploy
+              Wants=network-online.target
+              After=network-online.target
+
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/sbin/pdfx-backend-bootstrap.sh
+              TimeoutStartSec=1800
+              Restart=on-failure
+              RestartSec=30
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT_EOF
+
+              systemctl daemon-reload
+              systemctl enable pdfx-backend-bootstrap.service
+              systemctl start --no-block pdfx-backend-bootstrap.service
 
   BackendAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup

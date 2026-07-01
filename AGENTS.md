@@ -78,6 +78,9 @@ timeout count, backend replacement count, backend state, and active job counts.
 
 - Cold-start loops happen when the backend installs CUDA/PyTorch during boot.
   The fix is a prebuilt backend image, not a longer timeout by itself.
+- Stopped warm-pool instances can power off while cloud-init user data is still
+  running. Keep backend bootstrap work in the resume-safe
+  `pdfx-backend-bootstrap.service`, not only inline cloud-init commands.
 - Browser `NetworkError when attempting to fetch resource` on large PDFs can be
   a request-size cap at nginx/Flask or an upload path timeout. Check limits
   before assuming extractor failure.
