@@ -206,7 +206,7 @@ fi
 
 # Check Redis
 echo -n "  Redis: "
-if docker exec ${PROJECT_NAME}-redis-1 redis-cli ping 2>/dev/null | grep -q PONG; then
+if docker exec pdfx-redis redis-cli ping 2>/dev/null | grep -q PONG; then
     echo "HEALTHY"
 else
     echo "NOT READY"
