@@ -68,7 +68,7 @@ Default production-oriented behavior:
   broken metrics endpoint does not silently hide spend
 
 Use a confirmed SNS topic with an idle-guard/cost-guard name for email
-delivery:
+delivery; do not reuse an OOM-named topic for this cost guard:
 
 ```bash
 deploy/aws/deploy_idle_guard.sh \

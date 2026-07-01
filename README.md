@@ -1010,9 +1010,10 @@ deploy/aws/deploy_idle_guard.sh \
   --alarm-topic-arn <confirmed-idle-guard-sns-topic-arn>
 ```
 
-Use a confirmed SNS topic with an idle-guard/cost-guard name. For Slack, attach
-the same SNS topic to the team's AWS Chatbot Slack channel configuration, while
-keeping email as the fallback.
+Use a confirmed SNS topic with an idle-guard/cost-guard name; do not reuse an
+OOM-named topic for this cost guard. For Slack, attach the same SNS topic to the
+team's AWS Chatbot Slack channel configuration, while keeping email as the
+fallback.
 
 ---
 

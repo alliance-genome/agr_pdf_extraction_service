@@ -62,8 +62,9 @@ Watch the cost and cold-start alarms before and after infrastructure changes:
   may be burning money.
 - Idle-guard heartbeat, Lambda errors, and Lambda throttles confirm the cost
   guard is alive.
-- Some old resources may still have `OOM` in their names. Treat those as idle
-  or cost guard alerts unless the alarm definition actually measures memory.
+- Do not route idle/cost guard alarms to OOM-named SNS topics. OOM naming should
+  be reserved for alerts that actually measure memory kills or out-of-memory
+  events.
 
 Useful proxy metrics include queue depth, oldest pending job age, startup
 timeout count, backend replacement count, backend state, and active job counts.
