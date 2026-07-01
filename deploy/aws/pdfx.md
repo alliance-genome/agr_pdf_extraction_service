@@ -49,6 +49,13 @@ data/model/log mounts but removes source-code bind mounts, so production runs
 the app code baked into the ECR image instead of overlaying a potentially
 different checkout.
 
+GPU deploys are intentionally gated on CUDA being usable inside containers.
+`deploy.sh` probes the configured GPU image with `docker run --gpus all` before
+starting the Compose stack and then probes `torch.cuda` inside `pdfx-worker`
+after startup. If the host can run `nvidia-smi` but the worker probe fails, the
+backend is not ready; rerun the guarded deploy or restart app/worker after the
+NVIDIA container runtime is ready.
+
 ## Current Account Migration Note
 
 In the current AWS account, several canonical `pdfx` resources already exist

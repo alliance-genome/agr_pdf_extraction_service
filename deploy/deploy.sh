@@ -122,6 +122,68 @@ wait_for_postgres() {
     return 1
 }
 
+probe_gpu_image() {
+    local image="${PDFX_GPU_IMAGE:-pdfx-gpu}"
+
+    docker run --rm --gpus all --entrypoint python3.11 "$image" -c '
+import sys
+import torch
+
+if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+    sys.exit("CUDA is not available inside the GPU image")
+
+torch.cuda.mem_get_info(0)
+print(torch.cuda.get_device_name(0))
+'
+}
+
+wait_for_nvidia_container_runtime() {
+    if [ "$COMPOSE_FILE" != "docker-compose.gpu.yml" ]; then
+        return 0
+    fi
+
+    local image="${PDFX_GPU_IMAGE:-pdfx-gpu}"
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        if [ "${PDFX_DEPLOY_BUILD_MODE}" = "auto" ]; then
+            echo "Skipping pre-start NVIDIA image probe; ${image} will be built by Docker Compose if needed."
+            return 0
+        fi
+    fi
+
+    local attempts="${PDFX_NVIDIA_READY_ATTEMPTS:-36}"
+    local delay="${PDFX_NVIDIA_READY_DELAY_SECONDS:-5}"
+
+    echo "Waiting for NVIDIA container runtime..."
+    for attempt in $(seq 1 "$attempts"); do
+        if detect_gpu && probe_gpu_image >/tmp/pdfx-gpu-probe.out 2>/tmp/pdfx-gpu-probe.err; then
+            echo "  NVIDIA runtime is ready ($(cat /tmp/pdfx-gpu-probe.out))."
+            return 0
+        fi
+
+        echo "  NVIDIA runtime not ready (${attempt}/${attempts}); retrying in ${delay}s..."
+        if [ -s /tmp/pdfx-gpu-probe.err ]; then
+            sed 's/^/    /' /tmp/pdfx-gpu-probe.err | tail -n 8
+        fi
+        sleep "$delay"
+    done
+
+    echo "ERROR: NVIDIA container runtime did not become ready after $((attempts * delay)) seconds."
+    return 1
+}
+
+probe_worker_cuda() {
+    docker exec pdfx-worker python3.11 -c '
+import sys
+import torch
+
+if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+    sys.exit("CUDA is not available inside pdfx-worker")
+
+torch.cuda.mem_get_info(0)
+print(torch.cuda.get_device_name(0))
+'
+}
+
 # Step 1: Check prerequisites
 echo "Checking prerequisites..."
 
@@ -176,6 +238,8 @@ if [ "${PDFX_DEPLOY_BUILD_MODE}" = "rebuild" ]; then
     docker compose "${COMPOSE_ARGS[@]}" build app worker
 fi
 
+wait_for_nvidia_container_runtime
+
 echo "Starting dependency services..."
 docker compose "${COMPOSE_ARGS[@]}" up -d postgres redis grobid
 
@@ -226,6 +290,19 @@ if curl -sf http://localhost:5000/api/v1/health > /dev/null 2>&1; then
     echo "HEALTHY"
 else
     echo "NOT READY (may still be loading models)"
+fi
+
+if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
+    echo -n "  GPU worker CUDA: "
+    if probe_worker_cuda >/tmp/pdfx-worker-cuda-probe.out 2>/tmp/pdfx-worker-cuda-probe.err; then
+        echo "HEALTHY ($(cat /tmp/pdfx-worker-cuda-probe.out))"
+    else
+        echo "NOT READY"
+        if [ -s /tmp/pdfx-worker-cuda-probe.err ]; then
+            sed 's/^/    /' /tmp/pdfx-worker-cuda-probe.err | tail -n 8
+        fi
+        exit 1
+    fi
 fi
 
 echo ""

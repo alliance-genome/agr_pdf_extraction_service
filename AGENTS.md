@@ -57,6 +57,9 @@ GPU backend that should run only when there is work.
 - For urgent backend fixes, build/push a SHA-tagged backend image, update the
   launch/deploy path deliberately, and verify the backend actually pulled that
   tag. Do not assume `:latest` promotion alone changed an existing instance.
+- Backend GPU deploys should fail closed if CUDA is not usable inside the
+  container. `deploy/deploy.sh` probes the NVIDIA container runtime before
+  starting the stack and checks CUDA inside `pdfx-worker` after startup.
 
 ## Alerts And Metrics
 
@@ -89,6 +92,11 @@ timeout count, backend replacement count, backend state, and active job counts.
   jobs.
 - Backend `worker_not_ready` with healthy EC2 status checks usually means the
   application stack is still starting, not hardware failure.
+- If host `nvidia-smi` works but `torch.cuda.is_available()` is false inside
+  `pdfx-worker`, the app/worker containers likely started before the NVIDIA
+  container runtime/device plumbing was ready. Rerun the guarded backend deploy
+  or restart app/worker after confirming the runtime; do not mark the backend
+  healthy until the worker CUDA probe passes.
 - A backend job stuck around `llm_merge` with low CPU and no fresh worker logs
   is usually a slow/blocked OpenAI request inside the parallel consensus
   resolver. Check `/api/v1/extract/<process_id>` for progress, worker logs for
