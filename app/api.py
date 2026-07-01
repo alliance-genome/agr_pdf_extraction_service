@@ -473,8 +473,8 @@ def health():
             # Solo Celery workers cannot respond to inspect while processing a
             # PDF. Redis still accepts queued work, and the unacked broker task
             # confirms the running DB row is not merely stale.
-            checks["worker_state"] = "busy_or_unresponsive"
-            overall = "degraded"
+            checks["worker_state"] = "busy"
+            overall = "busy"
         else:
             overall = "unhealthy"
 

@@ -48,7 +48,7 @@ All endpoints except `/api/v1/health/live`, `/api/v1/health`, `/api/v1/health/de
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/api/v1/health/live` | GET | No | Proxy-only container liveness probe |
-| `/api/v1/health` | GET | No | Proxy health + EC2 state (degraded unless worker is ready) |
+| `/api/v1/health` | GET | No | Proxy health + EC2 state (`healthy`, `busy`, or degraded/stopped state) |
 | `/api/v1/health/deep` | GET | No | Deep probe: proxy auth validation + downstream status round-trip |
 | `/api/v1/metrics` | GET | No | Queue/replay/lifecycle/canary metrics for alerting |
 | `/api/v1/status` | GET | Yes | Passive EC2 state, idle time, active/queued job counts |

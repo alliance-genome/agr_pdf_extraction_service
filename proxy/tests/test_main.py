@@ -76,7 +76,7 @@ class TestHealthEndpoint:
         resp = client.get("/api/v1/health")
         assert resp.status_code == 200
 
-    def test_health_reports_degraded_when_backend_worker_busy(self, client, monkeypatch):
+    def test_health_reports_busy_when_backend_worker_busy(self, client, monkeypatch):
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
@@ -89,7 +89,7 @@ class TestHealthEndpoint:
             @staticmethod
             def json():
                 return {
-                    "status": "degraded",
+                    "status": "busy",
                     "checks": {
                         "service": "ok",
                         "grobid": "ok",
@@ -99,7 +99,7 @@ class TestHealthEndpoint:
                         "fresh_active_runs": 1,
                         "queued_runs": 2,
                         "broker_unacked": 1,
-                        "worker_state": "busy_or_unresponsive",
+                        "worker_state": "busy",
                     },
                 }
 
@@ -121,14 +121,14 @@ class TestHealthEndpoint:
         resp = client.get("/api/v1/health")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "degraded"
-        assert data["reason"] == "downstream_health_degraded"
+        assert data["status"] == "busy"
+        assert data["reason"] == "backend_busy"
         assert data["gpu_workers"] == 0
         assert data["gpu_active_runs"] == 1
         assert data["gpu_fresh_active_runs"] == 1
         assert data["gpu_queued_runs"] == 2
         assert data["gpu_broker_unacked"] == 1
-        assert data["gpu_worker_state"] == "busy_or_unresponsive"
+        assert data["gpu_worker_state"] == "busy"
         assert data["gpu_healthy"] is False
         assert data["gpu_busy"] is True
         assert data["gpu_accepting_submissions"] is True
@@ -416,14 +416,14 @@ class TestExtractStatusEndpoint:
         main_mod.lifecycle.state = InstanceState.READY
         main_mod.lifecycle.private_ip = "172.31.1.100"
         main_mod.lifecycle.last_health_status_code = 200
-        main_mod.lifecycle.last_health_reason = "worker_busy_or_unresponsive"
+        main_mod.lifecycle.last_health_reason = "worker_busy"
         main_mod.lifecycle.last_health_checks = {
             "grobid": "ok",
             "redis": "ok",
             "active_runs": 1,
             "fresh_active_runs": 1,
             "broker_unacked": 1,
-            "worker_state": "busy_or_unresponsive",
+            "worker_state": "busy",
         }
 
         resp = client.get(
@@ -451,14 +451,14 @@ class TestExtractStatusEndpoint:
 
         async def _refresh_health_snapshot():
             main_mod.lifecycle.last_health_status_code = 200
-            main_mod.lifecycle.last_health_reason = "worker_busy_or_unresponsive"
+            main_mod.lifecycle.last_health_reason = "worker_busy"
             main_mod.lifecycle.last_health_checks = {
                 "grobid": "ok",
                 "redis": "ok",
                 "active_runs": 1,
                 "fresh_active_runs": 1,
                 "broker_unacked": 1,
-                "worker_state": "busy_or_unresponsive",
+                "worker_state": "busy",
             }
             return True
 

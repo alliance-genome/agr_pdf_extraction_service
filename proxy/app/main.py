@@ -351,7 +351,7 @@ def _backend_accepting_but_worker_busy() -> bool:
     broker_unacked = checks.get("broker_unacked")
     worker_state = checks.get("worker_state")
     return (
-        reason == "worker_busy_or_unresponsive"
+        reason in {"worker_busy", "worker_busy_or_unresponsive"}
         and getattr(lifecycle, "last_health_status_code", None) == 200
         and checks.get("redis") == "ok"
         and checks.get("grobid") == "ok"
@@ -359,7 +359,7 @@ def _backend_accepting_but_worker_busy() -> bool:
         and fresh_active_runs > 0
         and isinstance(broker_unacked, int)
         and broker_unacked > 0
-        and worker_state == "busy_or_unresponsive"
+        and worker_state in {"busy", "busy_or_unresponsive"}
     )
 
 
@@ -503,14 +503,26 @@ async def health():
         gpu_status = str(result.get("gpu_status") or "").strip().lower()
         backend_busy = (
             resp.status_code == 200
-            and gpu_status == "degraded"
-            and result.get("gpu_worker_state") == "busy_or_unresponsive"
+            and (
+                gpu_status == "busy"
+                or (
+                    gpu_status == "degraded"
+                    and result.get("gpu_worker_state") == "busy_or_unresponsive"
+                )
+            )
+            and result.get("gpu_worker_state") in {"busy", "busy_or_unresponsive"}
         )
         result["gpu_healthy"] = resp.status_code == 200 and gpu_status == "ok"
         result["gpu_busy"] = backend_busy
-        result["gpu_accepting_submissions"] = resp.status_code == 200 and gpu_status in {"ok", "degraded"}
-        result["status"] = "healthy" if result["gpu_healthy"] else "degraded"
-        if gpu_status and gpu_status != "ok":
+        result["gpu_accepting_submissions"] = resp.status_code == 200 and gpu_status in {"ok", "busy", "degraded"}
+        if result["gpu_healthy"]:
+            result["status"] = "healthy"
+        elif backend_busy:
+            result["status"] = "busy"
+            result["reason"] = result.get("reason") or "backend_busy"
+        else:
+            result["status"] = "degraded"
+        if gpu_status and gpu_status not in {"ok", "busy"}:
             result["reason"] = result.get("reason") or f"downstream_health_{gpu_status}"
         if resp.status_code != 200:
             result["reason"] = result.get("reason") or f"downstream_health_status_{resp.status_code}"

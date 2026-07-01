@@ -285,9 +285,9 @@ class LifecycleManager:
                 and isinstance(broker_unacked, int)
                 and broker_unacked > 0
                 and checks.get("service") == "ok"
-                and checks.get("worker_state") == "busy_or_unresponsive"
+                and checks.get("worker_state") in {"busy", "busy_or_unresponsive"}
             ):
-                self._last_health_reason = "worker_busy_or_unresponsive"
+                self._last_health_reason = "worker_busy"
                 logger.info(
                     "EC2 backend accepts submissions but worker inspect is not responsive: "
                     "workers=%r fresh_active_runs=%r broker_unacked=%r",

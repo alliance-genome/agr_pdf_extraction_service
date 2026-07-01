@@ -290,7 +290,7 @@ def test_get_extraction_status_falls_back_to_celery_when_db_row_missing(client):
     assert payload["status"] == "pending"
 
 
-def test_health_reports_busy_solo_worker_as_degraded(client):
+def test_health_reports_busy_solo_worker_as_busy(client):
     process_id = str(uuid.uuid4())
     session = get_session()
     session.add(ExtractionRun(
@@ -321,14 +321,14 @@ def test_health_reports_busy_solo_worker_as_degraded(client):
 
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload["status"] == "degraded"
+    assert payload["status"] == "busy"
     assert payload["checks"]["workers"] == 0
     assert payload["checks"]["active_runs"] == 1
     assert payload["checks"]["fresh_active_runs"] == 1
     assert payload["checks"]["queued_runs"] == 0
     assert payload["checks"]["broker_queued"] == 2
     assert payload["checks"]["broker_unacked"] == 1
-    assert payload["checks"]["worker_state"] == "busy_or_unresponsive"
+    assert payload["checks"]["worker_state"] == "busy"
 
 
 def test_health_is_unhealthy_when_extraction_run_table_missing(client):

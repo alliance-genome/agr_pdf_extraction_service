@@ -244,7 +244,7 @@ class TestLifecycleManager:
             @staticmethod
             def json():
                 return {
-                    "status": "degraded",
+                    "status": "busy",
                     "checks": {
                         "service": "ok",
                         "grobid": "ok",
@@ -253,7 +253,7 @@ class TestLifecycleManager:
                         "active_runs": 1,
                         "fresh_active_runs": 1,
                         "broker_unacked": 1,
-                        "worker_state": "busy_or_unresponsive",
+                        "worker_state": "busy",
                     },
                 }
 
@@ -272,7 +272,7 @@ class TestLifecycleManager:
 
         monkeypatch.setattr("app.state_machine.httpx.AsyncClient", _Client)
         assert asyncio.run(mgr._check_health()) is True
-        assert mgr.last_health_reason == "worker_busy_or_unresponsive"
+        assert mgr.last_health_reason == "worker_busy"
         assert mgr.last_health_checks["broker_unacked"] == 1
 
     def test_check_health_rejects_stale_running_row_without_unacked_task(self, monkeypatch):
