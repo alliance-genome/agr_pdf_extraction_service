@@ -56,6 +56,7 @@ Default production-oriented behavior:
   does not reset if Auto Scaling replaces an EC2 instance
 - reset the stored clock if a real ASG scale-to-zero happened between
   scheduled guard checks
+- reset the stored clock if the monitored backend ASG name changes
 - track continuous backend idle time separately, so real extraction work does
   not count against the idle alarm
 - alert after 60 minutes with no queued, replaying, or active backend work
@@ -66,8 +67,8 @@ Default production-oriented behavior:
 - treat proxy metrics fetch failures as idle, so a running backend plus a
   broken metrics endpoint does not silently hide spend
 
-The existing `pdfx-dev-oom-alerts` SNS topic is already subscribed to
-`ctabone@morgan.harvard.edu` and can be reused for email delivery:
+Use a confirmed SNS topic with an idle-guard/cost-guard name for email
+delivery:
 
 ```bash
 deploy/aws/deploy_idle_guard.sh \
@@ -78,7 +79,7 @@ deploy/aws/deploy_idle_guard.sh \
   --backend-asg-name pdfx-backend \
   --proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics \
   --artifact-bucket agr-pdf-extraction-benchmark \
-  --alarm-topic-arn arn:aws:sns:us-east-1:100225593120:pdfx-dev-oom-alerts
+  --alarm-topic-arn <confirmed-idle-guard-sns-topic-arn>
 ```
 
 For Slack delivery, connect the same SNS topic to the team's AWS Chatbot Slack

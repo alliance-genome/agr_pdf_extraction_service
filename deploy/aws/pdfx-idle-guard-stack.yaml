@@ -46,7 +46,7 @@ Parameters:
     Description: If true, metrics fetch failure plus a running backend can trip the idle alarm.
   AlarmSnsTopicArn:
     Type: String
-    Description: SNS topic ARN for idle guard alarms.
+    Description: SNS topic ARN for idle guard/cost guard alarms.
   LambdaArtifactBucket:
     Type: String
     Description: S3 bucket containing the packaged idle guard Lambda zip.
@@ -129,6 +129,7 @@ Resources:
           BACKEND_ASG_NAME: !Ref BackendAsgName
           RUNNING_SINCE_PARAMETER_NAME: !Sub "/${ProjectName}/${EnvironmentName}/idle-guard/asg-running-since"
           IDLE_SINCE_PARAMETER_NAME: !Sub "/${ProjectName}/${EnvironmentName}/idle-guard/asg-idle-since"
+          ASG_STATE_PARAMETER_NAME: !Sub "/${ProjectName}/${EnvironmentName}/idle-guard/asg-name"
           PROXY_METRICS_URL: !Ref ProxyMetricsUrl
           IDLE_ALERT_AFTER_MINUTES: !Sub "${IdleAlertAfterMinutes}"
           ABSOLUTE_ALERT_AFTER_MINUTES: !Sub "${AbsoluteAlertAfterMinutes}"

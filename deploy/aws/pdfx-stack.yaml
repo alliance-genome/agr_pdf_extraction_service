@@ -141,10 +141,23 @@ Parameters:
     Default: 7
     MinValue: 1
     Description: Days to retain image artifacts tagged as temporary.
+  QueueRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Days to retain durable proxy queue objects before lifecycle cleanup.
   EcrRepositoryName:
     Type: String
     Default: agr_pdfx_proxy
     Description: ECR repository that stores the proxy image.
+  BackendImageRepositoryName:
+    Type: String
+    Default: agr_pdfx_backend
+    Description: ECR repository that stores the prebuilt GPU backend image.
+  BackendImageTag:
+    Type: String
+    Default: latest
+    Description: Backend GPU image tag pulled by EC2 bootstrap.
   ProxyImageTag:
     Type: String
     Default: latest
@@ -167,7 +180,7 @@ Parameters:
     Default: "256"
   ProxyTaskMemory:
     Type: String
-    Default: "512"
+    Default: "2048"
   QueuePrefix:
     Type: String
     Default: pdfx-proxy-queue
@@ -246,6 +259,12 @@ Resources:
                 Value: extracted-image
               - Key: pdfx-retention
                 Value: temporary
+          - Id: pdfx-expire-proxy-queue
+            Status: Enabled
+            ExpirationInDays: !Ref QueueRetentionDays
+            Prefix: !Sub "${QueuePrefix}/"
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
       Tags:
         - Key: Project
           Value: pdfx
@@ -334,6 +353,20 @@ Resources:
                   - ssm:GetParameters
                   - ssm:GetParametersByPath
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SsmParameterPath}/*"
+              - Sid: EcrAuth
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPullBackendImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${BackendImageRepositoryName}"
 
   BackendInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -462,7 +495,14 @@ Resources:
               mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
               chown -R ec2-user:ec2-user "$SERVICE_DIR"
               cd deploy
-              PDFX_DEPLOY_BUILD_MODE=auto GPU_MODE=on ./deploy.sh
+              BACKEND_IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}:${BackendImageTag}"
+              aws ecr get-login-password --region "${AWS::Region}" \
+                | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+              PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" \
+                PDFX_DEPLOY_BUILD_MODE=never \
+                PDFX_DEPLOY_PULL_IMAGES=auto \
+                GPU_MODE=on \
+                ./deploy.sh
 
   BackendAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup

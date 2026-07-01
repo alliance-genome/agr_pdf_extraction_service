@@ -1,0 +1,21 @@
+# Production override for prebuilt GPU images.
+#
+# The GPU compose path intentionally omits source-code bind mounts. When
+# PDFX_GPU_IMAGE points at an immutable ECR image, the image should be the
+# source of truth for both code and dependencies.
+
+x-prebuilt-volumes: &prebuilt-volumes
+  - ../data/cache:/app/data/cache
+  - ../data/uploads:/app/data/uploads
+  - ../data/models:/app/data/models
+  - ../data/model_cache:/root/.cache
+  - ../data/rapidocr_models:/usr/local/lib/python3.11/site-packages/rapidocr/models
+  - ../data/rapidocr_models:/usr/local/lib/python3.11/dist-packages/rapidocr/models
+  - ../logs:/app/logs
+
+services:
+  app:
+    volumes: *prebuilt-volumes
+
+  worker:
+    volumes: *prebuilt-volumes

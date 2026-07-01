@@ -1067,6 +1067,36 @@ class TestExtractCancelEndpoint:
         forward_mock.assert_awaited_once()
         assert main_mod.job_queue.size == 0
 
+    def test_replay_startup_failure_deletes_drained_remote_payloads(self, monkeypatch):
+        from app.job_queue import QueuedJob
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        job = QueuedJob(
+            job_id="startup-failed-job",
+            pdf_data=None,
+            form_fields={},
+            filename="failed.pdf",
+            pdf_s3_bucket="queue-bucket",
+            pdf_s3_key="prefix/payloads/startup-failed-job.pdf",
+        )
+        cleanup_mock = MagicMock()
+        job.cleanup = cleanup_mock
+
+        class _DrainedQueue:
+            def drain(self):
+                return [job]
+
+        monkeypatch.setattr(main_mod, "job_queue", _DrainedQueue())
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert main_mod.replay_submission_errors["startup-failed-job"] == (
+            "EC2 startup failed before queued replay."
+        )
+        assert "startup-failed-job" not in main_mod.job_payload_cache
+        cleanup_mock.assert_called_once_with(delete_remote=True)
+
     def test_ensure_queued_jobs_replaying_starts_replay_for_durable_leftovers(self, monkeypatch):
         import app.main as main_mod
 
@@ -1079,6 +1109,51 @@ class TestExtractCancelEndpoint:
 
         main_mod.lifecycle.ensure_running.assert_not_called()
         replay_mock.assert_called_once()
+
+    def test_startup_sync_replays_queue_after_state_refresh(self, monkeypatch):
+        import app.main as main_mod
+
+        events = []
+        main_mod.lifecycle.state = InstanceState.STOPPED
+
+        async def _sync_state_from_ec2():
+            events.append(("sync", main_mod.lifecycle.state))
+            main_mod.lifecycle.state = InstanceState.READY
+
+        async def _ensure_replay(reason, *, known_queued=False):
+            events.append(("replay", reason, known_queued, main_mod.lifecycle.state))
+
+        main_mod.lifecycle.sync_state_from_ec2 = AsyncMock(side_effect=_sync_state_from_ec2)
+        replay_mock = AsyncMock(side_effect=_ensure_replay)
+        monkeypatch.setattr(main_mod, "_ensure_queued_jobs_replaying", replay_mock)
+
+        asyncio.run(main_mod._sync_state_then_replay_startup_queue())
+
+        assert events == [
+            ("sync", InstanceState.STOPPED),
+            ("replay", "startup sync", False, InstanceState.READY),
+        ]
+
+    def test_startup_replay_still_runs_when_state_sync_fails(self, monkeypatch):
+        import app.main as main_mod
+
+        events = []
+
+        async def _sync_state_from_ec2():
+            events.append("sync")
+            raise RuntimeError("temporary AWS sync failure")
+
+        async def _ensure_replay(reason, *, known_queued=False):
+            events.append((reason, known_queued))
+
+        main_mod.lifecycle.sync_state_from_ec2 = AsyncMock(side_effect=_sync_state_from_ec2)
+        replay_mock = AsyncMock(side_effect=_ensure_replay)
+        monkeypatch.setattr(main_mod, "_ensure_queued_jobs_replaying", replay_mock)
+
+        asyncio.run(main_mod._sync_state_then_replay_startup_queue())
+
+        assert events == ["sync", ("startup sync", False)]
+        replay_mock.assert_awaited_once()
 
     def test_reconciler_requeues_memory_job_when_backend_not_ready(self, monkeypatch):
         from app.job_queue import QueuedJob

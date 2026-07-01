@@ -17,6 +17,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_NAME="pdfx"
 GPU_MODE="${GPU_MODE:-auto}" # auto|on|off
 PDFX_DEPLOY_BUILD_MODE="${PDFX_DEPLOY_BUILD_MODE:-auto}" # auto|rebuild|never
+PDFX_DEPLOY_PULL_IMAGES="${PDFX_DEPLOY_PULL_IMAGES:-auto}" # auto|always|never
 
 detect_gpu() {
     command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
@@ -70,6 +71,28 @@ case "${PDFX_DEPLOY_BUILD_MODE}" in
         ;;
 esac
 
+case "${PDFX_DEPLOY_PULL_IMAGES}" in
+    auto|always|never)
+        ;;
+    *)
+        echo "ERROR: Invalid PDFX_DEPLOY_PULL_IMAGES='${PDFX_DEPLOY_PULL_IMAGES}'. Use auto|always|never." >&2
+        exit 1
+        ;;
+esac
+
+SHOULD_PULL_PREBUILT_GPU_IMAGE=false
+if [ "${PDFX_DEPLOY_PULL_IMAGES}" = "always" ]; then
+    SHOULD_PULL_PREBUILT_GPU_IMAGE=true
+elif [ "${PDFX_DEPLOY_PULL_IMAGES}" = "auto" ] && [ "${PDFX_DEPLOY_BUILD_MODE}" = "never" ]; then
+    SHOULD_PULL_PREBUILT_GPU_IMAGE=true
+fi
+
+if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ] && \
+   [ -n "${PDFX_GPU_IMAGE:-}" ] && \
+   [ "${PDFX_DEPLOY_BUILD_MODE}" = "never" ]; then
+    COMPOSE_ARGS=(-f "$COMPOSE_FILE" -f "docker-compose.gpu.prebuilt.yml" -p "$PROJECT_NAME")
+fi
+
 if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
     GROBID_HEALTH_PORT="8070"
     echo "GPU deployment mode selected (${GPU_MODE}); using ${COMPOSE_FILE}"
@@ -122,6 +145,13 @@ echo "Stopping existing services..."
 docker compose "${COMPOSE_ARGS[@]}" down 2>/dev/null || true
 
 # Step 4: Start services
+if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ] && \
+   [ -n "${PDFX_GPU_IMAGE:-}" ] && \
+   [ "${SHOULD_PULL_PREBUILT_GPU_IMAGE}" = "true" ]; then
+    echo "Pulling prebuilt GPU application image: ${PDFX_GPU_IMAGE}"
+    docker compose "${COMPOSE_ARGS[@]}" pull app worker
+fi
+
 echo "Starting services (build mode: ${PDFX_DEPLOY_BUILD_MODE})..."
 docker compose "${COMPOSE_ARGS[@]}" up -d "${BUILD_ARGS[@]}"
 

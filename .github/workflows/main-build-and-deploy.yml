@@ -110,7 +110,8 @@ jobs:
       AWS_REGION: us-east-1
       IMAGE_TAG: ${{ needs.on-merge.outputs.image-tag }}
       SOURCE_REF: ${{ needs.on-merge.outputs.source-ref }}
-      IMAGE_NAME: agr_pdfx_proxy
+      PROXY_IMAGE_NAME: agr_pdfx_proxy
+      BACKEND_IMAGE_NAME: agr_pdfx_backend
       IMAGE_ARTIFACT_NAME: ${{ needs.build-proxy-image.outputs.image-artifact-name }}
       IMAGE_ARCHIVE_SHA256: ${{ needs.build-proxy-image.outputs.image-archive-sha256 }}
       IMAGE_ARCHIVE_PATH: /tmp/agr_pdfx_proxy-image.tar
@@ -139,20 +140,43 @@ jobs:
       - name: Amazon ECR login
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and push immutable backend image tag
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_SUMMARY: false
+        with:
+          context: .
+          file: ./deploy/Dockerfile.gpu
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          push: true
+          platforms: linux/amd64
+          cache-from: type=gha,scope=pdfx-backend
+          cache-to: type=gha,mode=max,scope=pdfx-backend
       - name: Push immutable proxy image tag
         env:
-          TARGET_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:${{ env.IMAGE_TAG }}
+          TARGET_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/${{ env.PROXY_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
         run: |
-          docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_TAGGED}"
+          docker tag "${PROXY_IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_TAGGED}"
           docker push "${TARGET_IMAGE_TAGGED}"
       - name: Register task definition and roll ECS service
         working-directory: proxy/deploy
         run: ./deploy.sh --region "${AWS_REGION}" --image-tag "${IMAGE_TAG}"
-      - name: Promote :latest to the just-deployed image
+      - name: Promote proxy :latest to the just-deployed image
         if: success()
         env:
-          SOURCE_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:${{ env.IMAGE_TAG }}
-          TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/agr_pdfx_proxy:latest
+          SOURCE_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/${{ env.PROXY_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/${{ env.PROXY_IMAGE_NAME }}:latest
         run: |
           docker tag "${SOURCE_IMAGE_TAGGED}" "${TARGET_IMAGE_LATEST}"
           docker push "${TARGET_IMAGE_LATEST}"
+      - name: Promote backend :latest to the just-built image
+        if: success()
+        env:
+          SOURCE_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/${{ env.BACKEND_IMAGE_NAME }}:latest
+        run: |
+          docker buildx imagetools create \
+            --tag "${TARGET_IMAGE_LATEST}" \
+            "${SOURCE_IMAGE_TAGGED}"

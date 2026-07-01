@@ -3,7 +3,14 @@
 #
 # Usage:
 #   docker build -t pdfx-gpu -f deploy/Dockerfile.gpu .
-#   docker-compose -f docker-compose.gpu.yml -p pdfx up -d
+#   docker compose -f docker-compose.gpu.yml -p pdfx up -d
+#
+# Production should set PDFX_GPU_IMAGE to the prebuilt ECR image and run
+# deploy.sh with PDFX_DEPLOY_BUILD_MODE=never, so backend cold starts pull
+# torch/CUDA layers instead of rebuilding them on every boot.
+#
+# This compose file intentionally runs code baked into the image instead of
+# bind-mounting source files over /app. Rebuild the image after code changes.
 
 x-shared-env: &shared-env
   GROBID_URL: http://grobid:8070
@@ -29,9 +36,6 @@ x-shared-volumes: &shared-volumes
   - ../data/rapidocr_models:/usr/local/lib/python3.11/site-packages/rapidocr/models
   - ../data/rapidocr_models:/usr/local/lib/python3.11/dist-packages/rapidocr/models
   - ../logs:/app/logs
-  - ../app:/app/app:ro
-  - ../celery_app.py:/app/celery_app.py:ro
-  - ../config.py:/app/config.py:ro
 
 services:
   nginx:
@@ -55,7 +59,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.gpu
-    image: pdfx-gpu
+    image: ${PDFX_GPU_IMAGE:-pdfx-gpu}
     container_name: pdfx-app
     hostname: pdfx-app
     restart: unless-stopped
@@ -103,7 +107,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.gpu
-    image: pdfx-gpu
+    image: ${PDFX_GPU_IMAGE:-pdfx-gpu}
     container_name: pdfx-worker
     hostname: pdfx-worker
     restart: unless-stopped

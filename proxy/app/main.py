@@ -115,6 +115,12 @@ def _mark_job_failed(process_id: str, reason: str) -> None:
     _record_job_event(process_id, "failed", reason=reason)
 
 
+def _mark_drained_jobs_failed(jobs: list[QueuedJob], reason: str) -> None:
+    for job in jobs:
+        job_payload_cache[job.job_id] = job
+        _mark_job_failed(job.job_id, reason)
+
+
 def _cleanup_cached_payload(process_id: str, *, delete_remote: bool = False) -> None:
     job = job_payload_cache.pop(process_id, None)
     if job:
@@ -260,6 +266,23 @@ async def _ensure_queued_jobs_replaying(reason: str, *, known_queued: bool = Fal
     _ensure_replay_task()
 
 
+async def _sync_state_then_replay_startup_queue() -> None:
+    """Refresh EC2 lifecycle state before deciding whether startup replay is needed."""
+    try:
+        await lifecycle.sync_state_from_ec2()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("sync_state_from_ec2 failed during startup replay sync", exc_info=True)
+
+    try:
+        await _ensure_queued_jobs_replaying("startup sync")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Failed to start queued-job replay after startup sync")
+
+
 def _progress_payload(stage: str, stage_display: str, percent: int = 0) -> dict[str, Any]:
     return {
         "stage": stage,
@@ -337,17 +360,16 @@ async def lifespan(app: FastAPI):
     """Kick off EC2 state sync and reconciliation loops on boot."""
     global reconciler_task, canary_task
 
-    sync_task = asyncio.create_task(lifecycle.sync_state_from_ec2())
-    queue_replay_task = asyncio.create_task(_ensure_queued_jobs_replaying("startup"))
+    startup_replay_task = asyncio.create_task(_sync_state_then_replay_startup_queue())
     reconciler_task = asyncio.create_task(_reconciler_loop())
     if settings.CANARY_INTERVAL_SECONDS > 0:
         canary_task = asyncio.create_task(_canary_loop())
 
-    logger.info("Proxy startup: scheduled EC2 state sync and maintenance tasks")
+    logger.info("Proxy startup: scheduled EC2 state sync, queued replay, and maintenance tasks")
     try:
         yield
     finally:
-        for task in (sync_task, queue_replay_task, reconciler_task, canary_task):
+        for task in (startup_replay_task, reconciler_task, canary_task):
             if task and not task.done():
                 task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -1148,15 +1170,13 @@ async def _replay_when_ready():
             break
         if lifecycle.state == InstanceState.STOPPED:
             jobs = job_queue.drain()
-            for job in jobs:
-                _mark_job_failed(job.job_id, "EC2 startup failed before queued replay.")
+            _mark_drained_jobs_failed(jobs, "EC2 startup failed before queued replay.")
             logger.error("EC2 startup failed. Marked %d queued jobs as failed.", len(jobs))
             return
         await asyncio.sleep(5)
     else:
         jobs = job_queue.drain()
-        for job in jobs:
-            _mark_job_failed(job.job_id, "EC2 startup timed out before queued replay.")
+        _mark_drained_jobs_failed(jobs, "EC2 startup timed out before queued replay.")
         logger.error("Timed out waiting for EC2. Marked %d queued jobs as failed.", len(jobs))
         return
 

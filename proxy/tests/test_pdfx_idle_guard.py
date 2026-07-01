@@ -133,6 +133,7 @@ def _load_guard(monkeypatch, clients: dict[str, Any]):
         "BACKEND_ASG_NAME": "pdfx-backend-test",
         "RUNNING_SINCE_PARAMETER_NAME": "/pdfx/prod/idle-guard/asg-running-since",
         "IDLE_SINCE_PARAMETER_NAME": "/pdfx/prod/idle-guard/asg-idle-since",
+        "ASG_STATE_PARAMETER_NAME": "/pdfx/prod/idle-guard/asg-name",
         "PROXY_METRICS_URL": "https://example.org/api/v1/metrics",
         "IDLE_ALERT_AFTER_MINUTES": "60",
         "ABSOLUTE_ALERT_AFTER_MINUTES": "240",
@@ -151,6 +152,41 @@ def _load_guard(monkeypatch, clients: dict[str, Any]):
         },
     )
     return module
+
+
+def test_idle_guard_resets_when_monitored_asg_name_changes(monkeypatch):
+    now = datetime.now(timezone.utc)
+    stored_since = now - timedelta(hours=12)
+    current_launch = now - timedelta(minutes=30)
+    running_param = "/pdfx/prod/idle-guard/asg-running-since"
+    idle_param = "/pdfx/prod/idle-guard/asg-idle-since"
+    asg_param = "/pdfx/prod/idle-guard/asg-name"
+    ssm = FakeSSM(
+        {
+            running_param: _iso(stored_since),
+            idle_param: _iso(stored_since),
+            asg_param: "pdfx-backend-test",
+        }
+    )
+    cw = FakeCloudWatch()
+    clients = {
+        "autoscaling": FakeASG([]),
+        "cloudwatch": cw,
+        "ec2": FakeEC2(current_launch),
+        "ssm": ssm,
+    }
+    module = _load_guard(monkeypatch, clients)
+    monkeypatch.setenv("BACKEND_ASG_NAME", "pdfx-backend")
+
+    result = module._run_check()
+
+    assert result["reset_after_asg_change"] is True
+    assert result["absolute_too_long"] is False
+    assert result["continuous_running_age_minutes"] < 60
+    assert ssm.parameters[asg_param] == "pdfx-backend"
+    assert ssm.parameters[running_param] == _iso(current_launch)
+    assert module._parse_iso_datetime(ssm.parameters[idle_param]) > current_launch
+    assert cw.value_for("AbsoluteRunningTooLong") == 0.0
 
 
 def test_idle_guard_resets_when_scale_to_zero_was_missed_between_checks(monkeypatch):

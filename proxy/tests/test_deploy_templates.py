@@ -21,6 +21,10 @@ def test_cloudformation_healthcheck_uses_proxy_liveness():
 
     assert "urlopen('http://localhost:80/api/v1/health/live', timeout=3)" in template_text
     assert "urlopen('http://localhost:80/api/v1/health', timeout=3)" not in template_text
+    assert "PDFX_DEPLOY_BUILD_MODE=never" in template_text
+    assert "PDFX_GPU_IMAGE=" in template_text
+    assert "BackendImageRepositoryName" in template_text
+    assert "agr_pdfx_backend" in template_text
 
 
 def test_idle_guard_stack_has_email_alarm_path_and_schedule():
@@ -37,6 +41,7 @@ def test_idle_guard_stack_has_email_alarm_path_and_schedule():
     assert "GuardCheckSucceeded" in template_text
     assert "RUNNING_SINCE_PARAMETER_NAME" in template_text
     assert "IDLE_SINCE_PARAMETER_NAME" in template_text
+    assert "ASG_STATE_PARAMETER_NAME" in template_text
     assert "ssm:GetParameter" in template_text
     assert "autoscaling:DescribeScalingActivities" in template_text
     assert "AlarmSnsTopicArn" in template_text
@@ -52,6 +57,31 @@ def test_deploy_script_supports_explicit_image_tag():
     assert "--image-tag" in script
     assert 'IMAGE_TAG="latest"' in script
     assert "agr_pdfx_proxy:${IMAGE_TAG}" in script
+
+
+def test_backend_deploy_supports_prebuilt_gpu_image():
+    script_path = Path(__file__).resolve().parents[2] / "deploy" / "deploy.sh"
+    script = script_path.read_text()
+    compose_path = Path(__file__).resolve().parents[2] / "deploy" / "docker-compose.gpu.yml"
+    compose_text = compose_path.read_text()
+    prebuilt_compose_path = Path(__file__).resolve().parents[2] / "deploy" / "docker-compose.gpu.prebuilt.yml"
+    prebuilt_compose_text = prebuilt_compose_path.read_text()
+
+    assert "PDFX_DEPLOY_BUILD_MODE" in script
+    assert "PDFX_DEPLOY_PULL_IMAGES" in script
+    assert "SHOULD_PULL_PREBUILT_GPU_IMAGE" in script
+    assert 'docker-compose.gpu.prebuilt.yml" -p "$PROJECT_NAME"' in script
+    assert '[ "${PDFX_DEPLOY_PULL_IMAGES}" = "always" ]' in script
+    assert '[ "${PDFX_DEPLOY_PULL_IMAGES}" = "auto" ] && [ "${PDFX_DEPLOY_BUILD_MODE}" = "never" ]' in script
+    assert "docker compose \"${COMPOSE_ARGS[@]}\" pull app worker" in script
+    assert "PDFX_GPU_IMAGE" in compose_text
+    assert "image: ${PDFX_GPU_IMAGE:-pdfx-gpu}" in compose_text
+    assert "../app:/app/app:ro" not in compose_text
+    assert "../celery_app.py:/app/celery_app.py:ro" not in compose_text
+    assert "../config.py:/app/config.py:ro" not in compose_text
+    assert "../app:/app/app:ro" not in prebuilt_compose_text
+    assert "../celery_app.py:/app/celery_app.py:ro" not in prebuilt_compose_text
+    assert "../config.py:/app/config.py:ro" not in prebuilt_compose_text
 
 
 def test_deploy_script_supports_environment_scoped_resources():
@@ -110,3 +140,16 @@ def test_iam_policy_is_environment_parameterized_and_allows_image_tags():
         if statement["Sid"] == "S3QueueReadWriteObjects"
     )
     assert "s3:PutObjectTagging" in object_statement["Action"]
+
+    gh_policy_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "github-actions-deploy-policy.json"
+    gh_policy_text = gh_policy_path.read_text()
+    assert "repository/agr_pdfx_proxy" in gh_policy_text
+    assert "repository/agr_pdfx_backend" in gh_policy_text
+
+    stack_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-stack.yaml"
+    stack_text = stack_path.read_text()
+    assert "ecr:GetAuthorizationToken" in stack_text
+    assert "ecr:GetDownloadUrlForLayer" in stack_text
+    assert "repository/${BackendImageRepositoryName}" in stack_text
+    assert "QueueRetentionDays" in stack_text
+    assert "pdfx-expire-proxy-queue" in stack_text

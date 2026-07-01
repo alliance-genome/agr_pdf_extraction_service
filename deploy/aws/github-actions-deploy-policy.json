@@ -8,7 +8,7 @@
       "Resource": "*"
     },
     {
-      "Sid": "EcrPushPullProxyRepo",
+      "Sid": "EcrPushPullPdfxRepos",
       "Effect": "Allow",
       "Action": [
         "ecr:BatchCheckLayerAvailability",
@@ -22,7 +22,10 @@
         "ecr:PutImage",
         "ecr:UploadLayerPart"
       ],
-      "Resource": "arn:aws:ecr:us-east-1:100225593120:repository/agr_pdfx_proxy"
+      "Resource": [
+        "arn:aws:ecr:us-east-1:100225593120:repository/agr_pdfx_proxy",
+        "arn:aws:ecr:us-east-1:100225593120:repository/agr_pdfx_backend"
+      ]
     },
     {
       "Sid": "SsmReadPdfxParams",

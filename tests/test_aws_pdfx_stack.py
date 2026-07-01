@@ -1,11 +1,17 @@
 """Tests for the PDFX AWS stack template."""
 
+import os
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 STACK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx-stack.yaml"
 RUNBOOK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx.md"
 GPU_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.gpu.yml"
+GPU_PREBUILT_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.gpu.prebuilt.yml"
 GPU_DOCKERFILE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "Dockerfile.gpu"
 GPU_CONSTRAINTS_PATH = Path(__file__).resolve().parents[1] / "deploy" / "gpu-constraints.txt"
 REQUIREMENTS_PATH = Path(__file__).resolve().parents[1] / "requirements.txt"
@@ -50,6 +56,9 @@ def test_pdfx_stack_supports_image_retention_and_tagged_uploads():
     assert "extracted-image" in template
     assert "pdfx-retention" in template
     assert "temporary" in template
+    assert "pdfx-expire-proxy-queue" in template
+    assert "ExpirationInDays: !Ref QueueRetentionDays" in template
+    assert 'Prefix: !Sub "${QueuePrefix}/"' in template
     assert template.count("s3:PutObjectTagging") >= 2
 
 
@@ -73,7 +82,10 @@ def test_pdfx_bootstrap_supports_branch_tag_or_sha_checkout():
     assert 'git -C "$SERVICE_DIR" fetch --all --tags --prune' in template
     assert 'git -C "$SERVICE_DIR" checkout "${BackendGitRef}"' in template
     assert 'git -C "$SERVICE_DIR" reset --hard "origin/${BackendGitRef}"' in template
-    assert "PDFX_DEPLOY_BUILD_MODE=auto GPU_MODE=on ./deploy.sh" in template
+    assert 'BACKEND_IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}:${BackendImageTag}"' in template
+    assert 'PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI"' in template
+    assert "PDFX_DEPLOY_BUILD_MODE=never" in template
+    assert "PDFX_DEPLOY_PULL_IMAGES=auto" in template
     assert 'git clone --branch "${BackendGitRef}"' not in template
 
 
@@ -96,11 +108,12 @@ def test_pdfx_runbook_documents_safe_bootstrap_path():
     assert "first deploy of this template as a new `pdfx` stack" in runbook
     assert "collide with those existing names" in runbook
     assert "retains its bootstrapped git" in runbook
-    assert "fresh one bootstraps and rebuilds" in runbook
+    assert "fresh one pulls" in runbook
     assert "remove legacy toggles such as `MARKER_EXTRACT_IMAGES`" in runbook
     assert "DeployBackendOnBoot=true" in runbook
     assert "--ssm-prefix /pdfx" in runbook
-    assert "of cloning an EBS volume" in runbook
+    assert "prebuilt `agr_pdfx_backend` ECR image" in runbook
+    assert "docker-compose.gpu.prebuilt.yml" in runbook
 
 
 def test_pdfx_stack_has_backend_resilience_alarms():
@@ -113,13 +126,61 @@ def test_pdfx_stack_has_backend_resilience_alarms():
     assert "AlarmSnsTopicArn" in template
 
 
-def test_gpu_compose_builds_local_image_for_backend():
+def test_gpu_compose_runs_image_baked_source():
     compose = GPU_COMPOSE_PATH.read_text()
+    prebuilt_compose = GPU_PREBUILT_COMPOSE_PATH.read_text()
 
-    assert "image: pdfx-gpu" in compose
+    assert "image: ${PDFX_GPU_IMAGE:-pdfx-gpu}" in compose
     assert "dockerfile: deploy/Dockerfile.gpu" in compose
+    assert "../app:/app/app:ro" not in compose
+    assert "../celery_app.py:/app/celery_app.py:ro" not in compose
+    assert "../config.py:/app/config.py:ro" not in compose
+    assert "../app:/app/app:ro" not in prebuilt_compose
+    assert "../celery_app.py:/app/celery_app.py:ro" not in prebuilt_compose
+    assert "../config.py:/app/config.py:ro" not in prebuilt_compose
     assert "/usr/local/lib/python3.11/site-packages/rapidocr/models" in compose
     assert "/usr/local/lib/python3.11/dist-packages/rapidocr/models" in compose
+    assert "/usr/local/lib/python3.11/site-packages/rapidocr/models" in prebuilt_compose
+    assert "/usr/local/lib/python3.11/dist-packages/rapidocr/models" in prebuilt_compose
+
+
+def test_prebuilt_gpu_compose_render_omits_source_bind_mounts(tmp_path):
+    if not shutil.which("docker"):
+        pytest.skip("docker CLI is not available")
+
+    repo = tmp_path / "repo"
+    deploy_dir = repo / "deploy"
+    deploy_dir.mkdir(parents=True)
+    (repo / ".env").write_text("")
+    for source in (GPU_COMPOSE_PATH, GPU_PREBUILT_COMPOSE_PATH):
+        shutil.copy(source, deploy_dir / source.name)
+
+    env = os.environ.copy()
+    env["PDFX_GPU_IMAGE"] = "example.com/pdfx:tag"
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            "docker-compose.gpu.yml",
+            "-f",
+            "docker-compose.gpu.prebuilt.yml",
+            "-p",
+            "pdfx",
+            "config",
+        ],
+        cwd=deploy_dir,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "example.com/pdfx:tag" in result.stdout
+    assert "/app/app" not in result.stdout
+    assert "/app/celery_app.py" not in result.stdout
+    assert "/app/config.py" not in result.stdout
 
 
 def test_gpu_dockerfile_preserves_cuda_pytorch_layer():

@@ -991,9 +991,10 @@ The guard checks the backend ASG and proxy `/api/v1/metrics`, then publishes
 idle shutdown logic. It stores the continuous ASG running-since timestamp in
 SSM Parameter Store, so replacement EC2 instances do not reset the runtime
 clock, but it resets the stored clock if a real ASG scale-to-zero happened
-between scheduled guard checks. It tracks idle-since separately so active
-extraction time does not count against the idle alarm, and it has
-heartbeat/error/throttle alarms for the guard Lambda itself.
+between scheduled guard checks or if the monitored backend ASG name changes. It
+tracks idle-since separately so active extraction time does not count against the
+idle alarm, and it has heartbeat/error/throttle alarms for the guard Lambda
+itself.
 
 Production example:
 
@@ -1006,12 +1007,12 @@ deploy/aws/deploy_idle_guard.sh \
   --backend-asg-name pdfx-backend \
   --proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics \
   --artifact-bucket agr-pdf-extraction-benchmark \
-  --alarm-topic-arn arn:aws:sns:us-east-1:100225593120:pdfx-dev-oom-alerts
+  --alarm-topic-arn <confirmed-idle-guard-sns-topic-arn>
 ```
 
-The current SNS topic above emails `ctabone@morgan.harvard.edu`. For Slack,
-attach the same SNS topic to the team's AWS Chatbot Slack channel
-configuration, while keeping email as the fallback.
+Use a confirmed SNS topic with an idle-guard/cost-guard name. For Slack, attach
+the same SNS topic to the team's AWS Chatbot Slack channel configuration, while
+keeping email as the fallback.
 
 ---
 
