@@ -119,6 +119,8 @@ def _mark_drained_jobs_failed(jobs: list[QueuedJob], reason: str) -> None:
     for job in jobs:
         job_payload_cache[job.job_id] = job
         _mark_job_failed(job.job_id, reason)
+        with suppress(Exception):
+            job_queue.remove_job(job.job_id)
 
 
 def _cleanup_cached_payload(process_id: str, *, delete_remote: bool = False) -> None:
@@ -1197,6 +1199,10 @@ async def _replay_when_ready():
                     job.form_fields,
                     authorization=job.authorization,
                 )
+            try:
+                job_queue.acknowledge(job.job_id)
+            except Exception as exc:
+                logger.error("Failed to acknowledge replayed job %s: %s", job.job_id, exc)
             if job.job_id in pending_cancel_requests:
                 reason = pending_cancel_requests.pop(job.job_id)
                 try:

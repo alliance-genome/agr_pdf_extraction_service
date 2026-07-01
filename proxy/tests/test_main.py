@@ -1048,6 +1048,35 @@ class TestExtractCancelEndpoint:
         second_process_id = "race-b" if first_call_process_id == "race-a" else "race-a"
         assert second_process_id in first_call_inflight
 
+    def test_replay_acknowledges_jobs_after_backend_accepts(self, monkeypatch):
+        from app.job_queue import QueuedJob
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        job = QueuedJob(
+            job_id="replay-ack-1",
+            pdf_data=b"%PDF ack",
+            form_fields={},
+            filename="ack.pdf",
+        )
+        acknowledged = []
+
+        class _AckQueue:
+            def drain(self):
+                return [job]
+
+            def acknowledge(self, job_id):
+                acknowledged.append(job_id)
+                return True
+
+        monkeypatch.setattr(main_mod, "job_queue", _AckQueue())
+        monkeypatch.setattr(main_mod, "_forward_extraction", AsyncMock(return_value=None))
+        monkeypatch.setattr(main_mod, "_forward_cancel_to_backend", AsyncMock(return_value=MagicMock()))
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert acknowledged == ["replay-ack-1"]
+
     def test_replay_keeps_queue_while_asg_replacement_is_starting(self, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.STARTING
@@ -1082,10 +1111,15 @@ class TestExtractCancelEndpoint:
         )
         cleanup_mock = MagicMock()
         job.cleanup = cleanup_mock
+        removed_jobs = []
 
         class _DrainedQueue:
             def drain(self):
                 return [job]
+
+            def remove_job(self, job_id):
+                removed_jobs.append(job_id)
+                return True
 
         monkeypatch.setattr(main_mod, "job_queue", _DrainedQueue())
 
@@ -1096,6 +1130,7 @@ class TestExtractCancelEndpoint:
         )
         assert "startup-failed-job" not in main_mod.job_payload_cache
         cleanup_mock.assert_called_once_with(delete_remote=True)
+        assert removed_jobs == ["startup-failed-job"]
 
     def test_ensure_queued_jobs_replaying_starts_replay_for_durable_leftovers(self, monkeypatch):
         import app.main as main_mod

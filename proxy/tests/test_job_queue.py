@@ -297,5 +297,43 @@ class TestS3JobQueue:
         jobs[0].cleanup()
         assert fake_client.deleted == [
             ("test-bucket", "prefix/jobs/0000000000001_job-missing.json"),
+        ]
+
+        assert q.acknowledge("job-ok") is True
+        assert fake_client.deleted == [
+            ("test-bucket", "prefix/jobs/0000000000001_job-missing.json"),
             ("test-bucket", "prefix/jobs/0000000000002_job-ok.json"),
+        ]
+
+    def test_acknowledge_deletes_metadata_without_payload(self, monkeypatch):
+        class _Paginator:
+            def paginate(self, **kwargs):
+                return [
+                    {
+                        "Contents": [
+                            {"Key": "prefix/jobs/0000000000001_job-a.json"},
+                        ]
+                    }
+                ]
+
+        class _FakeS3Client:
+            def __init__(self):
+                self.deleted = []
+
+            def get_paginator(self, name):
+                assert name == "list_objects_v2"
+                return _Paginator()
+
+            def delete_objects(self, Bucket, Delete):
+                for item in Delete["Objects"]:
+                    self.deleted.append((Bucket, item["Key"]))
+
+        fake_client = _FakeS3Client()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: fake_client)
+
+        q = S3JobQueue(bucket="test-bucket", prefix="prefix")
+
+        assert q.acknowledge("job-a") is True
+        assert fake_client.deleted == [
+            ("test-bucket", "prefix/jobs/0000000000001_job-a.json"),
         ]

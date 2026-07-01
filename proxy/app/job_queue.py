@@ -181,6 +181,10 @@ class BaseJobQueue:
     def remove_job(self, job_id: str) -> bool:
         raise NotImplementedError
 
+    def acknowledge(self, job_id: str) -> bool:
+        """Mark one queued job as handed off while keeping its payload available."""
+        return False
+
     def oldest_age_seconds(self) -> float:
         raise NotImplementedError
 
@@ -257,6 +261,9 @@ class InMemoryJobQueue(BaseJobQueue):
             if queued_job.job_id == job_id:
                 del self._queue[idx]
                 return True
+        return False
+
+    def acknowledge(self, job_id: str) -> bool:
         return False
 
     def oldest_age_seconds(self) -> float:
@@ -412,20 +419,16 @@ class S3JobQueue(BaseJobQueue):
     def drain(self) -> list[QueuedJob]:
         keys = self._iter_keys()
         jobs: list[QueuedJob] = []
-        loaded_keys: list[str] = []
         if not keys:
             return jobs
 
         for key in keys:
             try:
                 jobs.append(self._load_job(key))
-                loaded_keys.append(key)
             except QueuePayloadMissingError as exc:
                 logger.warning("%s; deleting orphaned queue metadata %s", exc, key)
                 self._delete_job_metadata(key)
 
-        # Delete in batches of 1000 (S3 limit).
-        self._delete_s3_keys(loaded_keys)
         return jobs
 
     def _load_job(self, key: str) -> QueuedJob:
@@ -484,6 +487,14 @@ class S3JobQueue(BaseJobQueue):
                 raw = obj["Body"].read().decode("utf-8")
                 job = QueuedJob.from_json(raw)
                 self._delete_job_objects(key, job)
+                return True
+        return False
+
+    def acknowledge(self, job_id: str) -> bool:
+        suffix = f"_{job_id}.json"
+        for key in self._iter_keys():
+            if key.endswith(suffix):
+                self._delete_job_metadata(key)
                 return True
         return False
 
