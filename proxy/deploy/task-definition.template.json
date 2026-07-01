@@ -30,7 +30,9 @@
         {"name": "RECONCILER_REQUEUE_ONCE", "value": "false"},
         {"name": "PROXY_BACKEND_READY_TIMEOUT_SECONDS", "value": "30"},
         {"name": "PROXY_BACKEND_READY_POLL_SECONDS", "value": "2"},
-        {"name": "ALWAYS_ON_MODE", "value": "false"}
+        {"name": "ALWAYS_ON_MODE", "value": "false"},
+        {"name": "MAX_UPLOAD_BYTES", "value": "524288000"},
+        {"name": "MAX_MULTIPART_OVERHEAD_BYTES", "value": "10485760"}
       ],
       "secrets": [
         {"name": "EC2_INSTANCE_ID", "valueFrom": "${SSM_PREFIX}/ec2-instance-id"},

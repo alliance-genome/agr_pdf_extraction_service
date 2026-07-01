@@ -36,8 +36,9 @@ GPU backend that should run only when there is work.
 - Keep PDFs out of Fargate memory. The proxy should stream/spool uploads and put
   them in the S3 queue; the backend should read from disk/container volumes.
 - Large PDF support is intentionally 500 MiB. If the limit changes, update all
-  relevant layers together: Flask config, backend nginx config, Compose env,
-  ECS/Fargate scratch capacity, docs, and tests.
+  relevant layers together: proxy `MAX_UPLOAD_BYTES` and multipart overhead
+  allowance, Flask config, backend nginx config, Compose env, ECS/Fargate
+  scratch capacity, docs, and tests.
 - Keep LLM calls bounded. PDFX consensus merge fans out multiple OpenAI calls;
   one slow request can hold the whole Celery task at `llm_merge`. Use
   `LLM_OPENAI_TIMEOUT_SECONDS` and `LLM_OPENAI_MAX_RETRIES` rather than letting
@@ -94,6 +95,9 @@ timeout count, backend replacement count, backend state, and active job counts.
 - Stale S3 queue metadata pointing at a deleted payload can block replay. The
   queue should delete proven-orphaned metadata and continue replaying other
   jobs.
+- Failed replay submissions must remove durable queue metadata before exposing
+  terminal status; otherwise status polling may keep reporting `queued` and the
+  idle stop guard may see phantom work.
 - Backend `worker_not_ready` with healthy EC2 status checks usually means the
   application stack is still starting, not hardware failure.
 - If host `nvidia-smi` works but `torch.cuda.is_available()` is false inside

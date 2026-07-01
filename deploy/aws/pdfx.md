@@ -168,6 +168,11 @@ Durable proxy queue metadata and PDF payload objects live under `QueuePrefix`
 in the audit bucket and expire after `QueueRetentionDays` as a safety net.
 Normal replay, cancellation, and failure paths should delete queue payloads
 sooner; lifecycle cleanup is for abandoned clients or interrupted cleanup paths.
+The proxy enforces `MAX_UPLOAD_BYTES=524288000` before backend wake/replay so
+oversized requests do not fill S3 queue storage or start the GPU only to fail at
+the backend upload cap. `MAX_MULTIPART_OVERHEAD_BYTES=10485760` gives the
+early `Content-Length` guard room for multipart boundaries and small form
+fields while still rejecting grossly oversized requests before body parsing.
 
 The proxy's bounded replacement wait defaults to
 `AsgStartupReplacementAttempts=1`, published to

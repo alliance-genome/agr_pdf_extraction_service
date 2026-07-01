@@ -223,6 +223,43 @@ class TestExtractEndpoint:
         )
         assert resp.status_code == 401
 
+    def test_extract_rejects_grossly_oversized_request_before_auth(self, client, monkeypatch):
+        import app.main as main_mod
+
+        monkeypatch.setattr(main_mod.settings, "MAX_UPLOAD_BYTES", 8)
+        monkeypatch.setattr(main_mod.settings, "MAX_MULTIPART_OVERHEAD_BYTES", 0)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("too-large.pdf", b"%PDF-1.4 too large", "application/pdf")},
+            data={"methods": "grobid,docling,marker", "merge": "true"},
+        )
+
+        assert resp.status_code == 413
+        assert "maximum allowed size" in resp.json()["detail"]
+        main_mod.cognito_auth.validate_token.assert_not_called()
+        main_mod.lifecycle.touch.assert_not_called()
+        main_mod.lifecycle.ensure_running.assert_not_called()
+
+    def test_extract_rejects_pdf_larger_than_proxy_limit(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        monkeypatch.setattr(main_mod.settings, "MAX_UPLOAD_BYTES", 8)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("too-large.pdf", b"%PDF-1.4 too large", "application/pdf")},
+            data={"methods": "grobid,docling,marker", "merge": "true"},
+        )
+
+        assert resp.status_code == 413
+        assert "maximum allowed size" in resp.json()["detail"]
+        assert main_mod.job_queue.size == 0
+        main_mod.lifecycle.ensure_running.assert_not_called()
+
     def test_extract_requeues_when_immediate_forward_fails(self, client, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.READY
@@ -1076,6 +1113,60 @@ class TestExtractCancelEndpoint:
         asyncio.run(main_mod._replay_when_ready())
 
         assert acknowledged == ["replay-ack-1"]
+
+    def test_failed_replay_removes_queue_metadata_before_status(self, client, monkeypatch):
+        from app.job_queue import QueuedJob
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        job = QueuedJob(
+            job_id="replay-fail-1",
+            pdf_data=b"%PDF fail",
+            form_fields={},
+            filename="fail.pdf",
+        )
+        queued = {"replay-fail-1"}
+        removed = []
+
+        class _ReplayQueue:
+            @property
+            def size(self):
+                return len(queued)
+
+            def drain(self):
+                return [job]
+
+            def acknowledge(self, job_id):
+                raise AssertionError("failed replay must not acknowledge")
+
+            def remove_job(self, job_id):
+                removed.append(job_id)
+                queued.discard(job_id)
+                return True
+
+            def has_job(self, job_id):
+                return job_id in queued
+
+        monkeypatch.setattr(main_mod, "job_queue", _ReplayQueue())
+        monkeypatch.setattr(
+            main_mod,
+            "_forward_extraction",
+            AsyncMock(side_effect=RuntimeError("backend rejected upload")),
+        )
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert removed == ["replay-fail-1"]
+        assert main_mod.replay_submission_errors["replay-fail-1"] == "backend rejected upload"
+        assert queued == set()
+
+        resp = client.get(
+            "/api/v1/extract/replay-fail-1",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "failed"
+        assert "backend rejected upload" in resp.json()["error"]
 
     def test_replay_keeps_queue_while_asg_replacement_is_starting(self, monkeypatch):
         import app.main as main_mod

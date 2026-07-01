@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from app.auth import CognitoAuth
@@ -112,6 +112,8 @@ def _record_job_event(process_id: str, event: str, *, reason: str | None = None)
 def _mark_job_failed(process_id: str, reason: str) -> None:
     replay_submission_errors[process_id] = reason
     _cleanup_cached_payload(process_id, delete_remote=True)
+    with suppress(Exception):
+        job_queue.remove_job(process_id)
     _record_job_event(process_id, "failed", reason=reason)
 
 
@@ -119,8 +121,6 @@ def _mark_drained_jobs_failed(jobs: list[QueuedJob], reason: str) -> None:
     for job in jobs:
         job_payload_cache[job.job_id] = job
         _mark_job_failed(job.job_id, reason)
-        with suppress(Exception):
-            job_queue.remove_job(job.job_id)
 
 
 def _cleanup_cached_payload(process_id: str, *, delete_remote: bool = False) -> None:
@@ -146,6 +146,51 @@ def _drop_submission_state(process_id: str) -> None:
 def _remove_queued_job(process_id: str) -> bool:
     """Remove one queued job by ID without draining unrelated jobs."""
     return job_queue.remove_job(process_id)
+
+
+def _upload_size_bytes(file: UploadFile) -> int | None:
+    size = getattr(file, "size", None)
+    if isinstance(size, int) and size >= 0:
+        return size
+
+    raw_file = getattr(file, "file", None)
+    if raw_file is None:
+        return None
+
+    try:
+        current = raw_file.tell()
+        raw_file.seek(0, 2)
+        size = raw_file.tell()
+        raw_file.seek(current)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+    return int(size) if isinstance(size, int) and size >= 0 else None
+
+
+def _validate_upload_size(file: UploadFile) -> None:
+    max_bytes = settings.MAX_UPLOAD_BYTES
+    if max_bytes <= 0:
+        return
+
+    size = _upload_size_bytes(file)
+    if size is None or size <= max_bytes:
+        return
+
+    max_mib = max_bytes / (1024 * 1024)
+    size_mib = size / (1024 * 1024)
+    raise HTTPException(
+        status_code=413,
+        detail=f"PDF upload is {size_mib:.1f} MiB; maximum allowed size is {max_mib:.0f} MiB.",
+    )
+
+
+def _upload_too_large_response() -> JSONResponse:
+    max_mib = settings.MAX_UPLOAD_BYTES / (1024 * 1024)
+    return JSONResponse(
+        status_code=413,
+        content={"detail": f"PDF upload exceeds the maximum allowed size of {max_mib:.0f} MiB."},
+    )
 
 
 def _record_job_cancelled(process_id: str, reason: str) -> None:
@@ -379,6 +424,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PDFX Proxy", version="1.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def reject_oversized_uploads(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/api/v1/extract" and settings.MAX_UPLOAD_BYTES > 0:
+        content_length = request.headers.get("content-length")
+        try:
+            request_bytes = int(content_length) if content_length is not None else None
+        except ValueError:
+            request_bytes = None
+        overhead_bytes = max(0, settings.MAX_MULTIPART_OVERHEAD_BYTES)
+        if request_bytes is not None and request_bytes > settings.MAX_UPLOAD_BYTES + overhead_bytes:
+            return _upload_too_large_response()
+
+    return await call_next(request)
 
 
 # --- Auth helper ---
@@ -618,6 +678,7 @@ async def submit_extraction(
 ):
     _require_auth(authorization)
     lifecycle.touch()
+    _validate_upload_size(file)
 
     process_id = str(uuid.uuid4())
     filename = file.filename or "upload.pdf"
@@ -720,6 +781,17 @@ async def get_extraction_status(
             "progress": _progress_payload("cancelled", "Job cancelled", 0),
         }
 
+    if process_id in replay_submission_errors:
+        error_message = replay_submission_errors[process_id]
+        return {
+            "process_id": process_id,
+            "status": "failed",
+            "state": lifecycle.state.value,
+            "error": error_message,
+            "message": "Failed to submit queued job to backend.",
+            "progress": _progress_payload("failed", "Queued job submission failed", 0),
+        }
+
     # If the job is still queued locally, report that.
     if job_queue.has_job(process_id):
         lifecycle.touch()
@@ -762,17 +834,6 @@ async def get_extraction_status(
             "state": lifecycle.state.value,
             "message": display,
             "progress": _progress_payload("queued", display, 0),
-        }
-
-    if process_id in replay_submission_errors:
-        error_message = replay_submission_errors[process_id]
-        return {
-            "process_id": process_id,
-            "status": "failed",
-            "state": lifecycle.state.value,
-            "error": error_message,
-            "message": "Failed to submit queued job to backend.",
-            "progress": _progress_payload("failed", "Queued job submission failed", 0),
         }
 
     # Only known active jobs, or explicit wake requests, may wake the backend.

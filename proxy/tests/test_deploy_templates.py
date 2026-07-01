@@ -121,6 +121,8 @@ def test_task_definition_is_environment_parameterized():
     assert container["name"] == "${CONTAINER_NAME}"
     assert {"name": "QUEUE_S3_PREFIX", "value": "${QUEUE_S3_PREFIX}"} in container["environment"]
     assert {"name": "QUEUE_S3_REGION", "value": "${QUEUE_S3_REGION}"} in container["environment"]
+    assert {"name": "MAX_UPLOAD_BYTES", "value": "524288000"} in container["environment"]
+    assert {"name": "MAX_MULTIPART_OVERHEAD_BYTES", "value": "10485760"} in container["environment"]
     assert container["secrets"][0]["valueFrom"].startswith("${SSM_PREFIX}/")
     assert {"name": "BACKEND_ASG_NAME", "valueFrom": "${SSM_PREFIX}/backend-asg-name"} in container["secrets"]
     assert {

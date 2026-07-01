@@ -63,6 +63,11 @@ def test_upload_limit_is_500_mib_across_backend_configs():
     assert "client_max_body_size 500m;" in nginx_config
     assert 'MAX_CONTENT_LENGTH: "524288000"' in cpu_compose
     assert 'MAX_CONTENT_LENGTH: "524288000"' in gpu_compose
+    stack_text = STACK_PATH.read_text()
+    assert "MAX_UPLOAD_BYTES" in stack_text
+    assert "MAX_MULTIPART_OVERHEAD_BYTES" in stack_text
+    assert 'Value: "524288000"' in stack_text
+    assert 'Value: "10485760"' in stack_text
     assert "| `MAX_CONTENT_LENGTH` | `524288000` | Max upload size in bytes (500 MiB) |" in readme
 
 

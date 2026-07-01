@@ -31,6 +31,8 @@ class Settings:
     ASG_STARTUP_REPLACEMENT_ATTEMPTS: int = int(os.environ.get("ASG_STARTUP_REPLACEMENT_ATTEMPTS", "1"))
     HEALTH_POLL_INTERVAL_SECONDS: int = int(os.environ.get("HEALTH_POLL_INTERVAL_SECONDS", "15"))
     MAX_QUEUED_JOBS: int = int(os.environ.get("MAX_QUEUED_JOBS", "10"))
+    MAX_UPLOAD_BYTES: int = int(os.environ.get("MAX_UPLOAD_BYTES", "524288000"))
+    MAX_MULTIPART_OVERHEAD_BYTES: int = int(os.environ.get("MAX_MULTIPART_OVERHEAD_BYTES", "10485760"))
 
     FORWARD_TIMEOUT_SECONDS: int = int(os.environ.get("FORWARD_TIMEOUT_SECONDS", "600"))
     PROXY_BACKEND_READY_TIMEOUT_SECONDS: int = int(os.environ.get("PROXY_BACKEND_READY_TIMEOUT_SECONDS", "30"))

@@ -854,6 +854,10 @@ Resources:
               Value: "false"
             - Name: ALWAYS_ON_MODE
               Value: !Ref AlwaysOnMode
+            - Name: MAX_UPLOAD_BYTES
+              Value: "524288000"
+            - Name: MAX_MULTIPART_OVERHEAD_BYTES
+              Value: "10485760"
           Secrets:
             - Name: EC2_INSTANCE_ID
               ValueFrom: !Ref SsmEc2InstanceId
