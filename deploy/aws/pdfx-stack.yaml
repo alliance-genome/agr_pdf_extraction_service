@@ -210,7 +210,7 @@ Parameters:
     Description: Optional comma-separated accepted client IDs; __PDFX_EMPTY__ disables.
   IdleTimeoutMinutes:
     Type: String
-    Default: "30"
+    Default: "120"
   StartupTimeoutMinutes:
     Type: String
     Default: "30"

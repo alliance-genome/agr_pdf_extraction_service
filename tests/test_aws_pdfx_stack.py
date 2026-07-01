@@ -37,6 +37,8 @@ def test_pdfx_stack_uses_canonical_resources():
     assert "HealthCheckType: EBS" in template
     assert "MaxSize: !Ref BackendMaxSize" in template
     assert "StartupTimeoutMinutes:" in template
+    assert "IdleTimeoutMinutes:" in template
+    assert 'Default: "120"' in template
     assert 'Default: "30"' in template
     assert "Name: !Sub \"/${SsmParameterPath}/ec2-instance-id\"" in template
     assert "Name: !Sub \"/${SsmParameterPath}/backend-asg-name\"" in template
@@ -235,7 +237,12 @@ def test_gpu_compose_keeps_web_app_cpu_only_and_worker_ocr_overridable():
 
     assert "DOCLING_DEVICE: cpu" in app_section
     assert 'CUDA_VISIBLE_DEVICES: ""' in app_section
+    assert 'PDFX_HEALTH_REQUIRE_MARKER_READY: "true"' in app_section
     assert 'DOCLING_DEVICE: "cuda"' in worker_section
+    assert 'PDFX_WORKER_PRELOAD_MARKER_MODELS: "auto"' in worker_section
+    assert 'PDFX_WORKER_PRELOAD_MARKER_REQUIRED: "true"' in worker_section
+    assert 'PDFX_WORKER_PRELOAD_MARKER_EXTRACT_IMAGES: "true"' in worker_section
+    assert 'command: ["python3.11", "-m", "app.worker_main"]' in compose
     assert "DOCLING_RAPIDOCR_BACKEND:" not in worker_section
     assert "DOCLING_RAPIDOCR_MODEL_TYPE:" not in worker_section
     assert "DOCLING_RAPIDOCR_USE_CUDA:" not in worker_section

@@ -331,6 +331,65 @@ def test_health_reports_busy_solo_worker_as_busy(client):
     assert payload["checks"]["worker_state"] == "busy"
 
 
+def test_health_requires_marker_ready_file_when_configured(client, tmp_path):
+    client.application.config["HEALTH_REQUIRE_MARKER_READY"] = True
+    client.application.config["MARKER_READY_FILE"] = str(tmp_path / "marker_worker_ready.json")
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 0
+    redis_client.hlen.return_value = 0
+    redis_client.zcard.return_value = 0
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = {"worker@example": {"ok": "pong"}}
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "unhealthy"
+    assert payload["checks"]["marker_models"] == "loading"
+    assert payload["checks"]["marker_models_error"] == "ready_file_missing"
+
+
+def test_health_accepts_marker_ready_file_when_configured(client, tmp_path):
+    ready_file = tmp_path / "marker_worker_ready.json"
+    ready_file.write_text('{"device": "cuda"}', encoding="utf-8")
+    client.application.config["HEALTH_REQUIRE_MARKER_READY"] = True
+    client.application.config["MARKER_READY_FILE"] = str(ready_file)
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 0
+    redis_client.hlen.return_value = 0
+    redis_client.zcard.return_value = 0
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = {"worker@example": {"ok": "pong"}}
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "ok"
+    assert payload["checks"]["marker_models"] == "ok"
+
+
 def test_health_is_unhealthy_when_extraction_run_table_missing(client):
     Base.metadata.drop_all(bind=get_engine())
 

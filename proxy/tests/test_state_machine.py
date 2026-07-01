@@ -40,9 +40,11 @@ class TestLifecycleManager:
     def test_job_finished_returns_to_ready(self):
         mgr, _ = self._make_manager(InstanceState.BUSY)
         mgr._active_jobs = 1
+        mgr._last_activity = 0
         mgr.job_finished()
         assert mgr.state == InstanceState.READY
         assert mgr.active_jobs == 0
+        assert mgr._last_activity > 0
 
     def test_job_finished_stays_busy_with_remaining_jobs(self):
         mgr, _ = self._make_manager(InstanceState.BUSY)

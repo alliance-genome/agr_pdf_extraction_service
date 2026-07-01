@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import logging
+import time
 import torch
 from pathlib import Path
 
@@ -117,23 +118,80 @@ def _save_image(img, img_path):
         img.save(img_path)
 
 
+def _resolve_device(device):
+    if str(device).lower() == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _dtype_for_device(device):
+    return torch.float16 if device.type == "cuda" else torch.float32
+
+
 def _get_converter(device, dtype, extract_images=False, disable_links=True):
     """Return a cached PdfConverter, creating models on first call."""
-    key = (str(device), str(dtype), bool(extract_images), bool(disable_links))
-    if key not in _cached_converters:
-        logger.info("Marker: loading models for %s/%s (first call in this worker process)", device, dtype)
-        artifact_dict = create_model_dict(device=device, dtype=dtype)
-        _cached_models[key] = artifact_dict
+    model_key = (str(device), str(dtype))
+    converter_key = (str(device), str(dtype), bool(extract_images), bool(disable_links))
+    if converter_key not in _cached_converters:
+        if model_key not in _cached_models:
+            logger.info("Marker: loading models for %s/%s (first call in this worker process)", device, dtype)
+            _cached_models[model_key] = create_model_dict(device=device, dtype=dtype)
+            logger.info("Marker: models loaded and cached")
+        else:
+            logger.info("Marker: reusing cached models for %s/%s", device, dtype)
+
+        logger.info(
+            "Marker: creating converter for %s/%s (extract_images=%s, disable_links=%s)",
+            device,
+            dtype,
+            bool(extract_images),
+            bool(disable_links),
+        )
         converter_config = {
             "extract_images": bool(extract_images),
             "disable_links": bool(disable_links),
         }
-        _cached_converters[key] = PdfConverter(
-            artifact_dict=artifact_dict,
+        _cached_converters[converter_key] = PdfConverter(
+            artifact_dict=_cached_models[model_key],
             config=converter_config,
         )
-        logger.info("Marker: models loaded and cached")
-    return _cached_converters[key]
+        logger.info(
+            "Marker: converter ready and cached (extract_images=%s, disable_links=%s)",
+            bool(extract_images),
+            bool(disable_links),
+        )
+    return _cached_converters[converter_key]
+
+
+def preload_marker_models(device="auto", extract_images=True, disable_links=True):
+    """Load Marker models/converter into the current process before taking jobs."""
+    dev = _resolve_device(device)
+    dtype = _dtype_for_device(dev)
+    start = time.monotonic()
+    _get_converter(
+        dev,
+        dtype,
+        extract_images=extract_images,
+        disable_links=disable_links,
+    )
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.monotonic() - start
+    device_name = torch.cuda.get_device_name(0) if dev.type == "cuda" else "cpu"
+    logger.info(
+        "Marker preload complete on %s using %s in %.1fs",
+        device_name,
+        dtype,
+        elapsed,
+    )
+    return {
+        "device": dev.type,
+        "device_name": device_name,
+        "dtype": str(dtype),
+        "extract_images": bool(extract_images),
+        "disable_links": bool(disable_links),
+        "elapsed_seconds": round(elapsed, 3),
+    }
 
 
 class Marker(PDFExtractor):
@@ -145,11 +203,8 @@ class Marker(PDFExtractor):
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-        if self.device == "cpu":
-            dev = torch.device("cpu")
-        else:
-            dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.float16 if dev.type == "cuda" else torch.float32
+        dev = _resolve_device(self.device)
+        dtype = _dtype_for_device(dev)
 
         converter = _get_converter(
             dev,

@@ -110,6 +110,7 @@ class LifecycleManager:
 
     def job_finished(self) -> None:
         self._active_jobs = max(0, self._active_jobs - 1)
+        self.touch()
         if self._active_jobs == 0 and self._state == InstanceState.BUSY:
             self._state = InstanceState.READY
             if self._ready_since is None:

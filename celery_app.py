@@ -26,26 +26,81 @@ from app.services.audit_logger import AuditLogger
 from app.logging_config import setup_logging, MergingLoggerAdapter
 
 logger = logging.getLogger(__name__)
+_torch_worker_configured = False
 
 
-@celery_setup_logging.connect
-def _configure_celery_logging(**kwargs):
-    """Take over Celery's logging so ALL messages go through our GELF handler.
+def _remove_marker_ready_file():
+    ready_file = getattr(Config, "MARKER_READY_FILE", "")
+    if not ready_file:
+        return
+    try:
+        os.remove(ready_file)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        logger.warning("Failed to remove Marker readiness file %s: %s", ready_file, exc)
 
-    Connecting to this signal prevents Celery from setting up its own logging.
-    This ensures the GELF 'host' field is 'pdfx-worker' from the very first message.
-    """
-    setup_logging(component="worker")
+
+def _write_marker_ready_file(payload):
+    ready_file = getattr(Config, "MARKER_READY_FILE", "")
+    if not ready_file:
+        return
+    payload = dict(payload)
+    payload.update({
+        "pid": os.getpid(),
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    })
+    ready_dir = os.path.dirname(ready_file)
+    if ready_dir:
+        os.makedirs(ready_dir, exist_ok=True)
+    temp_path = f"{ready_file}.tmp.{os.getpid()}"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+    os.replace(temp_path, ready_file)
 
 
-@worker_process_init.connect
-def _init_worker_process(**kwargs):
-    """Configure torch threading and GPU once per forked worker process."""
+def _marker_preload_enabled():
+    mode = getattr(Config, "WORKER_PRELOAD_MARKER_MODELS", "off")
+    return mode in {"1", "true", "yes", "on", "always", "auto"}
+
+
+def _preload_marker_models_for_worker():
+    if not _marker_preload_enabled():
+        return
+
+    _configure_torch_for_worker_process()
+    _remove_marker_ready_file()
+    try:
+        from app.services.marker_service import preload_marker_models
+
+        payload = preload_marker_models(
+            device=Config.MARKER_DEVICE,
+            extract_images=Config.WORKER_PRELOAD_MARKER_EXTRACT_IMAGES,
+            disable_links=True,
+        )
+        if str(Config.MARKER_DEVICE).lower() != "cpu" and payload.get("device") != "cuda":
+            raise RuntimeError("Marker preload resolved to CPU; CUDA is not available")
+        _write_marker_ready_file(payload)
+        logger.info("Marker worker readiness file written: %s", Config.MARKER_READY_FILE)
+    except Exception as exc:
+        _remove_marker_ready_file()
+        logger.exception("Marker model preload failed: %s", exc)
+        if Config.WORKER_PRELOAD_MARKER_REQUIRED:
+            raise
+
+
+def _configure_torch_for_worker_process():
+    """Configure torch threading/GPU once in the process that will run tasks."""
+    global _torch_worker_configured
+    if _torch_worker_configured:
+        return
+
     try:
         import torch
         num_threads = int(os.environ.get("OMP_NUM_THREADS", 8))
         torch.set_num_threads(num_threads)
         torch.set_num_interop_threads(max(1, num_threads // 4))
+        _torch_worker_configured = True
 
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
@@ -65,6 +120,22 @@ def _init_worker_process(**kwargs):
             )
     except Exception as exc:
         logger.warning("Failed to configure torch/GPU: %s", exc)
+
+
+@celery_setup_logging.connect
+def _configure_celery_logging(**kwargs):
+    """Take over Celery's logging so ALL messages go through our GELF handler.
+
+    Connecting to this signal prevents Celery from setting up its own logging.
+    This ensures the GELF 'host' field is 'pdfx-worker' from the very first message.
+    """
+    setup_logging(component="worker")
+
+
+@worker_process_init.connect
+def _init_worker_process(**kwargs):
+    """Configure torch threading and GPU once per forked worker process."""
+    _configure_torch_for_worker_process()
 
 # ---------------------------------------------------------------------------
 # Celery app

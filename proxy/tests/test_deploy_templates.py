@@ -59,6 +59,17 @@ def test_deploy_script_supports_explicit_image_tag():
     assert "agr_pdfx_proxy:${IMAGE_TAG}" in script
 
 
+def test_proxy_idle_timeout_defaults_to_two_hours():
+    config_path = Path(__file__).resolve().parents[1] / "app" / "config.py"
+    config_text = config_path.read_text()
+    stack_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-stack.yaml"
+    stack_text = stack_path.read_text()
+
+    assert 'IDLE_TIMEOUT_MINUTES", "120"' in config_text
+    assert "IdleTimeoutMinutes:" in stack_text
+    assert 'Default: "120"' in stack_text
+
+
 def test_backend_deploy_supports_prebuilt_gpu_image():
     script_path = Path(__file__).resolve().parents[2] / "deploy" / "deploy.sh"
     script = script_path.read_text()
@@ -79,12 +90,18 @@ def test_backend_deploy_supports_prebuilt_gpu_image():
     assert "docker run --rm --gpus all --entrypoint nvidia-smi" in script
     assert "PDFX_WORKER_CUDA_PROBE_TIMEOUT_SECONDS" in script
     assert "GPU worker CUDA" in script
+    assert "PDFX_FLASK_HEALTH_TIMEOUT_SECONDS" in script
+    assert "wait_for_flask_health" in script
     assert "torch.cuda.mem_get_info(0)" in script
     assert "PDFX_PREWARM_MODELS" in script
     assert "Prewarming Marker models into persistent cache" in script
     assert "from marker.models import create_model_dict" in script
+    assert "marker_worker_ready.json" in script
     assert "PDFX_GPU_IMAGE" in compose_text
     assert "image: ${PDFX_GPU_IMAGE:-pdfx-gpu}" in compose_text
+    assert "PDFX_MARKER_READY_FILE" in compose_text
+    assert "PDFX_HEALTH_REQUIRE_MARKER_READY" in compose_text
+    assert "PDFX_WORKER_PRELOAD_MARKER_MODELS" in compose_text
     assert "../app:/app/app:ro" not in compose_text
     assert "../celery_app.py:/app/celery_app.py:ro" not in compose_text
     assert "../config.py:/app/config.py:ro" not in compose_text

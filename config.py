@@ -44,6 +44,16 @@ class Config:
 
     # ---- Marker --------------------------------------------------------------
     MARKER_DEVICE = os.environ.get("MARKER_DEVICE", "cpu")
+    MARKER_READY_FILE = os.environ.get(
+        "PDFX_MARKER_READY_FILE",
+        os.path.join(CACHE_FOLDER, "marker_worker_ready.json"),
+    )
+    HEALTH_REQUIRE_MARKER_READY = os.environ.get("PDFX_HEALTH_REQUIRE_MARKER_READY", "false").lower() == "true"
+    WORKER_PRELOAD_MARKER_MODELS = os.environ.get("PDFX_WORKER_PRELOAD_MARKER_MODELS", "off").strip().lower()
+    WORKER_PRELOAD_MARKER_REQUIRED = os.environ.get("PDFX_WORKER_PRELOAD_MARKER_REQUIRED", "false").lower() == "true"
+    WORKER_PRELOAD_MARKER_EXTRACT_IMAGES = (
+        os.environ.get("PDFX_WORKER_PRELOAD_MARKER_EXTRACT_IMAGES", "true").lower() == "true"
+    )
 
     # ---- LLM (merge) ---------------------------------------------------------
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")

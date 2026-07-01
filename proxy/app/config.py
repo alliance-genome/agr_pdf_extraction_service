@@ -25,7 +25,7 @@ class Settings:
     # such as CurationAPI-Admin. Comma-separated; empty disables the allow-list.
     COGNITO_ACCEPTED_CLIENT_IDS: str = os.environ.get("COGNITO_ACCEPTED_CLIENT_IDS", "").strip()
 
-    IDLE_TIMEOUT_MINUTES: int = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "30"))
+    IDLE_TIMEOUT_MINUTES: int = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "120"))
     MIN_UPTIME_MINUTES: int = int(os.environ.get("MIN_UPTIME_MINUTES", "20"))
     STARTUP_TIMEOUT_MINUTES: int = int(os.environ.get("STARTUP_TIMEOUT_MINUTES", "30"))
     ASG_STARTUP_REPLACEMENT_ATTEMPTS: int = int(os.environ.get("ASG_STARTUP_REPLACEMENT_ATTEMPTS", "1"))

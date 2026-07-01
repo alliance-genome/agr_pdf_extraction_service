@@ -18,6 +18,7 @@ Endpoints:
 
 import os
 import uuid
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -232,6 +233,29 @@ def _check_db_ready():
             pass
 
 
+def _marker_ready_state():
+    if not current_app.config.get("HEALTH_REQUIRE_MARKER_READY", False):
+        return "disabled", None
+
+    ready_file = current_app.config.get("MARKER_READY_FILE")
+    if not ready_file:
+        return "missing", "not_configured"
+
+    try:
+        with open(ready_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict) or not payload:
+            return "missing", "empty_ready_file"
+        return "ok", None
+    except json.JSONDecodeError:
+        return "missing", "invalid_ready_file"
+    except FileNotFoundError:
+        return "loading", "ready_file_missing"
+    except Exception as exc:
+        logger.warning("Marker readiness check failed for %s: %s", ready_file, exc)
+        return "missing", type(exc).__name__
+
+
 def _redis_key_count(redis_client, command, key):
     try:
         return int(getattr(redis_client, command)(key))
@@ -438,6 +462,12 @@ def health():
     if db_error:
         checks["database_error"] = db_error
 
+    marker_status, marker_error = _marker_ready_state()
+    if marker_status != "disabled":
+        checks["marker_models"] = marker_status
+        if marker_error:
+            checks["marker_models_error"] = marker_error
+
     if db_status == "ok":
         checks["active_runs"] = _count_runs_by_status(["running"])
         checks["fresh_active_runs"] = _count_fresh_running_runs()
@@ -452,6 +482,8 @@ def health():
         overall = "degraded"
     if checks["database"] != "ok":
         overall = "unhealthy"
+    if checks.get("marker_models") not in {None, "ok"}:
+        overall = "unhealthy"
     if checks["workers"] == "unknown" and overall != "unhealthy":
         overall = "degraded"
     if checks["redis"] == "unavailable":
@@ -461,6 +493,7 @@ def health():
             checks["grobid"] == "ok"
             and checks["redis"] == "ok"
             and checks["database"] == "ok"
+            and checks.get("marker_models") in {None, "ok"}
         )
         busy_solo_worker = (
             dependencies_accept_submissions

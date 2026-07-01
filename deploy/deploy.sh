@@ -185,6 +185,32 @@ print(torch.cuda.get_device_name(0))
 '
 }
 
+wait_for_flask_health() {
+    local timeout_seconds="${PDFX_FLASK_HEALTH_TIMEOUT_SECONDS:-1800}"
+    local delay="${PDFX_FLASK_HEALTH_POLL_SECONDS:-10}"
+    local deadline=$((SECONDS + timeout_seconds))
+    local health_json=""
+
+    echo "  Waiting for Flask health (timeout ${timeout_seconds}s)..."
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if health_json="$(curl -fsS --max-time 10 http://localhost:5000/api/v1/health 2>/dev/null)"; then
+            echo "  Flask app is healthy: ${health_json}"
+            return 0
+        fi
+
+        echo "  Flask app not ready yet; retrying in ${delay}s..."
+        sleep "$delay"
+    done
+
+    echo "ERROR: Flask app did not become healthy after ${timeout_seconds}s."
+    echo "Last health response:"
+    curl -sS --max-time 10 http://localhost:5000/api/v1/health || true
+    echo ""
+    echo "Recent app/worker logs:"
+    docker compose "${COMPOSE_ARGS[@]}" logs --tail=80 app worker || true
+    return 1
+}
+
 should_prewarm_marker_models() {
     if [ "$COMPOSE_FILE" != "docker-compose.gpu.yml" ]; then
         return 1
@@ -291,6 +317,7 @@ mkdir -p "$REPO_ROOT/data/models"
 mkdir -p "$REPO_ROOT/data/model_cache"
 mkdir -p "$REPO_ROOT/data/rapidocr_models"
 mkdir -p "$REPO_ROOT/logs"
+rm -f "$REPO_ROOT/data/cache/marker_worker_ready.json"
 
 # Step 3: Stop existing services
 echo "Stopping existing services..."
@@ -357,13 +384,10 @@ else
     echo "NOT READY"
 fi
 
-# Check Flask app
-echo -n "  Flask app: "
-if curl -sf http://localhost:5000/api/v1/health > /dev/null 2>&1; then
-    echo "HEALTHY"
-else
-    echo "NOT READY (may still be loading models)"
-fi
+# Check Flask app. In GPU mode this also waits for the worker-process Marker
+# preload readiness file, because /health fails closed until Marker is hot.
+echo "  Flask app:"
+wait_for_flask_health
 
 if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
     echo -n "  GPU worker CUDA: "

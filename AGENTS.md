@@ -58,6 +58,9 @@ GPU backend that should run only when there is work.
 - For urgent backend fixes, build/push a SHA-tagged backend image, update the
   launch/deploy path deliberately, and verify the backend actually pulled that
   tag. Do not assume `:latest` promotion alone changed an existing instance.
+- Do not run a backend deploy/restart against a live production instance while
+  backend jobs are active or queued unless the operator explicitly chooses an
+  interrupting hotfix. `deploy/deploy.sh` stops the Compose stack.
 - Backend GPU deploys should fail closed if CUDA is not usable inside the
   container. `deploy/deploy.sh` probes the NVIDIA container runtime before
   starting the stack and checks CUDA inside `pdfx-worker` after startup.
@@ -65,6 +68,10 @@ GPU backend that should run only when there is work.
   host cache volumes by default (`PDFX_PREWARM_MODELS=auto`). This moves large
   first-use model downloads out of the first curator job and into warm-pool
   preparation.
+- Persistent cache prewarm is not the same as worker-process readiness. GPU
+  workers should preload Marker in-process and write the configured readiness
+  file before `/api/v1/health` can report healthy; otherwise the first real job
+  still pays the model-load tax.
 - If cold-starts still burn time pulling the large backend image or rebuilding
   model caches, prepare a prewarmed GPU worker AMI from a clean stopped stack:
   keep Docker images and model caches, remove runtime uploads/logs/volumes, then
@@ -116,6 +123,10 @@ timeout count, backend replacement count, backend state, and active job counts.
   the backend was deployed before the Marker prewarm hook or whether the
   persistent model cache volume was replaced. A prepared warm-pool backend
   should have those artifacts before user traffic arrives.
+- If `/api/v1/health` is unhealthy with `marker_models=loading`, that is a
+  deliberate fail-closed state. Do not replay queued production jobs until the
+  worker writes the Marker readiness file and the proxy sees the backend as
+  ready.
 - A backend job stuck around `llm_merge` with low CPU and no fresh worker logs
   is usually a slow/blocked OpenAI request inside the parallel consensus
   resolver. Check `/api/v1/extract/<process_id>` for progress, worker logs for

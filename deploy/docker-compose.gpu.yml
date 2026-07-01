@@ -23,6 +23,7 @@ x-shared-env: &shared-env
   HF_HOME: /app/data/models
   TRANSFORMERS_CACHE: /app/data/models
   TORCH_HOME: /app/data/models
+  PDFX_MARKER_READY_FILE: /app/data/cache/marker_worker_ready.json
   GELF_HOST: logs.alliancegenome.org
   GELF_PORT: "12201"
   # App/worker use Docker GELF for stdout/stderr so crash-adjacent output is
@@ -73,6 +74,7 @@ services:
       TORCH_DEVICE: cpu
       DOCLING_DEVICE: cpu
       CUDA_VISIBLE_DEVICES: ""
+      PDFX_HEALTH_REQUIRE_MARKER_READY: "true"
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
       # Keep synchronous web UI runs within the same safety envelope as Celery.
@@ -123,6 +125,9 @@ services:
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      PDFX_WORKER_PRELOAD_MARKER_MODELS: "auto"
+      PDFX_WORKER_PRELOAD_MARKER_REQUIRED: "true"
+      PDFX_WORKER_PRELOAD_MARKER_EXTRACT_IMAGES: "true"
       # --- Thread settings (single-GPU backend) ---
       OMP_NUM_THREADS: "8"
       MKL_NUM_THREADS: "8"
@@ -147,11 +152,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    command: >
-      celery -A celery_app worker
-      --loglevel=info
-      --pool=solo
-      -Q default
+    command: ["python3.11", "-m", "app.worker_main"]
     logging:
       driver: gelf
       options:
