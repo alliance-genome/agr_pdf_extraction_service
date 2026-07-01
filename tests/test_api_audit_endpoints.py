@@ -331,6 +331,36 @@ def test_health_reports_busy_solo_worker_as_degraded(client):
     assert payload["checks"]["worker_state"] == "busy_or_unresponsive"
 
 
+def test_health_is_unhealthy_when_extraction_run_table_missing(client):
+    Base.metadata.drop_all(bind=get_engine())
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 0
+    redis_client.hlen.return_value = 0
+    redis_client.zcard.return_value = 0
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = {"worker@example": {"ok": "pong"}}
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "unhealthy"
+    assert payload["checks"]["database"] == "unavailable"
+    assert payload["checks"]["active_runs"] == "unknown"
+    assert payload["checks"]["fresh_active_runs"] == "unknown"
+    assert payload["checks"]["queued_runs"] == "unknown"
+
+
 def test_health_stays_unhealthy_for_stale_running_row_without_unacked_task(client):
     process_id = str(uuid.uuid4())
     session = get_session()

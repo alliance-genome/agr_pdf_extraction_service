@@ -22,6 +22,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, request, jsonify, send_file, current_app
+from sqlalchemy import text
 from werkzeug.utils import secure_filename
 
 from app.error_utils import summarize_error_message
@@ -206,6 +207,24 @@ def _count_fresh_running_runs():
     except Exception as exc:
         logger.warning("Failed to count fresh running extraction_run rows: %s", exc)
         return "unknown"
+    finally:
+        try:
+            db_session.close()
+        except Exception:
+            pass
+
+
+def _check_db_ready():
+    db_session = _get_db_session()
+    if not db_session:
+        return "unavailable", "session_unavailable"
+
+    try:
+        db_session.execute(text("SELECT 1 FROM extraction_run LIMIT 1"))
+        return "ok", None
+    except Exception as exc:
+        logger.warning("Database health check failed: %s", exc)
+        return "unavailable", type(exc).__name__
     finally:
         try:
             db_session.close()
@@ -414,20 +433,34 @@ def health():
     except Exception:
         checks["workers"] = "unknown"
 
-    checks["active_runs"] = _count_runs_by_status(["running"])
-    checks["fresh_active_runs"] = _count_fresh_running_runs()
-    checks["queued_runs"] = _count_runs_by_status(["queued"])
+    db_status, db_error = _check_db_ready()
+    checks["database"] = db_status
+    if db_error:
+        checks["database_error"] = db_error
+
+    if db_status == "ok":
+        checks["active_runs"] = _count_runs_by_status(["running"])
+        checks["fresh_active_runs"] = _count_fresh_running_runs()
+        checks["queued_runs"] = _count_runs_by_status(["queued"])
+    else:
+        checks["active_runs"] = "unknown"
+        checks["fresh_active_runs"] = "unknown"
+        checks["queued_runs"] = "unknown"
 
     overall = "ok"
     if checks["grobid"] != "ok" or checks["redis"] != "ok":
         overall = "degraded"
-    if checks["workers"] == "unknown":
+    if checks["database"] != "ok":
+        overall = "unhealthy"
+    if checks["workers"] == "unknown" and overall != "unhealthy":
         overall = "degraded"
     if checks["redis"] == "unavailable":
         overall = "unhealthy"
     if isinstance(checks["workers"], int) and checks["workers"] <= 0:
         dependencies_accept_submissions = (
-            checks["grobid"] == "ok" and checks["redis"] == "ok"
+            checks["grobid"] == "ok"
+            and checks["redis"] == "ok"
+            and checks["database"] == "ok"
         )
         busy_solo_worker = (
             dependencies_accept_submissions

@@ -257,6 +257,11 @@ class LifecycleManager:
                 logger.debug("EC2 health not ready: redis=%r", checks.get("redis"))
                 return False
 
+            if "database" in checks and checks.get("database") != "ok":
+                self._last_health_reason = "database_not_ready"
+                logger.debug("EC2 health not ready: database=%r", checks.get("database"))
+                return False
+
             if checks.get("grobid") != "ok":
                 self._last_health_reason = "grobid_not_ready"
                 logger.debug("EC2 health not ready: grobid=%r", checks.get("grobid"))

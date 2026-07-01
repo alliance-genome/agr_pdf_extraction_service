@@ -103,6 +103,25 @@ fi
 
 echo "=== PDF Extraction Service Deployment ==="
 
+wait_for_postgres() {
+    local attempts=60
+    local delay=5
+
+    echo "Waiting for Postgres to accept connections..."
+    for attempt in $(seq 1 "$attempts"); do
+        if docker exec pdfx-postgres pg_isready -U pdfx >/dev/null 2>&1; then
+            echo "  Postgres is ready."
+            return 0
+        fi
+
+        echo "  Postgres not ready yet (${attempt}/${attempts}); retrying in ${delay}s..."
+        sleep "$delay"
+    done
+
+    echo "ERROR: Postgres did not become ready after $((attempts * delay)) seconds."
+    return 1
+}
+
 # Step 1: Check prerequisites
 echo "Checking prerequisites..."
 
@@ -144,7 +163,7 @@ mkdir -p "$REPO_ROOT/logs"
 echo "Stopping existing services..."
 docker compose "${COMPOSE_ARGS[@]}" down 2>/dev/null || true
 
-# Step 4: Start services
+# Step 4: Prepare application image and start dependency services
 if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ] && \
    [ -n "${PDFX_GPU_IMAGE:-}" ] && \
    [ "${SHOULD_PULL_PREBUILT_GPU_IMAGE}" = "true" ]; then
@@ -152,20 +171,28 @@ if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ] && \
     docker compose "${COMPOSE_ARGS[@]}" pull app worker
 fi
 
-echo "Starting services (build mode: ${PDFX_DEPLOY_BUILD_MODE})..."
-docker compose "${COMPOSE_ARGS[@]}" up -d "${BUILD_ARGS[@]}"
+if [ "${PDFX_DEPLOY_BUILD_MODE}" = "rebuild" ]; then
+    echo "Rebuilding application images before migrations..."
+    docker compose "${COMPOSE_ARGS[@]}" build app worker
+fi
 
-# Step 5: Wait for services to start
+echo "Starting dependency services..."
+docker compose "${COMPOSE_ARGS[@]}" up -d postgres redis grobid
+
+# Step 5: Wait for dependency services to start
 echo "Waiting for services to start..."
-sleep 10
+wait_for_postgres
 
 # Step 6: Run database migrations
 echo "Running database migrations..."
-docker compose "${COMPOSE_ARGS[@]}" exec -T app alembic upgrade head 2>/dev/null && \
-    echo "  Database migrations applied." || \
-    echo "  WARNING: Migration failed or Alembic not available. DB tracking may not work."
+docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps app alembic upgrade head
+echo "  Database migrations applied."
 
-# Step 7: Health checks
+# Step 7: Start full stack
+echo "Starting application services (build mode: ${PDFX_DEPLOY_BUILD_MODE})..."
+docker compose "${COMPOSE_ARGS[@]}" up -d "${BUILD_ARGS[@]}"
+
+# Step 8: Health checks
 echo ""
 echo "=== Health Checks ==="
 

@@ -1145,7 +1145,12 @@ async def _forward_extraction(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Failed to forward extraction to EC2: %s", exc)
+        logger.error(
+            "Failed to forward extraction to EC2: %s: %r",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
     finally:
         lifecycle.job_finished()
