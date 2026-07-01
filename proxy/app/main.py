@@ -1177,6 +1177,32 @@ def _coerce_json_payload(resp: httpx.Response) -> dict[str, Any]:
         return {"detail": text or f"Non-JSON response (status={resp.status_code})"}
 
 
+async def _fetch_backend_status_payload(
+    process_id: str,
+    *,
+    authorization: str | None,
+) -> tuple[int, dict[str, Any]]:
+    """Fetch backend status while preserving the proxy-visible process ID."""
+    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
+    status_url = f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}"
+    headers = {"Authorization": authorization} if authorization else {}
+
+    async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
+        if headers:
+            try:
+                resp = await client.get(status_url, headers=headers)
+            except TypeError:
+                resp = await client.get(status_url)
+        else:
+            resp = await client.get(status_url)
+
+    payload = _coerce_json_payload(resp)
+    if backend_process_id != process_id:
+        # Keep caller-visible process_id stable when replay rewrites backend IDs.
+        payload["process_id"] = process_id
+    return resp.status_code, payload
+
+
 async def _forward_extraction(
     process_id: str,
     pdf_data: bytes | Any,
@@ -1210,6 +1236,7 @@ async def _forward_extraction(
         backend_process_id = str(payload.get("process_id", "")).strip()
         if backend_process_id:
             proxy_to_backend_process[process_id] = backend_process_id
+            payload["process_id"] = process_id
 
         _record_job_event(process_id, "accepted_by_backend")
         replay_submission_errors.pop(process_id, None)
@@ -1319,6 +1346,9 @@ async def _reconciler_loop():
             if age < stale_after:
                 continue
 
+            if await _refresh_stale_backend_status(process_id, tracker, age=age):
+                continue
+
             if settings.RECONCILER_REQUEUE_ONCE and not tracker.requeue_attempted and process_id in job_payload_cache:
                 tracker.requeue_attempted = True
                 job = job_payload_cache[process_id]
@@ -1359,6 +1389,53 @@ async def _reconciler_loop():
                 "Progress monitoring timeout in proxy. "
                 "The worker may still be processing; backend extraction timeout is separate.",
             )
+
+
+async def _refresh_stale_backend_status(process_id: str, tracker: JobTracker, *, age: float) -> bool:
+    """Reconcile a quiet proxy tracker with backend truth before failing it."""
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY) or not lifecycle.private_ip:
+        return False
+
+    job = job_payload_cache.get(process_id)
+    authorization = job.authorization if job else None
+    if not authorization and settings.HEALTHCHECK_BEARER_TOKEN:
+        authorization = f"Bearer {settings.HEALTHCHECK_BEARER_TOKEN}"
+
+    try:
+        status_code, payload = await _fetch_backend_status_payload(
+            process_id,
+            authorization=authorization,
+        )
+    except Exception as exc:
+        logger.warning("Reconciler backend status refresh failed for %s: %s", process_id, exc)
+        return False
+
+    if status_code >= 400:
+        logger.warning(
+            "Reconciler backend status refresh for %s returned HTTP %s: %s",
+            process_id,
+            status_code,
+            payload.get("detail") or payload.get("error") or payload,
+        )
+        return False
+
+    _update_tracker_from_payload(process_id, payload)
+    status = str(payload.get("status", "")).strip().lower()
+    if status in TERMINAL_JOB_STATUSES:
+        _mark_terminal_cleanup_if_needed(process_id, payload)
+        return True
+
+    if status in ACTIVE_JOB_STATUSES:
+        tracker.last_progress_at = time.time()
+        logger.info(
+            "job=%s event=backend_still_processing status=%s stale_age_seconds=%.0f",
+            process_id,
+            status,
+            age,
+        )
+        return True
+
+    return False
 
 
 async def _canary_loop():

@@ -1,6 +1,7 @@
 """Integration tests for the FastAPI proxy routes."""
 
 import asyncio
+import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
@@ -392,6 +393,47 @@ class TestExtractEndpoint:
         assert resp.status_code == 202
         assert captured["form_fields"]["extract_images"] == "true"
         assert captured["form_fields"]["review_images"] == "false"
+
+    def test_forward_extraction_returns_proxy_process_id(self, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+
+        class _DummyResponse:
+            status_code = 202
+
+            @staticmethod
+            def json():
+                return {"process_id": "backend-1", "status": "queued"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, _url, **_kwargs):
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = asyncio.run(
+            main_mod._forward_extraction(
+                "proxy-1",
+                b"%PDF-1.4",
+                "input.pdf",
+                {"methods": "marker"},
+                authorization="Bearer test",
+            )
+        )
+
+        payload = json.loads(resp.body)
+        assert payload["process_id"] == "proxy-1"
+        assert main_mod.proxy_to_backend_process["proxy-1"] == "backend-1"
 
 
 class TestExtractStatusEndpoint:
@@ -1325,6 +1367,117 @@ class TestExtractCancelEndpoint:
         assert job.filename == "memory.pdf"
         main_mod.lifecycle.ensure_running.assert_awaited_once()
         main_mod._ensure_replay_task.assert_called_once()
+
+    def test_reconciler_keeps_stale_job_active_when_backend_still_running(self, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "stale-running-job"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="running",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_at=0,
+        )
+
+        class _DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"process_id": process_id, "status": "running"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _DummyResponse()
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+        monkeypatch.setattr(main_mod.settings, "HEALTHCHECK_BEARER_TOKEN", "")
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert main_mod.job_trackers[process_id].status == "running"
+        assert main_mod.job_trackers[process_id].last_progress_at > 0
+        assert main_mod._active_backend_jobs() == 1
+
+    def test_reconciler_clears_stale_job_when_backend_completed(self, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "stale-complete-job"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="running",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_at=0,
+        )
+
+        class _DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"process_id": process_id, "status": "complete"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _DummyResponse()
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+        monkeypatch.setattr(main_mod.settings, "HEALTHCHECK_BEARER_TOKEN", "")
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert main_mod.job_trackers[process_id].status == "complete"
+        assert main_mod._active_backend_jobs() == 0
 
     def test_local_cancel_cache_is_bounded(self, monkeypatch):
         import app.main as main_mod
