@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 import boto3
+from botocore.exceptions import ClientError
 
 from app.config import settings
 
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 class QueueFullError(Exception):
     """Queue cannot accept new jobs."""
+
+
+class QueuePayloadMissingError(Exception):
+    """Queued metadata points to an S3 payload that no longer exists."""
 
 
 @dataclass
@@ -101,6 +106,14 @@ class QueuedJob:
         try:
             with tmp:
                 boto3.client("s3").download_fileobj(bucket, self.pdf_s3_key, tmp)
+        except ClientError as exc:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp.name)
+            if _is_missing_s3_object_error(exc):
+                raise QueuePayloadMissingError(
+                    f"Queued job {self.job_id} is missing payload s3://{bucket}/{self.pdf_s3_key}",
+                ) from exc
+            raise
         except Exception:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp.name)
@@ -385,24 +398,34 @@ class S3JobQueue(BaseJobQueue):
 
     def dequeue(self) -> QueuedJob:
         keys = self._iter_keys()
-        if not keys:
-            raise IndexError("dequeue from empty queue")
-        key = keys[0]
-        job = self._load_job(key)
-        self._delete_job_metadata(key)
-        return job
+        for key in keys:
+            try:
+                job = self._load_job(key)
+            except QueuePayloadMissingError as exc:
+                logger.warning("%s; deleting orphaned queue metadata %s", exc, key)
+                self._delete_job_metadata(key)
+                continue
+            self._delete_job_metadata(key)
+            return job
+        raise IndexError("dequeue from empty queue")
 
     def drain(self) -> list[QueuedJob]:
         keys = self._iter_keys()
         jobs: list[QueuedJob] = []
+        loaded_keys: list[str] = []
         if not keys:
             return jobs
 
         for key in keys:
-            jobs.append(self._load_job(key))
+            try:
+                jobs.append(self._load_job(key))
+                loaded_keys.append(key)
+            except QueuePayloadMissingError as exc:
+                logger.warning("%s; deleting orphaned queue metadata %s", exc, key)
+                self._delete_job_metadata(key)
 
         # Delete in batches of 1000 (S3 limit).
-        self._delete_s3_keys(list(keys))
+        self._delete_s3_keys(loaded_keys)
         return jobs
 
     def _load_job(self, key: str) -> QueuedJob:
@@ -415,6 +438,14 @@ class S3JobQueue(BaseJobQueue):
             try:
                 with tmp:
                     self._client.download_fileobj(bucket, job.pdf_s3_key, tmp)
+            except ClientError as exc:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp.name)
+                if _is_missing_s3_object_error(exc):
+                    raise QueuePayloadMissingError(
+                        f"Queued job {job.job_id} is missing payload s3://{bucket}/{job.pdf_s3_key}",
+                    ) from exc
+                raise
             except Exception:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(tmp.name)
@@ -484,6 +515,13 @@ def build_job_queue(max_size: int = 10) -> BaseJobQueue:
         )
 
     return InMemoryJobQueue(max_size=max_size)
+
+
+def _is_missing_s3_object_error(exc: ClientError) -> bool:
+    error = exc.response.get("Error", {})
+    code = str(error.get("Code", "")).strip()
+    status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return status == 404 or code in {"404", "NoSuchKey", "NotFound"}
 
 
 # Backward-compatible alias used by tests/import sites.

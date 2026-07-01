@@ -109,6 +109,7 @@ def test_task_definition_is_environment_parameterized():
 
     assert template["family"] == "${TASK_FAMILY}"
     assert int(template["memory"]) >= 2048
+    assert template["ephemeralStorage"] == {"sizeInGiB": 50}
     container = template["containerDefinitions"][0]
     assert container["name"] == "${CONTAINER_NAME}"
     assert {"name": "QUEUE_S3_PREFIX", "value": "${QUEUE_S3_PREFIX}"} in container["environment"]
@@ -153,3 +154,5 @@ def test_iam_policy_is_environment_parameterized_and_allows_image_tags():
     assert "repository/${BackendImageRepositoryName}" in stack_text
     assert "QueueRetentionDays" in stack_text
     assert "pdfx-expire-proxy-queue" in stack_text
+    assert "ProxyTaskEphemeralStorageGiB" in stack_text
+    assert "EphemeralStorage:" in stack_text

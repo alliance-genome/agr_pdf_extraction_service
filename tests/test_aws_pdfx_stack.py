@@ -11,10 +11,14 @@ import pytest
 STACK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx-stack.yaml"
 RUNBOOK_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "pdfx.md"
 GPU_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.gpu.yml"
+CPU_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.yml"
 GPU_PREBUILT_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.gpu.prebuilt.yml"
 GPU_DOCKERFILE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "Dockerfile.gpu"
 GPU_CONSTRAINTS_PATH = Path(__file__).resolve().parents[1] / "deploy" / "gpu-constraints.txt"
 REQUIREMENTS_PATH = Path(__file__).resolve().parents[1] / "requirements.txt"
+NGINX_CONFIG_PATH = Path(__file__).resolve().parents[1] / "deploy" / "nginx.conf"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.py"
+README_PATH = Path(__file__).resolve().parents[1] / "README.md"
 
 
 def test_pdfx_stack_uses_canonical_resources():
@@ -46,6 +50,20 @@ def test_pdfx_stack_uses_canonical_resources():
     assert "MinimumHealthyPercent: 100" in template
     assert "DeploymentCircuitBreaker:" in template
     assert "Rollback: true" in template
+
+
+def test_upload_limit_is_500_mib_across_backend_configs():
+    backend_config = CONFIG_PATH.read_text()
+    nginx_config = NGINX_CONFIG_PATH.read_text()
+    cpu_compose = CPU_COMPOSE_PATH.read_text()
+    gpu_compose = GPU_COMPOSE_PATH.read_text()
+    readme = README_PATH.read_text()
+
+    assert "500 * 1024 * 1024" in backend_config
+    assert "client_max_body_size 500m;" in nginx_config
+    assert 'MAX_CONTENT_LENGTH: "524288000"' in cpu_compose
+    assert 'MAX_CONTENT_LENGTH: "524288000"' in gpu_compose
+    assert "| `MAX_CONTENT_LENGTH` | `524288000` | Max upload size in bytes (500 MiB) |" in readme
 
 
 def test_pdfx_stack_supports_image_retention_and_tagged_uploads():

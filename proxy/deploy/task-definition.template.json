@@ -4,6 +4,9 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
   "memory": "2048",
+  "ephemeralStorage": {
+    "sizeInGiB": 50
+  },
   "executionRoleArn": "${EXECUTION_ROLE_ARN}",
   "taskRoleArn": "${TASK_ROLE_ARN}",
   "containerDefinitions": [

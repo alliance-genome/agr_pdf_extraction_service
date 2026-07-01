@@ -181,6 +181,12 @@ Parameters:
   ProxyTaskMemory:
     Type: String
     Default: "2048"
+  ProxyTaskEphemeralStorageGiB:
+    Type: Number
+    Default: 50
+    MinValue: 21
+    MaxValue: 200
+    Description: Fargate scratch space for multipart PDF upload spooling before durable S3 queue writes.
   QueuePrefix:
     Type: String
     Default: pdfx-proxy-queue
@@ -790,6 +796,8 @@ Resources:
         - FARGATE
       Cpu: !Ref ProxyTaskCpu
       Memory: !Ref ProxyTaskMemory
+      EphemeralStorage:
+        SizeInGiB: !Ref ProxyTaskEphemeralStorageGiB
       ExecutionRoleArn: !GetAtt ProxyExecutionRole.Arn
       TaskRoleArn: !GetAtt ProxyTaskRole.Arn
       ContainerDefinitions:

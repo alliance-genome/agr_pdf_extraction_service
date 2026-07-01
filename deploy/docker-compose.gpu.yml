@@ -19,6 +19,7 @@ x-shared-env: &shared-env
   DATABASE_URL: postgresql://pdfx:${POSTGRES_PASSWORD:-pdfx}@postgres:5432/pdfx
   UPLOAD_FOLDER: /app/data/uploads
   CACHE_FOLDER: /app/data/cache
+  MAX_CONTENT_LENGTH: "524288000"
   HF_HOME: /app/data/models
   TRANSFORMERS_CACHE: /app/data/models
   TORCH_HOME: /app/data/models

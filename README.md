@@ -871,7 +871,7 @@ cd deploy && GPU_MODE=on ./deploy.sh
 
 - The Flask app container runs **CPU-only** (`CUDA_VISIBLE_DEVICES=""`) to avoid GPU memory contention with the worker.
 - The Celery worker runs with `--pool=solo` (single process) because Docling and Marker use internal threading and manage their own GPU memory.
-- Code is mounted read-only (`app:/app/app:ro`) for hot-reload during development, while data directories are shared read-write.
+- GPU deployments run the app and worker code baked into the image, while data directories are shared read-write.
 - All containers use **GELF logging** to `logs.alliancegenome.org:12201` for centralized log aggregation.
 - Health checks with generous start periods (120s) accommodate ML model loading time.
 
@@ -1137,7 +1137,7 @@ Everything below is optional and has sensible defaults.
 | `CELERY_RESULT_BACKEND` | `redis://localhost:6379/1` | Redis result backend |
 | `UPLOAD_FOLDER` | `./uploaded_pdfs` | Upload directory |
 | `CACHE_FOLDER` | `./extraction_cache` | Local cache directory |
-| `MAX_CONTENT_LENGTH` | `104857600` | Max upload size in bytes (100 MB) |
+| `MAX_CONTENT_LENGTH` | `524288000` | Max upload size in bytes (500 MiB) |
 | `EXTRACTION_CONFIG_VERSION` | `6` | Bump to invalidate cached outputs |
 | `AUDIT_S3_BUCKET` | _(empty)_ | S3 bucket for durable artifact storage; resolved from SSM if unset |
 | `AUDIT_S3_BUCKET_SSM_PARAM` | `/pdfx/audit-s3-bucket` | SSM parameter name for bucket resolution |
