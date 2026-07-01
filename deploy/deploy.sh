@@ -153,21 +153,26 @@ wait_for_nvidia_container_runtime() {
 
     local attempts="${PDFX_NVIDIA_READY_ATTEMPTS:-36}"
     local delay="${PDFX_NVIDIA_READY_DELAY_SECONDS:-5}"
+    local probe_out probe_err
+    probe_out="$(mktemp -t pdfx-gpu-probe.XXXXXX.out)"
+    probe_err="$(mktemp -t pdfx-gpu-probe.XXXXXX.err)"
 
     echo "Waiting for NVIDIA container runtime..."
     for attempt in $(seq 1 "$attempts"); do
-        if detect_gpu && probe_gpu_image >/tmp/pdfx-gpu-probe.out 2>/tmp/pdfx-gpu-probe.err; then
-            echo "  NVIDIA runtime is ready ($(cat /tmp/pdfx-gpu-probe.out))."
+        if detect_gpu && probe_gpu_image >"$probe_out" 2>"$probe_err"; then
+            echo "  NVIDIA runtime is ready ($(cat "$probe_out"))."
+            rm -f "$probe_out" "$probe_err"
             return 0
         fi
 
         echo "  NVIDIA runtime not ready (${attempt}/${attempts}); retrying in ${delay}s..."
-        if [ -s /tmp/pdfx-gpu-probe.err ]; then
-            sed 's/^/    /' /tmp/pdfx-gpu-probe.err | tail -n 8
+        if [ -s "$probe_err" ]; then
+            sed 's/^/    /' "$probe_err" | tail -n 8
         fi
         sleep "$delay"
     done
 
+    rm -f "$probe_out" "$probe_err"
     echo "ERROR: NVIDIA container runtime did not become ready after $((attempts * delay)) seconds."
     return 1
 }
@@ -367,13 +372,17 @@ fi
 
 if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
     echo -n "  GPU worker CUDA: "
-    if probe_worker_cuda >/tmp/pdfx-worker-cuda-probe.out 2>/tmp/pdfx-worker-cuda-probe.err; then
-        echo "HEALTHY ($(cat /tmp/pdfx-worker-cuda-probe.out))"
+    worker_probe_out="$(mktemp -t pdfx-worker-cuda-probe.XXXXXX.out)"
+    worker_probe_err="$(mktemp -t pdfx-worker-cuda-probe.XXXXXX.err)"
+    if probe_worker_cuda >"$worker_probe_out" 2>"$worker_probe_err"; then
+        echo "HEALTHY ($(cat "$worker_probe_out"))"
+        rm -f "$worker_probe_out" "$worker_probe_err"
     else
         echo "NOT READY"
-        if [ -s /tmp/pdfx-worker-cuda-probe.err ]; then
-            sed 's/^/    /' /tmp/pdfx-worker-cuda-probe.err | tail -n 8
+        if [ -s "$worker_probe_err" ]; then
+            sed 's/^/    /' "$worker_probe_err" | tail -n 8
         fi
+        rm -f "$worker_probe_out" "$worker_probe_err"
         exit 1
     fi
 fi

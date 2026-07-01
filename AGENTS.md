@@ -65,6 +65,10 @@ GPU backend that should run only when there is work.
   host cache volumes by default (`PDFX_PREWARM_MODELS=auto`). This moves large
   first-use model downloads out of the first curator job and into warm-pool
   preparation.
+- If cold-starts still burn time pulling the large backend image or rebuilding
+  model caches, prepare a prewarmed GPU worker AMI from a clean stopped stack:
+  keep Docker images and model caches, remove runtime uploads/logs/volumes, then
+  update the backend launch template through IaC or an auditable AWS CLI change.
 
 ## Alerts And Metrics
 
@@ -105,6 +109,9 @@ timeout count, backend replacement count, backend state, and active job counts.
   container runtime/device plumbing was ready. Rerun the guarded backend deploy
   or restart app/worker after confirming the runtime; do not mark the backend
   healthy until the worker CUDA probe passes.
+- Fixed-name probe files under `/tmp` can be left behind with root ownership
+  after manual debugging. Deploy scripts should use unique `mktemp` files for
+  GPU probes; do not rely on reusable `/tmp/pdfx-*probe*` paths.
 - If the first real job downloads Marker/Datalab model bundles, check whether
   the backend was deployed before the Marker prewarm hook or whether the
   persistent model cache volume was replaced. A prepared warm-pool backend
