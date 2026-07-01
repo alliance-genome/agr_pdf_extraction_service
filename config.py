@@ -52,6 +52,8 @@ class Config:
     LLM_CONFLICT_BATCH_SIZE = int(os.environ.get("LLM_CONFLICT_BATCH_SIZE", 500))
     LLM_CONFLICT_MAX_WORKERS = int(os.environ.get("LLM_CONFLICT_MAX_WORKERS", 100))
     LLM_CONFLICT_RETRY_ROUNDS = int(os.environ.get("LLM_CONFLICT_RETRY_ROUNDS", 2))
+    LLM_OPENAI_TIMEOUT_SECONDS = float(os.environ.get("LLM_OPENAI_TIMEOUT_SECONDS", 180))
+    LLM_OPENAI_MAX_RETRIES = int(os.environ.get("LLM_OPENAI_MAX_RETRIES", 1))
 
     # ---- Per-call-type model + reasoning defaults ----------------------------
     # Each call type can override both model and reasoning effort individually.

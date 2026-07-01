@@ -522,6 +522,8 @@ def _build_llm(model=None, reasoning_effort=None):
         conflict_batch_size=Config.LLM_CONFLICT_BATCH_SIZE,
         conflict_max_workers=Config.LLM_CONFLICT_MAX_WORKERS,
         conflict_retry_rounds=Config.LLM_CONFLICT_RETRY_ROUNDS,
+        openai_timeout_seconds=Config.LLM_OPENAI_TIMEOUT_SECONDS,
+        openai_max_retries=Config.LLM_OPENAI_MAX_RETRIES,
     )
 
 

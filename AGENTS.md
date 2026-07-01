@@ -38,6 +38,11 @@ GPU backend that should run only when there is work.
 - Large PDF support is intentionally 500 MiB. If the limit changes, update all
   relevant layers together: Flask config, backend nginx config, Compose env,
   ECS/Fargate scratch capacity, docs, and tests.
+- Keep LLM calls bounded. PDFX consensus merge fans out multiple OpenAI calls;
+  one slow request can hold the whole Celery task at `llm_merge`. Use
+  `LLM_OPENAI_TIMEOUT_SECONDS` and `LLM_OPENAI_MAX_RETRIES` rather than letting
+  the OpenAI client wait indefinitely. A timed-out segment should degrade through
+  the existing retry/fallback paths.
 
 ## Deploy Model
 
@@ -81,6 +86,11 @@ timeout count, backend replacement count, backend state, and active job counts.
   jobs.
 - Backend `worker_not_ready` with healthy EC2 status checks usually means the
   application stack is still starting, not hardware failure.
+- A backend job stuck around `llm_merge` with low CPU and no fresh worker logs
+  is usually a slow/blocked OpenAI request inside the parallel consensus
+  resolver. Check `/api/v1/extract/<process_id>` for progress, worker logs for
+  the last LLM segment, and the OpenAI timeout/retry config before assuming GPU
+  failure.
 - ALB-wide timeout changes affect other services on shared load balancers. Only
   change shared ALB attributes when logs prove that is the failing hop.
 

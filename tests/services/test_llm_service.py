@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from app.services.llm_service import (
     ConflictResolutionResponse,
     MicroConflictResolutionResponse,
@@ -19,6 +19,32 @@ class DummyLLM(LLM):
         self.conflict_max_workers = 4
         self.conflict_retry_rounds = 2
         self.usage = TokenAccumulator()
+
+
+def test_llm_client_uses_configured_timeout_and_retries():
+    with patch("app.services.llm_service.OpenAI") as openai_cls:
+        llm = LLM(
+            api_key="key",
+            openai_timeout_seconds=12.5,
+            openai_max_retries=0,
+        )
+
+    openai_cls.assert_called_once_with(api_key="key", timeout=12.5, max_retries=0)
+    assert llm.openai_timeout_seconds == 12.5
+    assert llm.openai_max_retries == 0
+
+
+def test_llm_client_allows_disabling_timeout():
+    with patch("app.services.llm_service.OpenAI") as openai_cls:
+        llm = LLM(
+            api_key="key",
+            openai_timeout_seconds=0,
+            openai_max_retries=2,
+        )
+
+    openai_cls.assert_called_once_with(api_key="key", timeout=None, max_retries=2)
+    assert llm.openai_timeout_seconds is None
+    assert llm.openai_max_retries == 2
 
 
 def test_resolve_conflicts_success():
