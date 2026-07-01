@@ -125,17 +125,10 @@ wait_for_postgres() {
 
 probe_gpu_image() {
     local image="${PDFX_GPU_IMAGE:-pdfx-gpu}"
+    local timeout_seconds="${PDFX_NVIDIA_PROBE_TIMEOUT_SECONDS:-30}"
 
-    docker run --rm --gpus all --entrypoint python3.11 "$image" -c '
-import sys
-import torch
-
-if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-    sys.exit("CUDA is not available inside the GPU image")
-
-torch.cuda.mem_get_info(0)
-print(torch.cuda.get_device_name(0))
-'
+    timeout "$timeout_seconds" docker run --rm --gpus all --entrypoint nvidia-smi "$image" \
+        --query-gpu=name --format=csv,noheader
 }
 
 wait_for_nvidia_container_runtime() {
@@ -178,7 +171,9 @@ wait_for_nvidia_container_runtime() {
 }
 
 probe_worker_cuda() {
-    docker exec pdfx-worker python3.11 -c '
+    local timeout_seconds="${PDFX_WORKER_CUDA_PROBE_TIMEOUT_SECONDS:-120}"
+
+    timeout "$timeout_seconds" docker exec pdfx-worker python3.11 -c '
 import sys
 import torch
 

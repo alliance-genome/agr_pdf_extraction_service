@@ -75,7 +75,9 @@ def test_backend_deploy_supports_prebuilt_gpu_image():
     assert '[ "${PDFX_DEPLOY_PULL_IMAGES}" = "auto" ] && [ "${PDFX_DEPLOY_BUILD_MODE}" = "never" ]' in script
     assert "docker compose \"${COMPOSE_ARGS[@]}\" pull app worker" in script
     assert "Waiting for NVIDIA container runtime" in script
-    assert "docker run --rm --gpus all --entrypoint python3.11" in script
+    assert "PDFX_NVIDIA_PROBE_TIMEOUT_SECONDS" in script
+    assert "docker run --rm --gpus all --entrypoint nvidia-smi" in script
+    assert "PDFX_WORKER_CUDA_PROBE_TIMEOUT_SECONDS" in script
     assert "GPU worker CUDA" in script
     assert "torch.cuda.mem_get_info(0)" in script
     assert "PDFX_PREWARM_MODELS" in script
