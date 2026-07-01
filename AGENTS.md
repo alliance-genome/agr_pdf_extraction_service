@@ -60,6 +60,10 @@ GPU backend that should run only when there is work.
 - Backend GPU deploys should fail closed if CUDA is not usable inside the
   container. `deploy/deploy.sh` probes the NVIDIA container runtime before
   starting the stack and checks CUDA inside `pdfx-worker` after startup.
+- Production-style prebuilt GPU deploys prewarm Marker models into persistent
+  host cache volumes by default (`PDFX_PREWARM_MODELS=auto`). This moves large
+  first-use model downloads out of the first curator job and into warm-pool
+  preparation.
 
 ## Alerts And Metrics
 
@@ -97,6 +101,10 @@ timeout count, backend replacement count, backend state, and active job counts.
   container runtime/device plumbing was ready. Rerun the guarded backend deploy
   or restart app/worker after confirming the runtime; do not mark the backend
   healthy until the worker CUDA probe passes.
+- If the first real job downloads Marker/Datalab model bundles, check whether
+  the backend was deployed before the Marker prewarm hook or whether the
+  persistent model cache volume was replaced. A prepared warm-pool backend
+  should have those artifacts before user traffic arrives.
 - A backend job stuck around `llm_merge` with low CPU and no fresh worker logs
   is usually a slow/blocked OpenAI request inside the parallel consensus
   resolver. Check `/api/v1/extract/<process_id>` for progress, worker logs for

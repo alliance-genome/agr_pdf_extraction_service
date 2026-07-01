@@ -18,6 +18,7 @@ PROJECT_NAME="pdfx"
 GPU_MODE="${GPU_MODE:-auto}" # auto|on|off
 PDFX_DEPLOY_BUILD_MODE="${PDFX_DEPLOY_BUILD_MODE:-auto}" # auto|rebuild|never
 PDFX_DEPLOY_PULL_IMAGES="${PDFX_DEPLOY_PULL_IMAGES:-auto}" # auto|always|never
+PDFX_PREWARM_MODELS="${PDFX_PREWARM_MODELS:-auto}" # auto|marker|off
 
 detect_gpu() {
     command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
@@ -184,6 +185,76 @@ print(torch.cuda.get_device_name(0))
 '
 }
 
+should_prewarm_marker_models() {
+    if [ "$COMPOSE_FILE" != "docker-compose.gpu.yml" ]; then
+        return 1
+    fi
+
+    case "${PDFX_PREWARM_MODELS}" in
+        auto)
+            [ "${PDFX_DEPLOY_BUILD_MODE}" = "never" ]
+            ;;
+        marker|true|1|yes|on)
+            return 0
+            ;;
+        off|false|0|no|none|never)
+            return 1
+            ;;
+        *)
+            echo "ERROR: Invalid PDFX_PREWARM_MODELS='${PDFX_PREWARM_MODELS}'. Use auto|marker|off." >&2
+            return 2
+            ;;
+    esac
+}
+
+prewarm_marker_models() {
+    local prewarm_status=0
+    should_prewarm_marker_models || prewarm_status=$?
+    if [ "$prewarm_status" -eq 1 ]; then
+        return 0
+    elif [ "$prewarm_status" -ne 0 ]; then
+        return "$prewarm_status"
+    fi
+
+    local image="${PDFX_GPU_IMAGE:-pdfx-gpu}"
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "Skipping Marker model prewarm; ${image} is not available yet."
+        return 0
+    fi
+
+    echo "Prewarming Marker models into persistent cache..."
+    docker run --rm --gpus all \
+        --env HF_HOME=/app/data/models \
+        --env TRANSFORMERS_CACHE=/app/data/models \
+        --env TORCH_HOME=/app/data/models \
+        --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
+        --env NVIDIA_VISIBLE_DEVICES=all \
+        --env NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+        -v "$REPO_ROOT/data/models:/app/data/models" \
+        -v "$REPO_ROOT/data/model_cache:/root/.cache" \
+        -v "$REPO_ROOT/data/rapidocr_models:/usr/local/lib/python3.11/site-packages/rapidocr/models" \
+        -v "$REPO_ROOT/data/rapidocr_models:/usr/local/lib/python3.11/dist-packages/rapidocr/models" \
+        --entrypoint python3.11 \
+        "$image" - <<'PY'
+import sys
+import time
+
+import torch
+from marker.models import create_model_dict
+
+if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+    sys.exit("CUDA is not available for Marker model prewarm")
+
+device = torch.device("cuda")
+dtype = torch.float16
+torch.cuda.mem_get_info(0)
+start = time.monotonic()
+create_model_dict(device=device, dtype=dtype)
+elapsed = time.monotonic() - start
+print(f"Marker models ready on {torch.cuda.get_device_name(0)} in {elapsed:.1f}s")
+PY
+}
+
 # Step 1: Check prerequisites
 echo "Checking prerequisites..."
 
@@ -239,6 +310,8 @@ if [ "${PDFX_DEPLOY_BUILD_MODE}" = "rebuild" ]; then
 fi
 
 wait_for_nvidia_container_runtime
+
+prewarm_marker_models
 
 echo "Starting dependency services..."
 docker compose "${COMPOSE_ARGS[@]}" up -d postgres redis grobid

@@ -78,6 +78,9 @@ def test_backend_deploy_supports_prebuilt_gpu_image():
     assert "docker run --rm --gpus all --entrypoint python3.11" in script
     assert "GPU worker CUDA" in script
     assert "torch.cuda.mem_get_info(0)" in script
+    assert "PDFX_PREWARM_MODELS" in script
+    assert "Prewarming Marker models into persistent cache" in script
+    assert "from marker.models import create_model_dict" in script
     assert "PDFX_GPU_IMAGE" in compose_text
     assert "image: ${PDFX_GPU_IMAGE:-pdfx-gpu}" in compose_text
     assert "../app:/app/app:ro" not in compose_text

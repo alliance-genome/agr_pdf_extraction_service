@@ -56,6 +56,13 @@ after startup. If the host can run `nvidia-smi` but the worker probe fails, the
 backend is not ready; rerun the guarded deploy or restart app/worker after the
 NVIDIA container runtime is ready.
 
+Production-style prebuilt GPU deploys also prewarm Marker model artifacts into
+the persistent host cache volumes by default (`PDFX_PREWARM_MODELS=auto` with
+`PDFX_DEPLOY_BUILD_MODE=never`). This makes stopped warm-pool preparation pay
+the model download/load cost before curator traffic reaches the worker. Set
+`PDFX_PREWARM_MODELS=off` only for controlled debugging where first-job model
+download latency is acceptable.
+
 ## Current Account Migration Note
 
 In the current AWS account, several canonical `pdfx` resources already exist
