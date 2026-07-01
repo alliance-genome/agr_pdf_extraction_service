@@ -50,7 +50,16 @@ reconciler_task: asyncio.Task | None = None
 canary_task: asyncio.Task | None = None
 
 
-ACTIVE_JOB_STATUSES = {"queued", "pending", "started", "running", "progress", "warming_up", "cancel_requested"}
+ACTIVE_JOB_STATUSES = {
+    "accepted_by_backend",
+    "queued",
+    "pending",
+    "started",
+    "running",
+    "progress",
+    "warming_up",
+    "cancel_requested",
+}
 TERMINAL_JOB_STATUSES = {
     "complete",
     "completed",

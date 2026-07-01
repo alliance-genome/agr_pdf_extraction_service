@@ -434,6 +434,7 @@ class TestExtractEndpoint:
         payload = json.loads(resp.body)
         assert payload["process_id"] == "proxy-1"
         assert main_mod.proxy_to_backend_process["proxy-1"] == "backend-1"
+        assert main_mod._active_backend_jobs() == 1
 
 
 class TestExtractStatusEndpoint:
