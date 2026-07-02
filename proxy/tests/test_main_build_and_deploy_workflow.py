@@ -77,6 +77,7 @@ def test_workflow_deploys_to_single_prod_environment_with_oidc():
     assert "/${{ env.PROXY_IMAGE_NAME }}:${{ env.IMAGE_TAG }}" in workflow_text
     assert "/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}" in workflow_text
     assert "file: ./deploy/Dockerfile.gpu" in workflow_text
+    assert "cache-to: type=gha,mode=max,scope=pdfx-backend,ignore-error=true" in workflow_text
     assert "./deploy.sh --region \"${AWS_REGION}\" --image-tag \"${IMAGE_TAG}\"" in workflow_text
 
 
