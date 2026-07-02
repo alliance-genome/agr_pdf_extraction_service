@@ -21,9 +21,9 @@ Parameters:
     Description: Public proxy metrics endpoint used to detect queued or active work.
   IdleAlertAfterMinutes:
     Type: Number
-    Default: 60
+    Default: 130
     MinValue: 1
-    Description: Alert when the backend has been running this long with no queued/replay/active work.
+    Description: Alert when the backend has been idle this long with no queued/replay/active work. Keep above the proxy idle-stop timeout.
   AbsoluteAlertAfterMinutes:
     Type: Number
     Default: 240

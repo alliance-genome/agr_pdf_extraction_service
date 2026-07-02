@@ -46,8 +46,12 @@ def test_idle_guard_stack_has_email_alarm_path_and_schedule():
     assert "autoscaling:DescribeScalingActivities" in template_text
     assert "AlarmSnsTopicArn" in template_text
     assert "PDFX/IdleGuard" in template_text
+    assert "Default: 130" in template_text
     assert "TreatMissingData: breaching" in template_text
     assert "TreatMissingData: notBreaching" in template_text
+
+    deploy_script = (Path(__file__).resolve().parents[2] / "deploy" / "aws" / "deploy_idle_guard.sh").read_text()
+    assert 'IDLE_ALERT_AFTER_MINUTES="130"' in deploy_script
 
 
 def test_deploy_script_supports_explicit_image_tag():

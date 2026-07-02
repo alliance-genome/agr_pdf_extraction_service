@@ -1006,6 +1006,7 @@ deploy/aws/deploy_idle_guard.sh \
   --env prod \
   --backend-asg-name pdfx-backend \
   --proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics \
+  --idle-alert-after-minutes 130 \
   --artifact-bucket agr-pdf-extraction-benchmark \
   --alarm-topic-arn <confirmed-idle-guard-sns-topic-arn>
 ```
@@ -1014,6 +1015,10 @@ Use a confirmed SNS topic with an idle-guard/cost-guard name; do not reuse an
 OOM-named topic for this cost guard. For Slack, attach the same SNS topic to the
 team's AWS Chatbot Slack channel configuration, while keeping email as the
 fallback.
+
+Production should keep the idle alert just beyond the proxy idle-stop timeout
+(currently 120 minutes) so alerts mean the backend stayed up after it should
+have stopped, not that the normal warm window is working.
 
 ---
 

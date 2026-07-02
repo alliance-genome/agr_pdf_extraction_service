@@ -11,16 +11,17 @@ Usage:
     --artifact-bucket <s3-bucket> \
     [--backend-asg-name pdfx-backend] \
     [--proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics] \
-    [--idle-alert-after-minutes 60] \
+    [--idle-alert-after-minutes 130] \
     [--absolute-alert-after-minutes 240] \
     [--project pdfx] \
     [--env prod] \
     [--region us-east-1] \
     [--profile <aws-profile>]
 
-The idle alarm fires when the backend ASG has been running longer than the
+The idle alarm fires when the backend ASG has been idle longer than the
 idle threshold while proxy metrics report no queued, replaying, or active work.
-The absolute alarm is a wider cap for any unusually long runtime.
+Set this slightly above the proxy idle-stop timeout so normal warm windows do
+not page. The absolute alarm is a wider cap for any unusually long runtime.
 USAGE
 }
 
@@ -31,7 +32,7 @@ AWS_PROFILE="${AWS_PROFILE:-}"
 STACK_NAME=""
 BACKEND_ASG_NAME="pdfx-backend"
 PROXY_METRICS_URL="https://pdfx.alliancegenome.org/api/v1/metrics"
-IDLE_ALERT_AFTER_MINUTES="60"
+IDLE_ALERT_AFTER_MINUTES="130"
 ABSOLUTE_ALERT_AFTER_MINUTES="240"
 SCHEDULE_EXPRESSION="rate(5 minutes)"
 METRICS_TIMEOUT_SECONDS="5"
