@@ -75,6 +75,16 @@ def _parse_review_images(form, extract_images):
     return _parse_bool(form.get("review_images"), default=True)
 
 
+def _parse_requested_process_id(form):
+    raw_process_id = str(form.get("process_id") or "").strip()
+    if not raw_process_id:
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(raw_process_id))
+    except ValueError as exc:
+        raise ValueError("Invalid process_id; expected a UUID.") from exc
+
+
 def _to_iso(dt):
     if not dt:
         return None
@@ -700,8 +710,12 @@ def submit_extraction():
     mod_abbreviation = request.form.get("mod_abbreviation")
 
     # --- Save uploaded file ---------------------------------------------------
+    try:
+        process_id = _parse_requested_process_id(request.form)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     filename = secure_filename(file.filename)
-    process_id = str(uuid.uuid4())
     upload_dir = current_app.config["UPLOAD_FOLDER"]
     os.makedirs(upload_dir, exist_ok=True)
     pdf_path = os.path.join(upload_dir, f"{process_id}_{filename}")

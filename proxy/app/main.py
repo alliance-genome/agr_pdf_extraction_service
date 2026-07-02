@@ -220,7 +220,29 @@ def _active_backend_jobs() -> int:
             continue
         if tracker.status in ACTIVE_JOB_STATUSES:
             count += 1
-    return count
+    return max(count, _backend_health_active_jobs())
+
+
+def _positive_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _active_jobs_from_backend_checks(checks: Any) -> int:
+    if not isinstance(checks, dict):
+        return 0
+    return max(
+        _positive_int(checks.get("fresh_active_runs")),
+        _positive_int(checks.get("queued_runs")),
+        _positive_int(checks.get("broker_queued")),
+        _positive_int(checks.get("broker_unacked")),
+    )
+
+
+def _backend_health_active_jobs() -> int:
+    checks = getattr(lifecycle, "last_health_checks", {}) or {}
+    return _active_jobs_from_backend_checks(checks)
 
 
 def _is_locally_active_process(process_id: str) -> bool:
@@ -500,6 +522,10 @@ async def health():
             result["gpu_status"] = payload.get("status")
             checks = payload.get("checks")
             if isinstance(checks, dict):
+                result["active_backend_jobs"] = max(
+                    int(result.get("active_backend_jobs") or 0),
+                    _active_jobs_from_backend_checks(checks),
+                )
                 result["gpu_workers"] = checks.get("workers")
                 result["gpu_redis"] = checks.get("redis")
                 result["gpu_grobid"] = checks.get("grobid")
@@ -628,6 +654,7 @@ async def health_deep():
 @app.get("/api/v1/metrics")
 async def metrics():
     """Operational metrics for alerting dashboards."""
+    await _refresh_backend_health_snapshot_for_queue()
     return {
         "queue_depth": job_queue.size,
         "queue_durable": job_queue.durable,
@@ -709,6 +736,7 @@ async def submit_extraction(
         "merge": merge,
         "clear_cache": clear_cache,
         "extract_images": extract_images,
+        "process_id": process_id,
     }
     if review_images is not None:
         form_fields["review_images"] = review_images
@@ -1222,13 +1250,15 @@ async def _forward_extraction(
 ) -> JSONResponse:
     """Forward a PDF extraction request to the EC2 backend."""
     lifecycle.job_started()
+    backend_form_fields = dict(form_fields)
+    backend_form_fields.setdefault("process_id", process_id)
     try:
         async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
             files = {"file": (filename, pdf_data, "application/pdf")}
             headers = {"Authorization": authorization} if authorization else None
             resp = await client.post(
                 f"{lifecycle.ec2_base_url}/api/v1/extract",
-                data=form_fields,
+                data=backend_form_fields,
                 files=files,
                 headers=headers,
             )
@@ -1243,9 +1273,11 @@ async def _forward_extraction(
             )
 
         backend_process_id = str(payload.get("process_id", "")).strip()
-        if backend_process_id:
+        if backend_process_id and backend_process_id != process_id:
             proxy_to_backend_process[process_id] = backend_process_id
             payload["process_id"] = process_id
+        elif backend_process_id == process_id:
+            proxy_to_backend_process.pop(process_id, None)
 
         _record_job_event(process_id, "accepted_by_backend")
         replay_submission_errors.pop(process_id, None)

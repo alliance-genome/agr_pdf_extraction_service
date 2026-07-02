@@ -209,6 +209,7 @@ class TestExtractEndpoint:
         assert data["state"] == "stopped"
         assert data["progress"]["stage"] == "ec2_starting"
         queued_job = next(iter(main_mod.job_payload_cache.values()))
+        assert queued_job.form_fields["process_id"] == data["process_id"]
         assert queued_job.form_fields["extract_images"] == "true"
         assert "review_images" not in queued_job.form_fields
         main_mod.lifecycle.ensure_running.assert_called()
@@ -362,6 +363,7 @@ class TestExtractEndpoint:
 
         assert resp.status_code == 202
         assert captured["form_fields"]["extract_images"] == "true"
+        assert "process_id" in captured["form_fields"]
         assert "review_images" not in captured["form_fields"]
 
     def test_extract_forwards_explicit_review_images_false_when_ready(self, client, monkeypatch):
@@ -393,11 +395,57 @@ class TestExtractEndpoint:
         assert resp.status_code == 202
         assert captured["form_fields"]["extract_images"] == "true"
         assert captured["form_fields"]["review_images"] == "false"
+        assert "process_id" in captured["form_fields"]
+
+    def test_forward_extraction_sends_proxy_process_id_to_backend(self, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        captured = {"data": None}
+
+        class _DummyResponse:
+            status_code = 202
+
+            @staticmethod
+            def json():
+                return {"process_id": "proxy-1", "status": "queued"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, _url, **kwargs):
+                captured["data"] = kwargs["data"]
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = asyncio.run(
+            main_mod._forward_extraction(
+                "proxy-1",
+                b"%PDF-1.4",
+                "input.pdf",
+                {"methods": "marker"},
+                authorization="Bearer test",
+            )
+        )
+
+        payload = json.loads(resp.body)
+        assert captured["data"]["process_id"] == "proxy-1"
+        assert payload["process_id"] == "proxy-1"
+        assert "proxy-1" not in main_mod.proxy_to_backend_process
 
     def test_forward_extraction_returns_proxy_process_id(self, monkeypatch):
         import app.main as main_mod
 
         main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        captured = {"data": None}
 
         class _DummyResponse:
             status_code = 202
@@ -416,7 +464,8 @@ class TestExtractEndpoint:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def post(self, _url, **_kwargs):
+            async def post(self, _url, **kwargs):
+                captured["data"] = kwargs["data"]
                 return _DummyResponse()
 
         monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
@@ -432,9 +481,36 @@ class TestExtractEndpoint:
         )
 
         payload = json.loads(resp.body)
+        assert captured["data"]["process_id"] == "proxy-1"
         assert payload["process_id"] == "proxy-1"
         assert main_mod.proxy_to_backend_process["proxy-1"] == "backend-1"
         assert main_mod._active_backend_jobs() == 1
+
+    def test_backend_health_snapshot_counts_as_active_work_after_proxy_restart(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.lifecycle.last_health_checks = {}
+
+        async def _refresh_health_snapshot():
+            main_mod.lifecycle.last_health_checks = {
+                "fresh_active_runs": 1,
+                "queued_runs": 0,
+                "broker_queued": 0,
+                "broker_unacked": 1,
+            }
+            return True
+
+        main_mod.lifecycle.refresh_health_snapshot = AsyncMock(side_effect=_refresh_health_snapshot)
+
+        resp = client.get("/api/v1/metrics")
+
+        assert resp.status_code == 200
+        assert resp.json()["active_backend_jobs"] == 1
+        assert main_mod._can_stop_ec2() is False
+        main_mod.lifecycle.refresh_health_snapshot.assert_awaited_once()
 
 
 class TestExtractStatusEndpoint:

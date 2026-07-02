@@ -95,6 +95,49 @@ def test_submit_extraction_returns_process_id_and_creates_db_row(mock_apply_asyn
 
 
 @patch("celery_app.extract_pdf.apply_async")
+def test_submit_extraction_honors_client_supplied_process_id(mock_apply_async, client):
+    requested_process_id = str(uuid.uuid4())
+    mock_apply_async.return_value = SimpleNamespace(id=requested_process_id)
+
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "process_id": requested_process_id,
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 202
+    payload = response.get_json()
+    assert payload["process_id"] == requested_process_id
+
+    call_kwargs = mock_apply_async.call_args.kwargs
+    assert call_kwargs["task_id"] == requested_process_id
+    assert call_kwargs["kwargs"]["process_id"] == requested_process_id
+
+    session = get_session()
+    run = session.get(ExtractionRun, requested_process_id)
+    assert run is not None
+    assert run.status == "queued"
+    session.close()
+
+
+def test_submit_extraction_rejects_invalid_client_process_id(client):
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "process_id": "../not-a-uuid",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert "Invalid process_id" in response.get_json()["error"]
+
+
+@patch("celery_app.extract_pdf.apply_async")
 def test_submit_extraction_passes_extract_images_to_celery(mock_apply_async, client):
     mock_apply_async.return_value = SimpleNamespace(id="process-id-placeholder")
 

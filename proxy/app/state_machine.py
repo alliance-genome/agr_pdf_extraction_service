@@ -4,6 +4,7 @@ import asyncio
 import enum
 import logging
 import time
+from contextlib import suppress
 from typing import Callable, Optional
 
 import httpx
@@ -327,6 +328,8 @@ class LifecycleManager:
                 continue  # don't stop while jobs are running
             if self._ready_since and (time.time() - self._ready_since) < min_uptime_seconds:
                 continue
+            with suppress(Exception):
+                await self.refresh_health_snapshot()
             if self._stop_guard:
                 try:
                     can_stop = self._stop_guard()

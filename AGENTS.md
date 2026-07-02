@@ -35,6 +35,10 @@ GPU backend that should run only when there is work.
   tests before calling the work done.
 - Keep PDFs out of Fargate memory. The proxy should stream/spool uploads and put
   them in the S3 queue; the backend should read from disk/container volumes.
+- Keep proxy-visible `process_id` values identical to backend `process_id`
+  values for new jobs. In-memory proxy-to-backend ID maps disappear on ECS
+  restarts, so the backend must honor the proxy-supplied UUID and the proxy
+  should keep the legacy map only as a fallback for older in-flight jobs.
 - Large PDF support is intentionally 500 MiB. If the limit changes, update all
   relevant layers together: proxy `MAX_UPLOAD_BYTES` and multipart overhead
   allowance, Flask config, backend nginx config, Compose env, ECS/Fargate
