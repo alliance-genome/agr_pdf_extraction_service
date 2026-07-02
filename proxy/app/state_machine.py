@@ -4,6 +4,7 @@ import asyncio
 import enum
 import logging
 import time
+from contextlib import suppress
 from typing import Callable, Optional
 
 import httpx
@@ -110,6 +111,7 @@ class LifecycleManager:
 
     def job_finished(self) -> None:
         self._active_jobs = max(0, self._active_jobs - 1)
+        self.touch()
         if self._active_jobs == 0 and self._state == InstanceState.BUSY:
             self._state = InstanceState.READY
             if self._ready_since is None:
@@ -257,6 +259,11 @@ class LifecycleManager:
                 logger.debug("EC2 health not ready: redis=%r", checks.get("redis"))
                 return False
 
+            if "database" in checks and checks.get("database") != "ok":
+                self._last_health_reason = "database_not_ready"
+                logger.debug("EC2 health not ready: database=%r", checks.get("database"))
+                return False
+
             if checks.get("grobid") != "ok":
                 self._last_health_reason = "grobid_not_ready"
                 logger.debug("EC2 health not ready: grobid=%r", checks.get("grobid"))
@@ -280,9 +287,9 @@ class LifecycleManager:
                 and isinstance(broker_unacked, int)
                 and broker_unacked > 0
                 and checks.get("service") == "ok"
-                and checks.get("worker_state") == "busy_or_unresponsive"
+                and checks.get("worker_state") in {"busy", "busy_or_unresponsive"}
             ):
-                self._last_health_reason = "worker_busy_or_unresponsive"
+                self._last_health_reason = "worker_busy"
                 logger.info(
                     "EC2 backend accepts submissions but worker inspect is not responsive: "
                     "workers=%r fresh_active_runs=%r broker_unacked=%r",
@@ -321,6 +328,8 @@ class LifecycleManager:
                 continue  # don't stop while jobs are running
             if self._ready_since and (time.time() - self._ready_since) < min_uptime_seconds:
                 continue
+            with suppress(Exception):
+                await self.refresh_health_snapshot()
             if self._stop_guard:
                 try:
                     can_stop = self._stop_guard()

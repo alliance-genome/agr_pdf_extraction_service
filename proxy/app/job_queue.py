@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 import boto3
+from botocore.exceptions import ClientError
 
 from app.config import settings
 
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 class QueueFullError(Exception):
     """Queue cannot accept new jobs."""
+
+
+class QueuePayloadMissingError(Exception):
+    """Queued metadata points to an S3 payload that no longer exists."""
 
 
 @dataclass
@@ -101,6 +106,14 @@ class QueuedJob:
         try:
             with tmp:
                 boto3.client("s3").download_fileobj(bucket, self.pdf_s3_key, tmp)
+        except ClientError as exc:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp.name)
+            if _is_missing_s3_object_error(exc):
+                raise QueuePayloadMissingError(
+                    f"Queued job {self.job_id} is missing payload s3://{bucket}/{self.pdf_s3_key}",
+                ) from exc
+            raise
         except Exception:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp.name)
@@ -167,6 +180,10 @@ class BaseJobQueue:
 
     def remove_job(self, job_id: str) -> bool:
         raise NotImplementedError
+
+    def acknowledge(self, job_id: str) -> bool:
+        """Mark one queued job as handed off while keeping its payload available."""
+        return False
 
     def oldest_age_seconds(self) -> float:
         raise NotImplementedError
@@ -244,6 +261,9 @@ class InMemoryJobQueue(BaseJobQueue):
             if queued_job.job_id == job_id:
                 del self._queue[idx]
                 return True
+        return False
+
+    def acknowledge(self, job_id: str) -> bool:
         return False
 
     def oldest_age_seconds(self) -> float:
@@ -385,12 +405,16 @@ class S3JobQueue(BaseJobQueue):
 
     def dequeue(self) -> QueuedJob:
         keys = self._iter_keys()
-        if not keys:
-            raise IndexError("dequeue from empty queue")
-        key = keys[0]
-        job = self._load_job(key)
-        self._delete_job_metadata(key)
-        return job
+        for key in keys:
+            try:
+                job = self._load_job(key)
+            except QueuePayloadMissingError as exc:
+                logger.warning("%s; deleting orphaned queue metadata %s", exc, key)
+                self._delete_job_metadata(key)
+                continue
+            self._delete_job_metadata(key)
+            return job
+        raise IndexError("dequeue from empty queue")
 
     def drain(self) -> list[QueuedJob]:
         keys = self._iter_keys()
@@ -399,10 +423,12 @@ class S3JobQueue(BaseJobQueue):
             return jobs
 
         for key in keys:
-            jobs.append(self._load_job(key))
+            try:
+                jobs.append(self._load_job(key))
+            except QueuePayloadMissingError as exc:
+                logger.warning("%s; deleting orphaned queue metadata %s", exc, key)
+                self._delete_job_metadata(key)
 
-        # Delete in batches of 1000 (S3 limit).
-        self._delete_s3_keys(list(keys))
         return jobs
 
     def _load_job(self, key: str) -> QueuedJob:
@@ -415,6 +441,14 @@ class S3JobQueue(BaseJobQueue):
             try:
                 with tmp:
                     self._client.download_fileobj(bucket, job.pdf_s3_key, tmp)
+            except ClientError as exc:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp.name)
+                if _is_missing_s3_object_error(exc):
+                    raise QueuePayloadMissingError(
+                        f"Queued job {job.job_id} is missing payload s3://{bucket}/{job.pdf_s3_key}",
+                    ) from exc
+                raise
             except Exception:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(tmp.name)
@@ -456,6 +490,14 @@ class S3JobQueue(BaseJobQueue):
                 return True
         return False
 
+    def acknowledge(self, job_id: str) -> bool:
+        suffix = f"_{job_id}.json"
+        for key in self._iter_keys():
+            if key.endswith(suffix):
+                self._delete_job_metadata(key)
+                return True
+        return False
+
     def oldest_age_seconds(self) -> float:
         keys = self._iter_keys()
         if not keys:
@@ -484,6 +526,13 @@ def build_job_queue(max_size: int = 10) -> BaseJobQueue:
         )
 
     return InMemoryJobQueue(max_size=max_size)
+
+
+def _is_missing_s3_object_error(exc: ClientError) -> bool:
+    error = exc.response.get("Error", {})
+    code = str(error.get("Code", "")).strip()
+    status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return status == 404 or code in {"404", "NoSuchKey", "NotFound"}
 
 
 # Backward-compatible alias used by tests/import sites.

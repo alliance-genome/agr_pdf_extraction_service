@@ -48,7 +48,7 @@ All endpoints except `/api/v1/health/live`, `/api/v1/health`, `/api/v1/health/de
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/api/v1/health/live` | GET | No | Proxy-only container liveness probe |
-| `/api/v1/health` | GET | No | Proxy health + EC2 state (degraded unless worker is ready) |
+| `/api/v1/health` | GET | No | Proxy health + EC2 state (`healthy`, `busy`, or degraded/stopped state) |
 | `/api/v1/health/deep` | GET | No | Deep probe: proxy auth validation + downstream status round-trip |
 | `/api/v1/metrics` | GET | No | Queue/replay/lifecycle/canary metrics for alerting |
 | `/api/v1/status` | GET | Yes | Passive EC2 state, idle time, active/queued job counts |
@@ -92,6 +92,11 @@ In S3 queue mode, the proxy stores the PDF upload as a separate object under
 `<QUEUE_S3_PREFIX>/payloads/` and stores only small job metadata under
 `<QUEUE_S3_PREFIX>/jobs/`. This avoids base64-encoding large PDFs into queue
 JSON and keeps Fargate memory bounded while the GPU instance wakes up.
+Uploads larger than `MAX_UPLOAD_BYTES` are rejected before backend wake/replay
+so oversized submissions do not fill the durable queue or start the GPU. When
+`Content-Length` is present, the proxy rejects grossly oversized requests before
+multipart parsing, allowing `MAX_MULTIPART_OVERHEAD_BYTES` for boundaries and
+form fields.
 Jobs that stream directly to an already-ready backend are not retained for
 later reconciler requeue; `RECONCILER_REQUEUE_ONCE` applies to jobs whose
 payload has entered the proxy queue/cache.
@@ -206,12 +211,14 @@ All settings come from environment variables. In production, values are injected
 | `COGNITO_REQUIRED_SCOPE` | No | `pdfx-api/extract` | OAuth scope accepted in the JWT |
 | `COGNITO_ACCEPTED_SCOPES` | No | — | Comma-separated additional scopes that also grant access |
 | `COGNITO_ACCEPTED_CLIENT_IDS` | No | — | Comma-separated Cognito app client_ids accepted without requiring a PDFX-specific scope (e.g. the CurationAPI-Admin M2M client) |
-| `IDLE_TIMEOUT_MINUTES` | No | `30` | Minutes of inactivity before EC2 is stopped |
+| `IDLE_TIMEOUT_MINUTES` | No | `120` | Minutes of inactivity before EC2 is stopped |
 | `MIN_UPTIME_MINUTES` | No | `20` | Minimum uptime after wake before idle stop is allowed |
 | `STARTUP_TIMEOUT_MINUTES` | No | `30` | Max minutes to wait for EC2 health check |
 | `ASG_STARTUP_REPLACEMENT_ATTEMPTS` | No | `1` | Extra ASG replacement attempts to wait through after startup timeout |
 | `HEALTH_POLL_INTERVAL_SECONDS` | No | `15` | Seconds between EC2 health polls during startup |
 | `MAX_QUEUED_JOBS` | No | `10` | Max queued jobs during startup |
+| `MAX_UPLOAD_BYTES` | No | `524288000` | Max PDF upload size accepted by the proxy (500 MiB) |
+| `MAX_MULTIPART_OVERHEAD_BYTES` | No | `10485760` | Multipart overhead allowance for early request-size rejection |
 | `FORWARD_TIMEOUT_SECONDS` | No | `600` | Timeout for forwarded HTTP requests to EC2 |
 | `PROXY_BACKEND_READY_TIMEOUT_SECONDS` | No | `30` | Max seconds artifact/image proxy routes wait for a refreshed or waking backend before returning 503 |
 | `PROXY_BACKEND_READY_POLL_SECONDS` | No | `2` | Seconds between backend readiness checks while artifact/image proxy routes wait |

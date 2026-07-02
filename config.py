@@ -3,7 +3,7 @@ import os
 
 class Config:
     # ---- Upload limits -------------------------------------------------------
-    MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", 100 * 1024 * 1024))  # 100MB
+    MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", 500 * 1024 * 1024))  # 500 MiB
 
     # ---- Storage paths -------------------------------------------------------
     UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join(os.getcwd(), "uploaded_pdfs"))
@@ -44,6 +44,16 @@ class Config:
 
     # ---- Marker --------------------------------------------------------------
     MARKER_DEVICE = os.environ.get("MARKER_DEVICE", "cpu")
+    MARKER_READY_FILE = os.environ.get(
+        "PDFX_MARKER_READY_FILE",
+        os.path.join(CACHE_FOLDER, "marker_worker_ready.json"),
+    )
+    HEALTH_REQUIRE_MARKER_READY = os.environ.get("PDFX_HEALTH_REQUIRE_MARKER_READY", "false").lower() == "true"
+    WORKER_PRELOAD_MARKER_MODELS = os.environ.get("PDFX_WORKER_PRELOAD_MARKER_MODELS", "off").strip().lower()
+    WORKER_PRELOAD_MARKER_REQUIRED = os.environ.get("PDFX_WORKER_PRELOAD_MARKER_REQUIRED", "false").lower() == "true"
+    WORKER_PRELOAD_MARKER_EXTRACT_IMAGES = (
+        os.environ.get("PDFX_WORKER_PRELOAD_MARKER_EXTRACT_IMAGES", "true").lower() == "true"
+    )
 
     # ---- LLM (merge) ---------------------------------------------------------
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -52,6 +62,8 @@ class Config:
     LLM_CONFLICT_BATCH_SIZE = int(os.environ.get("LLM_CONFLICT_BATCH_SIZE", 500))
     LLM_CONFLICT_MAX_WORKERS = int(os.environ.get("LLM_CONFLICT_MAX_WORKERS", 100))
     LLM_CONFLICT_RETRY_ROUNDS = int(os.environ.get("LLM_CONFLICT_RETRY_ROUNDS", 2))
+    LLM_OPENAI_TIMEOUT_SECONDS = float(os.environ.get("LLM_OPENAI_TIMEOUT_SECONDS", 180))
+    LLM_OPENAI_MAX_RETRIES = int(os.environ.get("LLM_OPENAI_MAX_RETRIES", 1))
 
     # ---- Per-call-type model + reasoning defaults ----------------------------
     # Each call type can override both model and reasoning effort individually.

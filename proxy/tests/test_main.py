@@ -1,6 +1,7 @@
 """Integration tests for the FastAPI proxy routes."""
 
 import asyncio
+import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
@@ -76,7 +77,7 @@ class TestHealthEndpoint:
         resp = client.get("/api/v1/health")
         assert resp.status_code == 200
 
-    def test_health_reports_degraded_when_backend_worker_busy(self, client, monkeypatch):
+    def test_health_reports_busy_when_backend_worker_busy(self, client, monkeypatch):
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
@@ -89,7 +90,7 @@ class TestHealthEndpoint:
             @staticmethod
             def json():
                 return {
-                    "status": "degraded",
+                    "status": "busy",
                     "checks": {
                         "service": "ok",
                         "grobid": "ok",
@@ -99,7 +100,7 @@ class TestHealthEndpoint:
                         "fresh_active_runs": 1,
                         "queued_runs": 2,
                         "broker_unacked": 1,
-                        "worker_state": "busy_or_unresponsive",
+                        "worker_state": "busy",
                     },
                 }
 
@@ -121,14 +122,14 @@ class TestHealthEndpoint:
         resp = client.get("/api/v1/health")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "degraded"
-        assert data["reason"] == "downstream_health_degraded"
+        assert data["status"] == "busy"
+        assert data["reason"] == "backend_busy"
         assert data["gpu_workers"] == 0
         assert data["gpu_active_runs"] == 1
         assert data["gpu_fresh_active_runs"] == 1
         assert data["gpu_queued_runs"] == 2
         assert data["gpu_broker_unacked"] == 1
-        assert data["gpu_worker_state"] == "busy_or_unresponsive"
+        assert data["gpu_worker_state"] == "busy"
         assert data["gpu_healthy"] is False
         assert data["gpu_busy"] is True
         assert data["gpu_accepting_submissions"] is True
@@ -208,6 +209,7 @@ class TestExtractEndpoint:
         assert data["state"] == "stopped"
         assert data["progress"]["stage"] == "ec2_starting"
         queued_job = next(iter(main_mod.job_payload_cache.values()))
+        assert queued_job.form_fields["process_id"] == data["process_id"]
         assert queued_job.form_fields["extract_images"] == "true"
         assert "review_images" not in queued_job.form_fields
         main_mod.lifecycle.ensure_running.assert_called()
@@ -222,6 +224,43 @@ class TestExtractEndpoint:
             files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
         )
         assert resp.status_code == 401
+
+    def test_extract_rejects_grossly_oversized_request_before_auth(self, client, monkeypatch):
+        import app.main as main_mod
+
+        monkeypatch.setattr(main_mod.settings, "MAX_UPLOAD_BYTES", 8)
+        monkeypatch.setattr(main_mod.settings, "MAX_MULTIPART_OVERHEAD_BYTES", 0)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("too-large.pdf", b"%PDF-1.4 too large", "application/pdf")},
+            data={"methods": "grobid,docling,marker", "merge": "true"},
+        )
+
+        assert resp.status_code == 413
+        assert "maximum allowed size" in resp.json()["detail"]
+        main_mod.cognito_auth.validate_token.assert_not_called()
+        main_mod.lifecycle.touch.assert_not_called()
+        main_mod.lifecycle.ensure_running.assert_not_called()
+
+    def test_extract_rejects_pdf_larger_than_proxy_limit(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        monkeypatch.setattr(main_mod.settings, "MAX_UPLOAD_BYTES", 8)
+
+        resp = client.post(
+            "/api/v1/extract",
+            headers={"Authorization": "Bearer test"},
+            files={"file": ("too-large.pdf", b"%PDF-1.4 too large", "application/pdf")},
+            data={"methods": "grobid,docling,marker", "merge": "true"},
+        )
+
+        assert resp.status_code == 413
+        assert "maximum allowed size" in resp.json()["detail"]
+        assert main_mod.job_queue.size == 0
+        main_mod.lifecycle.ensure_running.assert_not_called()
 
     def test_extract_requeues_when_immediate_forward_fails(self, client, monkeypatch):
         import app.main as main_mod
@@ -324,6 +363,7 @@ class TestExtractEndpoint:
 
         assert resp.status_code == 202
         assert captured["form_fields"]["extract_images"] == "true"
+        assert "process_id" in captured["form_fields"]
         assert "review_images" not in captured["form_fields"]
 
     def test_extract_forwards_explicit_review_images_false_when_ready(self, client, monkeypatch):
@@ -355,6 +395,122 @@ class TestExtractEndpoint:
         assert resp.status_code == 202
         assert captured["form_fields"]["extract_images"] == "true"
         assert captured["form_fields"]["review_images"] == "false"
+        assert "process_id" in captured["form_fields"]
+
+    def test_forward_extraction_sends_proxy_process_id_to_backend(self, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        captured = {"data": None}
+
+        class _DummyResponse:
+            status_code = 202
+
+            @staticmethod
+            def json():
+                return {"process_id": "proxy-1", "status": "queued"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, _url, **kwargs):
+                captured["data"] = kwargs["data"]
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = asyncio.run(
+            main_mod._forward_extraction(
+                "proxy-1",
+                b"%PDF-1.4",
+                "input.pdf",
+                {"methods": "marker"},
+                authorization="Bearer test",
+            )
+        )
+
+        payload = json.loads(resp.body)
+        assert captured["data"]["process_id"] == "proxy-1"
+        assert payload["process_id"] == "proxy-1"
+        assert "proxy-1" not in main_mod.proxy_to_backend_process
+
+    def test_forward_extraction_returns_proxy_process_id(self, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        captured = {"data": None}
+
+        class _DummyResponse:
+            status_code = 202
+
+            @staticmethod
+            def json():
+                return {"process_id": "backend-1", "status": "queued"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, _url, **kwargs):
+                captured["data"] = kwargs["data"]
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = asyncio.run(
+            main_mod._forward_extraction(
+                "proxy-1",
+                b"%PDF-1.4",
+                "input.pdf",
+                {"methods": "marker"},
+                authorization="Bearer test",
+            )
+        )
+
+        payload = json.loads(resp.body)
+        assert captured["data"]["process_id"] == "proxy-1"
+        assert payload["process_id"] == "proxy-1"
+        assert main_mod.proxy_to_backend_process["proxy-1"] == "backend-1"
+        assert main_mod._active_backend_jobs() == 1
+
+    def test_backend_health_snapshot_counts_as_active_work_after_proxy_restart(self, client, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.lifecycle.last_health_checks = {}
+
+        async def _refresh_health_snapshot():
+            main_mod.lifecycle.last_health_checks = {
+                "fresh_active_runs": 1,
+                "queued_runs": 0,
+                "broker_queued": 0,
+                "broker_unacked": 1,
+            }
+            return True
+
+        main_mod.lifecycle.refresh_health_snapshot = AsyncMock(side_effect=_refresh_health_snapshot)
+
+        resp = client.get("/api/v1/metrics")
+
+        assert resp.status_code == 200
+        assert resp.json()["active_backend_jobs"] == 1
+        assert main_mod._can_stop_ec2() is False
+        main_mod.lifecycle.refresh_health_snapshot.assert_awaited_once()
 
 
 class TestExtractStatusEndpoint:
@@ -379,14 +535,14 @@ class TestExtractStatusEndpoint:
         main_mod.lifecycle.state = InstanceState.READY
         main_mod.lifecycle.private_ip = "172.31.1.100"
         main_mod.lifecycle.last_health_status_code = 200
-        main_mod.lifecycle.last_health_reason = "worker_busy_or_unresponsive"
+        main_mod.lifecycle.last_health_reason = "worker_busy"
         main_mod.lifecycle.last_health_checks = {
             "grobid": "ok",
             "redis": "ok",
             "active_runs": 1,
             "fresh_active_runs": 1,
             "broker_unacked": 1,
-            "worker_state": "busy_or_unresponsive",
+            "worker_state": "busy",
         }
 
         resp = client.get(
@@ -414,14 +570,14 @@ class TestExtractStatusEndpoint:
 
         async def _refresh_health_snapshot():
             main_mod.lifecycle.last_health_status_code = 200
-            main_mod.lifecycle.last_health_reason = "worker_busy_or_unresponsive"
+            main_mod.lifecycle.last_health_reason = "worker_busy"
             main_mod.lifecycle.last_health_checks = {
                 "grobid": "ok",
                 "redis": "ok",
                 "active_runs": 1,
                 "fresh_active_runs": 1,
                 "broker_unacked": 1,
-                "worker_state": "busy_or_unresponsive",
+                "worker_state": "busy",
             }
             return True
 
@@ -1048,6 +1204,89 @@ class TestExtractCancelEndpoint:
         second_process_id = "race-b" if first_call_process_id == "race-a" else "race-a"
         assert second_process_id in first_call_inflight
 
+    def test_replay_acknowledges_jobs_after_backend_accepts(self, monkeypatch):
+        from app.job_queue import QueuedJob
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        job = QueuedJob(
+            job_id="replay-ack-1",
+            pdf_data=b"%PDF ack",
+            form_fields={},
+            filename="ack.pdf",
+        )
+        acknowledged = []
+
+        class _AckQueue:
+            def drain(self):
+                return [job]
+
+            def acknowledge(self, job_id):
+                acknowledged.append(job_id)
+                return True
+
+        monkeypatch.setattr(main_mod, "job_queue", _AckQueue())
+        monkeypatch.setattr(main_mod, "_forward_extraction", AsyncMock(return_value=None))
+        monkeypatch.setattr(main_mod, "_forward_cancel_to_backend", AsyncMock(return_value=MagicMock()))
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert acknowledged == ["replay-ack-1"]
+
+    def test_failed_replay_removes_queue_metadata_before_status(self, client, monkeypatch):
+        from app.job_queue import QueuedJob
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        job = QueuedJob(
+            job_id="replay-fail-1",
+            pdf_data=b"%PDF fail",
+            form_fields={},
+            filename="fail.pdf",
+        )
+        queued = {"replay-fail-1"}
+        removed = []
+
+        class _ReplayQueue:
+            @property
+            def size(self):
+                return len(queued)
+
+            def drain(self):
+                return [job]
+
+            def acknowledge(self, job_id):
+                raise AssertionError("failed replay must not acknowledge")
+
+            def remove_job(self, job_id):
+                removed.append(job_id)
+                queued.discard(job_id)
+                return True
+
+            def has_job(self, job_id):
+                return job_id in queued
+
+        monkeypatch.setattr(main_mod, "job_queue", _ReplayQueue())
+        monkeypatch.setattr(
+            main_mod,
+            "_forward_extraction",
+            AsyncMock(side_effect=RuntimeError("backend rejected upload")),
+        )
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert removed == ["replay-fail-1"]
+        assert main_mod.replay_submission_errors["replay-fail-1"] == "backend rejected upload"
+        assert queued == set()
+
+        resp = client.get(
+            "/api/v1/extract/replay-fail-1",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "failed"
+        assert "backend rejected upload" in resp.json()["error"]
+
     def test_replay_keeps_queue_while_asg_replacement_is_starting(self, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.STARTING
@@ -1067,6 +1306,42 @@ class TestExtractCancelEndpoint:
         forward_mock.assert_awaited_once()
         assert main_mod.job_queue.size == 0
 
+    def test_replay_startup_failure_deletes_drained_remote_payloads(self, monkeypatch):
+        from app.job_queue import QueuedJob
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        job = QueuedJob(
+            job_id="startup-failed-job",
+            pdf_data=None,
+            form_fields={},
+            filename="failed.pdf",
+            pdf_s3_bucket="queue-bucket",
+            pdf_s3_key="prefix/payloads/startup-failed-job.pdf",
+        )
+        cleanup_mock = MagicMock()
+        job.cleanup = cleanup_mock
+        removed_jobs = []
+
+        class _DrainedQueue:
+            def drain(self):
+                return [job]
+
+            def remove_job(self, job_id):
+                removed_jobs.append(job_id)
+                return True
+
+        monkeypatch.setattr(main_mod, "job_queue", _DrainedQueue())
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert main_mod.replay_submission_errors["startup-failed-job"] == (
+            "EC2 startup failed before queued replay."
+        )
+        assert "startup-failed-job" not in main_mod.job_payload_cache
+        cleanup_mock.assert_called_once_with(delete_remote=True)
+        assert removed_jobs == ["startup-failed-job"]
+
     def test_ensure_queued_jobs_replaying_starts_replay_for_durable_leftovers(self, monkeypatch):
         import app.main as main_mod
 
@@ -1079,6 +1354,51 @@ class TestExtractCancelEndpoint:
 
         main_mod.lifecycle.ensure_running.assert_not_called()
         replay_mock.assert_called_once()
+
+    def test_startup_sync_replays_queue_after_state_refresh(self, monkeypatch):
+        import app.main as main_mod
+
+        events = []
+        main_mod.lifecycle.state = InstanceState.STOPPED
+
+        async def _sync_state_from_ec2():
+            events.append(("sync", main_mod.lifecycle.state))
+            main_mod.lifecycle.state = InstanceState.READY
+
+        async def _ensure_replay(reason, *, known_queued=False):
+            events.append(("replay", reason, known_queued, main_mod.lifecycle.state))
+
+        main_mod.lifecycle.sync_state_from_ec2 = AsyncMock(side_effect=_sync_state_from_ec2)
+        replay_mock = AsyncMock(side_effect=_ensure_replay)
+        monkeypatch.setattr(main_mod, "_ensure_queued_jobs_replaying", replay_mock)
+
+        asyncio.run(main_mod._sync_state_then_replay_startup_queue())
+
+        assert events == [
+            ("sync", InstanceState.STOPPED),
+            ("replay", "startup sync", False, InstanceState.READY),
+        ]
+
+    def test_startup_replay_still_runs_when_state_sync_fails(self, monkeypatch):
+        import app.main as main_mod
+
+        events = []
+
+        async def _sync_state_from_ec2():
+            events.append("sync")
+            raise RuntimeError("temporary AWS sync failure")
+
+        async def _ensure_replay(reason, *, known_queued=False):
+            events.append((reason, known_queued))
+
+        main_mod.lifecycle.sync_state_from_ec2 = AsyncMock(side_effect=_sync_state_from_ec2)
+        replay_mock = AsyncMock(side_effect=_ensure_replay)
+        monkeypatch.setattr(main_mod, "_ensure_queued_jobs_replaying", replay_mock)
+
+        asyncio.run(main_mod._sync_state_then_replay_startup_queue())
+
+        assert events == ["sync", ("startup sync", False)]
+        replay_mock.assert_awaited_once()
 
     def test_reconciler_requeues_memory_job_when_backend_not_ready(self, monkeypatch):
         from app.job_queue import QueuedJob
@@ -1124,6 +1444,117 @@ class TestExtractCancelEndpoint:
         assert job.filename == "memory.pdf"
         main_mod.lifecycle.ensure_running.assert_awaited_once()
         main_mod._ensure_replay_task.assert_called_once()
+
+    def test_reconciler_keeps_stale_job_active_when_backend_still_running(self, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "stale-running-job"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="running",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_at=0,
+        )
+
+        class _DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"process_id": process_id, "status": "running"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _DummyResponse()
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+        monkeypatch.setattr(main_mod.settings, "HEALTHCHECK_BEARER_TOKEN", "")
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert main_mod.job_trackers[process_id].status == "running"
+        assert main_mod.job_trackers[process_id].last_progress_at > 0
+        assert main_mod._active_backend_jobs() == 1
+
+    def test_reconciler_clears_stale_job_when_backend_completed(self, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "stale-complete-job"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="running",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_at=0,
+        )
+
+        class _DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"process_id": process_id, "status": "complete"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _DummyResponse()
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+        monkeypatch.setattr(main_mod.settings, "HEALTHCHECK_BEARER_TOKEN", "")
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert main_mod.job_trackers[process_id].status == "complete"
+        assert main_mod._active_backend_jobs() == 0
 
     def test_local_cancel_cache_is_bounded(self, monkeypatch):
         import app.main as main_mod

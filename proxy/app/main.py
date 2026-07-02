@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from app.auth import CognitoAuth
@@ -50,7 +50,16 @@ reconciler_task: asyncio.Task | None = None
 canary_task: asyncio.Task | None = None
 
 
-ACTIVE_JOB_STATUSES = {"queued", "pending", "started", "running", "progress", "warming_up", "cancel_requested"}
+ACTIVE_JOB_STATUSES = {
+    "accepted_by_backend",
+    "queued",
+    "pending",
+    "started",
+    "running",
+    "progress",
+    "warming_up",
+    "cancel_requested",
+}
 TERMINAL_JOB_STATUSES = {
     "complete",
     "completed",
@@ -112,7 +121,15 @@ def _record_job_event(process_id: str, event: str, *, reason: str | None = None)
 def _mark_job_failed(process_id: str, reason: str) -> None:
     replay_submission_errors[process_id] = reason
     _cleanup_cached_payload(process_id, delete_remote=True)
+    with suppress(Exception):
+        job_queue.remove_job(process_id)
     _record_job_event(process_id, "failed", reason=reason)
+
+
+def _mark_drained_jobs_failed(jobs: list[QueuedJob], reason: str) -> None:
+    for job in jobs:
+        job_payload_cache[job.job_id] = job
+        _mark_job_failed(job.job_id, reason)
 
 
 def _cleanup_cached_payload(process_id: str, *, delete_remote: bool = False) -> None:
@@ -140,6 +157,51 @@ def _remove_queued_job(process_id: str) -> bool:
     return job_queue.remove_job(process_id)
 
 
+def _upload_size_bytes(file: UploadFile) -> int | None:
+    size = getattr(file, "size", None)
+    if isinstance(size, int) and size >= 0:
+        return size
+
+    raw_file = getattr(file, "file", None)
+    if raw_file is None:
+        return None
+
+    try:
+        current = raw_file.tell()
+        raw_file.seek(0, 2)
+        size = raw_file.tell()
+        raw_file.seek(current)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+    return int(size) if isinstance(size, int) and size >= 0 else None
+
+
+def _validate_upload_size(file: UploadFile) -> None:
+    max_bytes = settings.MAX_UPLOAD_BYTES
+    if max_bytes <= 0:
+        return
+
+    size = _upload_size_bytes(file)
+    if size is None or size <= max_bytes:
+        return
+
+    max_mib = max_bytes / (1024 * 1024)
+    size_mib = size / (1024 * 1024)
+    raise HTTPException(
+        status_code=413,
+        detail=f"PDF upload is {size_mib:.1f} MiB; maximum allowed size is {max_mib:.0f} MiB.",
+    )
+
+
+def _upload_too_large_response() -> JSONResponse:
+    max_mib = settings.MAX_UPLOAD_BYTES / (1024 * 1024)
+    return JSONResponse(
+        status_code=413,
+        content={"detail": f"PDF upload exceeds the maximum allowed size of {max_mib:.0f} MiB."},
+    )
+
+
 def _record_job_cancelled(process_id: str, reason: str) -> None:
     # Keep a bounded terminal cache for locally-cancelled IDs so polling can
     # report stable terminal state without unbounded growth.
@@ -158,7 +220,29 @@ def _active_backend_jobs() -> int:
             continue
         if tracker.status in ACTIVE_JOB_STATUSES:
             count += 1
-    return count
+    return max(count, _backend_health_active_jobs())
+
+
+def _positive_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _active_jobs_from_backend_checks(checks: Any) -> int:
+    if not isinstance(checks, dict):
+        return 0
+    return max(
+        _positive_int(checks.get("fresh_active_runs")),
+        _positive_int(checks.get("queued_runs")),
+        _positive_int(checks.get("broker_queued")),
+        _positive_int(checks.get("broker_unacked")),
+    )
+
+
+def _backend_health_active_jobs() -> int:
+    checks = getattr(lifecycle, "last_health_checks", {}) or {}
+    return _active_jobs_from_backend_checks(checks)
 
 
 def _is_locally_active_process(process_id: str) -> bool:
@@ -260,6 +344,23 @@ async def _ensure_queued_jobs_replaying(reason: str, *, known_queued: bool = Fal
     _ensure_replay_task()
 
 
+async def _sync_state_then_replay_startup_queue() -> None:
+    """Refresh EC2 lifecycle state before deciding whether startup replay is needed."""
+    try:
+        await lifecycle.sync_state_from_ec2()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("sync_state_from_ec2 failed during startup replay sync", exc_info=True)
+
+    try:
+        await _ensure_queued_jobs_replaying("startup sync")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Failed to start queued-job replay after startup sync")
+
+
 def _progress_payload(stage: str, stage_display: str, percent: int = 0) -> dict[str, Any]:
     return {
         "stage": stage,
@@ -281,7 +382,7 @@ def _backend_accepting_but_worker_busy() -> bool:
     broker_unacked = checks.get("broker_unacked")
     worker_state = checks.get("worker_state")
     return (
-        reason == "worker_busy_or_unresponsive"
+        reason in {"worker_busy", "worker_busy_or_unresponsive"}
         and getattr(lifecycle, "last_health_status_code", None) == 200
         and checks.get("redis") == "ok"
         and checks.get("grobid") == "ok"
@@ -289,7 +390,7 @@ def _backend_accepting_but_worker_busy() -> bool:
         and fresh_active_runs > 0
         and isinstance(broker_unacked, int)
         and broker_unacked > 0
-        and worker_state == "busy_or_unresponsive"
+        and worker_state in {"busy", "busy_or_unresponsive"}
     )
 
 
@@ -337,17 +438,16 @@ async def lifespan(app: FastAPI):
     """Kick off EC2 state sync and reconciliation loops on boot."""
     global reconciler_task, canary_task
 
-    sync_task = asyncio.create_task(lifecycle.sync_state_from_ec2())
-    queue_replay_task = asyncio.create_task(_ensure_queued_jobs_replaying("startup"))
+    startup_replay_task = asyncio.create_task(_sync_state_then_replay_startup_queue())
     reconciler_task = asyncio.create_task(_reconciler_loop())
     if settings.CANARY_INTERVAL_SECONDS > 0:
         canary_task = asyncio.create_task(_canary_loop())
 
-    logger.info("Proxy startup: scheduled EC2 state sync and maintenance tasks")
+    logger.info("Proxy startup: scheduled EC2 state sync, queued replay, and maintenance tasks")
     try:
         yield
     finally:
-        for task in (sync_task, queue_replay_task, reconciler_task, canary_task):
+        for task in (startup_replay_task, reconciler_task, canary_task):
             if task and not task.done():
                 task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -355,6 +455,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PDFX Proxy", version="1.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def reject_oversized_uploads(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/api/v1/extract" and settings.MAX_UPLOAD_BYTES > 0:
+        content_length = request.headers.get("content-length")
+        try:
+            request_bytes = int(content_length) if content_length is not None else None
+        except ValueError:
+            request_bytes = None
+        overhead_bytes = max(0, settings.MAX_MULTIPART_OVERHEAD_BYTES)
+        if request_bytes is not None and request_bytes > settings.MAX_UPLOAD_BYTES + overhead_bytes:
+            return _upload_too_large_response()
+
+    return await call_next(request)
 
 
 # --- Auth helper ---
@@ -407,6 +522,10 @@ async def health():
             result["gpu_status"] = payload.get("status")
             checks = payload.get("checks")
             if isinstance(checks, dict):
+                result["active_backend_jobs"] = max(
+                    int(result.get("active_backend_jobs") or 0),
+                    _active_jobs_from_backend_checks(checks),
+                )
                 result["gpu_workers"] = checks.get("workers")
                 result["gpu_redis"] = checks.get("redis")
                 result["gpu_grobid"] = checks.get("grobid")
@@ -419,14 +538,26 @@ async def health():
         gpu_status = str(result.get("gpu_status") or "").strip().lower()
         backend_busy = (
             resp.status_code == 200
-            and gpu_status == "degraded"
-            and result.get("gpu_worker_state") == "busy_or_unresponsive"
+            and (
+                gpu_status == "busy"
+                or (
+                    gpu_status == "degraded"
+                    and result.get("gpu_worker_state") == "busy_or_unresponsive"
+                )
+            )
+            and result.get("gpu_worker_state") in {"busy", "busy_or_unresponsive"}
         )
         result["gpu_healthy"] = resp.status_code == 200 and gpu_status == "ok"
         result["gpu_busy"] = backend_busy
-        result["gpu_accepting_submissions"] = resp.status_code == 200 and gpu_status in {"ok", "degraded"}
-        result["status"] = "healthy" if result["gpu_healthy"] else "degraded"
-        if gpu_status and gpu_status != "ok":
+        result["gpu_accepting_submissions"] = resp.status_code == 200 and gpu_status in {"ok", "busy", "degraded"}
+        if result["gpu_healthy"]:
+            result["status"] = "healthy"
+        elif backend_busy:
+            result["status"] = "busy"
+            result["reason"] = result.get("reason") or "backend_busy"
+        else:
+            result["status"] = "degraded"
+        if gpu_status and gpu_status not in {"ok", "busy"}:
             result["reason"] = result.get("reason") or f"downstream_health_{gpu_status}"
         if resp.status_code != 200:
             result["reason"] = result.get("reason") or f"downstream_health_status_{resp.status_code}"
@@ -523,6 +654,7 @@ async def health_deep():
 @app.get("/api/v1/metrics")
 async def metrics():
     """Operational metrics for alerting dashboards."""
+    await _refresh_backend_health_snapshot_for_queue()
     return {
         "queue_depth": job_queue.size,
         "queue_durable": job_queue.durable,
@@ -594,6 +726,7 @@ async def submit_extraction(
 ):
     _require_auth(authorization)
     lifecycle.touch()
+    _validate_upload_size(file)
 
     process_id = str(uuid.uuid4())
     filename = file.filename or "upload.pdf"
@@ -603,6 +736,7 @@ async def submit_extraction(
         "merge": merge,
         "clear_cache": clear_cache,
         "extract_images": extract_images,
+        "process_id": process_id,
     }
     if review_images is not None:
         form_fields["review_images"] = review_images
@@ -696,6 +830,17 @@ async def get_extraction_status(
             "progress": _progress_payload("cancelled", "Job cancelled", 0),
         }
 
+    if process_id in replay_submission_errors:
+        error_message = replay_submission_errors[process_id]
+        return {
+            "process_id": process_id,
+            "status": "failed",
+            "state": lifecycle.state.value,
+            "error": error_message,
+            "message": "Failed to submit queued job to backend.",
+            "progress": _progress_payload("failed", "Queued job submission failed", 0),
+        }
+
     # If the job is still queued locally, report that.
     if job_queue.has_job(process_id):
         lifecycle.touch()
@@ -738,17 +883,6 @@ async def get_extraction_status(
             "state": lifecycle.state.value,
             "message": display,
             "progress": _progress_payload("queued", display, 0),
-        }
-
-    if process_id in replay_submission_errors:
-        error_message = replay_submission_errors[process_id]
-        return {
-            "process_id": process_id,
-            "status": "failed",
-            "state": lifecycle.state.value,
-            "error": error_message,
-            "message": "Failed to submit queued job to backend.",
-            "progress": _progress_payload("failed", "Queued job submission failed", 0),
         }
 
     # Only known active jobs, or explicit wake requests, may wake the backend.
@@ -1080,6 +1214,32 @@ def _coerce_json_payload(resp: httpx.Response) -> dict[str, Any]:
         return {"detail": text or f"Non-JSON response (status={resp.status_code})"}
 
 
+async def _fetch_backend_status_payload(
+    process_id: str,
+    *,
+    authorization: str | None,
+) -> tuple[int, dict[str, Any]]:
+    """Fetch backend status while preserving the proxy-visible process ID."""
+    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
+    status_url = f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}"
+    headers = {"Authorization": authorization} if authorization else {}
+
+    async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
+        if headers:
+            try:
+                resp = await client.get(status_url, headers=headers)
+            except TypeError:
+                resp = await client.get(status_url)
+        else:
+            resp = await client.get(status_url)
+
+    payload = _coerce_json_payload(resp)
+    if backend_process_id != process_id:
+        # Keep caller-visible process_id stable when replay rewrites backend IDs.
+        payload["process_id"] = process_id
+    return resp.status_code, payload
+
+
 async def _forward_extraction(
     process_id: str,
     pdf_data: bytes | Any,
@@ -1090,13 +1250,15 @@ async def _forward_extraction(
 ) -> JSONResponse:
     """Forward a PDF extraction request to the EC2 backend."""
     lifecycle.job_started()
+    backend_form_fields = dict(form_fields)
+    backend_form_fields.setdefault("process_id", process_id)
     try:
         async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
             files = {"file": (filename, pdf_data, "application/pdf")}
             headers = {"Authorization": authorization} if authorization else None
             resp = await client.post(
                 f"{lifecycle.ec2_base_url}/api/v1/extract",
-                data=form_fields,
+                data=backend_form_fields,
                 files=files,
                 headers=headers,
             )
@@ -1111,8 +1273,11 @@ async def _forward_extraction(
             )
 
         backend_process_id = str(payload.get("process_id", "")).strip()
-        if backend_process_id:
+        if backend_process_id and backend_process_id != process_id:
             proxy_to_backend_process[process_id] = backend_process_id
+            payload["process_id"] = process_id
+        elif backend_process_id == process_id:
+            proxy_to_backend_process.pop(process_id, None)
 
         _record_job_event(process_id, "accepted_by_backend")
         replay_submission_errors.pop(process_id, None)
@@ -1121,7 +1286,12 @@ async def _forward_extraction(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Failed to forward extraction to EC2: %s", exc)
+        logger.error(
+            "Failed to forward extraction to EC2: %s: %r",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
     finally:
         lifecycle.job_finished()
@@ -1148,15 +1318,13 @@ async def _replay_when_ready():
             break
         if lifecycle.state == InstanceState.STOPPED:
             jobs = job_queue.drain()
-            for job in jobs:
-                _mark_job_failed(job.job_id, "EC2 startup failed before queued replay.")
+            _mark_drained_jobs_failed(jobs, "EC2 startup failed before queued replay.")
             logger.error("EC2 startup failed. Marked %d queued jobs as failed.", len(jobs))
             return
         await asyncio.sleep(5)
     else:
         jobs = job_queue.drain()
-        for job in jobs:
-            _mark_job_failed(job.job_id, "EC2 startup timed out before queued replay.")
+        _mark_drained_jobs_failed(jobs, "EC2 startup timed out before queued replay.")
         logger.error("Timed out waiting for EC2. Marked %d queued jobs as failed.", len(jobs))
         return
 
@@ -1177,6 +1345,10 @@ async def _replay_when_ready():
                     job.form_fields,
                     authorization=job.authorization,
                 )
+            try:
+                job_queue.acknowledge(job.job_id)
+            except Exception as exc:
+                logger.error("Failed to acknowledge replayed job %s: %s", job.job_id, exc)
             if job.job_id in pending_cancel_requests:
                 reason = pending_cancel_requests.pop(job.job_id)
                 try:
@@ -1213,6 +1385,9 @@ async def _reconciler_loop():
 
             age = now - tracker.last_progress_at
             if age < stale_after:
+                continue
+
+            if await _refresh_stale_backend_status(process_id, tracker, age=age):
                 continue
 
             if settings.RECONCILER_REQUEUE_ONCE and not tracker.requeue_attempted and process_id in job_payload_cache:
@@ -1255,6 +1430,53 @@ async def _reconciler_loop():
                 "Progress monitoring timeout in proxy. "
                 "The worker may still be processing; backend extraction timeout is separate.",
             )
+
+
+async def _refresh_stale_backend_status(process_id: str, tracker: JobTracker, *, age: float) -> bool:
+    """Reconcile a quiet proxy tracker with backend truth before failing it."""
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY) or not lifecycle.private_ip:
+        return False
+
+    job = job_payload_cache.get(process_id)
+    authorization = job.authorization if job else None
+    if not authorization and settings.HEALTHCHECK_BEARER_TOKEN:
+        authorization = f"Bearer {settings.HEALTHCHECK_BEARER_TOKEN}"
+
+    try:
+        status_code, payload = await _fetch_backend_status_payload(
+            process_id,
+            authorization=authorization,
+        )
+    except Exception as exc:
+        logger.warning("Reconciler backend status refresh failed for %s: %s", process_id, exc)
+        return False
+
+    if status_code >= 400:
+        logger.warning(
+            "Reconciler backend status refresh for %s returned HTTP %s: %s",
+            process_id,
+            status_code,
+            payload.get("detail") or payload.get("error") or payload,
+        )
+        return False
+
+    _update_tracker_from_payload(process_id, payload)
+    status = str(payload.get("status", "")).strip().lower()
+    if status in TERMINAL_JOB_STATUSES:
+        _mark_terminal_cleanup_if_needed(process_id, payload)
+        return True
+
+    if status in ACTIVE_JOB_STATUSES:
+        tracker.last_progress_at = time.time()
+        logger.info(
+            "job=%s event=backend_still_processing status=%s stale_age_seconds=%.0f",
+            process_id,
+            status,
+            age,
+        )
+        return True
+
+    return False
 
 
 async def _canary_loop():

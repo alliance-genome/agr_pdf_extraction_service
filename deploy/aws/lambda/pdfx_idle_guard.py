@@ -115,12 +115,47 @@ def _write_state_since(parameter_name: str, value: datetime) -> None:
     )
 
 
+def _write_state_value(parameter_name: str, value: str) -> None:
+    ssm.put_parameter(
+        Name=parameter_name,
+        Value=value,
+        Type="String",
+        Overwrite=True,
+    )
+
+
+def _delete_state(parameter_name: str) -> None:
+    try:
+        ssm.delete_parameter(Name=parameter_name)
+    except ssm.exceptions.ParameterNotFound:
+        pass
+
+
+def _reset_state_if_asg_changed(
+    asg_state_parameter: str,
+    asg_name: str,
+    running_since_parameter: str,
+    idle_since_parameter: str,
+) -> bool:
+    try:
+        response = ssm.get_parameter(Name=asg_state_parameter)
+        previous_asg_name = str(response["Parameter"]["Value"])
+    except (ssm.exceptions.ParameterNotFound, KeyError, TypeError):
+        _write_state_value(asg_state_parameter, asg_name)
+        return False
+
+    if previous_asg_name == asg_name:
+        return False
+
+    _delete_state(running_since_parameter)
+    _delete_state(idle_since_parameter)
+    _write_state_value(asg_state_parameter, asg_name)
+    return True
+
+
 def _state_since(parameter_name: str, state_active: bool, now: datetime) -> datetime | None:
     if not state_active:
-        try:
-            ssm.delete_parameter(Name=parameter_name)
-        except ssm.exceptions.ParameterNotFound:
-            pass
+        _delete_state(parameter_name)
         return None
 
     try:
@@ -207,6 +242,10 @@ def _run_check() -> dict[str, Any]:
     asg_name = os.environ["BACKEND_ASG_NAME"]
     running_since_parameter = os.environ["RUNNING_SINCE_PARAMETER_NAME"]
     idle_since_parameter = os.environ["IDLE_SINCE_PARAMETER_NAME"]
+    asg_state_parameter = os.environ.get(
+        "ASG_STATE_PARAMETER_NAME",
+        f"/{project}/{env}/idle-guard/asg-name",
+    )
     metrics_url = os.environ["PROXY_METRICS_URL"]
     idle_threshold = _env_int("IDLE_ALERT_AFTER_MINUTES", 60)
     absolute_threshold = _env_int("ABSOLUTE_ALERT_AFTER_MINUTES", 240)
@@ -226,6 +265,12 @@ def _run_check() -> dict[str, Any]:
     instance_ids = _active_asg_instances(group)
     oldest_age, current_run_started_at = _oldest_launch_info(instance_ids)
     now = datetime.now(timezone.utc)
+    reset_after_asg_change = _reset_state_if_asg_changed(
+        asg_state_parameter,
+        asg_name,
+        running_since_parameter,
+        idle_since_parameter,
+    )
 
     metrics: dict[str, Any] = {}
     metrics_error = None
@@ -240,6 +285,8 @@ def _run_check() -> dict[str, Any]:
 
     backend_running = desired > 0 or bool(instance_ids)
     backend_idle = backend_running and not has_active_work
+    if reset_after_asg_change and backend_running and current_run_started_at:
+        _write_state_since(running_since_parameter, current_run_started_at)
     running_since = _state_since(running_since_parameter, backend_running, now)
     reset_after_missed_stop = False
     missed_scale_to_zero_at = None
@@ -303,6 +350,7 @@ def _run_check() -> dict[str, Any]:
         "has_active_work": has_active_work,
         "idle_too_long": idle_too_long,
         "absolute_too_long": absolute_too_long,
+        "reset_after_asg_change": reset_after_asg_change,
         "reset_after_missed_stop": reset_after_missed_stop,
         "missed_scale_to_zero_at": (
             missed_scale_to_zero_at.isoformat() if missed_scale_to_zero_at else None

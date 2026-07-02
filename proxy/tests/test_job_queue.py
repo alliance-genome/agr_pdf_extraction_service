@@ -5,6 +5,8 @@ import io
 import json
 
 import pytest
+from botocore.exceptions import ClientError
+
 from app.job_queue import JobQueue, QueuedJob, QueueFullError, S3JobQueue
 
 
@@ -234,4 +236,104 @@ class TestS3JobQueue:
         assert fake_client.deleted == [
             ("test-bucket", "prefix/jobs/0000000000002_job-b.json"),
             ("test-bucket", "prefix/payloads/job-b.pdf"),
+        ]
+
+    def test_drain_skips_orphaned_metadata_when_payload_is_missing(self, monkeypatch):
+        class _Paginator:
+            def paginate(self, **kwargs):
+                return [
+                    {
+                        "Contents": [
+                            {"Key": "prefix/jobs/0000000000001_job-missing.json"},
+                            {"Key": "prefix/jobs/0000000000002_job-ok.json"},
+                        ]
+                    }
+                ]
+
+        class _FakeS3Client:
+            def __init__(self):
+                self.deleted = []
+
+            def get_paginator(self, name):
+                assert name == "list_objects_v2"
+                return _Paginator()
+
+            def get_object(self, Bucket, Key):
+                job_id = "job-missing" if Key.endswith("job-missing.json") else "job-ok"
+                payload = {
+                    "job_id": job_id,
+                    "filename": "paper.pdf",
+                    "form_fields": {},
+                    "queued_at": 1,
+                    "pdf_s3_bucket": Bucket,
+                    "pdf_s3_key": f"prefix/payloads/{job_id}.pdf",
+                }
+                return {"Body": io.BytesIO(json.dumps(payload).encode("utf-8"))}
+
+            def download_fileobj(self, bucket, key, fileobj):
+                if key.endswith("job-missing.pdf"):
+                    raise ClientError(
+                        {
+                            "Error": {"Code": "404", "Message": "Not Found"},
+                            "ResponseMetadata": {"HTTPStatusCode": 404},
+                        },
+                        "HeadObject",
+                    )
+                fileobj.write(b"%PDF ok")
+
+            def delete_objects(self, Bucket, Delete):
+                for item in Delete["Objects"]:
+                    self.deleted.append((Bucket, item["Key"]))
+
+        fake_client = _FakeS3Client()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: fake_client)
+
+        q = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        jobs = q.drain()
+
+        assert [job.job_id for job in jobs] == ["job-ok"]
+        with jobs[0].open_pdf() as pdf_file:
+            assert pdf_file.read() == b"%PDF ok"
+        jobs[0].cleanup()
+        assert fake_client.deleted == [
+            ("test-bucket", "prefix/jobs/0000000000001_job-missing.json"),
+        ]
+
+        assert q.acknowledge("job-ok") is True
+        assert fake_client.deleted == [
+            ("test-bucket", "prefix/jobs/0000000000001_job-missing.json"),
+            ("test-bucket", "prefix/jobs/0000000000002_job-ok.json"),
+        ]
+
+    def test_acknowledge_deletes_metadata_without_payload(self, monkeypatch):
+        class _Paginator:
+            def paginate(self, **kwargs):
+                return [
+                    {
+                        "Contents": [
+                            {"Key": "prefix/jobs/0000000000001_job-a.json"},
+                        ]
+                    }
+                ]
+
+        class _FakeS3Client:
+            def __init__(self):
+                self.deleted = []
+
+            def get_paginator(self, name):
+                assert name == "list_objects_v2"
+                return _Paginator()
+
+            def delete_objects(self, Bucket, Delete):
+                for item in Delete["Objects"]:
+                    self.deleted.append((Bucket, item["Key"]))
+
+        fake_client = _FakeS3Client()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: fake_client)
+
+        q = S3JobQueue(bucket="test-bucket", prefix="prefix")
+
+        assert q.acknowledge("job-a") is True
+        assert fake_client.deleted == [
+            ("test-bucket", "prefix/jobs/0000000000001_job-a.json"),
         ]

@@ -40,9 +40,11 @@ class TestLifecycleManager:
     def test_job_finished_returns_to_ready(self):
         mgr, _ = self._make_manager(InstanceState.BUSY)
         mgr._active_jobs = 1
+        mgr._last_activity = 0
         mgr.job_finished()
         assert mgr.state == InstanceState.READY
         assert mgr.active_jobs == 0
+        assert mgr._last_activity > 0
 
     def test_job_finished_stays_busy_with_remaining_jobs(self):
         mgr, _ = self._make_manager(InstanceState.BUSY)
@@ -198,6 +200,42 @@ class TestLifecycleManager:
         assert asyncio.run(mgr._check_health()) is False
         assert mgr.last_health_reason == "no_ready_workers"
 
+    def test_check_health_rejects_unready_database(self, monkeypatch):
+        mgr, _ = self._make_manager()
+        mgr._private_ip = "10.0.0.5"
+
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "status": "unhealthy",
+                    "checks": {
+                        "grobid": "ok",
+                        "redis": "ok",
+                        "database": "unavailable",
+                        "workers": 1,
+                    },
+                }
+
+        class _Client:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _Resp()
+
+        monkeypatch.setattr("app.state_machine.httpx.AsyncClient", _Client)
+        assert asyncio.run(mgr._check_health()) is False
+        assert mgr.last_health_reason == "database_not_ready"
+
     def test_check_health_accepts_busy_solo_worker(self, monkeypatch):
         mgr, _ = self._make_manager()
         mgr._private_ip = "10.0.0.5"
@@ -208,7 +246,7 @@ class TestLifecycleManager:
             @staticmethod
             def json():
                 return {
-                    "status": "degraded",
+                    "status": "busy",
                     "checks": {
                         "service": "ok",
                         "grobid": "ok",
@@ -217,7 +255,7 @@ class TestLifecycleManager:
                         "active_runs": 1,
                         "fresh_active_runs": 1,
                         "broker_unacked": 1,
-                        "worker_state": "busy_or_unresponsive",
+                        "worker_state": "busy",
                     },
                 }
 
@@ -236,7 +274,7 @@ class TestLifecycleManager:
 
         monkeypatch.setattr("app.state_machine.httpx.AsyncClient", _Client)
         assert asyncio.run(mgr._check_health()) is True
-        assert mgr.last_health_reason == "worker_busy_or_unresponsive"
+        assert mgr.last_health_reason == "worker_busy"
         assert mgr.last_health_checks["broker_unacked"] == 1
 
     def test_check_health_rejects_stale_running_row_without_unacked_task(self, monkeypatch):

@@ -3,7 +3,7 @@
 This runbook manages the canonical PDFX AWS service:
 
 - GPU backend managed by an EC2 Auto Scaling Group (`g5.4xlarge`, same Deep Learning GPU AMI family)
-- Docker Compose backend stack on the EC2 host
+- Docker Compose backend stack on the EC2 host, using a prebuilt GPU image from ECR
 - Fargate proxy in front of the backend
 - S3-backed durable proxy queue
 - S3 audit/artifact bucket with tagged temporary image lifecycle
@@ -33,10 +33,35 @@ template defaults:
 | Backend AMI | `ami-00c6ddd550364d6c3` |
 | Backend instance type | `g5.4xlarge` |
 | EC2 key pair | `pedro-benchmark-key` |
+| Proxy image repo | `agr_pdfx_proxy` |
+| Backend image repo | `agr_pdfx_backend` |
 
-The PDFX stack intentionally recreates backend instances from user data instead
-of cloning an EBS volume. Warm-pool reuse preserves Docker images and model
-caches across idle shutdowns.
+The backend AMI provides the host NVIDIA/Docker baseline. Python, PyTorch, CUDA
+runtime wheels, Docling, Marker, and application dependencies belong in the
+prebuilt `agr_pdfx_backend` ECR image. Backend user data should pull that image
+and run with `PDFX_DEPLOY_BUILD_MODE=never`; it must not pip-install PyTorch or
+CUDA dependencies during normal production boot. Warm-pool reuse preserves
+Docker images and model caches across idle shutdowns.
+
+When `PDFX_GPU_IMAGE` and `PDFX_DEPLOY_BUILD_MODE=never` are set, `deploy.sh`
+also applies `docker-compose.gpu.prebuilt.yml`. That override keeps persistent
+data/model/log mounts but removes source-code bind mounts, so production runs
+the app code baked into the ECR image instead of overlaying a potentially
+different checkout.
+
+GPU deploys are intentionally gated on CUDA being usable inside containers.
+`deploy.sh` probes the configured GPU image with `docker run --gpus all` before
+starting the Compose stack and then probes `torch.cuda` inside `pdfx-worker`
+after startup. If the host can run `nvidia-smi` but the worker probe fails, the
+backend is not ready; rerun the guarded deploy or restart app/worker after the
+NVIDIA container runtime is ready.
+
+Production-style prebuilt GPU deploys also prewarm Marker model artifacts into
+the persistent host cache volumes by default (`PDFX_PREWARM_MODELS=auto` with
+`PDFX_DEPLOY_BUILD_MODE=never`). This makes stopped warm-pool preparation pay
+the model download/load cost before curator traffic reaches the worker. Set
+`PDFX_PREWARM_MODELS=off` only for controlled debugging where first-job model
+download latency is acceptable.
 
 ## Current Account Migration Note
 
@@ -52,6 +77,11 @@ CloudFormation adoption. For the current account migration, create or import the
 backend resources carefully, update `/pdfx/backend-asg-name` and the proxy task
 role policy together, then retire the old suffixed resources after
 `https://pdfx.alliancegenome.org/api/v1/health/deep` is healthy.
+
+Production `pdfx.alliancegenome.org` must not point at resources whose names,
+tags, stack names, SSM paths, queues, or buckets contain a non-production suffix
+such as `-test`. If `/pdfx/backend-asg-name` resolves to anything other than a
+production backend such as `pdfx-backend`, treat that as a migration bug.
 
 ## Before Deploying
 
@@ -121,11 +151,28 @@ capacity to `1` on wake and back to `0` after idle shutdown. The warm pool keeps
 one stopped, already-bootstrapped backend instance so Docker images and ML model
 caches survive idle shutdown without paying for a running GPU. Keep
 in mind that the stopped warm-pool instance also retains its bootstrapped git
-ref and Docker image; after dependency or Dockerfile changes, terminate the warm
-instance so a fresh one bootstraps and rebuilds instead of relying on an `auto`
-wake. Keep
-`BackendMaxSize=1` for strict cost control. Use `BackendMaxSize=2` only for
-controlled testing of launch-before-terminate behavior.
+ref and Docker image; after dependency or Dockerfile changes, push a new
+`agr_pdfx_backend` image and terminate the warm instance so a fresh one pulls
+the new tag. Keep `BackendMaxSize=1` for strict cost control. Use
+`BackendMaxSize=2` only for controlled validation of launch-before-terminate
+behavior.
+
+The launch template installs a resume-safe systemd bootstrap service
+(`pdfx-backend-bootstrap.service`) before doing any long-running package,
+checkout, image pull, or deploy work. This matters for stopped warm-pool
+instances: AWS can stop a newly prepared instance while cloud-init is still
+running. On the next real start, cloud-init may not rerun user data, but the
+enabled systemd service starts again and completes the idempotent deploy.
+
+Durable proxy queue metadata and PDF payload objects live under `QueuePrefix`
+in the audit bucket and expire after `QueueRetentionDays` as a safety net.
+Normal replay, cancellation, and failure paths should delete queue payloads
+sooner; lifecycle cleanup is for abandoned clients or interrupted cleanup paths.
+The proxy enforces `MAX_UPLOAD_BYTES=524288000` before backend wake/replay so
+oversized requests do not fill S3 queue storage or start the GPU only to fail at
+the backend upload cap. `MAX_MULTIPART_OVERHEAD_BYTES=10485760` gives the
+early `Content-Length` guard room for multipart boundaries and small form
+fields while still rejecting grossly oversized requests before body parsing.
 
 The proxy's bounded replacement wait defaults to
 `AsgStartupReplacementAttempts=1`, published to
@@ -136,8 +183,9 @@ The proxy's bounded replacement wait defaults to
 Use `deploy/aws/pdfx-idle-guard-stack.yaml` when you want a separate
 belt-and-suspenders alert if a backend ASG stays running after it should have
 scaled down. The guard stores the continuous ASG runtime in SSM Parameter Store,
-emits a `GuardCheckSucceeded` heartbeat, and alarms if the guard itself stops
-checking. For the PDFX stack:
+resets that runtime when the monitored ASG name changes, emits a
+`GuardCheckSucceeded` heartbeat, and alarms if the guard itself stops checking.
+For the PDFX stack:
 
 ```bash
 deploy/aws/deploy_idle_guard.sh \
@@ -151,11 +199,11 @@ deploy/aws/deploy_idle_guard.sh \
   --alarm-topic-arn <sns-topic-arn>
 ```
 
-Use a confirmed SNS topic such as `pdfx-dev-oom-alerts`, which currently emails
-`ctabone@morgan.harvard.edu`, when alarm actions should notify an operator.
+Use a confirmed SNS topic with an idle-guard/cost-guard name when alarm actions
+should notify an operator.
 
-If cold boot time becomes too expensive, set `BackendWarmPoolMinSize=1`.
-That keeps one pre-initialized backend instance in the ASG warm pool in
+Keep `BackendWarmPoolMinSize=1` when production traffic expects low wake
+latency. That keeps one pre-initialized backend instance in the ASG warm pool in
 `Stopped` state, so you pay for EBS while idle but not for running GPU compute.
 
 ## Deploy Proxy Changes
@@ -231,12 +279,18 @@ git fetch --all --prune
 git checkout <branch-or-sha>
 git pull --ff-only || true
 cd deploy
-PDFX_DEPLOY_BUILD_MODE=rebuild GPU_MODE=on ./deploy.sh
+PDFX_GPU_IMAGE=100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend:<image-tag> \
+  PDFX_DEPLOY_BUILD_MODE=never \
+  PDFX_DEPLOY_PULL_IMAGES=auto \
+  GPU_MODE=on \
+  ./deploy.sh
 ```
 
-Use `PDFX_DEPLOY_BUILD_MODE=rebuild` only when dependencies or the Dockerfile
-changed. The default `auto` mode lets Docker Compose reuse the existing image
-and build only if the image is missing.
+Use `PDFX_DEPLOY_BUILD_MODE=rebuild` only for emergency local diagnosis. Normal
+production starts must use the prebuilt ECR image, otherwise each replacement
+can spend the startup window downloading and installing PyTorch/CUDA again.
+In prebuilt mode, `deploy.sh` includes `docker-compose.gpu.prebuilt.yml` so the
+running containers do not bind-mount checkout source over the image.
 
 If a backend startup fails, the proxy marks the ASG instance unhealthy with
 `SetInstanceHealth`. Auto Scaling then terminates it and launches a replacement

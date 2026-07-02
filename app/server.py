@@ -180,6 +180,8 @@ def process_pdf():
                     conflict_batch_size=cfg.get("LLM_CONFLICT_BATCH_SIZE", 10),
                     conflict_max_workers=cfg.get("LLM_CONFLICT_MAX_WORKERS", 4),
                     conflict_retry_rounds=cfg.get("LLM_CONFLICT_RETRY_ROUNDS", 2),
+                    openai_timeout_seconds=cfg.get("LLM_OPENAI_TIMEOUT_SECONDS", 180),
+                    openai_max_retries=cfg.get("LLM_OPENAI_MAX_RETRIES", 1),
                 )
 
                 merged_md = None

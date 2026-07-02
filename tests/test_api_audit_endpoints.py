@@ -95,6 +95,49 @@ def test_submit_extraction_returns_process_id_and_creates_db_row(mock_apply_asyn
 
 
 @patch("celery_app.extract_pdf.apply_async")
+def test_submit_extraction_honors_client_supplied_process_id(mock_apply_async, client):
+    requested_process_id = str(uuid.uuid4())
+    mock_apply_async.return_value = SimpleNamespace(id=requested_process_id)
+
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "process_id": requested_process_id,
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 202
+    payload = response.get_json()
+    assert payload["process_id"] == requested_process_id
+
+    call_kwargs = mock_apply_async.call_args.kwargs
+    assert call_kwargs["task_id"] == requested_process_id
+    assert call_kwargs["kwargs"]["process_id"] == requested_process_id
+
+    session = get_session()
+    run = session.get(ExtractionRun, requested_process_id)
+    assert run is not None
+    assert run.status == "queued"
+    session.close()
+
+
+def test_submit_extraction_rejects_invalid_client_process_id(client):
+    response = client.post(
+        "/api/v1/extract",
+        data={
+            "file": (io.BytesIO(b"%PDF-1.4"), "test.pdf"),
+            "process_id": "../not-a-uuid",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert "Invalid process_id" in response.get_json()["error"]
+
+
+@patch("celery_app.extract_pdf.apply_async")
 def test_submit_extraction_passes_extract_images_to_celery(mock_apply_async, client):
     mock_apply_async.return_value = SimpleNamespace(id="process-id-placeholder")
 
@@ -290,7 +333,7 @@ def test_get_extraction_status_falls_back_to_celery_when_db_row_missing(client):
     assert payload["status"] == "pending"
 
 
-def test_health_reports_busy_solo_worker_as_degraded(client):
+def test_health_reports_busy_solo_worker_as_busy(client):
     process_id = str(uuid.uuid4())
     session = get_session()
     session.add(ExtractionRun(
@@ -321,14 +364,103 @@ def test_health_reports_busy_solo_worker_as_degraded(client):
 
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload["status"] == "degraded"
+    assert payload["status"] == "busy"
     assert payload["checks"]["workers"] == 0
     assert payload["checks"]["active_runs"] == 1
     assert payload["checks"]["fresh_active_runs"] == 1
     assert payload["checks"]["queued_runs"] == 0
     assert payload["checks"]["broker_queued"] == 2
     assert payload["checks"]["broker_unacked"] == 1
-    assert payload["checks"]["worker_state"] == "busy_or_unresponsive"
+    assert payload["checks"]["worker_state"] == "busy"
+
+
+def test_health_requires_marker_ready_file_when_configured(client, tmp_path):
+    client.application.config["HEALTH_REQUIRE_MARKER_READY"] = True
+    client.application.config["MARKER_READY_FILE"] = str(tmp_path / "marker_worker_ready.json")
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 0
+    redis_client.hlen.return_value = 0
+    redis_client.zcard.return_value = 0
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = {"worker@example": {"ok": "pong"}}
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "unhealthy"
+    assert payload["checks"]["marker_models"] == "loading"
+    assert payload["checks"]["marker_models_error"] == "ready_file_missing"
+
+
+def test_health_accepts_marker_ready_file_when_configured(client, tmp_path):
+    ready_file = tmp_path / "marker_worker_ready.json"
+    ready_file.write_text('{"device": "cuda"}', encoding="utf-8")
+    client.application.config["HEALTH_REQUIRE_MARKER_READY"] = True
+    client.application.config["MARKER_READY_FILE"] = str(ready_file)
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 0
+    redis_client.hlen.return_value = 0
+    redis_client.zcard.return_value = 0
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = {"worker@example": {"ok": "pong"}}
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "ok"
+    assert payload["checks"]["marker_models"] == "ok"
+
+
+def test_health_is_unhealthy_when_extraction_run_table_missing(client):
+    Base.metadata.drop_all(bind=get_engine())
+
+    grobid_response = MagicMock()
+    grobid_response.status_code = 200
+    redis_client = MagicMock()
+    redis_client.llen.return_value = 0
+    redis_client.hlen.return_value = 0
+    redis_client.zcard.return_value = 0
+
+    with (
+        patch("requests.get", return_value=grobid_response),
+        patch("redis.from_url", return_value=redis_client),
+        patch("celery_app.celery.control.inspect") as mock_inspect,
+    ):
+        inspector = MagicMock()
+        inspector.ping.return_value = {"worker@example": {"ok": "pong"}}
+        mock_inspect.return_value = inspector
+
+        response = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "unhealthy"
+    assert payload["checks"]["database"] == "unavailable"
+    assert payload["checks"]["active_runs"] == "unknown"
+    assert payload["checks"]["fresh_active_runs"] == "unknown"
+    assert payload["checks"]["queued_runs"] == "unknown"
 
 
 def test_health_stays_unhealthy_for_stale_running_row_without_unacked_task(client):

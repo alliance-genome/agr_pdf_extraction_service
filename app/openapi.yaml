@@ -497,7 +497,7 @@ components:
       properties:
         status:
           type: string
-          enum: [ok, degraded, unhealthy]
+          enum: [ok, busy, degraded, unhealthy]
         checks:
           type: object
           required: [service, grobid, redis, workers]
@@ -547,8 +547,8 @@ components:
               description: Count of extraction runs currently marked queued.
             worker_state:
               type: string
-              enum: [busy_or_unresponsive]
-              description: Present when a solo worker is busy and cannot answer inspect.
+              enum: [busy, busy_or_unresponsive]
+              description: Present when a solo worker is busy and cannot answer inspect. `busy_or_unresponsive` is retained for compatibility with older deployments.
 
     ExtractionListItem:
       type: object

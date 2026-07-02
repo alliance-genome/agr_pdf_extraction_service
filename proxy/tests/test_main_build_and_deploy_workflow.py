@@ -65,14 +65,18 @@ def test_workflow_deploys_to_single_prod_environment_with_oidc():
         for step in (job.get("steps") or [])
     ]
     assert step_uses.count("aws-actions/configure-aws-credentials@v5") == 1
-    assert step_uses.count("docker/build-push-action@v6") == 1
+    assert step_uses.count("docker/build-push-action@v6") == 2
     assert "actions/upload-artifact@v4" in step_uses
     assert "actions/download-artifact@v5" in step_uses
 
     workflow_text = WORKFLOW_PATH.read_text()
     assert "role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}" in workflow_text
     assert "docker load --input" in workflow_text
-    assert "/agr_pdfx_proxy:${{ env.IMAGE_TAG }}" in workflow_text
+    assert "PROXY_IMAGE_NAME: agr_pdfx_proxy" in workflow_text
+    assert "BACKEND_IMAGE_NAME: agr_pdfx_backend" in workflow_text
+    assert "/${{ env.PROXY_IMAGE_NAME }}:${{ env.IMAGE_TAG }}" in workflow_text
+    assert "/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}" in workflow_text
+    assert "file: ./deploy/Dockerfile.gpu" in workflow_text
     assert "./deploy.sh --region \"${AWS_REGION}\" --image-tag \"${IMAGE_TAG}\"" in workflow_text
 
 
@@ -84,17 +88,23 @@ def test_latest_tag_is_promoted_only_after_ecs_rollout_succeeds():
     deploy_idx = next(
         i for i, name in enumerate(step_names) if "Register task definition" in name
     )
-    latest_idx = next(
-        i for i, name in enumerate(step_names) if "Promote :latest" in name
+    latest_indices = [
+        i for i, name in enumerate(step_names) if "Promote" in name and ":latest" in name
+    ]
+
+    assert latest_indices, "expected at least one :latest promotion step"
+    for latest_idx in latest_indices:
+        assert latest_idx > deploy_idx, (
+            ":latest must be pushed after the ECS rollout step so a failed rollout "
+            "does not leave :latest pointing at an image that never went live"
+        )
+        assert steps[latest_idx].get("if") == "success()"
+
+    proxy_latest_idx = next(
+        i for i, name in enumerate(step_names) if "Promote proxy :latest" in name
     )
 
-    assert latest_idx > deploy_idx, (
-        ":latest must be pushed after the ECS rollout step so a failed rollout "
-        "does not leave :latest pointing at an image that never went live"
-    )
-    assert steps[latest_idx].get("if") == "success()"
-
-    for earlier_step in steps[:latest_idx]:
+    for earlier_step in steps[:proxy_latest_idx]:
         run_block = earlier_step.get("run", "") or ""
         assert "agr_pdfx_proxy:latest" not in run_block, (
             f"found :latest push in step {earlier_step.get('name')!r} before ECS rollout"

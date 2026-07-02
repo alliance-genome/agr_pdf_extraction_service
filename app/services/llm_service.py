@@ -283,13 +283,32 @@ class LLM(PDFExtractor):
         conflict_batch_size: int = 500,
         conflict_max_workers: int = 100,
         conflict_retry_rounds: int = 2,
+        openai_timeout_seconds: float | None = None,
+        openai_max_retries: int | None = None,
     ):
-        self.client = OpenAI(api_key=api_key)
+        timeout = (
+            Config.LLM_OPENAI_TIMEOUT_SECONDS
+            if openai_timeout_seconds is None else openai_timeout_seconds
+        )
+        timeout = float(timeout)
+        client_timeout = None if timeout <= 0 else timeout
+        max_retries = (
+            Config.LLM_OPENAI_MAX_RETRIES
+            if openai_max_retries is None else openai_max_retries
+        )
+
+        self.client = OpenAI(
+            api_key=api_key,
+            timeout=client_timeout,
+            max_retries=max(0, int(max_retries)),
+        )
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.conflict_batch_size = max(1, int(conflict_batch_size))
         self.conflict_max_workers = max(1, int(conflict_max_workers))
         self.conflict_retry_rounds = max(1, int(conflict_retry_rounds))
+        self.openai_timeout_seconds = client_timeout
+        self.openai_max_retries = max(0, int(max_retries))
         self.usage = TokenAccumulator()
 
     @staticmethod

@@ -17,6 +17,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_NAME="pdfx"
 GPU_MODE="${GPU_MODE:-auto}" # auto|on|off
 PDFX_DEPLOY_BUILD_MODE="${PDFX_DEPLOY_BUILD_MODE:-auto}" # auto|rebuild|never
+PDFX_DEPLOY_PULL_IMAGES="${PDFX_DEPLOY_PULL_IMAGES:-auto}" # auto|always|never
+PDFX_PREWARM_MODELS="${PDFX_PREWARM_MODELS:-auto}" # auto|marker|off
 
 detect_gpu() {
     command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
@@ -70,6 +72,28 @@ case "${PDFX_DEPLOY_BUILD_MODE}" in
         ;;
 esac
 
+case "${PDFX_DEPLOY_PULL_IMAGES}" in
+    auto|always|never)
+        ;;
+    *)
+        echo "ERROR: Invalid PDFX_DEPLOY_PULL_IMAGES='${PDFX_DEPLOY_PULL_IMAGES}'. Use auto|always|never." >&2
+        exit 1
+        ;;
+esac
+
+SHOULD_PULL_PREBUILT_GPU_IMAGE=false
+if [ "${PDFX_DEPLOY_PULL_IMAGES}" = "always" ]; then
+    SHOULD_PULL_PREBUILT_GPU_IMAGE=true
+elif [ "${PDFX_DEPLOY_PULL_IMAGES}" = "auto" ] && [ "${PDFX_DEPLOY_BUILD_MODE}" = "never" ]; then
+    SHOULD_PULL_PREBUILT_GPU_IMAGE=true
+fi
+
+if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ] && \
+   [ -n "${PDFX_GPU_IMAGE:-}" ] && \
+   [ "${PDFX_DEPLOY_BUILD_MODE}" = "never" ]; then
+    COMPOSE_ARGS=(-f "$COMPOSE_FILE" -f "docker-compose.gpu.prebuilt.yml" -p "$PROJECT_NAME")
+fi
+
 if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
     GROBID_HEALTH_PORT="8070"
     echo "GPU deployment mode selected (${GPU_MODE}); using ${COMPOSE_FILE}"
@@ -79,6 +103,183 @@ else
 fi
 
 echo "=== PDF Extraction Service Deployment ==="
+
+wait_for_postgres() {
+    local attempts=60
+    local delay=5
+
+    echo "Waiting for Postgres to accept connections..."
+    for attempt in $(seq 1 "$attempts"); do
+        if docker exec pdfx-postgres pg_isready -U pdfx >/dev/null 2>&1; then
+            echo "  Postgres is ready."
+            return 0
+        fi
+
+        echo "  Postgres not ready yet (${attempt}/${attempts}); retrying in ${delay}s..."
+        sleep "$delay"
+    done
+
+    echo "ERROR: Postgres did not become ready after $((attempts * delay)) seconds."
+    return 1
+}
+
+probe_gpu_image() {
+    local image="${PDFX_GPU_IMAGE:-pdfx-gpu}"
+    local timeout_seconds="${PDFX_NVIDIA_PROBE_TIMEOUT_SECONDS:-30}"
+
+    timeout "$timeout_seconds" docker run --rm --gpus all --entrypoint nvidia-smi "$image" \
+        --query-gpu=name --format=csv,noheader
+}
+
+wait_for_nvidia_container_runtime() {
+    if [ "$COMPOSE_FILE" != "docker-compose.gpu.yml" ]; then
+        return 0
+    fi
+
+    local image="${PDFX_GPU_IMAGE:-pdfx-gpu}"
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        if [ "${PDFX_DEPLOY_BUILD_MODE}" = "auto" ]; then
+            echo "Skipping pre-start NVIDIA image probe; ${image} will be built by Docker Compose if needed."
+            return 0
+        fi
+    fi
+
+    local attempts="${PDFX_NVIDIA_READY_ATTEMPTS:-36}"
+    local delay="${PDFX_NVIDIA_READY_DELAY_SECONDS:-5}"
+    local probe_out probe_err
+    probe_out="$(mktemp -t pdfx-gpu-probe.XXXXXX.out)"
+    probe_err="$(mktemp -t pdfx-gpu-probe.XXXXXX.err)"
+
+    echo "Waiting for NVIDIA container runtime..."
+    for attempt in $(seq 1 "$attempts"); do
+        if detect_gpu && probe_gpu_image >"$probe_out" 2>"$probe_err"; then
+            echo "  NVIDIA runtime is ready ($(cat "$probe_out"))."
+            rm -f "$probe_out" "$probe_err"
+            return 0
+        fi
+
+        echo "  NVIDIA runtime not ready (${attempt}/${attempts}); retrying in ${delay}s..."
+        if [ -s "$probe_err" ]; then
+            sed 's/^/    /' "$probe_err" | tail -n 8
+        fi
+        sleep "$delay"
+    done
+
+    rm -f "$probe_out" "$probe_err"
+    echo "ERROR: NVIDIA container runtime did not become ready after $((attempts * delay)) seconds."
+    return 1
+}
+
+probe_worker_cuda() {
+    local timeout_seconds="${PDFX_WORKER_CUDA_PROBE_TIMEOUT_SECONDS:-120}"
+
+    timeout "$timeout_seconds" docker exec pdfx-worker python3.11 -c '
+import sys
+import torch
+
+if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+    sys.exit("CUDA is not available inside pdfx-worker")
+
+torch.cuda.mem_get_info(0)
+print(torch.cuda.get_device_name(0))
+'
+}
+
+wait_for_flask_health() {
+    local timeout_seconds="${PDFX_FLASK_HEALTH_TIMEOUT_SECONDS:-1800}"
+    local delay="${PDFX_FLASK_HEALTH_POLL_SECONDS:-10}"
+    local deadline=$((SECONDS + timeout_seconds))
+    local health_json=""
+
+    echo "  Waiting for Flask health (timeout ${timeout_seconds}s)..."
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if health_json="$(curl -fsS --max-time 10 http://localhost:5000/api/v1/health 2>/dev/null)"; then
+            echo "  Flask app is healthy: ${health_json}"
+            return 0
+        fi
+
+        echo "  Flask app not ready yet; retrying in ${delay}s..."
+        sleep "$delay"
+    done
+
+    echo "ERROR: Flask app did not become healthy after ${timeout_seconds}s."
+    echo "Last health response:"
+    curl -sS --max-time 10 http://localhost:5000/api/v1/health || true
+    echo ""
+    echo "Recent app/worker logs:"
+    docker compose "${COMPOSE_ARGS[@]}" logs --tail=80 app worker || true
+    return 1
+}
+
+should_prewarm_marker_models() {
+    if [ "$COMPOSE_FILE" != "docker-compose.gpu.yml" ]; then
+        return 1
+    fi
+
+    case "${PDFX_PREWARM_MODELS}" in
+        auto)
+            [ "${PDFX_DEPLOY_BUILD_MODE}" = "never" ]
+            ;;
+        marker|true|1|yes|on)
+            return 0
+            ;;
+        off|false|0|no|none|never)
+            return 1
+            ;;
+        *)
+            echo "ERROR: Invalid PDFX_PREWARM_MODELS='${PDFX_PREWARM_MODELS}'. Use auto|marker|off." >&2
+            return 2
+            ;;
+    esac
+}
+
+prewarm_marker_models() {
+    local prewarm_status=0
+    should_prewarm_marker_models || prewarm_status=$?
+    if [ "$prewarm_status" -eq 1 ]; then
+        return 0
+    elif [ "$prewarm_status" -ne 0 ]; then
+        return "$prewarm_status"
+    fi
+
+    local image="${PDFX_GPU_IMAGE:-pdfx-gpu}"
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "Skipping Marker model prewarm; ${image} is not available yet."
+        return 0
+    fi
+
+    echo "Prewarming Marker models into persistent cache..."
+    docker run --rm --gpus all \
+        --env HF_HOME=/app/data/models \
+        --env TRANSFORMERS_CACHE=/app/data/models \
+        --env TORCH_HOME=/app/data/models \
+        --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
+        --env NVIDIA_VISIBLE_DEVICES=all \
+        --env NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+        -v "$REPO_ROOT/data/models:/app/data/models" \
+        -v "$REPO_ROOT/data/model_cache:/root/.cache" \
+        -v "$REPO_ROOT/data/rapidocr_models:/usr/local/lib/python3.11/site-packages/rapidocr/models" \
+        -v "$REPO_ROOT/data/rapidocr_models:/usr/local/lib/python3.11/dist-packages/rapidocr/models" \
+        --entrypoint python3.11 \
+        "$image" - <<'PY'
+import sys
+import time
+
+import torch
+from marker.models import create_model_dict
+
+if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+    sys.exit("CUDA is not available for Marker model prewarm")
+
+device = torch.device("cuda")
+dtype = torch.float16
+torch.cuda.mem_get_info(0)
+start = time.monotonic()
+create_model_dict(device=device, dtype=dtype)
+elapsed = time.monotonic() - start
+print(f"Marker models ready on {torch.cuda.get_device_name(0)} in {elapsed:.1f}s")
+PY
+}
 
 # Step 1: Check prerequisites
 echo "Checking prerequisites..."
@@ -116,26 +317,46 @@ mkdir -p "$REPO_ROOT/data/models"
 mkdir -p "$REPO_ROOT/data/model_cache"
 mkdir -p "$REPO_ROOT/data/rapidocr_models"
 mkdir -p "$REPO_ROOT/logs"
+rm -f "$REPO_ROOT/data/cache/marker_worker_ready.json"
 
 # Step 3: Stop existing services
 echo "Stopping existing services..."
 docker compose "${COMPOSE_ARGS[@]}" down 2>/dev/null || true
 
-# Step 4: Start services
-echo "Starting services (build mode: ${PDFX_DEPLOY_BUILD_MODE})..."
-docker compose "${COMPOSE_ARGS[@]}" up -d "${BUILD_ARGS[@]}"
+# Step 4: Prepare application image and start dependency services
+if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ] && \
+   [ -n "${PDFX_GPU_IMAGE:-}" ] && \
+   [ "${SHOULD_PULL_PREBUILT_GPU_IMAGE}" = "true" ]; then
+    echo "Pulling prebuilt GPU application image: ${PDFX_GPU_IMAGE}"
+    docker compose "${COMPOSE_ARGS[@]}" pull app worker
+fi
 
-# Step 5: Wait for services to start
+if [ "${PDFX_DEPLOY_BUILD_MODE}" = "rebuild" ]; then
+    echo "Rebuilding application images before migrations..."
+    docker compose "${COMPOSE_ARGS[@]}" build app worker
+fi
+
+wait_for_nvidia_container_runtime
+
+prewarm_marker_models
+
+echo "Starting dependency services..."
+docker compose "${COMPOSE_ARGS[@]}" up -d postgres redis grobid
+
+# Step 5: Wait for dependency services to start
 echo "Waiting for services to start..."
-sleep 10
+wait_for_postgres
 
 # Step 6: Run database migrations
 echo "Running database migrations..."
-docker compose "${COMPOSE_ARGS[@]}" exec -T app alembic upgrade head 2>/dev/null && \
-    echo "  Database migrations applied." || \
-    echo "  WARNING: Migration failed or Alembic not available. DB tracking may not work."
+docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps app alembic upgrade head
+echo "  Database migrations applied."
 
-# Step 7: Health checks
+# Step 7: Start full stack
+echo "Starting application services (build mode: ${PDFX_DEPLOY_BUILD_MODE})..."
+docker compose "${COMPOSE_ARGS[@]}" up -d "${BUILD_ARGS[@]}"
+
+# Step 8: Health checks
 echo ""
 echo "=== Health Checks ==="
 
@@ -149,7 +370,7 @@ fi
 
 # Check Redis
 echo -n "  Redis: "
-if docker exec ${PROJECT_NAME}-redis-1 redis-cli ping 2>/dev/null | grep -q PONG; then
+if docker exec pdfx-redis redis-cli ping 2>/dev/null | grep -q PONG; then
     echo "HEALTHY"
 else
     echo "NOT READY"
@@ -163,12 +384,26 @@ else
     echo "NOT READY"
 fi
 
-# Check Flask app
-echo -n "  Flask app: "
-if curl -sf http://localhost:5000/api/v1/health > /dev/null 2>&1; then
-    echo "HEALTHY"
-else
-    echo "NOT READY (may still be loading models)"
+# Check Flask app. In GPU mode this also waits for the worker-process Marker
+# preload readiness file, because /health fails closed until Marker is hot.
+echo "  Flask app:"
+wait_for_flask_health
+
+if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ]; then
+    echo -n "  GPU worker CUDA: "
+    worker_probe_out="$(mktemp -t pdfx-worker-cuda-probe.XXXXXX.out)"
+    worker_probe_err="$(mktemp -t pdfx-worker-cuda-probe.XXXXXX.err)"
+    if probe_worker_cuda >"$worker_probe_out" 2>"$worker_probe_err"; then
+        echo "HEALTHY ($(cat "$worker_probe_out"))"
+        rm -f "$worker_probe_out" "$worker_probe_err"
+    else
+        echo "NOT READY"
+        if [ -s "$worker_probe_err" ]; then
+            sed 's/^/    /' "$worker_probe_err" | tail -n 8
+        fi
+        rm -f "$worker_probe_out" "$worker_probe_err"
+        exit 1
+    fi
 fi
 
 echo ""

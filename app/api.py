@@ -18,10 +18,12 @@ Endpoints:
 
 import os
 import uuid
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, request, jsonify, send_file, current_app
+from sqlalchemy import text
 from werkzeug.utils import secure_filename
 
 from app.error_utils import summarize_error_message
@@ -71,6 +73,16 @@ def _parse_review_images(form, extract_images):
     if not extract_images:
         return False
     return _parse_bool(form.get("review_images"), default=True)
+
+
+def _parse_requested_process_id(form):
+    raw_process_id = str(form.get("process_id") or "").strip()
+    if not raw_process_id:
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(raw_process_id))
+    except ValueError as exc:
+        raise ValueError("Invalid process_id; expected a UUID.") from exc
 
 
 def _to_iso(dt):
@@ -211,6 +223,47 @@ def _count_fresh_running_runs():
             db_session.close()
         except Exception:
             pass
+
+
+def _check_db_ready():
+    db_session = _get_db_session()
+    if not db_session:
+        return "unavailable", "session_unavailable"
+
+    try:
+        db_session.execute(text("SELECT 1 FROM extraction_run LIMIT 1"))
+        return "ok", None
+    except Exception as exc:
+        logger.warning("Database health check failed: %s", exc)
+        return "unavailable", type(exc).__name__
+    finally:
+        try:
+            db_session.close()
+        except Exception:
+            pass
+
+
+def _marker_ready_state():
+    if not current_app.config.get("HEALTH_REQUIRE_MARKER_READY", False):
+        return "disabled", None
+
+    ready_file = current_app.config.get("MARKER_READY_FILE")
+    if not ready_file:
+        return "missing", "not_configured"
+
+    try:
+        with open(ready_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict) or not payload:
+            return "missing", "empty_ready_file"
+        return "ok", None
+    except json.JSONDecodeError:
+        return "missing", "invalid_ready_file"
+    except FileNotFoundError:
+        return "loading", "ready_file_missing"
+    except Exception as exc:
+        logger.warning("Marker readiness check failed for %s: %s", ready_file, exc)
+        return "missing", type(exc).__name__
 
 
 def _redis_key_count(redis_client, command, key):
@@ -414,20 +467,43 @@ def health():
     except Exception:
         checks["workers"] = "unknown"
 
-    checks["active_runs"] = _count_runs_by_status(["running"])
-    checks["fresh_active_runs"] = _count_fresh_running_runs()
-    checks["queued_runs"] = _count_runs_by_status(["queued"])
+    db_status, db_error = _check_db_ready()
+    checks["database"] = db_status
+    if db_error:
+        checks["database_error"] = db_error
+
+    marker_status, marker_error = _marker_ready_state()
+    if marker_status != "disabled":
+        checks["marker_models"] = marker_status
+        if marker_error:
+            checks["marker_models_error"] = marker_error
+
+    if db_status == "ok":
+        checks["active_runs"] = _count_runs_by_status(["running"])
+        checks["fresh_active_runs"] = _count_fresh_running_runs()
+        checks["queued_runs"] = _count_runs_by_status(["queued"])
+    else:
+        checks["active_runs"] = "unknown"
+        checks["fresh_active_runs"] = "unknown"
+        checks["queued_runs"] = "unknown"
 
     overall = "ok"
     if checks["grobid"] != "ok" or checks["redis"] != "ok":
         overall = "degraded"
-    if checks["workers"] == "unknown":
+    if checks["database"] != "ok":
+        overall = "unhealthy"
+    if checks.get("marker_models") not in {None, "ok"}:
+        overall = "unhealthy"
+    if checks["workers"] == "unknown" and overall != "unhealthy":
         overall = "degraded"
     if checks["redis"] == "unavailable":
         overall = "unhealthy"
     if isinstance(checks["workers"], int) and checks["workers"] <= 0:
         dependencies_accept_submissions = (
-            checks["grobid"] == "ok" and checks["redis"] == "ok"
+            checks["grobid"] == "ok"
+            and checks["redis"] == "ok"
+            and checks["database"] == "ok"
+            and checks.get("marker_models") in {None, "ok"}
         )
         busy_solo_worker = (
             dependencies_accept_submissions
@@ -440,8 +516,8 @@ def health():
             # Solo Celery workers cannot respond to inspect while processing a
             # PDF. Redis still accepts queued work, and the unacked broker task
             # confirms the running DB row is not merely stale.
-            checks["worker_state"] = "busy_or_unresponsive"
-            overall = "degraded"
+            checks["worker_state"] = "busy"
+            overall = "busy"
         else:
             overall = "unhealthy"
 
@@ -634,8 +710,12 @@ def submit_extraction():
     mod_abbreviation = request.form.get("mod_abbreviation")
 
     # --- Save uploaded file ---------------------------------------------------
+    try:
+        process_id = _parse_requested_process_id(request.form)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     filename = secure_filename(file.filename)
-    process_id = str(uuid.uuid4())
     upload_dir = current_app.config["UPLOAD_FOLDER"]
     os.makedirs(upload_dir, exist_ok=True)
     pdf_path = os.path.join(upload_dir, f"{process_id}_{filename}")

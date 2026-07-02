@@ -141,10 +141,23 @@ Parameters:
     Default: 7
     MinValue: 1
     Description: Days to retain image artifacts tagged as temporary.
+  QueueRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Days to retain durable proxy queue objects before lifecycle cleanup.
   EcrRepositoryName:
     Type: String
     Default: agr_pdfx_proxy
     Description: ECR repository that stores the proxy image.
+  BackendImageRepositoryName:
+    Type: String
+    Default: agr_pdfx_backend
+    Description: ECR repository that stores the prebuilt GPU backend image.
+  BackendImageTag:
+    Type: String
+    Default: latest
+    Description: Backend GPU image tag pulled by EC2 bootstrap.
   ProxyImageTag:
     Type: String
     Default: latest
@@ -167,7 +180,13 @@ Parameters:
     Default: "256"
   ProxyTaskMemory:
     Type: String
-    Default: "512"
+    Default: "2048"
+  ProxyTaskEphemeralStorageGiB:
+    Type: Number
+    Default: 50
+    MinValue: 21
+    MaxValue: 200
+    Description: Fargate scratch space for multipart PDF upload spooling before durable S3 queue writes.
   QueuePrefix:
     Type: String
     Default: pdfx-proxy-queue
@@ -191,7 +210,7 @@ Parameters:
     Description: Optional comma-separated accepted client IDs; __PDFX_EMPTY__ disables.
   IdleTimeoutMinutes:
     Type: String
-    Default: "30"
+    Default: "120"
   StartupTimeoutMinutes:
     Type: String
     Default: "30"
@@ -246,6 +265,12 @@ Resources:
                 Value: extracted-image
               - Key: pdfx-retention
                 Value: temporary
+          - Id: pdfx-expire-proxy-queue
+            Status: Enabled
+            ExpirationInDays: !Ref QueueRetentionDays
+            Prefix: !Sub "${QueuePrefix}/"
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
       Tags:
         - Key: Project
           Value: pdfx
@@ -334,6 +359,20 @@ Resources:
                   - ssm:GetParameters
                   - ssm:GetParametersByPath
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SsmParameterPath}/*"
+              - Sid: EcrAuth
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPullBackendImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${BackendImageRepositoryName}"
 
   BackendInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -393,7 +432,13 @@ Resources:
               set -euo pipefail
               exec > >(tee /var/log/pdfx-bootstrap.log | logger -t pdfx-bootstrap -s 2>/dev/console) 2>&1
 
-              echo "Starting PDFX backend bootstrap"
+              echo "Installing PDFX backend bootstrap service"
+              cat > /usr/local/sbin/pdfx-backend-bootstrap.sh <<'BOOTSTRAP_SCRIPT'
+              #!/bin/bash
+              set -euo pipefail
+              exec > >(tee /var/log/pdfx-backend-bootstrap.log | logger -t pdfx-backend-bootstrap -s 2>/dev/console) 2>&1
+
+              echo "Starting PDFX backend bootstrap with prebuilt image ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}:${BackendImageTag}"
               dnf install -y docker git jq awscli
               systemctl enable --now docker
               usermod -aG docker ec2-user || true
@@ -462,7 +507,37 @@ Resources:
               mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
               chown -R ec2-user:ec2-user "$SERVICE_DIR"
               cd deploy
-              PDFX_DEPLOY_BUILD_MODE=auto GPU_MODE=on ./deploy.sh
+              BACKEND_IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}:${BackendImageTag}"
+              aws ecr get-login-password --region "${AWS::Region}" \
+                | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+              PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" \
+                PDFX_DEPLOY_BUILD_MODE=never \
+                PDFX_DEPLOY_PULL_IMAGES=auto \
+                GPU_MODE=on \
+                ./deploy.sh
+              BOOTSTRAP_SCRIPT
+
+              chmod +x /usr/local/sbin/pdfx-backend-bootstrap.sh
+              cat > /etc/systemd/system/pdfx-backend-bootstrap.service <<'UNIT_EOF'
+              [Unit]
+              Description=PDFX backend bootstrap and deploy
+              Wants=network-online.target
+              After=network-online.target
+
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/sbin/pdfx-backend-bootstrap.sh
+              TimeoutStartSec=1800
+              Restart=on-failure
+              RestartSec=30
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT_EOF
+
+              systemctl daemon-reload
+              systemctl enable pdfx-backend-bootstrap.service
+              systemctl start --no-block pdfx-backend-bootstrap.service
 
   BackendAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -750,6 +825,8 @@ Resources:
         - FARGATE
       Cpu: !Ref ProxyTaskCpu
       Memory: !Ref ProxyTaskMemory
+      EphemeralStorage:
+        SizeInGiB: !Ref ProxyTaskEphemeralStorageGiB
       ExecutionRoleArn: !GetAtt ProxyExecutionRole.Arn
       TaskRoleArn: !GetAtt ProxyTaskRole.Arn
       ContainerDefinitions:
@@ -777,6 +854,10 @@ Resources:
               Value: "false"
             - Name: ALWAYS_ON_MODE
               Value: !Ref AlwaysOnMode
+            - Name: MAX_UPLOAD_BYTES
+              Value: "524288000"
+            - Name: MAX_MULTIPART_OVERHEAD_BYTES
+              Value: "10485760"
           Secrets:
             - Name: EC2_INSTANCE_ID
               ValueFrom: !Ref SsmEc2InstanceId
