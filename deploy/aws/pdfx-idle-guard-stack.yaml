@@ -26,9 +26,9 @@ Parameters:
     Description: Alert when the backend has been idle this long with no queued/replay/active work. Keep above the proxy idle-stop timeout.
   AbsoluteAlertAfterMinutes:
     Type: Number
-    Default: 240
+    Default: 1440
     MinValue: 0
-    Description: Alert when the backend has been running this long even if work appears active; 0 disables this alarm.
+    Description: Alert when the backend has been running this long even if work appears active; 0 disables this alarm. Set well above the longest legitimate batch so this only fires as a stuck-instance failsafe.
   ScheduleExpression:
     Type: String
     Default: rate(5 minutes)
