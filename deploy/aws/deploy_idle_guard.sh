@@ -12,7 +12,7 @@ Usage:
     [--backend-asg-name pdfx-backend] \
     [--proxy-metrics-url https://pdfx.alliancegenome.org/api/v1/metrics] \
     [--idle-alert-after-minutes 130] \
-    [--absolute-alert-after-minutes 240] \
+    [--absolute-alert-after-minutes 1440] \
     [--project pdfx] \
     [--env prod] \
     [--region us-east-1] \
@@ -33,7 +33,7 @@ STACK_NAME=""
 BACKEND_ASG_NAME="pdfx-backend"
 PROXY_METRICS_URL="https://pdfx.alliancegenome.org/api/v1/metrics"
 IDLE_ALERT_AFTER_MINUTES="130"
-ABSOLUTE_ALERT_AFTER_MINUTES="240"
+ABSOLUTE_ALERT_AFTER_MINUTES="1440"
 SCHEDULE_EXPRESSION="rate(5 minutes)"
 METRICS_TIMEOUT_SECONDS="5"
 TREAT_METRICS_FETCH_FAILURE_AS_IDLE="true"

@@ -61,8 +61,9 @@ Default production-oriented behavior:
   not count against the idle alarm
 - alert after 130 minutes with no queued, replaying, or active backend work,
   which is intentionally just beyond the proxy's 120-minute idle-stop window
-- alert after 240 minutes of continuous backend runtime regardless of apparent
-  work
+- alert after 1440 minutes (24 hours) of continuous backend runtime regardless
+  of apparent work, as a stuck-instance failsafe set well beyond any legitimate
+  batch rather than a routine long-run warning
 - alert if the guard Lambda errors, is throttled, or misses two consecutive
   `GuardCheckSucceeded` heartbeats
 - treat proxy metrics fetch failures as idle, so a running backend plus a

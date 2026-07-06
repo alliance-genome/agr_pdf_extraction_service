@@ -248,7 +248,7 @@ def _run_check() -> dict[str, Any]:
     )
     metrics_url = os.environ["PROXY_METRICS_URL"]
     idle_threshold = _env_int("IDLE_ALERT_AFTER_MINUTES", 60)
-    absolute_threshold = _env_int("ABSOLUTE_ALERT_AFTER_MINUTES", 240)
+    absolute_threshold = _env_int("ABSOLUTE_ALERT_AFTER_MINUTES", 1440)
     metrics_timeout = _env_int("METRICS_TIMEOUT_SECONDS", 5)
     treat_metrics_failure_as_idle = os.environ.get(
         "TREAT_METRICS_FETCH_FAILURE_AS_IDLE", "true"
