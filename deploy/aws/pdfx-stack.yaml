@@ -28,10 +28,10 @@ Parameters:
     Type: AWS::EC2::VPC::Id
     Default: vpc-55522232
     Description: VPC that contains the shared ALB and PDFX backend.
-  BackendSubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Default: subnet-af62dca3
-    Description: Public subnet for the GPU backend instance.
+  BackendSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: subnet-3ebf4477,subnet-df7c7487,subnet-81c95ee4,subnet-ff838bd5,subnet-af62dca3
+    Description: Subnets across all AZs (1a,1b,1c,1d,1f) the backend ASG may launch into.
   EcsSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Default: subnet-04262fc338f638054,subnet-0d4703177afb1797d
@@ -111,10 +111,10 @@ Parameters:
     Description: Hard cap for backend GPU instances. Use 1 for strict cost control, 2 for launch-before-terminate experiments.
   BackendWarmPoolMinSize:
     Type: Number
-    Default: 1
+    Default: 0
     MinValue: 0
     MaxValue: 1
-    Description: Optional stopped warm-pool backend count for faster wake without running GPU cost.
+    Description: Stopped warm-pool count. 0 = terminate on idle and re-select cheapest on next wake.
   OperatorSshCidr:
     Type: String
     Default: 10.0.70.0/24
@@ -209,7 +209,7 @@ Parameters:
     Default: "120"
   StartupTimeoutMinutes:
     Type: String
-    Default: "30"
+    Default: "45"
   AsgStartupReplacementAttempts:
     Type: String
     Default: "1"
@@ -561,11 +561,21 @@ Resources:
       DesiredCapacity: !Ref BackendDesiredCapacity
       HealthCheckType: EBS
       HealthCheckGracePeriod: 900
-      VPCZoneIdentifier:
-        - !Ref BackendSubnetId
-      LaunchTemplate:
-        LaunchTemplateId: !Ref BackendLaunchTemplate
-        Version: !GetAtt BackendLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: !Ref BackendSubnetIds
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref BackendLaunchTemplate
+            Version: !GetAtt BackendLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: g5.2xlarge
+            - InstanceType: g5.4xlarge
+            # g6.2xlarge intentionally deferred to KANBAN-1411 (needs L4 validation;
+            # lowest-price cannot keep a cheaper type deprioritized).
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 100
+          OnDemandAllocationStrategy: lowest-price
       Tags:
         - Key: Name
           Value: !Ref BackendResourceName
