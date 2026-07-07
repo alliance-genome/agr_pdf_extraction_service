@@ -183,6 +183,11 @@ OUT2="$(select_amis_to_deregister 1 ami-4 "$LIST" | sort | tr '\n' ' ' | sed 's/
 # keep newest 1 (ami-4); prune ami-1,ami-2,ami-3 (none protected among pruned except... ami-4 protected already kept)
 check "$OUT2" "ami-1 ami-2 ami-3" "keep newest 1, protected already newest"
 
+# Protect an AMI that WOULD otherwise be pruned (exercises the grep -vx protect branch).
+OUT3="$(select_amis_to_deregister 2 ami-1 "$LIST" | sort | tr '\n' ' ' | sed 's/ $//')"
+# keep newest 2 (ami-4, ami-3); ami-1 & ami-2 would prune, but ami-1 is protected -> only ami-2.
+check "$OUT3" "ami-2" "protect a would-be-pruned AMI"
+
 exit $fail
 ```
 
@@ -299,8 +304,12 @@ set -euo pipefail
 
 # --- testable helper: fail if any required cache dir is empty ---
 assert_caches_nonempty() {
+  # Gate only on dirs known to populate: HF_HOME/Transformers/Torch all redirect to
+  # data/models, and any extraction runs OCR so data/rapidocr_models fills. data/model_cache
+  # (/root/.cache) is NOT asserted -- nothing reliably writes it, so gating on it would fail a
+  # healthy bake (design-review N2).
   local root="$1" rc=0 d
-  for d in data/models data/model_cache data/rapidocr_models; do
+  for d in data/models data/rapidocr_models; do
     if [ -z "$(find "$root/$d" -type f -print -quit 2>/dev/null)" ]; then
       echo "ERROR: cache dir '$d' is empty after warm-up extraction" >&2; rc=1
     fi
@@ -326,15 +335,12 @@ main() {
   cd "$SERVICE_DIR"
   mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
   # Placeholder .env sufficient for create_app()+worker health, NEVER real secrets (spec N2).
-  # The DB URL is assembled from a placeholder var (braced) so no credentialed-URI literal is
-  # committed -- keeps gitleaks/TruffleHog clean. Set PGPASS to the compose postgres service's
-  # local (non-secret) password from .env.example so the app can actually connect during bake.
-  PGPASS="bake-placeholder"
-  cat > .env <<ENV
+  # DB/Redis/Celery URLs come from compose x-shared-env (docker-compose.gpu.yml lines 15-19),
+  # which overrides env_file -- so no credentialed URI needs to live in this .env at all
+  # (keeps gitleaks/TruffleHog clean and avoids drifting from the compose defaults).
+  cat > .env <<'ENV'
 FLASK_ENV=production
 OPENAI_API_KEY=unused-during-bake
-DATABASE_URL=postgresql://pdfx:${PGPASS}@pdfx-postgres:5432/pdfx
-REDIS_URL=redis://pdfx-redis:6379/0
 ENV
 
   # ECR auth via the build instance's INSTANCE PROFILE (no static creds baked).
@@ -348,15 +354,17 @@ ENV
     PDFX_PREWARM_MODELS=marker GPU_MODE=on ./deploy.sh )
 
   # Warm the LAZY caches (Docling/rapidocr/GROBID) with one real extraction.
-  cp deploy/aws/ami/test-sample.pdf /tmp/sample.pdf 2>/dev/null || cp "$SERVICE_DIR/deploy/aws/ami/test-sample.pdf" /tmp/sample.pdf
+  # merge=false: skip the LLM merge (needs a real key) but still run grobid+docling+marker,
+  # which is what warms the caches. Without it the run ends 'failed' (api.py merge default=true).
+  cp "$SERVICE_DIR/deploy/aws/ami/test-sample.pdf" /tmp/sample.pdf
   local pid
-  pid="$(curl -sS -X POST http://127.0.0.1:5000/api/v1/extract -F 'file=@/tmp/sample.pdf' \
-    | sed -n 's/.*"process_id":"\([^"]*\)".*/\1/p')"
+  pid="$(curl -sS -X POST http://127.0.0.1:5000/api/v1/extract \
+    -F 'file=@/tmp/sample.pdf' -F 'merge=false' | jq -r '.process_id')"
   echo "warm-up extraction process_id=$pid"
   for _ in $(seq 1 120); do
-    status="$(curl -sS "http://127.0.0.1:5000/api/v1/extract/${pid}" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+    status="$(curl -sS "http://127.0.0.1:5000/api/v1/extract/${pid}" | jq -r '.status')"
     [ "$status" = "complete" ] && break
-    [ "$status" = "failed" ] && { echo "WARN: warm-up extraction failed; caches may be partial"; break; }
+    [ "$status" = "failed" ] && { echo "ERROR: warm-up extraction failed"; exit 1; }
     sleep 5
   done
 
@@ -499,6 +507,12 @@ build {
       "sudo -E deploy/aws/ami/provision.sh",
     ]
   }
+
+  # Emit the built AMI id to manifest.json for the CI job to read (robust vs. -machine-readable).
+  post-processor "manifest" {
+    output     = "manifest.json"
+    strip_path = true
+  }
 }
 ```
 
@@ -518,7 +532,7 @@ packer validate \
   -var base_ami_id=ami-00c6ddd550364d6c3 \
   -var backend_image_repo=100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend \
   -var backend_image_tag=validate-only \
-  -var iam_instance_profile=pdfx-backend-instance-profile \
+  -var iam_instance_profile=pdfx-ec2-profile \
   -var subnet_id=subnet-af62dca3 \
   pdfx-backend.pkr.hcl
 cd -
@@ -545,40 +559,13 @@ Wire the launch template to resolve the AMI from SSM, pin the immutable image ta
 - Consumes: SSM `/pdfx/backend-ami`, `/pdfx/backend-image-tag`; `/opt/pdfx/baked_fastpath.sh` baked into the AMI.
 - Produces: an ASG that launches the SSM-resolved AMI and boots fast when the baked digest matches.
 
-- [ ] **Step 1: Add the two SSM parameters (resources)**
+- [ ] **Step 1: Seed the two SSM parameters OUT OF BAND (do NOT CFN-manage their Value)**
 
-In the `SsmParameters` region of `pdfx-stack.yaml` (near the other `AWS::SSM::Parameter` resources, ~656), add:
+`/pdfx/backend-ami` and `/pdfx/backend-image-tag` hold values the **bake** mutates. Do **not** create them as `AWS::SSM::Parameter` resources with a `Value:` — CloudFormation reasserts a managed `Value` on every stack update, which would silently revert the live baked AMI/tag back to the seed and drop every wake to the slow full-bootstrap fallback (design-review B3). Instead they are seeded once via CLI (documented in Task 9) and thereafter owned by the bake; the launch template only *reads* them via `resolve:ssm`.
 
-```yaml
-  BackendAmiSsmParameter:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${SsmParameterPath}/backend-ami"
-      Type: String
-      Value: !Ref BackendAmiId    # seed with the base AMI; the bake overwrites with the baked AMI id
-      Description: AMI id the backend ASG launches (updated by the Packer bake).
+This step adds **no** CFN resource. It is a deliberate no-op in the template — the seed lives in the Task 9 runbook, and for a brand-new environment must run before the first ASG scale-out. (`BackendImageTag` already exists as a Parameter at `pdfx-stack.yaml:157`; do not re-add it.)
 
-  BackendImageTagSsmParameter:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${SsmParameterPath}/backend-image-tag"
-      Type: String
-      Value: !Ref BackendImageTag  # seed; the bake overwrites with the immutable baked tag
-      Description: Immutable backend image tag the baked AMI was built against and that boot pins.
-```
-
-- [ ] **Step 2: Add a `BackendImageTag` parameter (if not already present) and default**
-
-In Parameters (~near `BackendAmiId`), add:
-
-```yaml
-  BackendImageTag:
-    Type: String
-    Default: latest
-    Description: Seed backend image tag; superseded at runtime by /pdfx/backend-image-tag which the bake updates.
-```
-
-- [ ] **Step 3: Point the launch template ImageId at SSM**
+- [ ] **Step 2: Point the launch template ImageId at SSM**
 
 Change `BackendLaunchTemplate.LaunchTemplateData.ImageId` from `!Ref BackendAmiId` to the launch-time SSM resolution:
 
@@ -586,7 +573,7 @@ Change `BackendLaunchTemplate.LaunchTemplateData.ImageId` from `!Ref BackendAmiI
         ImageId: !Sub "resolve:ssm:/${SsmParameterPath}/backend-ami"
 ```
 
-- [ ] **Step 4: Insert the boot fast-path branch into UserData**
+- [ ] **Step 3: Insert the boot fast-path branch into UserData**
 
 In the `pdfx-backend-bootstrap.sh` heredoc (before the `deploy.sh` invocation near line ~520), replace the fixed deploy call with a branch that uses the baked marker when valid. Insert:
 
@@ -602,7 +589,10 @@ In the `pdfx-backend-bootstrap.sh` heredoc (before the `deploy.sh` invocation ne
               fi
 
               cd deploy
-              BACKEND_IMAGE_URI="${BACKEND_IMAGE_REPO}:${PINNED_TAG}"
+              # NOTE: this whole heredoc is inside CFN Fn::Sub, so shell vars MUST use bare $
+              # (not ${...}, which CFN would try to resolve as a template variable and fail
+              # validate-template -- design-review B1). Only real CFN refs use ${...} here.
+              BACKEND_IMAGE_URI="$BACKEND_IMAGE_REPO:$PINNED_TAG"
               aws ecr get-login-password --region "${AWS::Region}" \
                 | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
               if [ "$USE_FAST_PATH" = "1" ]; then
@@ -618,7 +608,7 @@ In the `pdfx-backend-bootstrap.sh` heredoc (before the `deploy.sh` invocation ne
 
 Remove the now-superseded original single `PDFX_GPU_IMAGE=... ./deploy.sh` block (the one using `${BackendImageTag}` directly).
 
-- [ ] **Step 5: Validate the template renders**
+- [ ] **Step 4: Validate the template renders**
 
 Run:
 ```bash
@@ -628,17 +618,17 @@ cfn-lint deploy/aws/pdfx-stack.yaml
 ```
 Expected: `validate OK`, and cfn-lint clean (or only pre-existing warnings unrelated to this change). If `cfn-lint` absent: `pip install cfn-lint`.
 
-- [ ] **Step 6: Assert the wiring is present**
+- [ ] **Step 5: Assert the wiring is present**
 
 Run:
 ```bash
 grep -q 'resolve:ssm:/${SsmParameterPath}/backend-ami' deploy/aws/pdfx-stack.yaml && echo "ImageId wired"
 grep -q 'should_use_baked_fastpath' deploy/aws/pdfx-stack.yaml && echo "fast-path wired"
-grep -q '/backend-image-tag' deploy/aws/pdfx-stack.yaml && echo "image-tag param wired"
+grep -q '/backend-image-tag' deploy/aws/pdfx-stack.yaml && echo "image-tag read wired"
 ```
 Expected: all three echoes print.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add deploy/aws/pdfx-stack.yaml
@@ -658,15 +648,21 @@ Replace the single-type launch with an on-demand `lowest-price` mix of g5.2xlarg
 - Consumes: `BackendLaunchTemplate` (from Task 5).
 - Produces: an ASG spanning five subnets with a two-type on-demand mix and no warm pool by default.
 
-- [ ] **Step 1: Add a multi-AZ subnet list parameter**
+- [ ] **Step 1: Add a multi-AZ subnet list parameter (with a Default) and retire the single-subnet param**
 
-In Parameters, add (and keep the existing single `BackendSubnetId` only if other resources still reference it; otherwise replace usages):
+In Parameters, add `BackendSubnetIds` **with a Default** (spec §5 wants the five prod subnets by default; a `List<...::Subnet::Id>` with no default forces every deploy to pass it and breaks existing tooling — design-review B4):
 
 ```yaml
   BackendSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: Subnets across all AZs the backend ASG may launch into.
-    # prod default: subnet-3ebf4477 (1a), subnet-df7c7487 (1b), subnet-81c95ee4 (1c), subnet-ff838bd5 (1d), subnet-af62dca3 (1f)
+    Default: subnet-3ebf4477,subnet-df7c7487,subnet-81c95ee4,subnet-ff838bd5,subnet-af62dca3
+    Description: Subnets across all AZs (1a,1b,1c,1d,1f) the backend ASG may launch into.
+```
+
+The existing `BackendSubnetId` (param at `:31`) is referenced only by the ASG `VPCZoneIdentifier` at `:552`. Step 3 replaces that reference, so **delete the `BackendSubnetId` parameter** to avoid a cfn-lint W2001 unused-parameter warning. First confirm it has no other references:
+
+```bash
+grep -n 'BackendSubnetId\b' deploy/aws/pdfx-stack.yaml   # expect only the param def and the :552 usage
 ```
 
 - [ ] **Step 2: Default the warm pool off and widen startup timeout**
@@ -679,13 +675,12 @@ In Parameters, add (and keep the existing single `BackendSubnetId` only if other
     MaxValue: 1
     Description: Stopped warm-pool count. 0 = terminate on idle and re-select cheapest on next wake.
 ```
-And the startup timeout parameter (find `StartupTimeoutMinutes`/the value seeding `/pdfx/startup-timeout-minutes`) → default `45`:
+And **edit** the existing `StartupTimeoutMinutes` (already at `:214`) — keep it `Type: String` like its sibling timeout params (it feeds a String SSM value); only change the default from `"30"` to `"45"` (margin so the full-bootstrap fallback can't cascade into a replace loop — design-review N5):
 
 ```yaml
   StartupTimeoutMinutes:
-    Type: Number
-    Default: 45         # was 30 — margin so the full-bootstrap fallback can't cascade into a replace loop
-    Description: Proxy startup timeout before marking a backend unhealthy.
+    Type: String
+    Default: "45"
 ```
 
 - [ ] **Step 3: Convert the ASG to a MixedInstancesPolicy across subnets**
@@ -775,12 +770,12 @@ Append two statements to the `Statement` array:
       "Sid": "PassBackendInstanceProfileRole",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::100225593120:role/pdfx-backend-instance-role",
+      "Resource": "arn:aws:iam::100225593120:role/pdfx-ec2-role",
       "Condition": { "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" } }
     }
 ```
 
-(If the backend instance role name differs, set the `Resource` to the role attached to `pdfx-backend-instance-profile`.)
+The bake reuses the existing backend instance profile `pdfx-ec2-profile` (role `pdfx-ec2-role`, defined in `pdfx-stack.yaml`), which already grants `ecr:GetAuthorizationToken` + pull on `agr_pdfx_backend` — exactly what the build box needs for ECR auth. No new instance profile/role is created.
 
 - [ ] **Step 2: Validate JSON + policy grammar**
 
@@ -815,7 +810,7 @@ Add a job that bakes a new AMI after a backend-affecting merge and publishes it 
 
 - [ ] **Step 1: Add a change-detection output to `on-merge`**
 
-In the `on-merge` job, add a step that sets `backend-changed` by diffing the merge commit:
+In the `on-merge` job, add these steps **after** the existing `Capture deployment metadata` (`id: meta`) step — the checkout's `ref: ${{ steps.meta.outputs.source-ref }}` is empty if placed before `meta` runs:
 
 ```yaml
       - name: Check out repository code
@@ -858,7 +853,7 @@ Append after `deploy-prod`:
       BACKEND_IMAGE_REPO: 100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend
       BASE_AMI_ID: ami-00c6ddd550364d6c3
       BUILD_SUBNET_ID: subnet-af62dca3
-      IAM_INSTANCE_PROFILE: pdfx-backend-instance-profile
+      IAM_INSTANCE_PROFILE: pdfx-ec2-profile
       SSM_PREFIX: /pdfx
     steps:
       - uses: actions/checkout@v5
@@ -885,10 +880,11 @@ Append after `deploy-prod`:
             -var backend_image_tag="${IMAGE_TAG}" \
             -var iam_instance_profile="${IAM_INSTANCE_PROFILE}" \
             -var subnet_id="${BUILD_SUBNET_ID}" \
-            -machine-readable pdfx-backend.pkr.hcl | tee /tmp/packer.log
-          AMI_ID="$(grep 'artifact,0,id' /tmp/packer.log | rev | cut -d',' -f1 | rev | cut -d':' -f2)"
+            pdfx-backend.pkr.hcl
+          # manifest.json artifact_id is "region:ami-xxxx"; take the ami id.
+          AMI_ID="$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d':' -f2)"
           echo "Baked AMI: $AMI_ID"
-          test -n "$AMI_ID"
+          test -n "$AMI_ID" && [ "$AMI_ID" != "null" ]
           aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
             --name "${SSM_PREFIX}/backend-ami" --type String --value "$AMI_ID"
           aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
@@ -923,8 +919,15 @@ Document baking, IAM, params, the `resolve:ssm` dry-run check, rollout, and back
 Include, as concrete runnable sections:
 - **What this is:** the baked-AMI + MixedInstancesPolicy design (link the spec).
 - **Manual bake:** the exact `packer init`/`packer build` command from Task 8 with `-var` values.
-- **Params written:** `/pdfx/backend-ami`, `/pdfx/backend-image-tag` (updated only after a successful `RegisterImage`).
-- **IAM:** the added statements and the `pdfx-backend-instance-profile` used for ECR auth on the build box.
+- **One-time SSM seed (before first use):** these two params are intentionally **not** CloudFormation-managed values (a managed `Value:` would be reasserted on every stack update, reverting the live baked AMI/tag — design-review B3). Seed them once:
+  ```bash
+  aws ssm put-parameter --profile ctabone --region us-east-1 --overwrite \
+    --name /pdfx/backend-ami --type String --value <seed-or-baked-ami-id>
+  aws ssm put-parameter --profile ctabone --region us-east-1 --overwrite \
+    --name /pdfx/backend-image-tag --type String --value <immutable-tag>
+  ```
+- **Params written by the bake:** `/pdfx/backend-ami`, `/pdfx/backend-image-tag` (updated only after a successful `RegisterImage`). Warn readers that a CloudFormation redeploy must **not** re-introduce these as managed-`Value` resources.
+- **IAM:** the added statements and the existing `pdfx-ec2-profile` (role `pdfx-ec2-role`) reused for ECR auth on the build box.
 - **Apply path (prod is drifted from the template):** prefer stack reconcile/import; if applying directly, mirror edits into `pdfx-stack.yaml`. Order: publish baked AMI → set both SSM params → **dry-run** `aws autoscaling update-auto-scaling-group` (this is where EC2 validates `ssm:GetParameters` for the `resolve:ssm` ImageId) → apply. Note the initial `resolve:ssm` switch creates one new launch-template version.
 - **Backout:** re-enable warm pool (`BackendWarmPoolMinSize=1`) and point `/pdfx/backend-ami` at a known-good AMI (or the DL base AMI → boot fallback path).
 - **Phase 2 (KANBAN-1411):** add `g6.2xlarge` to `Overrides` after booting a g6 from the baked AMI and running a real extraction.
@@ -943,7 +946,7 @@ git commit -m "Add PDFX AMI bake + rollout/backout operator README"
 - [ ] Run all shell unit tests: `bash deploy/aws/ami/tests/test_baked_fastpath.sh && bash deploy/aws/ami/tests/test_prune_amis.sh`
 - [ ] `packer validate` (Task 4 Step 3) and `cfn-lint deploy/aws/pdfx-stack.yaml` both pass.
 - [ ] `jq empty deploy/aws/github-actions-deploy-policy.json` and workflow lint pass.
-- [ ] Confirm **no `g6`** anywhere in `pdfx-stack.yaml` (Phase 1): `! grep -rn 'g6' deploy/aws/pdfx-stack.yaml`.
+- [ ] Confirm **no g6 in the instance mix** (Phase 1): `! grep -En 'InstanceType:[[:space:]]*g6' deploy/aws/pdfx-stack.yaml` (scoped to the override list so it doesn't match the explanatory `g6.2xlarge` comment the plan adds).
 - [ ] Push the branch and open a PR; do **not** apply to prod (that's the operator's step per the spec).
 
 ## Spec coverage self-check

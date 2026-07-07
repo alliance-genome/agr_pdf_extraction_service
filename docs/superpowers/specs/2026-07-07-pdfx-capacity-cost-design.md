@@ -125,7 +125,7 @@ Replace the ASG's single `LaunchTemplate` with a `MixedInstancesPolicy`.
 
 ## 6. Component C — AMI & image-tag wiring, lifecycle
 
-- New SSM String parameters, created by the stack with seed values:
+- New SSM String parameters, **seeded once out-of-band (not CloudFormation-managed values)** so a stack redeploy cannot reassert a stale seed over the bake's live value (design-review B3):
   - **`/pdfx/backend-ami`** — the AMI id to launch.
   - **`/pdfx/backend-image-tag`** — the immutable backend image tag the baked AMI was built against (and that the boot path pulls/verifies). This replaces the launch template's use of `:latest`, so the AMI and the image it runs are always a **matched pair**.
 - The launch template sets `ImageId: resolve:ssm:/pdfx/backend-ami`. EC2 resolves this **at instance launch**, so a rebake that updates the parameter is picked up on the next wake with **no CloudFormation deploy and no launch-template version bump** — in steady state. (The *initial* switch to `resolve:ssm` is itself one new LT version; see §8.)
