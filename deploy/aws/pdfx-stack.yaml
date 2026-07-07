@@ -509,6 +509,8 @@ Resources:
               USE_FAST_PATH=0
               if [ -f /opt/pdfx/baked_fastpath.sh ]; then
                 . /opt/pdfx/baked_fastpath.sh
+                # baked_fastpath.sh runs `aws ecr describe-images` with no --region; give it one.
+                export AWS_DEFAULT_REGION=${AWS::Region}
                 if should_use_baked_fastpath /opt/pdfx/baked.json "$BACKEND_IMAGE_REPO" "$PINNED_TAG"; then USE_FAST_PATH=1; fi
               fi
 
@@ -521,6 +523,7 @@ Resources:
                 | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
               if [ "$USE_FAST_PATH" = "1" ]; then
                 echo "Booting via baked fast path (images/models present)"
+                # PINNED_TAG must equal the baked tag string: the no-pull compose finds the local image by tag.
                 PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" PDFX_DEPLOY_BUILD_MODE=never \
                   PDFX_DEPLOY_PULL_IMAGES=never PDFX_PREWARM_MODELS=off GPU_MODE=on ./deploy.sh
               else

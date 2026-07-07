@@ -71,9 +71,15 @@ source "amazon-ebs" "pdfx_backend" {
 build {
   sources = ["source.amazon-ebs.pdfx_backend"]
 
+  # Pre-create the upload destination so the file provisioner copies repo
+  # contents into it (trailing-slash source => contents, not the dir itself).
+  provisioner "shell" {
+    inline = ["mkdir -p /tmp/repo"]
+  }
+
   # Ship the repo scripts the provisioner needs.
   provisioner "file" {
-    source      = "${path.root}/../../.." # repo root
+    source      = "${path.root}/../../../" # repo root
     destination = "/tmp/repo"
   }
 

@@ -66,6 +66,7 @@ ENV
     [ "$status" = "failed" ] && { echo "ERROR: warm-up extraction failed"; exit 1; }
     sleep 5
   done
+  [ "$status" = "complete" ] || { echo "ERROR: warm-up extraction did not complete (status=$status)"; exit 1; }
 
   assert_caches_nonempty "$SERVICE_DIR"
 

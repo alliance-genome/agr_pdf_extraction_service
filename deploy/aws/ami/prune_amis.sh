@@ -7,7 +7,7 @@ select_amis_to_deregister() {
   local keep_n="$1" protected="$2" list="$3"
   # Sort by date desc, drop the newest keep_n, then exclude the protected id.
   printf '%s\n' "$list" | sort -r | awk 'NF' | tail -n +"$((keep_n + 1))" \
-    | awk '{print $2}' | grep -vx "$protected" || true
+    | awk '{print $2}' | grep -Fvx "$protected" || true
 }
 
 main() {
