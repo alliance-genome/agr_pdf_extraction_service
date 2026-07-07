@@ -18,6 +18,7 @@ jobs:
     outputs:
       image-tag: ${{ steps.meta.outputs.image-tag }}
       source-ref: ${{ steps.meta.outputs.source-ref }}
+      backend-changed: ${{ steps.changed.outputs.backend-changed }}
     env:
       MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
       FALLBACK_SHA: ${{ github.sha }}
@@ -32,6 +33,21 @@ jobs:
         run: |
           echo "Merged PR detected for ${GITHUB_REPOSITORY}."
           echo "Deploying commit ${{ steps.meta.outputs.source-ref }}."
+      - name: Check out repository code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.meta.outputs.source-ref }}
+          fetch-depth: 2
+      - name: Detect backend-affecting changes
+        id: changed
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -E '^(deploy/Dockerfile\.gpu|requirements\.txt|app/|celery_app\.py|config\.py|deploy/docker-compose.*\.yml|deploy/aws/ami/)' >/dev/null; then
+            echo "backend-changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only HEAD~1 HEAD >/dev/null 2>&1; then
+            echo "backend-changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend-changed=true" >> "$GITHUB_OUTPUT"   # inconclusive -> run (safe over stale)
+          fi
 
   on-deploy:
     name: Skip on 'no-deploy' PRs
@@ -180,3 +196,59 @@ jobs:
           docker buildx imagetools create \
             --tag "${TARGET_IMAGE_LATEST}" \
             "${SOURCE_IMAGE_TAGGED}"
+
+  bake-backend-ami:
+    name: Bake backend AMI
+    needs: [on-merge, deploy-prod]
+    if: needs.on-merge.outputs.backend-changed == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ github.workflow }}-bake-backend-ami
+      cancel-in-progress: false
+    env:
+      AWS_REGION: us-east-1
+      IMAGE_TAG: ${{ needs.on-merge.outputs.image-tag }}
+      BACKEND_IMAGE_REPO: 100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend
+      BASE_AMI_ID: ami-00c6ddd550364d6c3
+      BUILD_SUBNET_ID: subnet-af62dca3
+      IAM_INSTANCE_PROFILE: pdfx-ec2-profile
+      SSM_PREFIX: /pdfx
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.on-merge.outputs.source-ref }}
+      - name: AWS credentials configuration
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}
+          role-session-name: gh-actions-${{ github.run_id }}-pdfx-bake
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@v3
+        with:
+          version: latest
+      - name: Bake AMI
+        working-directory: deploy/aws/ami
+        run: |
+          packer init pdfx-backend.pkr.hcl
+          packer build \
+            -var region="${AWS_REGION}" \
+            -var base_ami_id="${BASE_AMI_ID}" \
+            -var backend_image_repo="${BACKEND_IMAGE_REPO}" \
+            -var backend_image_tag="${IMAGE_TAG}" \
+            -var iam_instance_profile="${IAM_INSTANCE_PROFILE}" \
+            -var subnet_id="${BUILD_SUBNET_ID}" \
+            pdfx-backend.pkr.hcl
+          # manifest.json artifact_id is "region:ami-xxxx"; take the ami id.
+          AMI_ID="$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d':' -f2)"
+          echo "Baked AMI: $AMI_ID"
+          test -n "$AMI_ID" && [ "$AMI_ID" != "null" ]
+          aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
+            --name "${SSM_PREFIX}/backend-ami" --type String --value "$AMI_ID"
+          aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
+            --name "${SSM_PREFIX}/backend-image-tag" --type String --value "${IMAGE_TAG}"
+      - name: Prune old baked AMIs
+        run: KEEP_N=3 SSM_PREFIX=/pdfx AWS_REGION=us-east-1 bash deploy/aws/ami/prune_amis.sh
