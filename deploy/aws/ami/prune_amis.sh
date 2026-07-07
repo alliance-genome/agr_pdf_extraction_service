@@ -16,9 +16,14 @@ main() {
   protected="$(aws ssm get-parameter --region "$region" --name "${ssm_prefix}/backend-ami" \
     --query 'Parameter.Value' --output text 2>/dev/null || echo "none")"
   local list
-  list="$(aws ec2 describe-images --region "$region" --owners self \
+  # Cleanup is best-effort: a transient describe failure must not red an
+  # already-successful bake (the image build + SSM updates are done by now).
+  if ! list="$(aws ec2 describe-images --region "$region" --owners self \
     --filters 'Name=tag:Role,Values=backend-baked' \
-    --query 'Images[].[CreationDate,ImageId]' --output text)"
+    --query 'Images[].[CreationDate,ImageId]' --output text 2>/dev/null)"; then
+    echo "prune: describe-images failed; skipping cleanup this run."
+    return 0
+  fi
   local to_prune
   to_prune="$(select_amis_to_deregister "$keep_n" "$protected" "$list")"
   [ -n "$to_prune" ] || { echo "Nothing to prune."; return 0; }
@@ -31,7 +36,8 @@ main() {
       echo "[dry-run] would deregister $ami and snapshots: $snaps"
     else
       echo "Deregistering $ami"
-      aws ec2 deregister-image --region "$region" --image-id "$ami"
+      aws ec2 deregister-image --region "$region" --image-id "$ami" \
+        || { echo "warn: deregister $ami failed; leaving it for next run"; continue; }
       for s in $snaps; do aws ec2 delete-snapshot --region "$region" --snapshot-id "$s" || true; done
     fi
   done <<< "$to_prune"

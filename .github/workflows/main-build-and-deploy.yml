@@ -41,6 +41,12 @@ jobs:
       - name: Detect backend-affecting changes
         id: changed
         run: |
+          # Gate targets what is actually baked INTO the AMI: the backend image
+          # inputs (Dockerfile.gpu, requirements, app/, celery_app.py, config.py,
+          # compose) and the bake tooling (deploy/aws/ami/). deploy/deploy.sh and
+          # deploy/manage.sh are intentionally omitted: boot re-runs deploy.sh
+          # fresh from the git clone, and the digest fast-path falls back safely,
+          # so a change to those does not require a rebake.
           if git diff --name-only HEAD~1 HEAD | grep -E '^(deploy/Dockerfile\.gpu|requirements\.txt|app/|celery_app\.py|config\.py|deploy/docker-compose.*\.yml|deploy/aws/ami/)' >/dev/null; then
             echo "backend-changed=true" >> "$GITHUB_OUTPUT"
           elif git diff --name-only HEAD~1 HEAD >/dev/null 2>&1; then
