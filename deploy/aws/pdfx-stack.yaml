@@ -74,10 +74,6 @@ Parameters:
     MinValue: 1
     MaxValue: 50000
     Description: Unique priority on the shared HTTPS listener.
-  BackendAmiId:
-    Type: AWS::EC2::Image::Id
-    Default: ami-00c6ddd550364d6c3
-    Description: Deep Learning Base OSS NVIDIA Driver GPU AMI used by prod.
   BackendInstanceType:
     Type: String
     Default: g5.4xlarge
@@ -386,7 +382,7 @@ Resources:
     Properties:
       LaunchTemplateName: !Ref BackendResourceName
       LaunchTemplateData:
-        ImageId: !Ref BackendAmiId
+        ImageId: !Sub "resolve:ssm:/${SsmParameterPath}/backend-ami"
         InstanceType: !Ref BackendInstanceType
         KeyName: !Ref BackendKeyName
         IamInstanceProfile:
@@ -506,15 +502,32 @@ Resources:
 
               mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
               chown -R ec2-user:ec2-user "$SERVICE_DIR"
+              # --- baked-AMI fast path (spec 4B) ---
+              BACKEND_IMAGE_REPO="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}"
+              PINNED_TAG="$(aws ssm get-parameter --region "${AWS::Region}" \
+                --name "/${SsmParameterPath}/backend-image-tag" --query Parameter.Value --output text 2>/dev/null || echo "${BackendImageTag}")"
+              USE_FAST_PATH=0
+              if [ -f /opt/pdfx/baked_fastpath.sh ]; then
+                . /opt/pdfx/baked_fastpath.sh
+                if should_use_baked_fastpath /opt/pdfx/baked.json "$BACKEND_IMAGE_REPO" "$PINNED_TAG"; then USE_FAST_PATH=1; fi
+              fi
+
               cd deploy
-              BACKEND_IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}:${BackendImageTag}"
+              # NOTE: this whole heredoc is inside CFN Fn::Sub, so shell vars MUST use bare $
+              # (not ${!...}, which CFN would try to resolve as a template variable and fail
+              # validate-template -- design-review B1). Only real CFN refs use ${!...} here.
+              BACKEND_IMAGE_URI="$BACKEND_IMAGE_REPO:$PINNED_TAG"
               aws ecr get-login-password --region "${AWS::Region}" \
                 | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
-              PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" \
-                PDFX_DEPLOY_BUILD_MODE=never \
-                PDFX_DEPLOY_PULL_IMAGES=auto \
-                GPU_MODE=on \
-                ./deploy.sh
+              if [ "$USE_FAST_PATH" = "1" ]; then
+                echo "Booting via baked fast path (images/models present)"
+                PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" PDFX_DEPLOY_BUILD_MODE=never \
+                  PDFX_DEPLOY_PULL_IMAGES=never PDFX_PREWARM_MODELS=off GPU_MODE=on ./deploy.sh
+              else
+                echo "Baked marker absent/mismatched; full pull+prewarm fallback"
+                PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" PDFX_DEPLOY_BUILD_MODE=never \
+                  PDFX_DEPLOY_PULL_IMAGES=auto PDFX_PREWARM_MODELS=auto GPU_MODE=on ./deploy.sh
+              fi
               BOOTSTRAP_SCRIPT
 
               chmod +x /usr/local/sbin/pdfx-backend-bootstrap.sh
