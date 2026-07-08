@@ -108,6 +108,25 @@ wait_for_postgres() {
     local attempts=60
     local delay=5
 
+    if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
+        # External DB (e.g. RDS): the bundled pdfx-postgres container is not
+        # started, so verify TCP reachability of the host in DATABASE_URL.
+        local hostport host port
+        hostport="$(printf '%s' "${DATABASE_URL:-}" | sed -E 's#^[^@]*@([^/?]+).*#\1#')"
+        host="${hostport%%:*}"; port="${hostport##*:}"; [ "$port" = "$host" ] && port=5432
+        echo "Waiting for external Postgres at ${host}:${port}..."
+        for attempt in $(seq 1 "$attempts"); do
+            if timeout 5 bash -c ">/dev/tcp/${host}/${port}" 2>/dev/null; then
+                echo "  External Postgres reachable."
+                return 0
+            fi
+            echo "  External Postgres not reachable yet (${attempt}/${attempts}); retrying in ${delay}s..."
+            sleep "$delay"
+        done
+        echo "ERROR: external Postgres ${host}:${port} not reachable after $((attempts * delay))s."
+        return 1
+    fi
+
     echo "Waiting for Postgres to accept connections..."
     for attempt in $(seq 1 "$attempts"); do
         if docker exec pdfx-postgres pg_isready -U pdfx >/dev/null 2>&1; then
@@ -319,6 +338,29 @@ mkdir -p "$REPO_ROOT/data/rapidocr_models"
 mkdir -p "$REPO_ROOT/logs"
 rm -f "$REPO_ROOT/data/cache/marker_worker_ready.json"
 
+# External DB (RDS) mode: layer the override so the bundled Postgres is excluded
+# and app/worker talk to DATABASE_URL. Must be set before any compose command.
+if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
+    if [ -z "${DATABASE_URL:-}" ]; then
+        echo "ERROR: PDFX_EXTERNAL_DB=true but DATABASE_URL is empty (expected the app-role URL)." >&2
+        exit 1
+    fi
+    if [ -z "${PDFX_MIGRATE_DATABASE_URL:-}" ]; then
+        echo "ERROR: PDFX_EXTERNAL_DB=true requires PDFX_MIGRATE_DATABASE_URL (migrations run as the DB" >&2
+        echo "       admin/master role, not the least-privilege runtime app role in DATABASE_URL)." >&2
+        exit 1
+    fi
+    # !override on depends_on (docker-compose.external-db.yml) needs Compose >= 2.24.4;
+    # older versions merge additively and pull the bundled postgres back into `up`.
+    compose_ver="$(docker compose version --short 2>/dev/null | sed 's/^v//' || echo 0)"
+    if [ "$(printf '%s\n%s\n' "2.24.4" "$compose_ver" | sort -V | head -1)" != "2.24.4" ]; then
+        echo "ERROR: external-db mode needs docker compose >= 2.24.4 (found ${compose_ver})." >&2
+        exit 1
+    fi
+    echo "External DB mode: using external Postgres (RDS); bundled Postgres disabled."
+    COMPOSE_ARGS+=(-f "docker-compose.external-db.yml")
+fi
+
 # Step 3: Stop existing services
 echo "Stopping existing services..."
 docker compose "${COMPOSE_ARGS[@]}" down 2>/dev/null || true
@@ -341,15 +383,27 @@ wait_for_nvidia_container_runtime
 prewarm_marker_models
 
 echo "Starting dependency services..."
-docker compose "${COMPOSE_ARGS[@]}" up -d postgres redis grobid
+if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
+    docker compose "${COMPOSE_ARGS[@]}" up -d redis grobid
+else
+    docker compose "${COMPOSE_ARGS[@]}" up -d postgres redis grobid
+fi
 
 # Step 5: Wait for dependency services to start
 echo "Waiting for services to start..."
 wait_for_postgres
 
-# Step 6: Run database migrations
+# Step 6: Run database migrations. In external-DB mode run them as the migration
+# role (master) via PDFX_MIGRATE_DATABASE_URL; the long-running app/worker use the
+# least-privilege app role via DATABASE_URL, so the master creds never reach runtime.
 echo "Running database migrations..."
-docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps app alembic upgrade head
+if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
+    # PDFX_MIGRATE_DATABASE_URL is guaranteed set above (external-DB guard).
+    docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps \
+        -e DATABASE_URL="$PDFX_MIGRATE_DATABASE_URL" app alembic upgrade head
+else
+    docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps app alembic upgrade head
+fi
 echo "  Database migrations applied."
 
 # Step 7: Start full stack
@@ -378,7 +432,9 @@ fi
 
 # Check Postgres
 echo -n "  Postgres: "
-if docker exec pdfx-postgres pg_isready -U pdfx 2>/dev/null | grep -q "accepting connections"; then
+if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
+    echo "external (RDS)"
+elif docker exec pdfx-postgres pg_isready -U pdfx 2>/dev/null | grep -q "accepting connections"; then
     echo "HEALTHY"
 else
     echo "NOT READY"

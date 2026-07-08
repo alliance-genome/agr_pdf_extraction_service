@@ -35,6 +35,13 @@ variable "subnet_id" {
   type = string
 }
 
+variable "security_group_ids" {
+  type = list(string)
+  # [ephemeral SSH SG (port 22 for Packer), a SG admitted by the ECR interface
+  # VPC endpoints so the build box can reach api/dkr.ecr.us-east-1].
+  default = ["sg-0e29540f9db1ac31b", "sg-21ac675b"]
+}
+
 variable "root_volume_size" {
   type    = number
   default = 200
@@ -49,8 +56,17 @@ source "amazon-ebs" "pdfx_backend" {
   ssh_username                = "ec2-user"
   iam_instance_profile        = var.iam_instance_profile
   subnet_id                   = var.subnet_id
+  security_group_ids          = var.security_group_ids
   associate_public_ip_address = true
   ami_name                    = "pdfx-backend-baked-${var.backend_image_tag}-${local.ts}"
+
+  # The ~200 GB AMI snapshot (7 GB image + model caches) takes far longer than
+  # Packer's default AMI-ready wait; allow up to ~60 min so a slow snapshot
+  # doesn't false-fail an otherwise-successful bake.
+  aws_polling {
+    delay_seconds = 20
+    max_attempts  = 180
+  }
 
   launch_block_device_mappings {
     device_name           = "/dev/xvda"
@@ -71,31 +87,19 @@ source "amazon-ebs" "pdfx_backend" {
 build {
   sources = ["source.amazon-ebs.pdfx_backend"]
 
-  # Pre-create the upload destination so the file provisioner copies repo
-  # contents into it (trailing-slash source => contents, not the dir itself).
-  provisioner "shell" {
-    inline = ["mkdir -p /tmp/repo"]
-  }
-
-  # Ship the repo scripts the provisioner needs.
+  # provision.sh re-clones the repo at BACKEND_GIT_REF from GitHub, so the bake
+  # only needs provision.sh itself delivered. Uploading a single file (not the
+  # whole repo) avoids a slow .git upload and the root-owned-copy chmod failure.
   provisioner "file" {
-    source      = "${path.root}/../../../" # repo root
-    destination = "/tmp/repo"
+    source      = "${path.root}/provision.sh"
+    destination = "/tmp/provision.sh"
   }
 
+  # Run as root, passing the bake vars explicitly (robust regardless of the
+  # instance's sudoers env policy) and via `bash` so no execute bit is needed.
   provisioner "shell" {
-    environment_vars = [
-      "BACKEND_IMAGE_REPO=${var.backend_image_repo}",
-      "BACKEND_IMAGE_TAG=${var.backend_image_tag}",
-      "BASE_AMI_ID=${var.base_ami_id}",
-      "AWS_REGION=${var.region}",
-      "BACKEND_GIT_REF=${var.backend_image_tag}",
-    ]
     inline = [
-      "sudo cp -r /tmp/repo /home/ec2-user/agr_pdf_extraction_service_src || true",
-      "cd /home/ec2-user/agr_pdf_extraction_service_src || cd /tmp/repo",
-      "chmod +x deploy/aws/ami/provision.sh",
-      "sudo -E deploy/aws/ami/provision.sh",
+      "sudo env BACKEND_IMAGE_REPO='${var.backend_image_repo}' BACKEND_IMAGE_TAG='${var.backend_image_tag}' BASE_AMI_ID='${var.base_ami_id}' AWS_REGION='${var.region}' BACKEND_GIT_REF='${var.backend_image_tag}' bash /tmp/provision.sh",
     ]
   }
 

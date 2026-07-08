@@ -1,0 +1,43 @@
+# Run the backend against an EXTERNAL Postgres (e.g. AWS RDS) instead of the
+# bundled local `postgres` container. Layer it on top of the base file:
+#
+#   docker compose -f docker-compose.gpu.yml -f docker-compose.external-db.yml ...
+#
+# deploy.sh adds this override automatically when PDFX_EXTERNAL_DB=true, and
+# requires DATABASE_URL (pointing at the external DB) in the environment at
+# compose time. Local development is unaffected (it uses the base file only,
+# which keeps the bundled Postgres and the in-cluster DATABASE_URL).
+services:
+  # Keep the bundled Postgres out of this deployment. Nothing enabled depends on
+  # it once app/worker drop it below, and the profile stops it being started
+  # explicitly (deploy.sh also omits it from `up -d`).
+  postgres:
+    profiles: ["localdb-only"]
+
+  app:
+    # Replace the base depends_on (which required postgres) with just the
+    # services that still run locally. Requires Compose >= 2.24.4 for !override.
+    depends_on: !override
+      redis:
+        condition: service_healthy
+      grobid:
+        condition: service_healthy
+    # `environment` wins over env_file and over the base shared-env's in-cluster
+    # DATABASE_URL, so the app talks to the external DB.
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set for external-db mode}
+    # Mount the RDS CA bundle so DATABASE_URL's sslmode=verify-full can validate
+    # the server certificate. The host file is provided by the AMI bake or boot.
+    volumes:
+      - /opt/pdfx/rds-ca.pem:/opt/pdfx/rds-ca.pem:ro
+
+  worker:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+      grobid:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set for external-db mode}
+    volumes:
+      - /opt/pdfx/rds-ca.pem:/opt/pdfx/rds-ca.pem:ro

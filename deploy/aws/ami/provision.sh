@@ -26,6 +26,22 @@ main() {
   sudo dnf install -y docker git jq awscli
   sudo systemctl enable --now docker
 
+  # Docker Compose plugin — AL2023's docker package doesn't bundle it; install
+  # the same version the launch-template bootstrap uses (DockerComposeVersion).
+  if ! docker compose version >/dev/null 2>&1; then
+    sudo mkdir -p /usr/local/lib/docker/cli-plugins
+    sudo curl -fsSL "https://github.com/docker/compose/releases/download/v2.30.3/docker-compose-linux-x86_64" \
+      -o /usr/local/lib/docker/cli-plugins/docker-compose
+    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
+
+  # RDS CA bundle for TLS verify-full to the external metadata DB. Mounted into
+  # app/worker by docker-compose.external-db.yml at /opt/pdfx/rds-ca.pem. Baking
+  # it avoids a boot-time fetch; the boot user-data re-fetches only if missing.
+  sudo mkdir -p /opt/pdfx
+  sudo curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    -o /opt/pdfx/rds-ca.pem
+
   # Fresh checkout at the ref being baked (Packer sets BACKEND_GIT_REF; default = tag).
   sudo rm -rf "$SERVICE_DIR"
   sudo -u ec2-user git clone https://github.com/alliance-genome/agr_pdf_extraction_service.git "$SERVICE_DIR"
@@ -74,16 +90,6 @@ ENV
   # fall back to `docker compose down`; both are idempotent cleanup, so C-runs-when-A-true is fine.
   # shellcheck disable=SC2015
   ( cd deploy && GPU_MODE=on ./manage.sh down 2>/dev/null || docker compose -f docker-compose.gpu.yml -p pdfx down )
-
-  # --- write marker for the boot fast-path ---
-  local digest
-  digest="$(aws ecr describe-images --region "$AWS_REGION" --repository-name "${BACKEND_IMAGE_REPO##*/}" \
-    --image-ids imageTag="$BACKEND_IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
-  sudo mkdir -p /opt/pdfx
-  sudo cp deploy/aws/ami/lib/baked_fastpath.sh /opt/pdfx/baked_fastpath.sh
-  printf '{"backend_image_repo":"%s","backend_image_tag":"%s","backend_image_digest":"%s","base_ami_id":"%s","baked_at":"%s"}\n' \
-    "$BACKEND_IMAGE_REPO" "$BACKEND_IMAGE_TAG" "$digest" "$BASE_AMI_ID" "$(date -u +%FT%TZ)" \
-    | sudo tee /opt/pdfx/baked.json >/dev/null
 
   # --- hygiene: strip all secrets/identity before snapshot ---
   rm -f "$SERVICE_DIR/.env"
