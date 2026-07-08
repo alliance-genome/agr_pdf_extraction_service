@@ -42,6 +42,14 @@ variable "security_group_ids" {
   default = ["sg-0e29540f9db1ac31b", "sg-21ac675b"]
 }
 
+variable "backend_git_ref" {
+  type = string
+  # Git ref checked out into the baked AMI (the boot re-runs deploy.sh from it).
+  # Empty -> provision.sh falls back to backend_image_tag. Set to a branch/SHA
+  # (e.g. "main") to bake newer deploy code against an existing image tag.
+  default = ""
+}
+
 variable "root_volume_size" {
   type    = number
   default = 200
@@ -99,7 +107,7 @@ build {
   # instance's sudoers env policy) and via `bash` so no execute bit is needed.
   provisioner "shell" {
     inline = [
-      "sudo env BACKEND_IMAGE_REPO='${var.backend_image_repo}' BACKEND_IMAGE_TAG='${var.backend_image_tag}' BASE_AMI_ID='${var.base_ami_id}' AWS_REGION='${var.region}' BACKEND_GIT_REF='${var.backend_image_tag}' bash /tmp/provision.sh",
+      "sudo env BACKEND_IMAGE_REPO='${var.backend_image_repo}' BACKEND_IMAGE_TAG='${var.backend_image_tag}' BASE_AMI_ID='${var.base_ami_id}' AWS_REGION='${var.region}' BACKEND_GIT_REF='${var.backend_git_ref}' bash /tmp/provision.sh",
     ]
   }
 

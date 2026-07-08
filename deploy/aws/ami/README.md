@@ -254,28 +254,20 @@ Restore prior behavior with two independent levers (either or both):
 Because `/pdfx/backend-ami` is resolved at launch, the next wake picks up the change
 with no launch-template version bump and no CloudFormation deploy.
 
-## Phase 2 — add g6.2xlarge (KANBAN-1411)
+## Phase 2 — g6.2xlarge added (KANBAN-1411) ✅
 
-Phase 1 ships with `g5.2xlarge` + `g5.4xlarge` only. `g6.2xlarge` (L4/Ada) is
-deliberately excluded because the allocation strategy is `lowest-price`: the instant
-g6.2xlarge (the cheapest of the three) is added to `Overrides`, 100% of launches go to
-it — there is no "in the list but deprioritized" state. Do **not** add it until L4 is
-validated end-to-end.
+`g6.2xlarge` (L4/Ada) is now in the ASG `MixedInstancesPolicy.Overrides`. Because the
+allocation strategy is `lowest-price` and g6.2xlarge is the cheapest of the three, it is
+now the preferred type with g5.2xlarge / g5.4xlarge as capacity fallback — more capacity
+resilience **and** lower cost.
 
-Before adding `g6.2xlarge` to the ASG `MixedInstancesPolicy.Overrides` in
-`pdfx-stack.yaml`:
-
-1. Confirm a successful `g6.2xlarge` bake (the bake already runs on `g6.2xlarge`, so a
-   green bake is a strong L4 signal).
-2. Boot an instance from the baked AMI **on g6.2xlarge** and run a real extraction that
-   exercises Marker **and** Docling **and** GROBID, confirming the CUDA 12.8 / PyTorch /
-   Marker / Docling stack behaves correctly on L4 end-to-end.
-
-Only then add:
+L4 was validated end-to-end before adding it: green g6.2xlarge bakes plus multiple
+g6.2xlarge boots from the baked AMI running real extractions (Marker + Docling + GROBID)
+on the CUDA 12.8 / PyTorch stack. Current Overrides:
 
 ```yaml
           Overrides:
             - InstanceType: g5.2xlarge
             - InstanceType: g5.4xlarge
-            - InstanceType: g6.2xlarge   # Phase 2 (KANBAN-1411): added after L4 validation
+            - InstanceType: g6.2xlarge   # KANBAN-1411: preferred (cheapest), L4-validated
 ```

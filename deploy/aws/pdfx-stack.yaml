@@ -601,8 +601,10 @@ Resources:
           Overrides:
             - InstanceType: g5.2xlarge
             - InstanceType: g5.4xlarge
-            # g6.2xlarge intentionally deferred to KANBAN-1411 (needs L4 validation;
-            # lowest-price cannot keep a cheaper type deprioritized).
+            # g6.2xlarge (L4/Ada) added after L4 validation (KANBAN-1411). It is the
+            # cheapest of the three, so lowest-price prefers it with g5 as capacity
+            # fallback -- more capacity resilience AND lower cost.
+            - InstanceType: g6.2xlarge
         InstancesDistribution:
           OnDemandBaseCapacity: 0
           OnDemandPercentageAboveBaseCapacity: 100
