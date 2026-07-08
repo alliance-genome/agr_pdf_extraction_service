@@ -345,6 +345,11 @@ if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
         echo "ERROR: PDFX_EXTERNAL_DB=true but DATABASE_URL is empty (expected the app-role URL)." >&2
         exit 1
     fi
+    if [ -z "${PDFX_MIGRATE_DATABASE_URL:-}" ]; then
+        echo "ERROR: PDFX_EXTERNAL_DB=true requires PDFX_MIGRATE_DATABASE_URL (migrations run as the DB" >&2
+        echo "       admin/master role, not the least-privilege runtime app role in DATABASE_URL)." >&2
+        exit 1
+    fi
     # !override on depends_on (docker-compose.external-db.yml) needs Compose >= 2.24.4;
     # older versions merge additively and pull the bundled postgres back into `up`.
     compose_ver="$(docker compose version --short 2>/dev/null | sed 's/^v//' || echo 0)"
@@ -392,7 +397,8 @@ wait_for_postgres
 # role (master) via PDFX_MIGRATE_DATABASE_URL; the long-running app/worker use the
 # least-privilege app role via DATABASE_URL, so the master creds never reach runtime.
 echo "Running database migrations..."
-if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ] && [ -n "${PDFX_MIGRATE_DATABASE_URL:-}" ]; then
+if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
+    # PDFX_MIGRATE_DATABASE_URL is guaranteed set above (external-DB guard).
     docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps \
         -e DATABASE_URL="$PDFX_MIGRATE_DATABASE_URL" app alembic upgrade head
 else

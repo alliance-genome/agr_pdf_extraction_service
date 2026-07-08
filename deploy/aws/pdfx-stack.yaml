@@ -127,8 +127,8 @@ Parameters:
   BackendRootVolumeInitRate:
     Type: Number
     Default: 300
-    MinValue: 0
-    MaxValue: 300
+    # EBS accepts 0 (disabled) or 100-300 MiB/s; 1-99 is rejected at launch.
+    AllowedValues: [0, 100, 150, 200, 250, 300]
     Description: >-
       EBS Provisioned Rate for Volume Initialization (MiB/s, 100-300) so the
       baked root volume hydrates from its snapshot at boot instead of paying the

@@ -16,13 +16,21 @@ sticky, single-AZ warm pool and cold-started from scratch (~22 min: install Dock
 shortage in the warm pool's AZ cascaded into a force-replace loop and a curator-facing
 outage. This design replaces that with two pieces:
 
-- **A pre-baked AMI** (this directory, built by Packer). It ships the Docker images
-  and **all** ML model caches (Marker, Docling, rapidocr, GROBID) already on disk, so
-  a fresh instance only fetches secrets from SSM and runs `compose up` (~2–4 min). A
-  boot fast-path (`should_use_baked_fastpath`) uses the baked images only when the
-  baked image **digest** still matches the pinned immutable tag; otherwise it falls
-  back to the full pull+prewarm path, so a stale/missing AMI degrades gracefully to
-  today's behavior instead of failing.
+- **A pre-baked AMI** (this directory, built by Packer). It ships the Docker images,
+  **all** ML model caches (Marker, Docling, rapidocr, GROBID), and the RDS CA bundle
+  already on disk. To avoid the slow first-touch EBS-snapshot lazy-load (reading the
+  baked ~17 GB off a cold volume is ~9 MB/s → ~12 min), the launch template sets an
+  **EBS `VolumeInitializationRate`** (provisioned-init, default 300 MiB/s) so the root
+  volume hydrates from its snapshot at boot; a fresh instance then fetches secrets from
+  SSM and runs `compose up` (~4–5 min). Boot uses `PDFX_DEPLOY_PULL_IMAGES=never`
+  `PDFX_PREWARM_MODELS=off` — no digest fast-path, no fallback path.
+- **An external metadata DB (RDS Postgres)** instead of a bundled `postgres` container:
+  moves the single `extraction_run` table off the GPU cold-start path (no local DB to
+  boot/migrate on every wake) and makes it durable across scale-to-zero. Wired via
+  `deploy.sh PDFX_EXTERNAL_DB=true` + `deploy/docker-compose.external-db.yml`. Runtime
+  app/worker connect as a **least-privilege** app role (`/pdfx/database-url`); `alembic`
+  migrations run as the master role (`/pdfx/database-url-migrate`); both use TLS
+  `sslmode=verify-full` with the baked `/opt/pdfx/rds-ca.pem`.
 - **A `MixedInstancesPolicy`** on the ASG (`deploy/aws/pdfx-stack.yaml`): on-demand,
   `lowest-price`, `g5.2xlarge` + `g5.4xlarge` across all five AZs, warm pool off by
   default. Idle scale-in terminates the instance, so each wake re-selects the cheapest
@@ -33,16 +41,15 @@ outage. This design replaces that with two pieces:
 | File | Purpose |
 |------|---------|
 | `pdfx-backend.pkr.hcl` | Packer `amazon-ebs` template. Builds on `g6.2xlarge` (standing L4/Ada smoke test). |
-| `provision.sh` | Bake provisioner: reuses `deploy.sh`, runs one real sample extraction to warm all caches, asserts caches non-empty, writes `/opt/pdfx/baked.json`, scrubs secrets/identity before snapshot. |
+| `provision.sh` | Bake provisioner: reuses `deploy.sh`, runs one real sample extraction to warm all caches, asserts caches non-empty, bakes the RDS CA bundle to `/opt/pdfx/rds-ca.pem`, scrubs secrets/identity before snapshot. |
 | `test-sample.pdf` | Small multi-element PDF (heading + paragraph + table) used to warm Docling/GROBID/rapidocr caches during the bake. |
-| `lib/baked_fastpath.sh` | `should_use_baked_fastpath` — boot fast-path decision (digest match vs. fallback). Baked into the AMI at `/opt/pdfx/baked_fastpath.sh`. |
 | `prune_amis.sh` | Deregisters old `Role=backend-baked` AMIs (keep last `KEEP_N`, default 3); never touches the AMI referenced by `/pdfx/backend-ami`. |
-| `tests/` | Shell unit tests for the fast-path and prune selection logic. |
+| `tests/` | Shell unit tests for the prune selection logic. |
 
 Run the unit tests any time:
 
 ```bash
-bash deploy/aws/ami/tests/test_baked_fastpath.sh && bash deploy/aws/ami/tests/test_prune_amis.sh
+bash deploy/aws/ami/tests/test_prune_amis.sh
 ```
 
 ## Manual bake
@@ -98,12 +105,18 @@ the `put-parameter` commands below.
 
 ## SSM parameters
 
-Two `String` parameters wire the AMI and image tag to the launch template:
+Parameters that wire the AMI, image, and DB to the launch template / boot:
 
 - **`/pdfx/backend-ami`** — the AMI id the launch template resolves at instance launch
-  (`ImageId: resolve:ssm:/pdfx/backend-ami`).
+  (`ImageId: resolve:ssm:/pdfx/backend-ami`). **Must be created with
+  `--data-type aws:ec2:image`** — the LT `resolve:ssm` `ImageId` rejects a plain-String
+  parameter (`SsmInvalidParameter: … supported: aws:ec2:image`).
 - **`/pdfx/backend-image-tag`** — the immutable backend image tag the AMI was baked
-  against; the boot path pins and digest-verifies it (replaces the old `:latest`).
+  against; the boot path pins it (replaces the old `:latest`).
+- **`/pdfx/database-url`** (SecureString) — runtime DB URL (least-priv `pdfx_app` role,
+  `sslmode=verify-full`); consumed by the compose override.
+- **`/pdfx/database-url-migrate`** (SecureString) — migration DB URL (master role);
+  used only by `deploy.sh`'s `alembic upgrade head`, never by the runtime containers.
 
 ### One-time seed (before first use)
 
@@ -116,16 +129,15 @@ band, before the first ASG scale-out:
 
 ```bash
 aws ssm put-parameter --profile ctabone --region us-east-1 --overwrite \
-  --name /pdfx/backend-ami --type String --value <seed-or-baked-ami-id>
+  --name /pdfx/backend-ami --value <baked-ami-id> --type String --data-type aws:ec2:image
 aws ssm put-parameter --profile ctabone --region us-east-1 --overwrite \
   --name /pdfx/backend-image-tag --type String --value <immutable-tag>
 ```
 
 `resolve:ssm` fails a launch if the parameter is empty/invalid, so both must hold valid
-values before the first scale-out. If no baked AMI exists yet, seed `/pdfx/backend-ami`
-with the DL base AMI (`ami-00c6ddd550364d6c3`) — the baked marker will be absent, so the
-instance takes the full pull+prewarm fallback path (current behavior) until a real
-baked AMI is published.
+values before the first scale-out. The boot path has **no digest fast-path and no
+pull+prewarm fallback** — it uses the baked images/models directly — so `/pdfx/backend-ami`
+must point at a **real baked AMI** (not the DL base) and the RDS URLs must be seeded.
 
 ### Written by the bake
 
@@ -231,12 +243,12 @@ Restore prior behavior with two independent levers (either or both):
    `EnableBackendWarmPool` condition (`!Not [!Equals [BackendWarmPoolMinSize, 0]]`),
    recreating the `AWS::AutoScaling::WarmPool` resource.
 2. **Point the AMI at a known-good build.** Overwrite `/pdfx/backend-ami` with a
-   previously-good baked AMI id, or with the DL base AMI (`ami-00c6ddd550364d6c3`) so
-   the baked marker is absent and the instance takes the full pull+prewarm fallback:
+   previously-good baked AMI id. The boot has no base-AMI fallback, so it must be a real
+   baked AMI:
 
    ```bash
    aws ssm put-parameter --profile ctabone --region us-east-1 --overwrite \
-     --name /pdfx/backend-ami --type String --value <known-good-or-base-ami-id>
+     --name /pdfx/backend-ami --value <known-good-baked-ami-id> --type String --data-type aws:ec2:image
    ```
 
 Because `/pdfx/backend-ami` is resolved at launch, the next wake picks up the change
