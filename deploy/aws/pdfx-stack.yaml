@@ -419,6 +419,9 @@ Resources:
               VolumeSize: !Ref BackendRootVolumeSize
               VolumeType: gp3
               Iops: 3000
+              # Hydrate the baked snapshot at boot instead of paying the slow first-touch
+              # EBS lazy-load; collapses the cold-start image/model read from ~12 min to ~1 min.
+              VolumeInitializationRate: !Ref BackendRootVolumeInitRate
               Encrypted: true
               DeleteOnTermination: true
         MetadataOptions:
@@ -528,35 +531,34 @@ Resources:
 
               mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
               chown -R ec2-user:ec2-user "$SERVICE_DIR"
-              # --- baked-AMI fast path (spec 4B) ---
+              # --- baked images/models + external metadata DB (RDS) ---
+              # The AMI ships the backend image + model caches; the root volume is hydrated
+              # fast by EBS provisioned-init (see BlockDeviceMappings). Runtime app/worker use
+              # the least-privilege app-role URL (DATABASE_URL); alembic migrations run as the
+              # master role (PDFX_MIGRATE_DATABASE_URL). Both use TLS verify-full via the RDS CA
+              # bundle (baked to /opt/pdfx/rds-ca.pem; refetched here only if missing).
               BACKEND_IMAGE_REPO="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}"
               PINNED_TAG="$(aws ssm get-parameter --region "${AWS::Region}" \
                 --name "/${SsmParameterPath}/backend-image-tag" --query Parameter.Value --output text 2>/dev/null || echo "${BackendImageTag}")"
-              USE_FAST_PATH=0
-              if [ -f /opt/pdfx/baked_fastpath.sh ]; then
-                . /opt/pdfx/baked_fastpath.sh
-                # baked_fastpath.sh runs `aws ecr describe-images` with no --region; give it one.
-                export AWS_DEFAULT_REGION=${AWS::Region}
-                if should_use_baked_fastpath /opt/pdfx/baked.json "$BACKEND_IMAGE_REPO" "$PINNED_TAG"; then USE_FAST_PATH=1; fi
-              fi
+              DATABASE_URL="$(aws ssm get-parameter --region "${AWS::Region}" --with-decryption \
+                --name "/${SsmParameterPath}/database-url" --query Parameter.Value --output text)"
+              PDFX_MIGRATE_DATABASE_URL="$(aws ssm get-parameter --region "${AWS::Region}" --with-decryption \
+                --name "/${SsmParameterPath}/database-url-migrate" --query Parameter.Value --output text)"
+              export DATABASE_URL PDFX_MIGRATE_DATABASE_URL
+              mkdir -p /opt/pdfx
+              [ -f /opt/pdfx/rds-ca.pem ] || curl -fsSL \
+                https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /opt/pdfx/rds-ca.pem
 
               cd deploy
               # NOTE: this whole heredoc is inside CFN Fn::Sub, so shell vars MUST use bare $
-              # (not ${!...}, which CFN would try to resolve as a template variable and fail
-              # validate-template -- design-review B1). Only real CFN refs use ${!...} here.
+              # (not ${!...}, which CFN would try to resolve as a template variable). Only real
+              # CFN refs use ${...} here.
               BACKEND_IMAGE_URI="$BACKEND_IMAGE_REPO:$PINNED_TAG"
               aws ecr get-login-password --region "${AWS::Region}" \
                 | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
-              if [ "$USE_FAST_PATH" = "1" ]; then
-                echo "Booting via baked fast path (images/models present)"
-                # PINNED_TAG must equal the baked tag string: the no-pull compose finds the local image by tag.
-                PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" PDFX_DEPLOY_BUILD_MODE=never \
-                  PDFX_DEPLOY_PULL_IMAGES=never PDFX_PREWARM_MODELS=off GPU_MODE=on ./deploy.sh
-              else
-                echo "Baked marker absent/mismatched; full pull+prewarm fallback"
-                PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" PDFX_DEPLOY_BUILD_MODE=never \
-                  PDFX_DEPLOY_PULL_IMAGES=auto PDFX_PREWARM_MODELS=auto GPU_MODE=on ./deploy.sh
-              fi
+              echo "Deploying (baked images/models + external RDS; provisioned-init hydrated volume)"
+              PDFX_EXTERNAL_DB=true PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" PDFX_DEPLOY_BUILD_MODE=never \
+                PDFX_DEPLOY_PULL_IMAGES=never PDFX_PREWARM_MODELS=off GPU_MODE=on ./deploy.sh
               BOOTSTRAP_SCRIPT
 
               chmod +x /usr/local/sbin/pdfx-backend-bootstrap.sh
@@ -1030,11 +1032,16 @@ Resources:
   # --- Backend metadata database (RDS Postgres) -------------------------------
   # Moves the single `extraction_run` table off the ephemeral GPU node so it is
   # durable across scale-to-zero cycles AND off the cold-start critical path (no
-  # local postgres container to boot + migrate on every wake). The backend
-  # connects via DATABASE_URL (SSM SecureString /<SsmParameterPath>/database-url)
-  # with deploy.sh PDFX_EXTERNAL_DB=true and the docker-compose.external-db.yml
-  # override. NOTE: prod is managed directly via CLI (this stack is the reference
-  # IaC); the live instance is `pdfx-backend-db` with its DATABASE_URL in SSM.
+  # local postgres container to boot + migrate on every wake). Two roles: the
+  # runtime app/worker connect as a least-privilege app role via DATABASE_URL
+  # (SSM SecureString /<SsmParameterPath>/database-url); alembic migrations run as
+  # the master role via /<SsmParameterPath>/database-url-migrate. Both use TLS
+  # sslmode=verify-full with the baked RDS CA bundle. Wired by deploy.sh
+  # PDFX_EXTERNAL_DB=true + the docker-compose.external-db.yml override.
+  # NOTE: prod is managed directly via CLI (this stack is the reference IaC). The
+  # live instance `pdfx-backend-db` was CLI-created (master password in SSM, not
+  # Secrets Manager) and its SG admits the two backend GPU SGs; reconcile before
+  # any attempt to deploy this block over the live resource.
   BackendDbSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
@@ -1056,6 +1063,14 @@ Resources:
         - Key: Name
           Value: !Sub "${BackendResourceName}-rds-sg"
 
+  BackendDbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub "PDFX backend Postgres 16 params (${EnvironmentName})"
+      Family: postgres16
+      Parameters:
+        rds.force_ssl: "1"
+
   BackendDatabase:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Snapshot
@@ -1071,11 +1086,15 @@ Resources:
       DBName: pdfx
       MasterUsername: pdfx
       # RDS manages the master password in Secrets Manager (no plaintext in IaC).
-      # The live prod instance was CLI-created; its full DATABASE_URL (incl.
-      # password) lives in SSM SecureString /<SsmParameterPath>/database-url.
+      # The live prod instance was CLI-created; its master password + full role
+      # URLs live in SSM SecureStrings /<SsmParameterPath>/database-url{,-migrate}.
       ManageMasterUserPassword: true
       MultiAZ: false
       PubliclyAccessible: false
+      DeletionProtection: true
+      DBParameterGroupName: !Ref BackendDbParameterGroup
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
       DBSubnetGroupName: !Ref BackendDbSubnetGroup
       VPCSecurityGroups:
         - !Ref BackendDbSecurityGroup
@@ -1086,6 +1105,62 @@ Resources:
           Value: !Sub "${BackendResourceName}-db"
         - Key: Purpose
           Value: pdfx-extraction-run-metadata
+
+  # DB CloudWatch alarms -> the existing alarm SNS topic (also created live via CLI).
+  BackendDbLowStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${BackendResourceName}-db-low-storage"
+      AlarmDescription: RDS free storage below 2 GiB.
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Statistic: Average
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref BackendDatabase
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+  BackendDbHighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${BackendResourceName}-db-high-cpu"
+      AlarmDescription: RDS CPU above 85% for 15 min.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref BackendDatabase
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+  BackendDbHighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${BackendResourceName}-db-high-connections"
+      AlarmDescription: RDS connections above 40.
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Statistic: Average
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref BackendDatabase
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 40
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
 
 Outputs:
   BackendDatabaseEndpoint:
