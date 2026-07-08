@@ -28,10 +28,10 @@ Parameters:
     Type: AWS::EC2::VPC::Id
     Default: vpc-55522232
     Description: VPC that contains the shared ALB and PDFX backend.
-  BackendSubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Default: subnet-af62dca3
-    Description: Public subnet for the GPU backend instance.
+  BackendSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: subnet-3ebf4477,subnet-df7c7487,subnet-81c95ee4,subnet-ff838bd5,subnet-af62dca3
+    Description: Subnets across all AZs (1a,1b,1c,1d,1f) the backend ASG may launch into.
   EcsSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Default: subnet-04262fc338f638054,subnet-0d4703177afb1797d
@@ -74,10 +74,6 @@ Parameters:
     MinValue: 1
     MaxValue: 50000
     Description: Unique priority on the shared HTTPS listener.
-  BackendAmiId:
-    Type: AWS::EC2::Image::Id
-    Default: ami-00c6ddd550364d6c3
-    Description: Deep Learning Base OSS NVIDIA Driver GPU AMI used by prod.
   BackendInstanceType:
     Type: String
     Default: g5.4xlarge
@@ -115,10 +111,10 @@ Parameters:
     Description: Hard cap for backend GPU instances. Use 1 for strict cost control, 2 for launch-before-terminate experiments.
   BackendWarmPoolMinSize:
     Type: Number
-    Default: 1
+    Default: 0
     MinValue: 0
     MaxValue: 1
-    Description: Optional stopped warm-pool backend count for faster wake without running GPU cost.
+    Description: Stopped warm-pool count. 0 = terminate on idle and re-select cheapest on next wake.
   OperatorSshCidr:
     Type: String
     Default: 10.0.70.0/24
@@ -213,7 +209,7 @@ Parameters:
     Default: "120"
   StartupTimeoutMinutes:
     Type: String
-    Default: "30"
+    Default: "45"
   AsgStartupReplacementAttempts:
     Type: String
     Default: "1"
@@ -386,7 +382,7 @@ Resources:
     Properties:
       LaunchTemplateName: !Ref BackendResourceName
       LaunchTemplateData:
-        ImageId: !Ref BackendAmiId
+        ImageId: !Sub "resolve:ssm:/${SsmParameterPath}/backend-ami"
         InstanceType: !Ref BackendInstanceType
         KeyName: !Ref BackendKeyName
         IamInstanceProfile:
@@ -506,15 +502,35 @@ Resources:
 
               mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs
               chown -R ec2-user:ec2-user "$SERVICE_DIR"
+              # --- baked-AMI fast path (spec 4B) ---
+              BACKEND_IMAGE_REPO="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}"
+              PINNED_TAG="$(aws ssm get-parameter --region "${AWS::Region}" \
+                --name "/${SsmParameterPath}/backend-image-tag" --query Parameter.Value --output text 2>/dev/null || echo "${BackendImageTag}")"
+              USE_FAST_PATH=0
+              if [ -f /opt/pdfx/baked_fastpath.sh ]; then
+                . /opt/pdfx/baked_fastpath.sh
+                # baked_fastpath.sh runs `aws ecr describe-images` with no --region; give it one.
+                export AWS_DEFAULT_REGION=${AWS::Region}
+                if should_use_baked_fastpath /opt/pdfx/baked.json "$BACKEND_IMAGE_REPO" "$PINNED_TAG"; then USE_FAST_PATH=1; fi
+              fi
+
               cd deploy
-              BACKEND_IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}:${BackendImageTag}"
+              # NOTE: this whole heredoc is inside CFN Fn::Sub, so shell vars MUST use bare $
+              # (not ${!...}, which CFN would try to resolve as a template variable and fail
+              # validate-template -- design-review B1). Only real CFN refs use ${!...} here.
+              BACKEND_IMAGE_URI="$BACKEND_IMAGE_REPO:$PINNED_TAG"
               aws ecr get-login-password --region "${AWS::Region}" \
                 | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
-              PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" \
-                PDFX_DEPLOY_BUILD_MODE=never \
-                PDFX_DEPLOY_PULL_IMAGES=auto \
-                GPU_MODE=on \
-                ./deploy.sh
+              if [ "$USE_FAST_PATH" = "1" ]; then
+                echo "Booting via baked fast path (images/models present)"
+                # PINNED_TAG must equal the baked tag string: the no-pull compose finds the local image by tag.
+                PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" PDFX_DEPLOY_BUILD_MODE=never \
+                  PDFX_DEPLOY_PULL_IMAGES=never PDFX_PREWARM_MODELS=off GPU_MODE=on ./deploy.sh
+              else
+                echo "Baked marker absent/mismatched; full pull+prewarm fallback"
+                PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI" PDFX_DEPLOY_BUILD_MODE=never \
+                  PDFX_DEPLOY_PULL_IMAGES=auto PDFX_PREWARM_MODELS=auto GPU_MODE=on ./deploy.sh
+              fi
               BOOTSTRAP_SCRIPT
 
               chmod +x /usr/local/sbin/pdfx-backend-bootstrap.sh
@@ -548,11 +564,21 @@ Resources:
       DesiredCapacity: !Ref BackendDesiredCapacity
       HealthCheckType: EBS
       HealthCheckGracePeriod: 900
-      VPCZoneIdentifier:
-        - !Ref BackendSubnetId
-      LaunchTemplate:
-        LaunchTemplateId: !Ref BackendLaunchTemplate
-        Version: !GetAtt BackendLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: !Ref BackendSubnetIds
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref BackendLaunchTemplate
+            Version: !GetAtt BackendLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: g5.2xlarge
+            - InstanceType: g5.4xlarge
+            # g6.2xlarge intentionally deferred to KANBAN-1411 (needs L4 validation;
+            # lowest-price cannot keep a cheaper type deprioritized).
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 100
+          OnDemandAllocationStrategy: lowest-price
       Tags:
         - Key: Name
           Value: !Ref BackendResourceName
