@@ -84,16 +84,6 @@ ENV
   # shellcheck disable=SC2015
   ( cd deploy && GPU_MODE=on ./manage.sh down 2>/dev/null || docker compose -f docker-compose.gpu.yml -p pdfx down )
 
-  # --- write marker for the boot fast-path ---
-  local digest
-  digest="$(aws ecr describe-images --region "$AWS_REGION" --repository-name "${BACKEND_IMAGE_REPO##*/}" \
-    --image-ids imageTag="$BACKEND_IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
-  sudo mkdir -p /opt/pdfx
-  sudo cp deploy/aws/ami/lib/baked_fastpath.sh /opt/pdfx/baked_fastpath.sh
-  printf '{"backend_image_repo":"%s","backend_image_tag":"%s","backend_image_digest":"%s","base_ami_id":"%s","baked_at":"%s"}\n' \
-    "$BACKEND_IMAGE_REPO" "$BACKEND_IMAGE_TAG" "$digest" "$BASE_AMI_ID" "$(date -u +%FT%TZ)" \
-    | sudo tee /opt/pdfx/baked.json >/dev/null
-
   # --- hygiene: strip all secrets/identity before snapshot ---
   rm -f "$SERVICE_DIR/.env"
   rm -f "$HOME/.docker/config.json" /home/ec2-user/.docker/config.json 2>/dev/null || true
