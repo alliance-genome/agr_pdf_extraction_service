@@ -124,6 +124,32 @@ Parameters:
     Default: 200
     MinValue: 80
     Description: Root EBS volume size in GiB.
+  BackendRootVolumeInitRate:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 300
+    Description: >-
+      EBS Provisioned Rate for Volume Initialization (MiB/s, 100-300) so the
+      baked root volume hydrates from its snapshot at boot instead of paying the
+      slow first-touch lazy-load. 0 disables it. Charged per-init on snapshot size.
+  BackendDbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: RDS instance class for the backend Postgres metadata DB.
+  BackendDbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    Description: RDS allocated storage (GiB).
+  BackendDbEngineVersion:
+    Type: String
+    Default: "16.14"
+    Description: Postgres engine version for the backend RDS metadata DB.
+  BackendDbBackupRetentionDays:
+    Type: Number
+    Default: 7
+    Description: RDS automated backup retention (days).
   AuditBucketName:
     Type: String
     Default: agr-pdf-extraction-benchmark
@@ -1001,7 +1027,70 @@ Resources:
         DNSName: !Ref AlbDnsName
         EvaluateTargetHealth: true
 
+  # --- Backend metadata database (RDS Postgres) -------------------------------
+  # Moves the single `extraction_run` table off the ephemeral GPU node so it is
+  # durable across scale-to-zero cycles AND off the cold-start critical path (no
+  # local postgres container to boot + migrate on every wake). The backend
+  # connects via DATABASE_URL (SSM SecureString /<SsmParameterPath>/database-url)
+  # with deploy.sh PDFX_EXTERNAL_DB=true and the docker-compose.external-db.yml
+  # override. NOTE: prod is managed directly via CLI (this stack is the reference
+  # IaC); the live instance is `pdfx-backend-db` with its DATABASE_URL in SSM.
+  BackendDbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "PDFX backend RDS subnet group (${EnvironmentName})"
+      SubnetIds: !Ref BackendSubnetIds
+
+  BackendDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "PDFX backend RDS Postgres access (${EnvironmentName})"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: Postgres 5432 from backend GPU instances
+      Tags:
+        - Key: Name
+          Value: !Sub "${BackendResourceName}-rds-sg"
+
+  BackendDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${BackendResourceName}-db"
+      Engine: postgres
+      EngineVersion: !Ref BackendDbEngineVersion
+      DBInstanceClass: !Ref BackendDbInstanceClass
+      AllocatedStorage: !Ref BackendDbAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: pdfx
+      MasterUsername: pdfx
+      # RDS manages the master password in Secrets Manager (no plaintext in IaC).
+      # The live prod instance was CLI-created; its full DATABASE_URL (incl.
+      # password) lives in SSM SecureString /<SsmParameterPath>/database-url.
+      ManageMasterUserPassword: true
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref BackendDbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref BackendDbSecurityGroup
+      BackupRetentionPeriod: !Ref BackendDbBackupRetentionDays
+      AutoMinorVersionUpgrade: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${BackendResourceName}-db"
+        - Key: Purpose
+          Value: pdfx-extraction-run-metadata
+
 Outputs:
+  BackendDatabaseEndpoint:
+    Description: Backend RDS Postgres endpoint address.
+    Value: !GetAtt BackendDatabase.Endpoint.Address
   BackendAutoScalingGroupName:
     Value: !Ref BackendAutoScalingGroup
   BackendLaunchTemplateId:
