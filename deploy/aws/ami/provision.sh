@@ -26,6 +26,15 @@ main() {
   sudo dnf install -y docker git jq awscli
   sudo systemctl enable --now docker
 
+  # Docker Compose plugin — AL2023's docker package doesn't bundle it; install
+  # the same version the launch-template bootstrap uses (DockerComposeVersion).
+  if ! docker compose version >/dev/null 2>&1; then
+    sudo mkdir -p /usr/local/lib/docker/cli-plugins
+    sudo curl -fsSL "https://github.com/docker/compose/releases/download/v2.30.3/docker-compose-linux-x86_64" \
+      -o /usr/local/lib/docker/cli-plugins/docker-compose
+    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
+
   # Fresh checkout at the ref being baked (Packer sets BACKEND_GIT_REF; default = tag).
   sudo rm -rf "$SERVICE_DIR"
   sudo -u ec2-user git clone https://github.com/alliance-genome/agr_pdf_extraction_service.git "$SERVICE_DIR"
