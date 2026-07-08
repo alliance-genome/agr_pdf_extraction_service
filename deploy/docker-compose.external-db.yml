@@ -26,6 +26,10 @@ services:
     # DATABASE_URL, so the app talks to the external DB.
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set for external-db mode}
+    # Mount the RDS CA bundle so DATABASE_URL's sslmode=verify-full can validate
+    # the server certificate. The host file is provided by the AMI bake or boot.
+    volumes:
+      - /opt/pdfx/rds-ca.pem:/opt/pdfx/rds-ca.pem:ro
 
   worker:
     depends_on: !override
@@ -35,3 +39,5 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set for external-db mode}
+    volumes:
+      - /opt/pdfx/rds-ca.pem:/opt/pdfx/rds-ca.pem:ro

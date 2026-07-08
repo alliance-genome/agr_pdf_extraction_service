@@ -341,6 +341,17 @@ rm -f "$REPO_ROOT/data/cache/marker_worker_ready.json"
 # External DB (RDS) mode: layer the override so the bundled Postgres is excluded
 # and app/worker talk to DATABASE_URL. Must be set before any compose command.
 if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
+    if [ -z "${DATABASE_URL:-}" ]; then
+        echo "ERROR: PDFX_EXTERNAL_DB=true but DATABASE_URL is empty (expected the app-role URL)." >&2
+        exit 1
+    fi
+    # !override on depends_on (docker-compose.external-db.yml) needs Compose >= 2.24.4;
+    # older versions merge additively and pull the bundled postgres back into `up`.
+    compose_ver="$(docker compose version --short 2>/dev/null | sed 's/^v//' || echo 0)"
+    if [ "$(printf '%s\n%s\n' "2.24.4" "$compose_ver" | sort -V | head -1)" != "2.24.4" ]; then
+        echo "ERROR: external-db mode needs docker compose >= 2.24.4 (found ${compose_ver})." >&2
+        exit 1
+    fi
     echo "External DB mode: using external Postgres (RDS); bundled Postgres disabled."
     COMPOSE_ARGS+=(-f "docker-compose.external-db.yml")
 fi
@@ -377,9 +388,16 @@ fi
 echo "Waiting for services to start..."
 wait_for_postgres
 
-# Step 6: Run database migrations
+# Step 6: Run database migrations. In external-DB mode run them as the migration
+# role (master) via PDFX_MIGRATE_DATABASE_URL; the long-running app/worker use the
+# least-privilege app role via DATABASE_URL, so the master creds never reach runtime.
 echo "Running database migrations..."
-docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps app alembic upgrade head
+if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ] && [ -n "${PDFX_MIGRATE_DATABASE_URL:-}" ]; then
+    docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps \
+        -e DATABASE_URL="$PDFX_MIGRATE_DATABASE_URL" app alembic upgrade head
+else
+    docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps app alembic upgrade head
+fi
 echo "  Database migrations applied."
 
 # Step 7: Start full stack

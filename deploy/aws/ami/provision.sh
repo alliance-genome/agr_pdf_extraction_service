@@ -35,6 +35,13 @@ main() {
     sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
   fi
 
+  # RDS CA bundle for TLS verify-full to the external metadata DB. Mounted into
+  # app/worker by docker-compose.external-db.yml at /opt/pdfx/rds-ca.pem. Baking
+  # it avoids a boot-time fetch; the boot user-data re-fetches only if missing.
+  sudo mkdir -p /opt/pdfx
+  sudo curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    -o /opt/pdfx/rds-ca.pem
+
   # Fresh checkout at the ref being baked (Packer sets BACKEND_GIT_REF; default = tag).
   sudo rm -rf "$SERVICE_DIR"
   sudo -u ec2-user git clone https://github.com/alliance-genome/agr_pdf_extraction_service.git "$SERVICE_DIR"
