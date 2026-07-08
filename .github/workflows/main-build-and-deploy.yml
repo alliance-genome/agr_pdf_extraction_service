@@ -252,8 +252,11 @@ jobs:
           AMI_ID="$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d':' -f2)"
           echo "Baked AMI: $AMI_ID"
           test -n "$AMI_ID" && [ "$AMI_ID" != "null" ]
+          # --data-type aws:ec2:image is REQUIRED: the launch template's
+          # ImageId: resolve:ssm:/pdfx/backend-ami rejects a plain-String param
+          # (SsmInvalidParameter). Plain put-parameter here would fail the update.
           aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
-            --name "${SSM_PREFIX}/backend-ami" --type String --value "$AMI_ID"
+            --name "${SSM_PREFIX}/backend-ami" --type String --data-type aws:ec2:image --value "$AMI_ID"
           aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
             --name "${SSM_PREFIX}/backend-image-tag" --type String --value "${IMAGE_TAG}"
       - name: Prune old baked AMIs
