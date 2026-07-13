@@ -143,6 +143,7 @@ aws "${AWS_ARGS[@]}" cloudformation deploy \
   --stack-name "$STACK_NAME" \
   --template-file "$TEMPLATE_FILE" \
   --parameter-overrides "${PARAMS[@]}" \
+  --tags "Team=specialists" "Project=${PROJECT_NAME}" \
   --capabilities CAPABILITY_NAMED_IAM
 
 echo
