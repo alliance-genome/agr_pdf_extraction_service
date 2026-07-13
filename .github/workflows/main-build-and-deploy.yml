@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      backend_build_subnet_id:
+        description: Public subnet for the temporary Packer GPU instance
+        required: false
+        default: subnet-81c95ee4
+        type: string
 
 defaults:
   run:
@@ -216,7 +221,7 @@ jobs:
       IMAGE_ARCHIVE_PATH: /tmp/agr_pdfx_proxy-image.tar
       BACKEND_IMAGE_REPO: 100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend
       BASE_AMI_ID: ami-00c6ddd550364d6c3
-      BUILD_SUBNET_ID: subnet-af62dca3
+      BUILD_SUBNET_ID: ${{ inputs.backend_build_subnet_id || 'subnet-81c95ee4' }}
       IAM_INSTANCE_PROFILE: pdfx-ec2-profile
       SSM_PREFIX: /pdfx
       PUBLIC_BASE_URL: https://pdfx.alliancegenome.org

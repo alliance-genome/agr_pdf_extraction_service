@@ -72,7 +72,7 @@ packer build \
   -var backend_image_repo=100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend \
   -var backend_image_tag=<immutable-merge-sha> \
   -var iam_instance_profile=pdfx-ec2-profile \
-  -var subnet_id=subnet-af62dca3 \
+  -var subnet_id=subnet-81c95ee4 \
   pdfx-backend.pkr.hcl
 ```
 
@@ -95,13 +95,19 @@ packer validate \
   -var backend_image_repo=100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend \
   -var backend_image_tag=validate-only \
   -var iam_instance_profile=pdfx-ec2-profile \
-  -var subnet_id=subnet-af62dca3 \
+  -var subnet_id=subnet-81c95ee4 \
   pdfx-backend.pkr.hcl
 ```
 
 A manual bake does **not** publish to SSM (only CI's `deploy-prod` release job runs the
 `aws ssm put-parameter` step). After a manual bake, set the SSM params yourself with
 the `put-parameter` commands below.
+
+CI defaults its temporary Packer instance to `subnet-81c95ee4` (`us-east-1c`). For a
+capacity error in that AZ, manually dispatch **Main Build and Deploy** with
+`force_backend_bake=true` and set `backend_build_subnet_id` to another approved public
+PDFX subnet. The override changes only the disposable build box; it does not change the
+production backend ASG subnets.
 
 ## SSM parameters
 
