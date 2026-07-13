@@ -168,7 +168,7 @@ aws ssm get-parameters --profile ctabone --region us-east-1 \
 ## IAM
 
 Bake permissions live in `deploy/aws/github-actions-deploy-policy.json` (the CI OIDC
-role, `secrets.GH_ACTIONS_AWS_ROLE`). This work added two statements:
+role, `secrets.GH_ACTIONS_AWS_ROLE`). The bake-specific grants are:
 
 - **`PackerBakeEc2`** — the EC2 actions Packer's `amazon-ebs` builder uses: run/stop/
   terminate instances; create/register/deregister image; create/delete snapshot;
@@ -176,6 +176,9 @@ role, `secrets.GH_ACTIONS_AWS_ROLE`). This work added two statements:
   `AssociateIamInstanceProfile` / `ReplaceIamInstanceProfileAssociation`; and the
   `ec2:Describe*` reads (`Images`, `Instances`, `InstanceStatus`, `Subnets`, `Vpcs`,
   `SecurityGroups`, `Snapshots`, `Regions`, `ImageAttribute`, `KeyPairs`, `Tags`).
+- **`ReadBackendInstanceProfile`** — `iam:GetInstanceProfile` restricted to
+  `arn:aws:iam::100225593120:instance-profile/pdfx-ec2-profile`, which Packer validates
+  before it launches the temporary build box.
 - **`PassBackendInstanceProfileRole`** — `iam:PassRole` on
   `arn:aws:iam::100225593120:role/pdfx-ec2-role`, conditioned on
   `iam:PassedToService = ec2.amazonaws.com`, so the build box can be launched with an

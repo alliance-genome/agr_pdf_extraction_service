@@ -414,8 +414,18 @@ def test_iam_policy_is_environment_parameterized_and_allows_image_tags():
 
     gh_policy_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "github-actions-deploy-policy.json"
     gh_policy_text = gh_policy_path.read_text()
+    gh_policy = json.loads(gh_policy_text)
     assert "repository/agr_pdfx_proxy" in gh_policy_text
     assert "repository/agr_pdfx_backend" in gh_policy_text
+    profile_read = next(
+        statement
+        for statement in gh_policy["Statement"]
+        if statement["Sid"] == "ReadBackendInstanceProfile"
+    )
+    assert profile_read["Action"] == "iam:GetInstanceProfile"
+    assert profile_read["Resource"] == (
+        "arn:aws:iam::100225593120:instance-profile/pdfx-ec2-profile"
+    )
 
     stack_path = Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-stack.yaml"
     stack_text = stack_path.read_text()
