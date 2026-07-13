@@ -84,6 +84,10 @@ packer build \
 - Packer allows up to two hours for AWS to register the encrypted 200 GB AMI
   snapshot. The GPU build instance is already stopped during this wait; do not
   cancel a healthy bake merely because snapshot progress advances slowly.
+- The GitHub Actions OIDC role session lasts three hours so its AWS credentials
+  remain valid through image build, provisioning, the two-hour AMI wait, and
+  cleanup. The role itself must have `MaxSessionDuration=10800`; see the parent
+  AWS README for the apply command.
 - The build writes `manifest.json`; read the new AMI id with:
 
   ```bash

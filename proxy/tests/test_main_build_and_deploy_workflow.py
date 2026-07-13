@@ -96,6 +96,7 @@ def test_workflow_uses_one_environment_scoped_oidc_release_job():
 
     workflow_text = WORKFLOW_PATH.read_text()
     assert "role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}" in workflow_text
+    assert "role-duration-seconds: 10800" in workflow_text
     assert "file: ./deploy/Dockerfile.gpu" in workflow_text
     assert 'backend_git_ref="${SOURCE_REF}"' in workflow_text
     assert "BUILD_SUBNET_ID: ${{ inputs.backend_build_subnet_id || 'subnet-81c95ee4' }}" in workflow_text

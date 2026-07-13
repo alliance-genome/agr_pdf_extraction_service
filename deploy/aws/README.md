@@ -41,6 +41,20 @@ write `/pdfx/*` placeholder parameters before it registers a new proxy task
 definition, because ASG-aware proxy revisions require both the legacy EC2
 instance parameter and the backend ASG parameter to exist.
 
+Backend AMI registration can outlast the default one-hour STS session. The
+workflow requests a three-hour session, so the production role must retain
+`MaxSessionDuration=10800`:
+
+```bash
+aws iam update-role --profile ctabone \
+  --role-name agr-pdfx-proxy-gh-actions \
+  --max-session-duration 10800
+```
+
+Keep the role maximum and the workflow's `role-duration-seconds` in sync. The
+extra hour beyond Packer's two-hour AMI wait covers image build, capacity
+retries, provisioning, instance stop, and cleanup.
+
 ## GPU Idle Guard Alerts
 
 `pdfx-idle-guard-stack.yaml` creates a scheduled Lambda and CloudWatch alarms
