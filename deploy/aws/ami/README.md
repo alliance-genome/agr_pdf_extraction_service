@@ -81,6 +81,9 @@ packer build \
 - Optional vars with defaults: `build_instance_type=g6.2xlarge` (the bake doubles as
   the standing L4 smoke test — it fails if the stack can't run on L4), and
   `root_volume_size=200`.
+- Packer allows up to two hours for AWS to register the encrypted 200 GB AMI
+  snapshot. The GPU build instance is already stopped during this wait; do not
+  cancel a healthy bake merely because snapshot progress advances slowly.
 - The build writes `manifest.json`; read the new AMI id with:
 
   ```bash
