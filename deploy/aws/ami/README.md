@@ -54,8 +54,8 @@ bash deploy/aws/ami/tests/test_prune_amis.sh
 
 ## Manual bake
 
-CI bakes automatically on backend-affecting merges (job `bake-backend-ami` in
-`.github/workflows/main-build-and-deploy.yml`). Bake by hand only for out-of-band
+CI bakes automatically on backend-affecting merges inside the environment-gated
+`deploy-prod` job in `.github/workflows/main-build-and-deploy.yml`. Bake by hand only for out-of-band
 recovery or to produce a known-good AMI for backout.
 
 Requires an AWS session (env credentials or `AWS_PROFILE=ctabone`) for a principal
@@ -99,7 +99,7 @@ packer validate \
   pdfx-backend.pkr.hcl
 ```
 
-A manual bake does **not** publish to SSM (only CI's `bake-backend-ami` job runs the
+A manual bake does **not** publish to SSM (only CI's `deploy-prod` release job runs the
 `aws ssm put-parameter` step). After a manual bake, set the SSM params yourself with
 the `put-parameter` commands below.
 
@@ -111,8 +111,10 @@ Parameters that wire the AMI, image, and DB to the launch template / boot:
   (`ImageId: resolve:ssm:/pdfx/backend-ami`). **Must be created with
   `--data-type aws:ec2:image`** — the LT `resolve:ssm` `ImageId` rejects a plain-String
   parameter (`SsmInvalidParameter: … supported: aws:ec2:image`).
-- **`/pdfx/backend-image-tag`** — the immutable backend image tag the AMI was baked
-  against; the boot path pins it (replaces the old `:latest`).
+- **`/pdfx/backend-image-tag`** — a mirrored release record and legacy bootstrap
+  fallback. New baked AMIs carry the authoritative immutable tag in
+  `/opt/pdfx/backend-image-tag`, so the image and its tag cannot be split by two
+  independent SSM reads.
 - **`/pdfx/database-url`** (SecureString) — runtime DB URL (least-priv `pdfx_app` role,
   `sslmode=verify-full`); consumed by the compose override.
 - **`/pdfx/database-url-migrate`** (SecureString) — migration DB URL (master role);
@@ -134,17 +136,20 @@ aws ssm put-parameter --profile ctabone --region us-east-1 --overwrite \
   --name /pdfx/backend-image-tag --type String --value <immutable-tag>
 ```
 
-`resolve:ssm` fails a launch if the parameter is empty/invalid, so both must hold valid
-values before the first scale-out. The boot path has **no digest fast-path and no
-pull+prewarm fallback** — it uses the baked images/models directly — so `/pdfx/backend-ami`
-must point at a **real baked AMI** (not the DL base) and the RDS URLs must be seeded.
+`resolve:ssm` fails a launch if the AMI parameter is empty/invalid. Until the
+launch-template bootstrap with baked-marker support is applied, both release parameters
+must hold valid, matched values. The boot path has **no pull+prewarm fallback** — it
+uses the baked images/models directly — so `/pdfx/backend-ami` must point at a **real
+baked AMI** (not the DL base) and the RDS URLs must be seeded.
 
 ### Written by the bake
 
-CI's `bake-backend-ami` job `--overwrite`s both parameters — and it only reaches the
-`put-parameter` step **after** `packer build` succeeds (i.e. after a successful
-`RegisterImage`), so the ASG never resolves an empty/invalid value. The prune step then
-keeps the newest 3 baked AMIs and never deregisters the one referenced by
+CI's environment-gated backend release path records the previous pair, overwrites both
+parameters only after the image is available, re-reads and verifies the exact requested
+values, and restores the previous pair if publication fails. The baked marker is the
+runtime source of truth after the corresponding launch-template bootstrap is applied;
+the SSM image tag remains useful for release visibility and legacy fallback. The prune
+step keeps the newest 3 baked AMIs and never deregisters the AMI referenced by
 `/pdfx/backend-ami`.
 
 > **Clobber warning.** A CloudFormation redeploy must **never** re-introduce
@@ -199,12 +204,14 @@ unavoidable, mirror the identical changes into `pdfx-stack.yaml` in the same PR.
 
 Apply in this order:
 
-1. **Publish a baked AMI** (manual bake above, or let CI's `bake-backend-ami` run).
-2. **Set both SSM params** — `/pdfx/backend-ami` to the new AMI id and
+1. **Reconcile the launch-template bootstrap** so it reads the baked
+   `/opt/pdfx/backend-image-tag` marker, with SSM retained as the legacy fallback.
+2. **Publish a baked AMI** (manual bake above, or let CI's backend release path run).
+3. **Set both SSM params** — `/pdfx/backend-ami` to the new AMI id and
    `/pdfx/backend-image-tag` to its immutable tag (CI does this; verify with the
    `get-parameters` command above).
-3. **Dry-run the `resolve:ssm` permission chain BEFORE cutover** (see below).
-4. **Apply the ASG change** (`UpdateAutoScalingGroup`, or the stack update). The
+4. **Dry-run the `resolve:ssm` permission chain BEFORE cutover** (see below).
+5. **Apply the ASG change** (`UpdateAutoScalingGroup`, or the stack update). The
    **initial** switch to a `resolve:ssm` `ImageId` creates **one new launch-template
    version**; subsequent rebakes only mutate the SSM value and are picked up at the
    next launch with **no** LT version bump and no CloudFormation deploy.

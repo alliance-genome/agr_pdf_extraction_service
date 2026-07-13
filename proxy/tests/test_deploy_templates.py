@@ -1,7 +1,11 @@
 """Tests for deployment template invariants."""
 
 import json
+import os
+import subprocess
 from pathlib import Path
+
+import yaml
 
 
 def test_task_definition_healthcheck_uses_python_not_curl():
@@ -52,6 +56,69 @@ def test_idle_guard_stack_has_email_alarm_path_and_schedule():
 
     deploy_script = (Path(__file__).resolve().parents[2] / "deploy" / "aws" / "deploy_idle_guard.sh").read_text()
     assert 'IDLE_ALERT_AFTER_MINUTES="130"' in deploy_script
+    assert "--reuse-existing-parameters" in deploy_script
+    assert "read_existing_parameter" in deploy_script
+    assert "reuse_existing_parameter_unless_explicit" in deploy_script
+    assert "TreatMetricsFetchFailureAsIdle" in deploy_script
+    assert "LambdaArtifactBucket" in deploy_script
+
+
+def test_idle_guard_reuses_stack_parameters_but_keeps_explicit_overrides(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "deploy" / "aws" / "deploy_idle_guard.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    aws_log = tmp_path / "aws.log"
+    fake_aws = fake_bin / "aws"
+    fake_aws.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$FAKE_AWS_LOG"
+case "$*" in
+  *BackendAsgName*) echo stored-asg ;;
+  *ProxyMetricsUrl*) echo https://stored.example/api/v1/metrics ;;
+  *IdleAlertAfterMinutes*) echo 131 ;;
+  *AbsoluteAlertAfterMinutes*) echo 1500 ;;
+  *ScheduleExpression*) echo 'rate(10 minutes)' ;;
+  *MetricsTimeoutSeconds*) echo 9 ;;
+  *TreatMetricsFetchFailureAsIdle*) echo false ;;
+  *AlarmSnsTopicArn*) echo arn:aws:sns:us-east-1:123456789012:stored-topic ;;
+  *LambdaArtifactBucket*) echo stored-bucket ;;
+esac
+"""
+    )
+    fake_aws.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["FAKE_AWS_LOG"] = str(aws_log)
+
+    result = subprocess.run(
+        [
+            str(script_path),
+            "--reuse-existing-parameters",
+            "--idle-alert-after-minutes",
+            "999",
+        ],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = aws_log.read_text()
+    deploy_call = next(line for line in calls.splitlines() if "cloudformation deploy" in line)
+    assert "BackendAsgName=stored-asg" in deploy_call
+    assert "ProxyMetricsUrl=https://stored.example/api/v1/metrics" in deploy_call
+    assert "IdleAlertAfterMinutes=999" in deploy_call
+    assert "AbsoluteAlertAfterMinutes=1500" in deploy_call
+    assert "ScheduleExpression=rate(10 minutes)" in deploy_call
+    assert "MetricsTimeoutSeconds=9" in deploy_call
+    assert "TreatMetricsFetchFailureAsIdle=false" in deploy_call
+    assert "AlarmSnsTopicArn=arn:aws:sns:us-east-1:123456789012:stored-topic" in deploy_call
+    assert "LambdaArtifactBucket=stored-bucket" in deploy_call
+    assert "--tags Team=specialists Project=pdfx" in deploy_call
 
 
 def test_deploy_script_supports_explicit_image_tag():
@@ -130,6 +197,116 @@ def test_deploy_script_supports_environment_scoped_resources():
     assert 'ensure_ssm_param "${SSM_PREFIX}/asg-startup-replacement-attempts" "1"' in script
     assert 'if $DRY_RUN; then' in script
     assert "Would create placeholder SSM parameter" in script
+    assert '"minimumHealthyPercent":100' in script
+    assert '"maximumPercent":200' in script
+    assert '--deployment-configuration "$DEPLOYMENT_CONFIGURATION"' in script
+    assert 'ACTIVE_TASK_DEF=$("${AWS_CMD[@]}" ecs describe-services' in script
+    assert 'PRIMARY_ROLLOUT_STATE=$("${AWS_CMD[@]}" ecs describe-services' in script
+    assert '"$ACTIVE_TASK_DEF" != "$TASK_DEF_ARN"' in script
+    assert '"$PRIMARY_ROLLOUT_STATE" != "COMPLETED"' in script
+
+
+def test_deploy_script_fails_when_ecs_stabilizes_after_rollback(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "proxy" / "deploy" / "deploy.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_aws = fake_bin / "aws"
+    fake_aws.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+case "$args" in
+  *"ssm get-parameter"*"/aws-account-id"*) echo 123456789012 ;;
+  *"ssm get-parameter"*"/ec2-instance-id"*) echo i-0123456789abcdef0 ;;
+  *"ssm get-parameter"*"/execution-role-name"*) echo execution-role ;;
+  *"ssm get-parameter"*"/task-role-name"*) echo task-role ;;
+  *"ssm get-parameter"*"/audit-s3-bucket"*) echo audit-bucket ;;
+  *"ssm get-parameter"*"/backend-asg-name"*) echo pdfx-backend ;;
+  *"ssm get-parameter"*) echo configured ;;
+  *"ecs register-task-definition"*) echo arn:aws:ecs:us-east-1:123456789012:task-definition/pdfx-proxy:52 ;;
+  *"ecs update-service"*) echo '{}' ;;
+  *"ecs wait services-stable"*) exit 0 ;;
+  *"ecs describe-services"*"taskDefinition"*) echo arn:aws:ecs:us-east-1:123456789012:task-definition/pdfx-proxy:51 ;;
+  *"ecs describe-services"*"rolloutState"*) echo COMPLETED ;;
+  *) echo "unexpected aws invocation: $args" >&2; exit 90 ;;
+esac
+"""
+    )
+    fake_aws.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [str(script_path), "--image-tag", "new-release"],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "ECS stabilized without completing the requested task definition" in result.stderr
+    assert "pdfx-proxy:52" in result.stderr
+    assert "pdfx-proxy:51" in result.stderr
+
+
+def test_backend_release_publication_restores_ssm_pair_on_partial_write(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow_path = repo_root / ".github" / "workflows" / "main-build-and-deploy.yml"
+    workflow = yaml.safe_load(workflow_path.read_text())
+    publish_script = next(
+        step["run"]
+        for step in workflow["jobs"]["deploy-prod"]["steps"]
+        if step.get("name") == "Publish matched backend AMI and image tag"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    aws_log = tmp_path / "aws.log"
+    fake_aws = fake_bin / "aws"
+    fake_aws.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
+case "$*" in
+  *"ssm get-parameter"*"/backend-ami"*) echo ami-00000000000000001 ;;
+  *"ssm get-parameter"*"/backend-image-tag"*) echo old-tag ;;
+  *"ssm put-parameter"*"--value new-tag"*) exit 42 ;;
+  *"ssm put-parameter"*) exit 0 ;;
+  *) echo "unexpected aws invocation: $*" >&2; exit 90 ;;
+esac
+"""
+    )
+    fake_aws.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "FAKE_AWS_LOG": str(aws_log),
+            "AWS_REGION": "us-east-1",
+            "SSM_PREFIX": "/pdfx",
+            "NEW_AMI_ID": "ami-00000000000000002",
+            "IMAGE_TAG": "new-tag",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", publish_script],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 42
+    assert "restoring the previous SSM pair" in result.stderr
+    calls = aws_log.read_text()
+    assert "--value ami-00000000000000002" in calls
+    assert "--value new-tag" in calls
+    assert "--value ami-00000000000000001" in calls
+    assert "--value old-tag" in calls
 
 
 def test_task_definition_is_environment_parameterized():

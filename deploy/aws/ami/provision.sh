@@ -41,11 +41,21 @@ main() {
   sudo mkdir -p /opt/pdfx
   sudo curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
     -o /opt/pdfx/rds-ca.pem
+  printf '%s\n' "$BACKEND_IMAGE_TAG" | sudo tee /opt/pdfx/backend-image-tag >/dev/null
+  sudo chmod 0444 /opt/pdfx/backend-image-tag
 
   # Fresh checkout at the ref being baked (Packer sets BACKEND_GIT_REF; default = tag).
   sudo rm -rf "$SERVICE_DIR"
   sudo -u ec2-user git clone https://github.com/alliance-genome/agr_pdf_extraction_service.git "$SERVICE_DIR"
-  sudo -u ec2-user git -C "$SERVICE_DIR" checkout "${BACKEND_GIT_REF:-$BACKEND_IMAGE_TAG}" || true
+  local requested_ref="${BACKEND_GIT_REF:-$BACKEND_IMAGE_TAG}"
+  sudo -u ec2-user git -C "$SERVICE_DIR" checkout "$requested_ref"
+  local checked_out_commit requested_commit
+  checked_out_commit="$(sudo -u ec2-user git -C "$SERVICE_DIR" rev-parse HEAD)"
+  requested_commit="$(sudo -u ec2-user git -C "$SERVICE_DIR" rev-parse "${requested_ref}^{commit}")"
+  if [ "$checked_out_commit" != "$requested_commit" ]; then
+    echo "ERROR: backend checkout does not resolve to requested ref $requested_ref" >&2
+    return 1
+  fi
 
   cd "$SERVICE_DIR"
   mkdir -p data/cache data/uploads data/models data/model_cache data/rapidocr_models logs

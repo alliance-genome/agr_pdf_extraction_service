@@ -538,8 +538,13 @@ Resources:
               # master role (PDFX_MIGRATE_DATABASE_URL). Both use TLS verify-full via the RDS CA
               # bundle (baked to /opt/pdfx/rds-ca.pem; refetched here only if missing).
               BACKEND_IMAGE_REPO="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}"
-              PINNED_TAG="$(aws ssm get-parameter --region "${AWS::Region}" \
-                --name "/${SsmParameterPath}/backend-image-tag" --query Parameter.Value --output text 2>/dev/null || echo "${BackendImageTag}")"
+              if [ -s /opt/pdfx/backend-image-tag ]; then
+                PINNED_TAG="$(tr -d '[:space:]' < /opt/pdfx/backend-image-tag)"
+              else
+                echo "WARNING: baked image-tag marker missing; using legacy SSM fallback"
+                PINNED_TAG="$(aws ssm get-parameter --region "${AWS::Region}" \
+                  --name "/${SsmParameterPath}/backend-image-tag" --query Parameter.Value --output text 2>/dev/null || echo "${BackendImageTag}")"
+              fi
               DATABASE_URL="$(aws ssm get-parameter --region "${AWS::Region}" --with-decryption \
                 --name "/${SsmParameterPath}/database-url" --query Parameter.Value --output text)"
               PDFX_MIGRATE_DATABASE_URL="$(aws ssm get-parameter --region "${AWS::Region}" --with-decryption \
@@ -551,8 +556,8 @@ Resources:
 
               cd deploy
               # NOTE: this whole heredoc is inside CFN Fn::Sub, so shell vars MUST use bare $
-              # (not ${!...}, which CFN would try to resolve as a template variable). Only real
-              # CFN refs use ${...} here.
+              # names. Braced shell expansions would be parsed as template variables; reserve
+              # that syntax for real CloudFormation references.
               BACKEND_IMAGE_URI="$BACKEND_IMAGE_REPO:$PINNED_TAG"
               aws ecr get-login-password --region "${AWS::Region}" \
                 | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
@@ -1125,8 +1130,7 @@ Resources:
       Threshold: 2147483648
       ComparisonOperator: LessThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlarmSnsTopicArn
+      AlarmActions: !If [HasAlarmActions, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
   BackendDbHighCpuAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -1143,8 +1147,7 @@ Resources:
       Threshold: 85
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlarmSnsTopicArn
+      AlarmActions: !If [HasAlarmActions, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
   BackendDbHighConnectionsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -1161,8 +1164,7 @@ Resources:
       Threshold: 40
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlarmSnsTopicArn
+      AlarmActions: !If [HasAlarmActions, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
 
 Outputs:
   BackendDatabaseEndpoint:

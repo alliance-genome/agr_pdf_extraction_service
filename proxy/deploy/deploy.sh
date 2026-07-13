@@ -28,6 +28,7 @@ LOG_GROUP=""
 QUEUE_PREFIX=""
 UPDATE_SERVICE=true
 WAIT_FOR_STABLE=true
+DEPLOYMENT_CONFIGURATION='{"maximumPercent":200,"minimumHealthyPercent":100,"deploymentCircuitBreaker":{"enable":true,"rollback":true}}'
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -235,6 +236,7 @@ echo "==> Updating ECS service to new task definition..."
     --cluster "$CLUSTER_NAME" \
     --service "$SERVICE_NAME" \
     --task-definition "$TASK_DEF_ARN" \
+    --deployment-configuration "$DEPLOYMENT_CONFIGURATION" \
     --force-new-deployment \
     --query "service.{serviceName:serviceName,taskDefinition:taskDefinition}" \
     --output json
@@ -244,7 +246,24 @@ if $WAIT_FOR_STABLE; then
     "${AWS_CMD[@]}" ecs wait services-stable \
         --cluster "$CLUSTER_NAME" \
         --services "$SERVICE_NAME"
-    echo "==> Service is stable."
+    ACTIVE_TASK_DEF=$("${AWS_CMD[@]}" ecs describe-services \
+        --cluster "$CLUSTER_NAME" \
+        --services "$SERVICE_NAME" \
+        --query 'services[0].taskDefinition' \
+        --output text)
+    PRIMARY_ROLLOUT_STATE=$("${AWS_CMD[@]}" ecs describe-services \
+        --cluster "$CLUSTER_NAME" \
+        --services "$SERVICE_NAME" \
+        --query 'services[0].deployments[?status==`PRIMARY`].rolloutState | [0]' \
+        --output text)
+    if [[ "$ACTIVE_TASK_DEF" != "$TASK_DEF_ARN" || "$PRIMARY_ROLLOUT_STATE" != "COMPLETED" ]]; then
+        echo "ERROR: ECS stabilized without completing the requested task definition." >&2
+        echo "       Requested: ${TASK_DEF_ARN}" >&2
+        echo "       Active:    ${ACTIVE_TASK_DEF}" >&2
+        echo "       Rollout:   ${PRIMARY_ROLLOUT_STATE}" >&2
+        exit 1
+    fi
+    echo "==> Service is stable on ${TASK_DEF_ARN}."
 else
     echo "==> Skipping service wait (--no-wait)."
 fi
