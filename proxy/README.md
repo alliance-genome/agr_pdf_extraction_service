@@ -300,7 +300,8 @@ automates the manual steps above when a PR is merged into `main`.
 - Trigger: `pull_request.closed` on `main`, guarded by `github.event.pull_request.merged == true`
 - Escape hatch: add the `no-deploy` label to the PR to skip the deployment job
 - Manual recovery: `workflow_dispatch` can force a proxy deploy, a backend
-  image+AMI bake, or both from the selected ref
+  image+AMI bake, or both from the selected ref. Backend bakes can also override
+  the temporary Packer subnet when an AZ has insufficient GPU capacity.
 - Target: the canonical `pdfx` environment.
 - Approval gate: the `deploy-prod` job is attached to the GitHub Actions
   `prod` environment, so required reviewers can block production rollout
