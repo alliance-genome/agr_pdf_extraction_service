@@ -249,6 +249,9 @@ jobs:
         with:
           role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}
           role-session-name: gh-actions-${{ github.run_id }}.${{ github.run_number }}.${{ github.run_attempt }}-pdfx-prod
+          # Backend bakes can spend up to two hours waiting for AMI registration.
+          # Keep the credentials valid through image build, provisioning, and cleanup.
+          role-duration-seconds: 10800
           aws-region: ${{ env.AWS_REGION }}
       - name: Amazon ECR login
         id: login-ecr

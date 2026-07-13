@@ -81,6 +81,13 @@ packer build \
 - Optional vars with defaults: `build_instance_type=g6.2xlarge` (the bake doubles as
   the standing L4 smoke test — it fails if the stack can't run on L4), and
   `root_volume_size=200`.
+- Packer allows up to two hours for AWS to register the encrypted 200 GB AMI
+  snapshot. The GPU build instance is already stopped during this wait; do not
+  cancel a healthy bake merely because snapshot progress advances slowly.
+- The GitHub Actions OIDC role session lasts three hours so its AWS credentials
+  remain valid through image build, provisioning, the two-hour AMI wait, and
+  cleanup. The role itself must have `MaxSessionDuration=10800`; see the parent
+  AWS README for the apply command.
 - The build writes `manifest.json`; read the new AMI id with:
 
   ```bash

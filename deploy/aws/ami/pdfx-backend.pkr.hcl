@@ -69,11 +69,12 @@ source "amazon-ebs" "pdfx_backend" {
   ami_name                    = "pdfx-backend-baked-${var.backend_image_tag}-${local.ts}"
 
   # The ~200 GB AMI snapshot (7 GB image + model caches) takes far longer than
-  # Packer's default AMI-ready wait; allow up to ~60 min so a slow snapshot
-  # doesn't false-fail an otherwise-successful bake.
+  # Packer's default AMI-ready wait. AWS has taken more than 60 minutes to
+  # register a healthy bake, so allow up to ~120 minutes rather than deleting
+  # an otherwise-successful pending image at the old timeout.
   aws_polling {
     delay_seconds = 20
-    max_attempts  = 180
+    max_attempts  = 360
   }
 
   launch_block_device_mappings {

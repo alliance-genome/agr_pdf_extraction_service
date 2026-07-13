@@ -12,6 +12,13 @@ WORKFLOW_PATH = (
     / "workflows"
     / "main-build-and-deploy.yml"
 )
+PACKER_TEMPLATE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "deploy"
+    / "aws"
+    / "ami"
+    / "pdfx-backend.pkr.hcl"
+)
 
 
 def _load_workflow():
@@ -44,6 +51,15 @@ def test_workflow_supports_merged_prs_and_manual_recovery():
     assert "backend_build_subnet_id:" in workflow
     assert "default: subnet-81c95ee4" in workflow
     assert "no-deploy" in workflow
+
+
+def test_packer_allows_two_hours_for_large_ami_registration():
+    template = PACKER_TEMPLATE_PATH.read_text()
+
+    polling = re.search(r"aws_polling\s*\{(?P<body>.*?)\}", template, re.DOTALL)
+    assert polling is not None
+    assert re.search(r"delay_seconds\s*=\s*20\b", polling.group("body"))
+    assert re.search(r"max_attempts\s*=\s*360\b", polling.group("body"))
 
 
 def test_workflow_uses_one_environment_scoped_oidc_release_job():
@@ -80,6 +96,7 @@ def test_workflow_uses_one_environment_scoped_oidc_release_job():
 
     workflow_text = WORKFLOW_PATH.read_text()
     assert "role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}" in workflow_text
+    assert "role-duration-seconds: 10800" in workflow_text
     assert "file: ./deploy/Dockerfile.gpu" in workflow_text
     assert 'backend_git_ref="${SOURCE_REF}"' in workflow_text
     assert "BUILD_SUBNET_ID: ${{ inputs.backend_build_subnet_id || 'subnet-81c95ee4' }}" in workflow_text
