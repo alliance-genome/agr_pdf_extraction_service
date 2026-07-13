@@ -29,6 +29,8 @@ QUEUE_PREFIX=""
 UPDATE_SERVICE=true
 WAIT_FOR_STABLE=true
 DEPLOYMENT_CONFIGURATION='{"maximumPercent":200,"minimumHealthyPercent":100,"deploymentCircuitBreaker":{"enable":true,"rollback":true}}'
+ROLLOUT_VERIFY_ATTEMPTS="${ECS_ROLLOUT_VERIFY_ATTEMPTS:-30}"
+ROLLOUT_VERIFY_DELAY_SECONDS="${ECS_ROLLOUT_VERIFY_DELAY_SECONDS:-5}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -48,6 +50,15 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if ! [[ "$ROLLOUT_VERIFY_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: ECS_ROLLOUT_VERIFY_ATTEMPTS must be a positive integer" >&2
+    exit 1
+fi
+if ! [[ "$ROLLOUT_VERIFY_DELAY_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "ERROR: ECS_ROLLOUT_VERIFY_DELAY_SECONDS must be a non-negative number" >&2
+    exit 1
+fi
 
 AWS_CMD=(aws --region "$REGION")
 [[ -n "$PROFILE" ]] && AWS_CMD=(aws --profile "$PROFILE" --region "$REGION")
@@ -246,23 +257,49 @@ if $WAIT_FOR_STABLE; then
     "${AWS_CMD[@]}" ecs wait services-stable \
         --cluster "$CLUSTER_NAME" \
         --services "$SERVICE_NAME"
-    ACTIVE_TASK_DEF=$("${AWS_CMD[@]}" ecs describe-services \
-        --cluster "$CLUSTER_NAME" \
-        --services "$SERVICE_NAME" \
-        --query 'services[0].taskDefinition' \
-        --output text)
-    PRIMARY_ROLLOUT_STATE=$("${AWS_CMD[@]}" ecs describe-services \
-        --cluster "$CLUSTER_NAME" \
-        --services "$SERVICE_NAME" \
-        --query 'services[0].deployments[?status==`PRIMARY`].rolloutState | [0]' \
-        --output text)
-    if [[ "$ACTIVE_TASK_DEF" != "$TASK_DEF_ARN" || "$PRIMARY_ROLLOUT_STATE" != "COMPLETED" ]]; then
-        echo "ERROR: ECS stabilized without completing the requested task definition." >&2
-        echo "       Requested: ${TASK_DEF_ARN}" >&2
-        echo "       Active:    ${ACTIVE_TASK_DEF}" >&2
-        echo "       Rollout:   ${PRIMARY_ROLLOUT_STATE}" >&2
-        exit 1
-    fi
+
+    # The built-in services-stable waiter can return a few seconds before the
+    # deployment's rolloutState changes from IN_PROGRESS to COMPLETED. Poll
+    # that final state briefly, while still failing immediately if the circuit
+    # breaker rolled the service back to a different task definition.
+    for ((attempt = 1; attempt <= ROLLOUT_VERIFY_ATTEMPTS; attempt++)); do
+        ACTIVE_TASK_DEF=$("${AWS_CMD[@]}" ecs describe-services \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+        PRIMARY_ROLLOUT_STATE=$("${AWS_CMD[@]}" ecs describe-services \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME" \
+            --query 'services[0].deployments[?status==`PRIMARY`].rolloutState | [0]' \
+            --output text)
+
+        if [[ "$ACTIVE_TASK_DEF" != "$TASK_DEF_ARN" ]]; then
+            echo "ERROR: ECS stabilized on a different task definition (possible rollback)." >&2
+            echo "       Requested: ${TASK_DEF_ARN}" >&2
+            echo "       Active:    ${ACTIVE_TASK_DEF}" >&2
+            echo "       Rollout:   ${PRIMARY_ROLLOUT_STATE}" >&2
+            exit 1
+        fi
+
+        case "$PRIMARY_ROLLOUT_STATE" in
+            COMPLETED)
+                break
+                ;;
+            IN_PROGRESS)
+                if ((attempt == ROLLOUT_VERIFY_ATTEMPTS)); then
+                    echo "ERROR: ECS rollout remained IN_PROGRESS after ${ROLLOUT_VERIFY_ATTEMPTS} verification attempts." >&2
+                    exit 1
+                fi
+                echo "    Rollout state is still IN_PROGRESS; verifying again in ${ROLLOUT_VERIFY_DELAY_SECONDS}s..."
+                sleep "$ROLLOUT_VERIFY_DELAY_SECONDS"
+                ;;
+            *)
+                echo "ERROR: ECS reported unexpected rollout state: ${PRIMARY_ROLLOUT_STATE}" >&2
+                exit 1
+                ;;
+        esac
+    done
     echo "==> Service is stable on ${TASK_DEF_ARN}."
 else
     echo "==> Skipping service wait (--no-wait)."

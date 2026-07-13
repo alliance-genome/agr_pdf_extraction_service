@@ -203,7 +203,9 @@ def test_deploy_script_supports_environment_scoped_resources():
     assert 'ACTIVE_TASK_DEF=$("${AWS_CMD[@]}" ecs describe-services' in script
     assert 'PRIMARY_ROLLOUT_STATE=$("${AWS_CMD[@]}" ecs describe-services' in script
     assert '"$ACTIVE_TASK_DEF" != "$TASK_DEF_ARN"' in script
-    assert '"$PRIMARY_ROLLOUT_STATE" != "COMPLETED"' in script
+    assert 'case "$PRIMARY_ROLLOUT_STATE" in' in script
+    assert "ECS_ROLLOUT_VERIFY_ATTEMPTS" in script
+    assert "ECS_ROLLOUT_VERIFY_DELAY_SECONDS" in script
 
 
 def test_deploy_script_fails_when_ecs_stabilizes_after_rollback(tmp_path):
@@ -247,9 +249,68 @@ esac
     )
 
     assert result.returncode == 1
-    assert "ECS stabilized without completing the requested task definition" in result.stderr
+    assert "ECS stabilized on a different task definition" in result.stderr
     assert "pdfx-proxy:52" in result.stderr
     assert "pdfx-proxy:51" in result.stderr
+
+
+def test_deploy_script_waits_for_rollout_state_to_catch_up(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "proxy" / "deploy" / "deploy.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    rollout_state_file = tmp_path / "rollout-state-count"
+    fake_aws = fake_bin / "aws"
+    fake_aws.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+case "$args" in
+  *"ssm get-parameter"*"/aws-account-id"*) echo 123456789012 ;;
+  *"ssm get-parameter"*"/ec2-instance-id"*) echo i-0123456789abcdef0 ;;
+  *"ssm get-parameter"*"/execution-role-name"*) echo execution-role ;;
+  *"ssm get-parameter"*"/task-role-name"*) echo task-role ;;
+  *"ssm get-parameter"*"/audit-s3-bucket"*) echo audit-bucket ;;
+  *"ssm get-parameter"*"/backend-asg-name"*) echo pdfx-backend ;;
+  *"ssm get-parameter"*) echo configured ;;
+  *"ecs register-task-definition"*) echo arn:aws:ecs:us-east-1:123456789012:task-definition/pdfx-proxy:52 ;;
+  *"ecs update-service"*) echo '{}' ;;
+  *"ecs wait services-stable"*) exit 0 ;;
+  *"ecs describe-services"*"taskDefinition"*) echo arn:aws:ecs:us-east-1:123456789012:task-definition/pdfx-proxy:52 ;;
+  *"ecs describe-services"*"rolloutState"*)
+    count=$(cat "$FAKE_ROLLOUT_STATE_FILE" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FAKE_ROLLOUT_STATE_FILE"
+    if ((count == 1)); then echo IN_PROGRESS; else echo COMPLETED; fi
+    ;;
+  *) echo "unexpected aws invocation: $args" >&2; exit 90 ;;
+esac
+"""
+    )
+    fake_aws.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "FAKE_ROLLOUT_STATE_FILE": str(rollout_state_file),
+            "ECS_ROLLOUT_VERIFY_ATTEMPTS": "3",
+            "ECS_ROLLOUT_VERIFY_DELAY_SECONDS": "0",
+        }
+    )
+
+    result = subprocess.run(
+        [str(script_path), "--image-tag", "new-release"],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Rollout state is still IN_PROGRESS" in result.stdout
+    assert "Service is stable on" in result.stdout
+    assert rollout_state_file.read_text().strip() == "2"
 
 
 def test_backend_release_publication_restores_ssm_pair_on_partial_write(tmp_path):
