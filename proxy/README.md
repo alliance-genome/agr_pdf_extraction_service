@@ -299,15 +299,16 @@ automates the manual steps above when a PR is merged into `main`.
 
 - Trigger: `pull_request.closed` on `main`, guarded by `github.event.pull_request.merged == true`
 - Escape hatch: add the `no-deploy` label to the PR to skip the deployment job
+- Manual recovery: `workflow_dispatch` can force a proxy deploy, a backend
+  image+AMI bake, or both from the selected ref
 - Target: the canonical `pdfx` environment.
 - Approval gate: the `deploy-prod` job is attached to the GitHub Actions
   `prod` environment, so required reviewers can block production rollout
   until explicitly approved
-- Image handling: the workflow builds the proxy image once, uploads it as a
-  GitHub Actions artifact, and the deploy job downloads that exact archive,
-  verifies its checksum, pushes it to ECR as
-  `agr_pdfx_proxy:<merge-commit-sha>` plus `:latest`, then runs
-  `proxy/deploy/deploy.sh --image-tag <merge-commit-sha>`
+- Path-aware releases: proxy inputs build and roll only the proxy; backend
+  inputs build the backend image and publish a baked AMI; idle-guard changes
+  emit explicit operator deployment instructions. Documentation-only merges
+  do not roll production.
 
 Required GitHub setup:
 
@@ -319,15 +320,30 @@ Required GitHub setup:
 - Configure required reviewers on the `prod` environment if you want a
   manual approval gate before the deploy job runs
 
-The image promotion sequence inside the deploy job is:
+The proxy image promotion sequence inside the deploy job is:
 
 1. push `agr_pdfx_proxy:<merge-commit-sha>` to ECR (immutable artifact)
 2. run `proxy/deploy/deploy.sh --image-tag <merge-commit-sha>` to register a
    new ECS task definition and roll the `pdfx-proxy` service
-3. only after step 2 succeeds, re-tag the same image as `:latest` and push
+3. run public liveness, health, and metrics smoke checks
+4. only after rollout and smoke checks succeed, re-tag the same image as
+   `:latest` and push
 
 This keeps `:latest` pointing at the most recent image that actually rolled
 out to prod — if ECS rollout fails, `:latest` does not move.
+
+Backend releases use the same environment-scoped AWS role. The immutable
+backend image is built only for backend-affecting changes. CI then bakes and
+validates the AMI, publishes and verifies `/pdfx/backend-ami` plus the mirrored
+`/pdfx/backend-image-tag` release record, prunes old AMIs, and only then promotes
+the backend image to `:latest`. The AMI carries its authoritative immutable tag
+in `/opt/pdfx/backend-image-tag`; the SSM tag remains a legacy bootstrap
+fallback until the corresponding launch-template update is applied. A failed
+bake or pair publication therefore cannot move backend `:latest`.
+
+`proxy/deploy/deploy.sh` also enforces `minimumHealthyPercent=100` and
+`maximumPercent=200` on every ECS update. With one desired task, ECS must keep
+the old target healthy until the replacement passes its checks.
 
 The assumed AWS role needs enough access to:
 

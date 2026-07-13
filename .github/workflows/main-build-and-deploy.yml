@@ -5,6 +5,18 @@ on:
     types: [closed]
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      force_proxy_deploy:
+        description: Build and deploy the proxy even if no proxy files changed
+        required: false
+        default: false
+        type: boolean
+      force_backend_bake:
+        description: Build the backend and publish a new baked AMI from this ref
+        required: false
+        default: false
+        type: boolean
 
 defaults:
   run:
@@ -12,16 +24,25 @@ defaults:
 
 jobs:
   on-merge:
-    name: Skip on unmerged
-    if: github.event.pull_request.merged == true
+    name: Determine deployment scope
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    permissions:
+      contents: read
+      pull-requests: read
     runs-on: ubuntu-24.04
     outputs:
       image-tag: ${{ steps.meta.outputs.image-tag }}
       source-ref: ${{ steps.meta.outputs.source-ref }}
+      proxy-changed: ${{ steps.changed.outputs.proxy-changed }}
       backend-changed: ${{ steps.changed.outputs.backend-changed }}
+      idle-guard-changed: ${{ steps.changed.outputs.idle-guard-changed }}
+      main-stack-changed: ${{ steps.changed.outputs.main-stack-changed }}
+      backend-bake-deferred: ${{ steps.changed.outputs.backend-bake-deferred }}
     env:
       MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
       FALLBACK_SHA: ${{ github.sha }}
+      FORCE_PROXY_DEPLOY: ${{ inputs.force_proxy_deploy || 'false' }}
+      FORCE_BACKEND_BAKE: ${{ inputs.force_backend_bake || 'false' }}
     steps:
       - name: Capture deployment metadata
         id: meta
@@ -29,45 +50,94 @@ jobs:
           source_ref="${MERGE_COMMIT_SHA:-$FALLBACK_SHA}"
           echo "source-ref=${source_ref}" >> "$GITHUB_OUTPUT"
           echo "image-tag=${source_ref}" >> "$GITHUB_OUTPUT"
-      - name: Confirm execution
-        run: |
-          echo "Merged PR detected for ${GITHUB_REPOSITORY}."
-          echo "Deploying commit ${{ steps.meta.outputs.source-ref }}."
       - name: Check out repository code
         uses: actions/checkout@v5
         with:
           ref: ${{ steps.meta.outputs.source-ref }}
           fetch-depth: 2
-      - name: Detect backend-affecting changes
+      - name: Detect deployment-affecting changes
         id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # Gate targets what is actually baked INTO the AMI: the backend image
-          # inputs (Dockerfile.gpu, requirements, app/, celery_app.py, config.py,
-          # compose) and the bake tooling (deploy/aws/ami/). deploy/deploy.sh and
-          # deploy/manage.sh are intentionally omitted: boot re-runs deploy.sh
-          # fresh from the git clone, and the digest fast-path falls back safely,
-          # so a change to those does not require a rebake.
-          if git diff --name-only HEAD~1 HEAD | grep -E '^(deploy/Dockerfile\.gpu|requirements\.txt|app/|celery_app\.py|config\.py|deploy/docker-compose.*\.yml|deploy/aws/ami/)' >/dev/null; then
-            echo "backend-changed=true" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only HEAD~1 HEAD >/dev/null 2>&1; then
-            echo "backend-changed=false" >> "$GITHUB_OUTPUT"
+          proxy_changed=false
+          backend_changed=false
+          idle_guard_changed=false
+          main_stack_changed=false
+          backend_bake_deferred=false
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            proxy_changed="$FORCE_PROXY_DEPLOY"
+            backend_changed="$FORCE_BACKEND_BAKE"
+          elif changed_files="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[].filename')"; then
+            printf 'Changed files:\n%s\n' "$changed_files"
+
+            if grep -Eq '^(proxy/Dockerfile|proxy/requirements\.txt|proxy/app/|proxy/deploy/)' <<< "$changed_files"; then
+              proxy_changed=true
+            fi
+
+            # These paths affect the backend image, the checked-out deploy
+            # code embedded in the AMI, or the bake itself.
+            if grep -Eq '^(\.dockerignore$|requirements\.txt$|alembic\.ini$|alembic/|app/|celery_app\.py$|config\.py$|deploy/Dockerfile\.gpu$|deploy/gpu-constraints\.txt$|deploy/deploy\.sh$|deploy/manage\.sh$|deploy/nginx\.conf$|deploy/docker-compose[^/]*\.yml$|deploy/aws/ami/(pdfx-backend\.pkr\.hcl|provision\.sh)$)' <<< "$changed_files"; then
+              backend_changed=true
+            fi
+
+            if grep -Eq '^deploy/aws/(deploy_idle_guard\.sh|pdfx-idle-guard-stack\.yaml|lambda/pdfx_idle_guard\.py)$' <<< "$changed_files"; then
+              idle_guard_changed=true
+            fi
+
+            if grep -Eq '^deploy/aws/pdfx-stack\.yaml$' <<< "$changed_files"; then
+              main_stack_changed=true
+            fi
           else
-            echo "backend-changed=true" >> "$GITHUB_OUTPUT"   # inconclusive -> run (safe over stale)
+            echo "Could not determine the merge diff; enabling all safe release paths." >&2
+            proxy_changed=true
+            backend_changed=true
+            idle_guard_changed=true
+            main_stack_changed=true
           fi
 
+          if [[ "$EVENT_NAME" != "workflow_dispatch" && "$main_stack_changed" == "true" && "$backend_changed" == "true" ]]; then
+            echo "Deferring the backend bake until the live launch-template bootstrap is reconciled." >&2
+            backend_changed=false
+            backend_bake_deferred=true
+          fi
+
+          {
+            echo "proxy-changed=${proxy_changed}"
+            echo "backend-changed=${backend_changed}"
+            echo "idle-guard-changed=${idle_guard_changed}"
+            echo "main-stack-changed=${main_stack_changed}"
+            echo "backend-bake-deferred=${backend_bake_deferred}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Deployment scope"
+            echo "- Source: \`${{ steps.meta.outputs.source-ref }}\`"
+            echo "- Proxy deploy: \`${proxy_changed}\`"
+            echo "- Backend image + AMI bake: \`${backend_changed}\`"
+            echo "- Idle guard operator deploy required: \`${idle_guard_changed}\`"
+            echo "- Main stack reconciliation required: \`${main_stack_changed}\`"
+            echo "- Backend bake deferred pending reconciliation: \`${backend_bake_deferred}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   on-deploy:
-    name: Skip on 'no-deploy' PRs
+    name: Honor no-deploy label
     needs: on-merge
-    if: "!contains(github.event.pull_request.labels.*.name, 'no-deploy')"
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.pull_request.labels.*.name, 'no-deploy')
     runs-on: ubuntu-24.04
     steps:
       - name: Confirm execution
-        run: |
-          echo "No 'no-deploy' label found."
+        run: echo "Deployment is allowed for this event."
 
   build-proxy-image:
     name: Build proxy image once
     needs: [on-merge, on-deploy]
+    if: needs.on-merge.outputs.proxy-changed == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -89,8 +159,7 @@ jobs:
           ref: ${{ env.SOURCE_REF }}
       - name: Capture artifact metadata
         id: meta
-        run: |
-          echo "image-artifact-name=proxy-image-${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+        run: echo "image-artifact-name=proxy-image-${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build proxy image archive
@@ -118,8 +187,16 @@ jobs:
           if-no-files-found: error
 
   deploy-prod:
-    name: Deploy proxy to prod
+    name: Release changed production components
     needs: [on-merge, on-deploy, build-proxy-image]
+    if: >-
+      ${{
+        always() &&
+        needs.on-merge.result == 'success' &&
+        needs.on-deploy.result == 'success' &&
+        (needs.on-merge.outputs.proxy-changed == 'true' || needs.on-merge.outputs.backend-changed == 'true') &&
+        (needs.on-merge.outputs.proxy-changed != 'true' || needs.build-proxy-image.result == 'success')
+      }}
     permissions:
       contents: read
       id-token: write
@@ -137,22 +214,31 @@ jobs:
       IMAGE_ARTIFACT_NAME: ${{ needs.build-proxy-image.outputs.image-artifact-name }}
       IMAGE_ARCHIVE_SHA256: ${{ needs.build-proxy-image.outputs.image-archive-sha256 }}
       IMAGE_ARCHIVE_PATH: /tmp/agr_pdfx_proxy-image.tar
+      BACKEND_IMAGE_REPO: 100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend
+      BASE_AMI_ID: ami-00c6ddd550364d6c3
+      BUILD_SUBNET_ID: subnet-af62dca3
+      IAM_INSTANCE_PROFILE: pdfx-ec2-profile
+      SSM_PREFIX: /pdfx
+      PUBLIC_BASE_URL: https://pdfx.alliancegenome.org
     steps:
       - name: Check out repository code
         uses: actions/checkout@v5
         with:
           ref: ${{ env.SOURCE_REF }}
-      - name: Download built image artifact
+
+      - name: Download built proxy image artifact
+        if: needs.on-merge.outputs.proxy-changed == 'true'
         uses: actions/download-artifact@v5
         with:
           name: ${{ env.IMAGE_ARTIFACT_NAME }}
           path: /tmp
-      - name: Verify image artifact checksum
-        run: |
-          echo "${IMAGE_ARCHIVE_SHA256}  ${IMAGE_ARCHIVE_PATH}" | sha256sum --check --
+      - name: Verify proxy image artifact checksum
+        if: needs.on-merge.outputs.proxy-changed == 'true'
+        run: echo "${IMAGE_ARCHIVE_SHA256}  ${IMAGE_ARCHIVE_PATH}" | sha256sum --check --
       - name: Load built proxy image
-        run: |
-          docker load --input "${IMAGE_ARCHIVE_PATH}"
+        if: needs.on-merge.outputs.proxy-changed == 'true'
+        run: docker load --input "${IMAGE_ARCHIVE_PATH}"
+
       - name: AWS credentials configuration
         uses: aws-actions/configure-aws-credentials@v5
         with:
@@ -163,8 +249,11 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
       - name: Set up Docker Buildx
+        if: needs.on-merge.outputs.backend-changed == 'true'
         uses: docker/setup-buildx-action@v3
+
       - name: Build and push immutable backend image tag
+        if: needs.on-merge.outputs.backend-changed == 'true'
         uses: docker/build-push-action@v6
         env:
           DOCKER_BUILD_SUMMARY: false
@@ -176,67 +265,45 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha,scope=pdfx-backend
           cache-to: type=gha,mode=max,scope=pdfx-backend,ignore-error=true
+
       - name: Push immutable proxy image tag
+        if: needs.on-merge.outputs.proxy-changed == 'true'
         env:
           TARGET_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/${{ env.PROXY_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
         run: |
           docker tag "${PROXY_IMAGE_NAME}:${IMAGE_TAG}" "${TARGET_IMAGE_TAGGED}"
           docker push "${TARGET_IMAGE_TAGGED}"
       - name: Register task definition and roll ECS service
+        if: needs.on-merge.outputs.proxy-changed == 'true'
         working-directory: proxy/deploy
         run: ./deploy.sh --region "${AWS_REGION}" --image-tag "${IMAGE_TAG}"
-      - name: Promote proxy :latest to the just-deployed image
-        if: success()
+      - name: Smoke test the public proxy
+        if: needs.on-merge.outputs.proxy-changed == 'true'
+        run: |
+          for path in /api/v1/health/live /api/v1/health /api/v1/metrics; do
+            curl --fail --silent --show-error \
+              --retry 12 --retry-delay 5 --retry-all-errors \
+              --max-time 20 "${PUBLIC_BASE_URL}${path}" >/dev/null
+          done
+          health_json="$(curl --fail --silent --show-error --max-time 20 "${PUBLIC_BASE_URL}/api/v1/health")"
+          python3 -c 'import json,sys; payload=json.load(sys.stdin); assert payload.get("proxy") == "ok", payload' <<< "$health_json"
+      - name: Promote proxy :latest to the deployed image
+        if: success() && needs.on-merge.outputs.proxy-changed == 'true'
         env:
           SOURCE_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/${{ env.PROXY_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/${{ env.PROXY_IMAGE_NAME }}:latest
         run: |
           docker tag "${SOURCE_IMAGE_TAGGED}" "${TARGET_IMAGE_LATEST}"
           docker push "${TARGET_IMAGE_LATEST}"
-      - name: Promote backend :latest to the just-built image
-        if: success()
-        env:
-          SOURCE_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/${{ env.BACKEND_IMAGE_NAME }}:latest
-        run: |
-          docker buildx imagetools create \
-            --tag "${TARGET_IMAGE_LATEST}" \
-            "${SOURCE_IMAGE_TAGGED}"
 
-  bake-backend-ami:
-    name: Bake backend AMI
-    needs: [on-merge, deploy-prod]
-    if: needs.on-merge.outputs.backend-changed == 'true'
-    permissions:
-      contents: read
-      id-token: write
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: ${{ github.workflow }}-bake-backend-ami
-      cancel-in-progress: false
-    env:
-      AWS_REGION: us-east-1
-      IMAGE_TAG: ${{ needs.on-merge.outputs.image-tag }}
-      BACKEND_IMAGE_REPO: 100225593120.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_backend
-      BASE_AMI_ID: ami-00c6ddd550364d6c3
-      BUILD_SUBNET_ID: subnet-af62dca3
-      IAM_INSTANCE_PROFILE: pdfx-ec2-profile
-      SSM_PREFIX: /pdfx
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.on-merge.outputs.source-ref }}
-      - name: AWS credentials configuration
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}
-          role-session-name: gh-actions-${{ github.run_id }}-pdfx-bake
-          aws-region: ${{ env.AWS_REGION }}
       - name: Set up Packer
+        if: needs.on-merge.outputs.backend-changed == 'true'
         uses: hashicorp/setup-packer@v3
         with:
           version: latest
-      - name: Bake AMI
+      - name: Bake backend AMI
+        id: bake-ami
+        if: needs.on-merge.outputs.backend-changed == 'true'
         working-directory: deploy/aws/ami
         run: |
           packer init pdfx-backend.pkr.hcl
@@ -245,19 +312,93 @@ jobs:
             -var base_ami_id="${BASE_AMI_ID}" \
             -var backend_image_repo="${BACKEND_IMAGE_REPO}" \
             -var backend_image_tag="${IMAGE_TAG}" \
+            -var backend_git_ref="${SOURCE_REF}" \
             -var iam_instance_profile="${IAM_INSTANCE_PROFILE}" \
             -var subnet_id="${BUILD_SUBNET_ID}" \
             pdfx-backend.pkr.hcl
-          # manifest.json artifact_id is "region:ami-xxxx"; take the ami id.
           AMI_ID="$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d':' -f2)"
           echo "Baked AMI: $AMI_ID"
-          test -n "$AMI_ID" && [ "$AMI_ID" != "null" ]
-          # --data-type aws:ec2:image is REQUIRED: the launch template's
-          # ImageId: resolve:ssm:/pdfx/backend-ami rejects a plain-String param
-          # (SsmInvalidParameter). Plain put-parameter here would fail the update.
+          test -n "$AMI_ID" && [[ "$AMI_ID" == ami-* ]]
+          aws ec2 wait image-available --region "${AWS_REGION}" --image-ids "$AMI_ID"
+          echo "ami-id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+      - name: Publish matched backend AMI and image tag
+        if: needs.on-merge.outputs.backend-changed == 'true'
+        env:
+          NEW_AMI_ID: ${{ steps.bake-ami.outputs.ami-id }}
+        run: |
+          OLD_AMI_ID="$(aws ssm get-parameter --region "${AWS_REGION}" \
+            --name "${SSM_PREFIX}/backend-ami" --query Parameter.Value --output text)"
+          OLD_IMAGE_TAG="$(aws ssm get-parameter --region "${AWS_REGION}" \
+            --name "${SSM_PREFIX}/backend-image-tag" --query Parameter.Value --output text)"
+          [[ "$OLD_AMI_ID" == ami-* ]]
+          [[ -n "$OLD_IMAGE_TAG" && "$OLD_IMAGE_TAG" != "None" ]]
+
+          rollback_release_pair() {
+            local exit_code=$?
+            trap - ERR
+            set +e
+            echo "ERROR: backend release publication failed; restoring the previous SSM pair." >&2
+            aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
+              --name "${SSM_PREFIX}/backend-ami" --type String --data-type aws:ec2:image --value "$OLD_AMI_ID"
+            aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
+              --name "${SSM_PREFIX}/backend-image-tag" --type String --value "$OLD_IMAGE_TAG"
+            exit "$exit_code"
+          }
+          trap rollback_release_pair ERR
+
           aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
-            --name "${SSM_PREFIX}/backend-ami" --type String --data-type aws:ec2:image --value "$AMI_ID"
+            --name "${SSM_PREFIX}/backend-ami" --type String --data-type aws:ec2:image --value "$NEW_AMI_ID"
           aws ssm put-parameter --region "${AWS_REGION}" --overwrite \
             --name "${SSM_PREFIX}/backend-image-tag" --type String --value "${IMAGE_TAG}"
+          PUBLISHED_AMI_ID="$(aws ssm get-parameter --region "${AWS_REGION}" \
+            --name "${SSM_PREFIX}/backend-ami" --query Parameter.Value --output text)"
+          PUBLISHED_IMAGE_TAG="$(aws ssm get-parameter --region "${AWS_REGION}" \
+            --name "${SSM_PREFIX}/backend-image-tag" --query Parameter.Value --output text)"
+          if [[ "$PUBLISHED_AMI_ID" != "$NEW_AMI_ID" || "$PUBLISHED_IMAGE_TAG" != "$IMAGE_TAG" ]]; then
+            echo "ERROR: published backend release pair did not match the requested values." >&2
+            false
+          fi
+          trap - ERR
+          printf 'Published backend release: AMI=%s image-tag=%s\n' "$PUBLISHED_AMI_ID" "$PUBLISHED_IMAGE_TAG"
       - name: Prune old baked AMIs
+        if: needs.on-merge.outputs.backend-changed == 'true'
         run: KEEP_N=3 SSM_PREFIX=/pdfx AWS_REGION=us-east-1 bash deploy/aws/ami/prune_amis.sh
+      - name: Promote backend :latest after successful AMI publication
+        if: success() && needs.on-merge.outputs.backend-changed == 'true'
+        env:
+          SOURCE_IMAGE_TAGGED: ${{ steps.login-ecr.outputs.registry }}/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          TARGET_IMAGE_LATEST: ${{ steps.login-ecr.outputs.registry }}/${{ env.BACKEND_IMAGE_NAME }}:latest
+        run: docker buildx imagetools create --tag "${TARGET_IMAGE_LATEST}" "${SOURCE_IMAGE_TAGGED}"
+
+  idle-guard-deploy-required:
+    name: Report idle guard deployment requirement
+    needs: [on-merge, on-deploy]
+    if: needs.on-merge.outputs.idle-guard-changed == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish operator instructions
+        run: |
+          echo "::notice title=Idle guard deployment required::Run deploy/aws/deploy_idle_guard.sh --reuse-existing-parameters after merge."
+          {
+            echo "### Idle guard deployment required"
+            echo "This merge changed idle-guard IaC. Apply it with:"
+            echo '```bash'
+            echo 'deploy/aws/deploy_idle_guard.sh --profile <profile> --region us-east-1 --reuse-existing-parameters'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  main-stack-reconcile-required:
+    name: Report main stack reconciliation requirement
+    needs: [on-merge, on-deploy]
+    if: needs.on-merge.outputs.main-stack-changed == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish operator instructions
+        run: |
+          echo "::notice title=PDFX stack reconciliation required::Production is drifted from pdfx-stack.yaml; review and apply/import the launch-template changes deliberately."
+          {
+            echo "### Main PDFX stack reconciliation required"
+            echo "Production resources are not cleanly CloudFormation-managed. This merge changed \`deploy/aws/pdfx-stack.yaml\`; review the diff and reconcile/import the affected resources before treating the reference template as live."
+            echo "For the baked image-tag marker, update the backend launch-template bootstrap before relying on the marker as the runtime source of truth. Legacy SSM fallback remains supported until then."
+            echo "If the deployment-scope summary says the backend bake was deferred, reconcile the launch template first and then run this workflow manually with \`force_backend_bake=true\`."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,7 @@
 """Tests for the main branch deployment workflow."""
 
 from pathlib import Path
+import re
 
 import yaml
 
@@ -17,18 +18,33 @@ def _load_workflow():
     return yaml.safe_load(WORKFLOW_PATH.read_text())
 
 
-def test_workflow_triggers_only_for_merged_prs_to_main():
+def _backend_path_pattern():
+    detector = next(
+        step
+        for step in _load_workflow()["jobs"]["on-merge"]["steps"]
+        if step.get("id") == "changed"
+    )["run"]
+    match = re.search(
+        r"if grep -Eq '([^']*deploy/Dockerfile\\\.gpu[^']*)' <<< \"\$changed_files\"; then",
+        detector,
+    )
+    assert match is not None
+    return re.compile(match.group(1))
+
+
+def test_workflow_supports_merged_prs_and_manual_recovery():
     workflow = WORKFLOW_PATH.read_text()
 
     assert "pull_request:" in workflow
     assert "types: [closed]" in workflow
-    assert "branches:" in workflow
-    assert "- main" in workflow
     assert "github.event.pull_request.merged == true" in workflow
+    assert "workflow_dispatch:" in workflow
+    assert "force_proxy_deploy:" in workflow
+    assert "force_backend_bake:" in workflow
     assert "no-deploy" in workflow
 
 
-def test_workflow_deploys_to_single_prod_environment_with_oidc():
+def test_workflow_uses_one_environment_scoped_oidc_release_job():
     data = _load_workflow()
     jobs = data["jobs"]
 
@@ -37,9 +53,7 @@ def test_workflow_deploys_to_single_prod_environment_with_oidc():
         for name, job in jobs.items()
         if "environment" in job
     }
-    assert environments == {"deploy-prod": "prod"}, (
-        f"expected a single deploy-prod job bound to the 'prod' environment, got {environments}"
-    )
+    assert environments == {"deploy-prod": "prod"}
 
     id_token_writers = {
         name
@@ -49,15 +63,8 @@ def test_workflow_deploys_to_single_prod_environment_with_oidc():
     assert id_token_writers == {"deploy-prod"}
 
     deploy_prod = jobs["deploy-prod"]
-    needs = deploy_prod.get("needs") or []
-    assert "build-proxy-image" in needs
-    assert "deploy-dev" not in needs
-    assert "deploy-stage" not in needs
-
-    for forbidden_job in ("deploy-dev", "deploy-stage"):
-        assert forbidden_job not in jobs, (
-            f"{forbidden_job} reappeared; this workflow is intentionally single-environment"
-        )
+    assert "build-proxy-image" in (deploy_prod.get("needs") or [])
+    assert "always()" in deploy_prod["if"]
 
     step_uses = [
         step.get("uses", "")
@@ -71,42 +78,106 @@ def test_workflow_deploys_to_single_prod_environment_with_oidc():
 
     workflow_text = WORKFLOW_PATH.read_text()
     assert "role-to-assume: ${{ secrets.GH_ACTIONS_AWS_ROLE }}" in workflow_text
-    assert "docker load --input" in workflow_text
-    assert "PROXY_IMAGE_NAME: agr_pdfx_proxy" in workflow_text
-    assert "BACKEND_IMAGE_NAME: agr_pdfx_backend" in workflow_text
-    assert "/${{ env.PROXY_IMAGE_NAME }}:${{ env.IMAGE_TAG }}" in workflow_text
-    assert "/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}" in workflow_text
     assert "file: ./deploy/Dockerfile.gpu" in workflow_text
-    assert "cache-to: type=gha,mode=max,scope=pdfx-backend,ignore-error=true" in workflow_text
-    assert "./deploy.sh --region \"${AWS_REGION}\" --image-tag \"${IMAGE_TAG}\"" in workflow_text
+    assert 'backend_git_ref="${SOURCE_REF}"' in workflow_text
 
 
-def test_latest_tag_is_promoted_only_after_ecs_rollout_succeeds():
+def test_change_scope_avoids_unrelated_builds_and_covers_backend_inputs():
     data = _load_workflow()
-    steps = data["jobs"]["deploy-prod"]["steps"]
+    scope_steps = data["jobs"]["on-merge"]["steps"]
+    detector = next(step for step in scope_steps if step.get("id") == "changed")
+    detector_script = detector["run"]
 
+    assert "proxy-changed" in detector_script
+    assert "backend-changed" in detector_script
+    assert "idle-guard-changed" in detector_script
+    assert "main-stack-changed" in detector_script
+    assert "gh api --paginate" in detector_script
+    assert 'pulls/${PR_NUMBER}/files?per_page=100' in detector_script
+    assert "git diff --name-only HEAD~1 HEAD" not in detector_script
+    assert "proxy/app/" in detector_script
+    assert "proxy/deploy/" in detector_script
+    assert "alembic/" in detector_script
+    assert "deploy/gpu-constraints" in detector_script
+    assert "deploy/deploy" in detector_script
+    assert "deploy/aws/ami/(pdfx-backend" in detector_script
+
+    jobs = data["jobs"]
+    assert jobs["build-proxy-image"]["if"] == "needs.on-merge.outputs.proxy-changed == 'true'"
+    backend_build = next(
+        step
+        for step in jobs["deploy-prod"]["steps"]
+        if step.get("name") == "Build and push immutable backend image tag"
+    )
+    assert "backend-changed" in backend_build["if"]
+    assert "idle-guard-deploy-required" in jobs
+    assert "main-stack-reconcile-required" in jobs
+    assert "--reuse-existing-parameters" in WORKFLOW_PATH.read_text()
+
+
+def test_backend_change_scope_only_includes_runtime_and_bake_inputs():
+    pattern = _backend_path_pattern()
+
+    triggering_paths = (
+        ".dockerignore",
+        "requirements.txt",
+        "alembic/versions/example.py",
+        "app/main.py",
+        "deploy/Dockerfile.gpu",
+        "deploy/docker-compose.gpu.yml",
+        "deploy/aws/ami/pdfx-backend.pkr.hcl",
+        "deploy/aws/ami/provision.sh",
+    )
+    ignored_paths = (
+        "README.md",
+        "deploy/aws/ami/README.md",
+        "deploy/aws/ami/tests/test_prune_amis.sh",
+        "deploy/aws/ami/prune_amis.sh",
+        ".github/workflows/main-build-and-deploy.yml",
+    )
+
+    assert all(pattern.search(path) for path in triggering_paths)
+    assert not any(pattern.search(path) for path in ignored_paths)
+
+
+def test_proxy_latest_moves_only_after_rollout_and_public_smoke_test():
+    steps = _load_workflow()["jobs"]["deploy-prod"]["steps"]
     step_names = [step.get("name", "") for step in steps]
-    deploy_idx = next(
-        i for i, name in enumerate(step_names) if "Register task definition" in name
+
+    deploy_idx = step_names.index("Register task definition and roll ECS service")
+    smoke_idx = step_names.index("Smoke test the public proxy")
+    latest_idx = step_names.index("Promote proxy :latest to the deployed image")
+
+    assert deploy_idx < smoke_idx < latest_idx
+    assert steps[latest_idx]["if"] == (
+        "success() && needs.on-merge.outputs.proxy-changed == 'true'"
     )
-    latest_indices = [
-        i for i, name in enumerate(step_names) if "Promote" in name and ":latest" in name
-    ]
+    assert "/api/v1/health/live" in steps[smoke_idx]["run"]
+    assert "/api/v1/metrics" in steps[smoke_idx]["run"]
 
-    assert latest_indices, "expected at least one :latest promotion step"
-    for latest_idx in latest_indices:
-        assert latest_idx > deploy_idx, (
-            ":latest must be pushed after the ECS rollout step so a failed rollout "
-            "does not leave :latest pointing at an image that never went live"
-        )
-        assert steps[latest_idx].get("if") == "success()"
 
-    proxy_latest_idx = next(
-        i for i, name in enumerate(step_names) if "Promote proxy :latest" in name
+def test_backend_latest_moves_only_after_ami_and_ssm_publication():
+    steps = _load_workflow()["jobs"]["deploy-prod"]["steps"]
+    step_names = [step.get("name", "") for step in steps]
+
+    build_idx = step_names.index("Build and push immutable backend image tag")
+    bake_idx = step_names.index("Bake backend AMI")
+    publish_idx = step_names.index("Publish matched backend AMI and image tag")
+    prune_idx = step_names.index("Prune old baked AMIs")
+    latest_idx = step_names.index(
+        "Promote backend :latest after successful AMI publication"
     )
 
-    for earlier_step in steps[:proxy_latest_idx]:
-        run_block = earlier_step.get("run", "") or ""
-        assert "agr_pdfx_proxy:latest" not in run_block, (
-            f"found :latest push in step {earlier_step.get('name')!r} before ECS rollout"
-        )
+    assert build_idx < bake_idx < publish_idx < prune_idx < latest_idx
+    assert steps[latest_idx]["if"] == (
+        "success() && needs.on-merge.outputs.backend-changed == 'true'"
+    )
+    bake_script = steps[bake_idx]["run"]
+    assert "aws ec2 wait image-available" in bake_script
+    assert 'echo "ami-id=${AMI_ID}" >> "$GITHUB_OUTPUT"' in bake_script
+    publish_script = steps[publish_idx]["run"]
+    assert "backend-ami" in publish_script
+    assert "--data-type aws:ec2:image" in publish_script
+    assert "backend-image-tag" in publish_script
+    assert "rollback_release_pair" in publish_script
+    assert '"$PUBLISHED_AMI_ID" != "$NEW_AMI_ID"' in publish_script

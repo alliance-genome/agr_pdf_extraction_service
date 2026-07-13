@@ -15,6 +15,7 @@ CPU_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-comp
 GPU_PREBUILT_COMPOSE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.gpu.prebuilt.yml"
 GPU_DOCKERFILE_PATH = Path(__file__).resolve().parents[1] / "deploy" / "Dockerfile.gpu"
 GPU_CONSTRAINTS_PATH = Path(__file__).resolve().parents[1] / "deploy" / "gpu-constraints.txt"
+AMI_PROVISION_PATH = Path(__file__).resolve().parents[1] / "deploy" / "aws" / "ami" / "provision.sh"
 REQUIREMENTS_PATH = Path(__file__).resolve().parents[1] / "requirements.txt"
 NGINX_CONFIG_PATH = Path(__file__).resolve().parents[1] / "deploy" / "nginx.conf"
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.py"
@@ -39,7 +40,7 @@ def test_pdfx_stack_uses_canonical_resources():
     assert "StartupTimeoutMinutes:" in template
     assert "IdleTimeoutMinutes:" in template
     assert 'Default: "120"' in template
-    assert 'Default: "30"' in template
+    assert 'Default: "45"' in template
     assert "Name: !Sub \"/${SsmParameterPath}/ec2-instance-id\"" in template
     assert "Name: !Sub \"/${SsmParameterPath}/backend-asg-name\"" in template
     assert "Name: !Sub \"/${SsmParameterPath}/asg-startup-replacement-attempts\"" in template
@@ -110,11 +111,29 @@ def test_pdfx_bootstrap_supports_branch_tag_or_sha_checkout():
     assert 'git -C "$SERVICE_DIR" fetch --all --tags --prune' in template
     assert 'git -C "$SERVICE_DIR" checkout "${BackendGitRef}"' in template
     assert 'git -C "$SERVICE_DIR" reset --hard "origin/${BackendGitRef}"' in template
-    assert 'BACKEND_IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}:${BackendImageTag}"' in template
+    assert 'BACKEND_IMAGE_REPO="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendImageRepositoryName}"' in template
+    assert "if [ -s /opt/pdfx/backend-image-tag ]; then" in template
+    assert "PINNED_TAG=\"$(tr -d '[:space:]' < /opt/pdfx/backend-image-tag)\"" in template
+    assert "baked image-tag marker missing; using legacy SSM fallback" in template
+    assert 'PINNED_TAG="$(aws ssm get-parameter' in template
+    assert 'BACKEND_IMAGE_URI="$BACKEND_IMAGE_REPO:$PINNED_TAG"' in template
     assert 'PDFX_GPU_IMAGE="$BACKEND_IMAGE_URI"' in template
     assert "PDFX_DEPLOY_BUILD_MODE=never" in template
-    assert "PDFX_DEPLOY_PULL_IMAGES=auto" in template
+    assert "PDFX_DEPLOY_PULL_IMAGES=never" in template
     assert 'git clone --branch "${BackendGitRef}"' not in template
+    assert "${...}" not in template
+
+
+def test_ami_bake_writes_immutable_backend_image_tag_marker():
+    provision = AMI_PROVISION_PATH.read_text()
+
+    assert 'checkout "$requested_ref"' in provision
+    assert 'checkout "${BACKEND_GIT_REF:-$BACKEND_IMAGE_TAG}" || true' not in provision
+    assert 'rev-parse "${requested_ref}^{commit}"' in provision
+    assert '"$checked_out_commit" != "$requested_commit"' in provision
+    assert 'printf \'%s\\n\' "$BACKEND_IMAGE_TAG"' in provision
+    assert "/opt/pdfx/backend-image-tag" in provision
+    assert "chmod 0444 /opt/pdfx/backend-image-tag" in provision
 
 
 def test_deploy_script_does_not_force_rebuild_by_default():
@@ -153,6 +172,17 @@ def test_pdfx_stack_has_backend_resilience_alarms():
     assert "pdfx-startup-timeouts" in template
     assert "pdfx-backend-replacements" in template
     assert "AlarmSnsTopicArn" in template
+
+
+def test_every_alarm_conditions_the_optional_sns_topic():
+    template = STACK_PATH.read_text()
+    conditioned_action = (
+        "AlarmActions: !If [HasAlarmActions, [!Ref AlarmSnsTopicArn], "
+        "!Ref AWS::NoValue]"
+    )
+
+    assert template.count(conditioned_action) == 5
+    assert "AlarmActions:\n        - !Ref AlarmSnsTopicArn" not in template
 
 
 def test_gpu_compose_runs_image_baked_source():

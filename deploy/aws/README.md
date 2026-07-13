@@ -85,6 +85,17 @@ deploy/aws/deploy_idle_guard.sh \
   --alarm-topic-arn <confirmed-idle-guard-sns-topic-arn>
 ```
 
+For an existing stack, reuse its current operational parameters while applying
+the latest template, Lambda, and stack tags. Explicit command-line values still
+override the corresponding stored parameter:
+
+```bash
+deploy/aws/deploy_idle_guard.sh \
+  --profile ctabone \
+  --region us-east-1 \
+  --reuse-existing-parameters
+```
+
 For Slack delivery, connect the same SNS topic to the team's AWS Chatbot Slack
 channel configuration, or add that topic ARN to an existing Chatbot
 configuration. Keep email subscribed as the fallback path.

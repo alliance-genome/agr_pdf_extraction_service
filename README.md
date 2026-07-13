@@ -1011,6 +1011,11 @@ deploy/aws/deploy_idle_guard.sh \
   --alarm-topic-arn <confirmed-idle-guard-sns-topic-arn>
 ```
 
+To redeploy an existing idle-guard stack while preserving its operational
+parameters, pass `--reuse-existing-parameters` with the appropriate AWS profile
+and region. Explicit command-line values override the corresponding stored
+parameter.
+
 Use a confirmed SNS topic with an idle-guard/cost-guard name; do not reuse an
 OOM-named topic for this cost guard. For Slack, attach the same SNS topic to the
 team's AWS Chatbot Slack channel configuration, while keeping email as the
