@@ -111,6 +111,12 @@
       "Resource": "*"
     },
     {
+      "Sid": "ReadBackendInstanceProfile",
+      "Effect": "Allow",
+      "Action": "iam:GetInstanceProfile",
+      "Resource": "arn:aws:iam::100225593120:instance-profile/pdfx-ec2-profile"
+    },
+    {
       "Sid": "PassBackendInstanceProfileRole",
       "Effect": "Allow",
       "Action": "iam:PassRole",
