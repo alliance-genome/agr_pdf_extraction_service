@@ -539,6 +539,10 @@ def _safe_log_event(audit_logger, stage, status, **kwargs):
 
 def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
     if not audit_logger:
+        if merge:
+            raise RuntimeError(
+                "Merged output cannot be completed without durable artifact storage"
+            )
         return {}
 
     artifacts = {}
@@ -599,14 +603,16 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
 
     if merge:
         merged_path = result.get("merged_cache_path") or _cached_path(result.get("file_hash"), "merged")
-        if merged_path and os.path.exists(merged_path):
-            try:
-                with open(merged_path, "rb") as f:
-                    key = audit_logger.upload_artifact("merged.md", f.read())
-                if key:
-                    artifacts["merged"] = key
-            except Exception as exc:
-                logger.warning("Failed to upload merged artifact: %s", exc)
+        if not merged_path or not os.path.exists(merged_path):
+            raise RuntimeError("Committed merged output is unavailable for durable upload")
+        try:
+            with open(merged_path, "rb") as f:
+                key = audit_logger.upload_artifact("merged.md", f.read())
+        except Exception as exc:
+            raise RuntimeError("Failed to upload durable merged output") from exc
+        if not key:
+            raise RuntimeError("Failed to upload durable merged output")
+        artifacts["merged"] = key
 
     images = []
     if file_hash:

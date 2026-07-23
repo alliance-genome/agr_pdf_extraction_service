@@ -261,7 +261,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "404":
-          description: Process or artifact not found.
+          description: Process or requested artifact not found; merged output may not have been requested.
           content:
             application/json:
               schema:
@@ -272,6 +272,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/JobNotCompleteResponse"
+        "500":
+          description: A completed merge violated its durable-artifact invariant.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /extract/{process_id}/images:
     get:

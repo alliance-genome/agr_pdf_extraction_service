@@ -1062,6 +1062,7 @@ def download_result(process_id, method):
         download_paths = data.get("download_paths", {})
         file_hash = data.get("file_hash", "")
         verified_merge_payload = None
+        local_merge_verification_failed = False
 
         if method in {"merged", "audit"} and data.get("merged_cache_path"):
             contract_id = data.get("merge_contract_id")
@@ -1077,54 +1078,63 @@ def download_result(process_id, method):
                 isinstance(value, dict)
                 for value in (native_receipts, skeleton_ids, skeleton_projection_ids)
             ):
-                return jsonify({"error": "Merge bundle metadata is incomplete"}), 409
-            try:
-                artifacts = {}
-                completed_sources = data.get("available_extractors")
-                if not isinstance(completed_sources, list):
-                    raise ValueError("merge result completed source set is invalid")
-                completed_sources = [
-                    source
-                    for source in completed_sources
-                    if source in VALID_METHODS
-                ]
-                if not completed_sources:
-                    raise ValueError("merge result has no completed source set")
-                for source in completed_sources:
-                    source_path = download_paths.get(source)
-                    if not source_path:
-                        raise ValueError(f"missing merge source path: {source}")
-                    with open(source_path, "r", encoding="utf-8") as handle:
-                        artifacts[source] = SourceArtifact.from_text(source, handle.read())
-                merged_text, _metrics, merge_audit = load_merge_bundle(
-                    merged_path=merged_path,
-                    metrics_path=metrics_path,
-                    audit_path=audit_path,
-                    artifacts=artifacts,
-                    expected_contract_id=contract_id,
-                    expected_native_structure_receipt_digests=native_receipts,
-                    expected_skeleton_candidate_ids=skeleton_ids,
-                    expected_skeleton_candidate_projection_ids=(
-                        skeleton_projection_ids
-                    ),
-                )
-                verified_merge_payload = (
-                    merged_text.encode("utf-8")
-                    if method == "merged"
-                    else json.dumps(
-                        merge_audit,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                )
-            except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+                local_merge_verification_failed = True
                 logger.warning(
-                    "Merge download bundle verification failed for %s: %s",
+                    "Merge download bundle metadata is incomplete for %s; "
+                    "trying durable artifact",
                     process_id,
-                    type(exc).__name__,
                 )
-                return jsonify({"error": "Merge bundle verification failed"}), 409
+            else:
+                try:
+                    artifacts = {}
+                    completed_sources = data.get("available_extractors")
+                    if not isinstance(completed_sources, list):
+                        raise ValueError("merge result completed source set is invalid")
+                    completed_sources = [
+                        source
+                        for source in completed_sources
+                        if source in VALID_METHODS
+                    ]
+                    if not completed_sources:
+                        raise ValueError("merge result has no completed source set")
+                    for source in completed_sources:
+                        source_path = download_paths.get(source)
+                        if not source_path:
+                            raise ValueError(f"missing merge source path: {source}")
+                        with open(source_path, "r", encoding="utf-8") as handle:
+                            artifacts[source] = SourceArtifact.from_text(
+                                source, handle.read()
+                            )
+                    merged_text, _metrics, merge_audit = load_merge_bundle(
+                        merged_path=merged_path,
+                        metrics_path=metrics_path,
+                        audit_path=audit_path,
+                        artifacts=artifacts,
+                        expected_contract_id=contract_id,
+                        expected_native_structure_receipt_digests=native_receipts,
+                        expected_skeleton_candidate_ids=skeleton_ids,
+                        expected_skeleton_candidate_projection_ids=(
+                            skeleton_projection_ids
+                        ),
+                    )
+                    verified_merge_payload = (
+                        merged_text.encode("utf-8")
+                        if method == "merged"
+                        else json.dumps(
+                            merge_audit,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+                    local_merge_verification_failed = True
+                    logger.warning(
+                        "Merge download bundle verification failed for %s: %s; "
+                        "trying durable artifact",
+                        process_id,
+                        type(exc).__name__,
+                    )
 
         if method == "merged":
             filepath = data.get("merged_cache_path")
@@ -1133,7 +1143,12 @@ def download_result(process_id, method):
         else:
             filepath = download_paths.get(method)
 
-        if verified_merge_payload is not None or (filepath and os.path.exists(filepath)):
+        local_file_available = (
+            method not in {"merged", "audit"}
+            and filepath
+            and os.path.exists(filepath)
+        )
+        if verified_merge_payload is not None or local_file_available:
             if method == "audit":
                 download_name = f"{file_hash}_audit.json"
                 mimetype = "application/json"
@@ -1149,15 +1164,38 @@ def download_result(process_id, method):
                 mimetype=mimetype,
             )
 
-        if method in {"merged", "audit"} and data.get("merged_cache_path"):
-            return jsonify({"error": "Committed merge bundle not found"}), 404
+        celery_s3_key = _find_artifact_s3_key(
+            data.get("artifacts_json"),
+            method,
+        )
+        if celery_s3_key:
+            response = _s3_redirect_for_artifact(celery_s3_key)
+            if response:
+                return response
 
     # Fallback: look up S3 artifact from DB
     run = _get_run_by_process_id(process_id)
     if run is None:
+        if (
+            method == "merged"
+            and result.state == "SUCCESS"
+            and local_merge_verification_failed
+        ):
+            return jsonify({
+                "error": "Completed merge artifact is internally unavailable"
+            }), 500
         return jsonify({"error": "process_id not found"}), 404
 
-    if run["status"] not in ("succeeded", "complete"):
+    known_completed_merge = (
+        method == "merged"
+        and result.state == "SUCCESS"
+        and local_merge_verification_failed
+    )
+
+    if (
+        run["status"] not in ("succeeded", "complete")
+        and not known_completed_merge
+    ):
         return jsonify({"error": "Job not complete yet.", "status": run["status"]}), 409
 
     s3_key = _find_artifact_s3_key(run.get("artifacts_json"), method)
@@ -1165,6 +1203,14 @@ def download_result(process_id, method):
         resp = _s3_redirect_for_artifact(s3_key)
         if resp:
             return resp
+
+    if method == "merged" and (
+        known_completed_merge
+        or run.get("consensus_metrics_json") is not None
+    ):
+        return jsonify({
+            "error": "Completed merge artifact is internally unavailable"
+        }), 500
 
     return jsonify({"error": f"Output file not found for method: {method}"}), 404
 

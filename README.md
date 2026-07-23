@@ -150,8 +150,10 @@ Important endpoints:
 | `GET` | `/api/v1/extract/{process_id}/logs` | Obtain an audit-log URL |
 | `GET` | `/api/v1/extract/{process_id}/artifacts/urls` | Obtain artifact URLs |
 
-Merged downloads are served only after the output alias and manifest digest
-checks pass.
+Merged downloads are served from a locally verified bundle or the exact durable
+S3 artifact uploaded during finalization. A merge job is not marked successful
+unless that durable upload succeeds, so a completed job does not depend on the
+GPU host's local cache remaining present.
 
 ## Configuration
 

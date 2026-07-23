@@ -458,6 +458,55 @@ def test_upload_artifacts_tags_image_objects(tmp_path, monkeypatch):
     }
 
 
+def test_upload_artifacts_requires_durable_merged_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    merged_path = tmp_path / "v1_hash_docling_merged.md"
+    merged_path.write_text("# Title\n\nMerged.", encoding="utf-8")
+
+    class DisabledAuditLogger:
+        def upload_artifact(self, filename, content, subdir=None, tags=None):
+            return None
+
+    with pytest.raises(RuntimeError, match="durable merged output"):
+        celery_app._upload_artifacts(
+            DisabledAuditLogger(),
+            {
+                "file_hash": "hash",
+                "merged_cache_path": str(merged_path),
+                "download_paths": {},
+                "images": [],
+            },
+            merge=True,
+        )
+
+
+def test_upload_artifacts_records_durable_merged_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    merged_path = tmp_path / "v1_hash_docling_merged.md"
+    merged_path.write_text("# Title\n\nMerged.", encoding="utf-8")
+
+    class EnabledAuditLogger:
+        def upload_artifact(self, filename, content, subdir=None, tags=None):
+            assert filename == "merged.md"
+            assert content == b"# Title\n\nMerged."
+            return "pdfx/audit/process/merged.md"
+
+    artifacts = celery_app._upload_artifacts(
+        EnabledAuditLogger(),
+        {
+            "file_hash": "hash",
+            "merged_cache_path": str(merged_path),
+            "download_paths": {},
+            "images": [],
+        },
+        merge=True,
+    )
+
+    assert artifacts["merged"] == "pdfx/audit/process/merged.md"
+
+
 def test_review_images_with_text_context_applies_llm_decision(monkeypatch):
     monkeypatch.setattr(celery_app.Config, "IMAGE_TEXT_REVIEW_MODEL", "gpt-5.6-luna")
 
