@@ -481,6 +481,18 @@ def test_upload_artifacts_requires_durable_merged_output(tmp_path, monkeypatch):
         )
 
 
+def test_upload_artifacts_requires_logger_for_merged_output():
+    with pytest.raises(RuntimeError, match="durable artifact storage"):
+        celery_app._upload_artifacts(
+            None,
+            {
+                "download_paths": {},
+                "images": [],
+            },
+            merge=True,
+        )
+
+
 def test_upload_artifacts_records_durable_merged_output(tmp_path, monkeypatch):
     monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
     monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
