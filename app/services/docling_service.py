@@ -1,9 +1,18 @@
 """Docling-based PDF extraction service with process-local converter caching."""
 
-import inspect
+import json
 import os
 import logging
+from importlib.metadata import version
+
 from app.services.pdf_extractor import PDFExtractor
+from app.services.native_extractor_artifact import (
+    persist_native_extractor_artifact,
+)
+from app.services.native_style import (
+    docling_native_style_bytes,
+    unavailable_native_style_bytes,
+)
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
@@ -66,7 +75,7 @@ def _get_rapidocr_langs():
     return det_lang, rec_lang
 
 
-def _build_ocr_options():
+def _build_ocr_options(*, force_full_page_ocr=False):
     """Build explicit Docling OCR options.
 
     Docling's automatic OCR selection can choose RapidOCR's torch backend on
@@ -123,10 +132,14 @@ def _build_ocr_options():
         rec_lang,
         use_cuda,
     )
-    return RapidOcrOptions(backend=backend, rapidocr_params=rapidocr_params)
+    return RapidOcrOptions(
+        backend=backend,
+        rapidocr_params=rapidocr_params,
+        force_full_page_ocr=bool(force_full_page_ocr),
+    )
 
 
-def _get_converter(device="cpu", num_threads=None):
+def _get_converter(device="cpu", num_threads=None, *, force_full_page_ocr=False):
     """Return a cached DocumentConverter, creating one on first call."""
     if num_threads is None:
         num_threads = int(os.environ.get("DOCLING_NUM_THREADS", 0)) or None
@@ -136,7 +149,7 @@ def _get_converter(device="cpu", num_threads=None):
         *_get_rapidocr_langs(),
         _get_rapidocr_use_cuda(),
     )
-    key = (device, num_threads, ocr_key)
+    key = (device, num_threads, ocr_key, bool(force_full_page_ocr))
     if key not in _cached_converters:
         logger.info("Docling: creating converter for device=%s, num_threads=%s (first call in this worker process)", device, num_threads)
 
@@ -165,8 +178,14 @@ def _get_converter(device="cpu", num_threads=None):
             pipeline_options = PdfPipelineOptions()
             pipeline_options.accelerator_options = accel_opts
 
+        # Docling discards parsed page cells after assembly by default. Native
+        # font names live only on those cells, so retain them until the compact
+        # style sidecar is serialized below.
+        pipeline_options.generate_parsed_pages = True
         pipeline_options.do_ocr = True
-        pipeline_options.ocr_options = _build_ocr_options()
+        pipeline_options.ocr_options = _build_ocr_options(
+            force_full_page_ocr=force_full_page_ocr
+        )
 
         format_options = {
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
@@ -177,47 +196,101 @@ def _get_converter(device="cpu", num_threads=None):
 
 
 class Docling(PDFExtractor):
-    def __init__(self, device="cpu"):
+    def __init__(self, device="cpu", *, force_full_page_ocr=False):
         self.device = device
+        self.force_full_page_ocr = bool(force_full_page_ocr)
         self.num_threads = int(os.environ.get("DOCLING_NUM_THREADS", 0)) or None
 
     def extract(self, pdf_path, output_filename):
-        converter = _get_converter(self.device, self.num_threads)
+        converter = _get_converter(
+            self.device,
+            self.num_threads,
+            force_full_page_ocr=self.force_full_page_ocr,
+        )
         result = converter.convert(pdf_path)
         doc = result.document
 
-        export_signature = inspect.signature(doc.export_to_markdown)
-        if "page_no" not in export_signature.parameters:
-            raise RuntimeError(
-                "Installed Docling version does not support page-aware markdown export "
-                "(missing export_to_markdown(page_no=...))."
-            )
-
         if not hasattr(doc, "num_pages"):
             raise RuntimeError(
-                "Installed Docling document object does not expose num_pages(); "
-                "cannot produce page-aware markdown."
+                "Installed Docling document object does not expose num_pages()."
             )
 
         total_pages = int(doc.num_pages())
         if total_pages <= 0:
             raise RuntimeError("Docling reported zero pages for document; cannot export markdown.")
 
-        page_blocks = []
-        for page_no in range(1, total_pages + 1):
-            page_markdown = doc.export_to_markdown(
-                image_placeholder="",
-                page_break_placeholder="",
-                text_width=-1,
-                page_no=page_no,
-            ).strip()
-            page_blocks.append(f"<!-- page: {page_no} -->")
-            if page_markdown:
-                page_blocks.append(page_markdown)
-
-        markdown = "\n\n".join(page_blocks).strip()
+        markdown = doc.export_to_markdown(
+            image_placeholder="",
+            page_break_placeholder="",
+            text_width=-1,
+        ).strip()
         if not markdown:
-            raise RuntimeError("Docling returned empty markdown during page-aware export.")
+            raise RuntimeError("Docling returned empty Markdown.")
+
+        structured = doc.export_to_dict(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+        native_bytes = json.dumps(
+            structured,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            native_style_bytes = docling_native_style_bytes(result)
+        except Exception as exc:
+            logger.warning(
+                "Docling native PDF style capture unavailable: %s",
+                type(exc).__name__,
+            )
+            native_style_bytes = unavailable_native_style_bytes(
+                "docling", type(exc).__name__
+            )
+        del result
+
+        from app.services.page_coverage import native_payload_covered_pages
+
+        covered_pages = native_payload_covered_pages("docling", native_bytes)
 
         with open(output_filename, "w", encoding="utf-8") as f:
             f.write(markdown)
+
+        persist_native_extractor_artifact(
+            source="docling",
+            output_filename=output_filename,
+            native_bytes=native_bytes,
+            native_media_type="application/json",
+            pdf_path=pdf_path,
+            extractor_versions={
+                "docling": version("docling"),
+                "docling-core": version("docling-core"),
+            },
+            options={
+                "device": self.device,
+                "do_ocr": True,
+                "force_full_page_ocr": self.force_full_page_ocr,
+                "ocr_backend": os.environ.get(
+                    "DOCLING_RAPIDOCR_BACKEND",
+                    "onnxruntime",
+                ),
+                "ocr_model_type": _get_rapidocr_model_type(),
+                "generate_parsed_pages": True,
+                "native_style_cell_collection": "word_cells",
+                "native_style_sidecar": True,
+            },
+            expected_page_count=total_pages,
+            covered_pages=covered_pages,
+            native_style_bytes=native_style_bytes,
+        )
+
+        from app.services.page_coverage import write_extractor_page_coverage
+
+        write_extractor_page_coverage(
+            source="docling",
+            output_filename=output_filename,
+            pdf_path=pdf_path,
+            expected_page_count=total_pages,
+            covered_pages=covered_pages,
+        )

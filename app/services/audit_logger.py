@@ -206,6 +206,16 @@ class AuditLogger:
     def get_log_s3_key(self):
         return self._log_s3_key
 
+    def timing_events(self):
+        """Return content-free stage timing evidence for run metrics."""
+
+        allowed = {"ts", "stage", "status", "duration_s", "total_duration_s"}
+        with self._lock:
+            return [
+                {key: value for key, value in event.items() if key in allowed}
+                for event in self._events
+            ]
+
     def __enter__(self):
         return self
 

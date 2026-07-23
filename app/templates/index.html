@@ -125,7 +125,8 @@
             resultDiv.style.display = 'block';
             
             try {
-                const response = await fetch('/process', {
+                formData.set('methods', selectedMethods.join(','));
+                const response = await fetch('/api/v1/extract', {
                     method: 'POST',
                     body: formData
                 });
@@ -133,56 +134,7 @@
                 const data = await response.json();
                 
                 if (response.ok) {
-                    let cacheMsg = '';
-                    if (data.cached_methods && data.cached_methods.length > 0) {
-                        cacheMsg = `<p class="cache-info">ℹ️ Used cached extractions for: ${data.cached_methods.join(', ')}</p>`;
-                    }
-                    
-                    let processingMsg = `<p class="success">✓ Processing completed successfully!</p>`;
-                    processingMsg += `<p class="cache-info">Methods used: ${data.methods_used.join(', ')}</p>`;
-                    messageDiv.innerHTML = processingMsg + cacheMsg;
-                    
-                    // Build download section
-                    let downloadHTML = '<h3>Download Extractions:</h3>';
-                    data.methods_used.forEach(method => {
-                        downloadHTML += `<a href="/download/${data.file_hash}/${method.toLowerCase()}" class="download-btn">📥 Download ${method}</a>`;
-                    });
-                    
-                    if (data.merged_output) {
-                        downloadHTML += `<a href="/download/${data.file_hash}/merged" class="download-btn">📥 Download Merged</a>`;
-                    }
-                    downloadsDiv.innerHTML = downloadHTML;
-                    
-                    // Build output section
-                    let outputHTML = '';
-                    
-                    if (data.merged_output) {
-                        outputHTML += '<h3>Merged and Structured Output:</h3>';
-                        outputHTML += `<pre>${escapeHtml(data.merged_output)}</pre>`;
-                    } else {
-                        // Show individual outputs
-                        if (data.individual_outputs) {
-                            for (const [method, content] of Object.entries(data.individual_outputs)) {
-                                outputHTML += `<h3>${method} Output:</h3>`;
-                                outputHTML += `<pre>${escapeHtml(content)}</pre>`;
-                            }
-                        }
-                    }
-                    
-                    // Build extracted figures section
-                    if (data.images && data.images.length > 0) {
-                        outputHTML += '<h3>Extracted Figures:</h3>';
-                        outputHTML += '<div style="display: flex; flex-wrap: wrap; gap: 15px;">';
-                        data.images.forEach(img => {
-                            outputHTML += `<div style="border: 1px solid #ddd; padding: 10px; border-radius: 4px;">`;
-                            outputHTML += `<img src="/download/${data.file_hash}/images/${encodeURIComponent(img.filename)}" style="max-width: 400px; max-height: 300px; display: block; margin-bottom: 8px;">`;
-                            outputHTML += `<a href="/download/${data.file_hash}/images/${encodeURIComponent(img.filename)}" class="download-btn" style="font-size: 0.85em; padding: 5px 10px;">Download ${escapeHtml(img.filename)}</a>`;
-                            outputHTML += `</div>`;
-                        });
-                        outputHTML += '</div>';
-                    }
-
-                    outputSection.innerHTML = outputHTML;
+                    await pollExtraction(data.process_id, data.merge);
                 } else {
                     messageDiv.innerHTML = `<p class="error">✗ Error: ${data.error}</p>`;
                 }
@@ -190,6 +142,49 @@
                 messageDiv.innerHTML = `<p class="error">✗ Error: ${error.message}</p>`;
             }
         });
+
+        async function pollExtraction(processId, mergeEnabled) {
+            const messageDiv = document.getElementById('message');
+            const downloadsDiv = document.getElementById('downloads');
+            const outputSection = document.getElementById('outputSection');
+
+            while (true) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                const response = await fetch(`/api/v1/extract/${encodeURIComponent(processId)}`);
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to read extraction status');
+                }
+
+                if (data.status === 'failed' || data.status === 'cancelled') {
+                    messageDiv.innerHTML = `<p class="error">✗ Error: ${escapeHtml(data.error || data.message || data.status)}</p>`;
+                    return;
+                }
+                if (data.status !== 'complete') {
+                    const progress = data.progress || {};
+                    const detail = progress.stage_display || data.status;
+                    messageDiv.innerHTML = `<p>Processing: ${escapeHtml(detail)}</p><p class="cache-info">Job ${escapeHtml(processId)}</p>`;
+                    continue;
+                }
+
+                messageDiv.innerHTML = `<p class="success">✓ Processing completed successfully!</p><p class="cache-info">Job ${escapeHtml(processId)}</p>`;
+                let downloadHTML = '<h3>Download Extractions:</h3>';
+                const completedMethods = Array.isArray(data.available_extractors)
+                    ? data.available_extractors
+                    : Array.isArray(data.result?.available_extractors)
+                        ? data.result.available_extractors
+                        : [];
+                completedMethods.forEach(method => {
+                    downloadHTML += `<a href="/api/v1/extract/${encodeURIComponent(processId)}/download/${encodeURIComponent(method)}" class="download-btn">📥 Download ${escapeHtml(method.toUpperCase())}</a>`;
+                });
+                if (mergeEnabled) {
+                    downloadHTML += `<a href="/api/v1/extract/${encodeURIComponent(processId)}/download/merged" class="download-btn">📥 Download Merged</a>`;
+                }
+                downloadsDiv.innerHTML = downloadHTML;
+                outputSection.innerHTML = '<p>Full outputs are available from the verified download links above.</p>';
+                return;
+            }
+        }
         
         function escapeHtml(text) {
             const map = {

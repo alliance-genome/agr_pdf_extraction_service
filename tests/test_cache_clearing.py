@@ -30,7 +30,17 @@ def test_clear_merge_scope_keeps_extractor_cache(tmp_path, monkeypatch):
     run_log = _cache_file(tmp_path, version, file_hash, "docling_grobid_marker_run.log")
     image = tmp_path / "images" / f"v{version}_{file_hash}_marker" / "page_1.png"
 
-    for path in (grobid, docling, marker, merged, merged_combo, metrics, audit, run_log, image):
+    for path in (
+        grobid,
+        docling,
+        marker,
+        merged,
+        merged_combo,
+        metrics,
+        audit,
+        run_log,
+        image,
+    ):
         _touch(path)
 
     result = celery_app._clear_cached_outputs(file_hash, "merge")
@@ -54,17 +64,19 @@ def test_clear_extraction_scope_also_clears_merge_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", version)
 
     grobid = _cache_file(tmp_path, version, file_hash, "grobid.md")
+    coverage = Path(f"{grobid}.page-coverage.json")
     merged_combo = _cache_file(tmp_path, version, file_hash, "docling_grobid_marker_merged.md")
     image = tmp_path / "images" / f"v{version}_{file_hash}_marker" / "page_1.png"
     run_log = _cache_file(tmp_path, version, file_hash, "docling_grobid_marker_run.log")
 
-    for path in (grobid, merged_combo, image, run_log):
+    for path in (grobid, coverage, merged_combo, image, run_log):
         _touch(path)
 
     result = celery_app._clear_cached_outputs(file_hash, "extraction")
 
     assert result["scope"] == "extraction"
     assert not grobid.exists()
+    assert not coverage.exists()
     assert not merged_combo.exists()
     assert not image.exists()
     assert run_log.exists()

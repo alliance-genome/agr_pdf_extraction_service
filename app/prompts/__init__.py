@@ -19,11 +19,7 @@ Usage::
 
     from app.prompts import render_prompt
 
-    # Static prompt (no placeholders)
-    msg = render_prompt("conflict_batch")
-
-    # Dynamic prompt (with {variable} placeholders)
-    msg = render_prompt("rescue_numeric", context_display=ctx, seg_id=sid, ...)
+    msg = render_prompt("source_selection")
 """
 
 from __future__ import annotations

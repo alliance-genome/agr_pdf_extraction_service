@@ -1,1 +1,1 @@
-"""Service layer package for extractors, consensus logic, and audit helpers."""
+"""Service layer package for extractors, source-backed merging, and audit helpers."""

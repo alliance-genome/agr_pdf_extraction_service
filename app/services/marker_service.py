@@ -1,16 +1,19 @@
 """Marker-based PDF extraction service with cached model/converter instances."""
 
+import json
 import os
 import re
 import shutil
 import logging
 import time
 import torch
+from importlib.metadata import version
 from pathlib import Path
 
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.output import text_from_rendered
+from marker.renderers.json import JSONRenderer
 from marker.schema import BlockTypes
 
 from app.image_metadata import (
@@ -20,6 +23,9 @@ from app.image_metadata import (
     write_image_manifest,
 )
 from app.services.pdf_extractor import PDFExtractor
+from app.services.native_extractor_artifact import (
+    persist_native_extractor_artifact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,29 @@ _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _IMAGE_BLOCK_TYPES = (BlockTypes.Figure, BlockTypes.Picture)
 _IMAGE_GROUP_TYPES = (BlockTypes.FigureGroup, BlockTypes.PictureGroup)
 _CAPTION_TYPES = (BlockTypes.Caption, BlockTypes.Footnote)
+
+
+def _clean_publication_markdown(text):
+    """Remove renderer-only spans and image/link artifacts without page comments."""
+
+    text = _PAGE_SPAN_RE.sub(lambda match: match.group(2), text)
+    text = _SPAN_REF_RE.sub(r"\1", text)
+    text = _IMAGE_REF_RE.sub("", text)
+    text = _LINK_REF_RE.sub(r"\1", text)
+    return _MULTI_NEWLINE_RE.sub("\n\n", text).strip()
+
+
+def _serialize_marker_document(document):
+    """Return the canonical official Marker JSON renderer output."""
+
+    rendered = JSONRenderer(config={"extract_images": False})(document)
+    payload = rendered.model_dump(mode="json", exclude_none=True)
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _rounded_polygon_points(polygon):
@@ -224,12 +253,12 @@ class Marker(PDFExtractor):
             structured_metadata = _collect_structured_image_metadata(document, images.keys())
             for image_name, metadata in structured_metadata.items():
                 image_references.setdefault(image_name, {})["structured_metadata"] = metadata
-        # Preserve page provenance as explicit markdown markers before span cleanup.
-        text = _PAGE_SPAN_RE.sub(lambda m: f"<!-- page: {m.group(1)} -->\n{m.group(2)}", text)
-        text = _SPAN_REF_RE.sub(r"\1", text)
-        text = _IMAGE_REF_RE.sub("", text)
-        text = _LINK_REF_RE.sub(r"\1", text)
-        text = _MULTI_NEWLINE_RE.sub("\n\n", text).strip()
+        text = _clean_publication_markdown(text)
+        native_bytes = _serialize_marker_document(document)
+
+        from app.services.page_coverage import native_payload_covered_pages
+
+        covered_pages = native_payload_covered_pages("marker", native_bytes)
 
         metadata = rendered.metadata
         num_pages = len(metadata.get("page_stats", []))
@@ -237,6 +266,33 @@ class Marker(PDFExtractor):
 
         with open(output_filename, "w", encoding="utf-8") as f:
             f.write(text)
+
+        persist_native_extractor_artifact(
+            source="marker",
+            output_filename=output_filename,
+            native_bytes=native_bytes,
+            native_media_type="application/json",
+            pdf_path=pdf_path,
+            extractor_versions={"marker-pdf": version("marker-pdf")},
+            options={
+                "device": dev.type,
+                "disable_links": True,
+                "dtype": str(dtype),
+                "extract_images": bool(self.extract_images),
+            },
+            expected_page_count=len(document.pages),
+            covered_pages=covered_pages,
+        )
+
+        from app.services.page_coverage import write_extractor_page_coverage
+
+        write_extractor_page_coverage(
+            source="marker",
+            output_filename=output_filename,
+            pdf_path=pdf_path,
+            expected_page_count=len(document.pages),
+            covered_pages=covered_pages,
+        )
 
         if self.extract_images:
             output_stem = Path(output_filename).stem

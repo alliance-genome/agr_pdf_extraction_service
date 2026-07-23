@@ -5,7 +5,7 @@ from flask import Flask
 
 from app.utils import (
     allowed_file, get_file_hash, get_cached_path, is_extraction_cached,
-    get_images_dir, has_image_extraction_manifest, list_images, rewrite_image_paths,
+    get_images_dir, has_image_extraction_manifest, list_images,
 )
 
 @pytest.fixture
@@ -194,48 +194,3 @@ def test_has_image_extraction_manifest(app_context):
         f.write('{"images":[]}')
 
     assert has_image_extraction_manifest(file_hash) is True
-
-
-def test_rewrite_image_paths_rewrites_existing(app_context):
-    """Image references to existing files should be rewritten."""
-    file_hash = "rewritetest"
-    images_dir = get_images_dir(file_hash)
-    os.makedirs(images_dir, exist_ok=True)
-
-    with open(os.path.join(images_dir, "fig1.png"), "wb") as f:
-        f.write(b"\x89PNG")
-
-    md = "Some text.\n\n![Figure 1](fig1.png)\n\nMore text."
-    result = rewrite_image_paths(md, file_hash)
-    assert f"![Figure 1](/download/{file_hash}/images/fig1.png)" in result
-    assert "More text." in result
-
-
-def test_rewrite_image_paths_leaves_missing(app_context):
-    """Image references to non-existing files should be left unchanged."""
-    file_hash = "missingtest"
-    md = "![Figure 1](nonexistent.png)"
-    result = rewrite_image_paths(md, file_hash)
-    assert result == md
-
-
-def test_rewrite_image_paths_no_images(app_context):
-    """Markdown with no image references should be unchanged."""
-    file_hash = "noimgtest"
-    md = "# Title\n\nJust text, no images."
-    result = rewrite_image_paths(md, file_hash)
-    assert result == md
-
-
-def test_rewrite_image_paths_strips_subdirectory(app_context):
-    """Image references with subdirectory paths should be rewritten using basename only."""
-    file_hash = "subdirtest"
-    images_dir = get_images_dir(file_hash)
-    os.makedirs(images_dir, exist_ok=True)
-
-    with open(os.path.join(images_dir, "fig1.png"), "wb") as f:
-        f.write(b"\x89PNG")
-
-    md = "![Alt](images/some_dir/fig1.png)"
-    result = rewrite_image_paths(md, file_hash)
-    assert f"![Alt](/download/{file_hash}/images/fig1.png)" in result

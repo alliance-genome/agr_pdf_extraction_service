@@ -143,6 +143,23 @@ def test_openapi_cancel_response_enum_is_precise(client):
     assert enum_values == {"cancelled", "complete", "failed"}
 
 
+def test_config_endpoint_reports_only_release_approved_5_6_models(client):
+    response = client.get("/api/v1/config")
+    assert response.status_code == 200
+
+    payload = response.get_json()
+    assert payload["merge_contract_id"] == "pdfx-native-skeleton-selection"
+    assert payload["resolved_runtime_models"] == {
+        "source_selection": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
+        "hard_selection": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+        "image_text_review": {"model": "gpt-5.6-luna", "reasoning_effort": "medium"},
+    }
+    assert all(
+        role["model"].startswith("gpt-5.6-")
+        for role in payload["resolved_runtime_models"].values()
+    )
+
+
 def test_swagger_docs_page_available(client):
     response = client.get("/docs")
     assert response.status_code == 200

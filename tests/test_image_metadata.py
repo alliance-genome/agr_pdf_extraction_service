@@ -128,7 +128,7 @@ def test_apply_text_image_review_overrides_decision_but_keeps_heuristic():
             "figure_label": None,
             "figure_number": None,
         },
-        model="gpt-5.4-mini",
+        model="gpt-5.6-luna",
     )
 
     assert reviewed["heuristic_is_likely_figure"] is True
@@ -136,7 +136,7 @@ def test_apply_text_image_review_overrides_decision_but_keeps_heuristic():
     assert reviewed["figure_decision_source"] == "llm_text"
     assert reviewed["image_reviewed"] is True
     assert reviewed["image_review_classification"] == "publisher_logo"
-    assert reviewed["image_review_model"] == "gpt-5.4-mini"
+    assert reviewed["image_review_model"] == "gpt-5.6-luna"
 
 
 def test_apply_text_image_review_uses_llm_label_and_number_without_reconstruction():
@@ -153,7 +153,7 @@ def test_apply_text_image_review_uses_llm_label_and_number_without_reconstructio
             "figure_label": "Figure",
             "figure_number": "2",
         },
-        model="gpt-5.4-mini",
+        model="gpt-5.6-luna",
     )
 
     assert reviewed["figure_label"] == "Figure"
@@ -177,7 +177,7 @@ def test_strip_text_image_review_removes_cached_llm_metadata_and_restores_heuris
             "figure_label": "Fig. 2",
             "figure_number": "2",
         },
-        model="gpt-5.4-mini",
+        model="gpt-5.6-luna",
     )
 
     stripped = strip_text_image_review(reviewed)

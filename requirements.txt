@@ -3,18 +3,21 @@ flask
 
 # PDF extraction tools
 requests
-docling[vlm]
+docling[vlm]==2.113.0
+docling-core==2.87.1
+pypdfium2>=4.30,<5  # Independent PDF container page count for completion evidence
 onnxruntime>=1.18,<2  # RapidOCR/Docling OCR backend; CPU wheel is intentional even in GPU deployments
-marker-pdf>=1.10.2,<1.11
+marker-pdf==1.10.2
 
 # LLM
 openai
 pydantic>=2.0
 
 # Consensus pipeline
-agr-abc-document-parsers>=1.5.0
+agr-abc-document-parsers==1.6.0
 mistune
 rapidfuzz
+regex  # UAX #29 extended-grapheme boundaries for lossless candidate clipping
 scipy
 numba
 numpy<2.4  # numba 0.61.x requires numpy <2.4; remove pin when numba adds 2.4 support
