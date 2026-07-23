@@ -24,9 +24,46 @@ from app.image_metadata import (
 from app.models import ExtractionRun, get_session
 from app.services.audit_logger import AuditLogger
 from app.logging_config import setup_logging, MergingLoggerAdapter
+from app.services.model_policy import validate_runtime_model_policy
+from app.services.merge_artifact import (
+    load_merge_bundle,
+    persist_merge_bundle,
+)
+from app.services.source_contracts import SourceArtifact
+from app.services.native_extractor_artifact import (
+    has_valid_native_extractor_artifact,
+    load_native_extractor_artifact,
+    native_artifact_path,
+    native_manifest_path,
+)
+from app.services.page_coverage import page_coverage_sidecar_path
 
 logger = logging.getLogger(__name__)
 _torch_worker_configured = False
+EXTRACTOR_METHODS = ("grobid", "docling", "marker")
+
+
+class EmptyExtractorOutputError(ValueError):
+    """Typed failure for an extractor artifact with no usable text."""
+
+    def __init__(self, method, *, cached=False):
+        self.method = method
+        self.cached = bool(cached)
+        origin = "cached" if self.cached else "new"
+        super().__init__(f"{method} returned an empty {origin} artifact")
+
+
+def _require_usable_extractor_text(method, text, *, cached=False, output_path=None):
+    if isinstance(text, str) and text.strip():
+        return text
+    if output_path:
+        try:
+            os.remove(output_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Unable to remove unusable %s extractor cache artifact", method)
+    raise EmptyExtractorOutputError(method, cached=cached)
 
 
 def _remove_marker_ready_file():
@@ -135,6 +172,7 @@ def _configure_celery_logging(**kwargs):
 @worker_process_init.connect
 def _init_worker_process(**kwargs):
     """Configure torch threading and GPU once per forked worker process."""
+    validate_runtime_model_policy()
     _configure_torch_for_worker_process()
 
 # ---------------------------------------------------------------------------
@@ -155,8 +193,8 @@ celery.conf.update(
     task_acks_late=True,
     task_default_queue="default",  # explicit: workers listen on -Q default
     worker_prefetch_multiplier=1,  # one job at a time per worker process
-    task_soft_time_limit=1800,     # 30 min soft limit (GPU: seconds per paper; CPU fallback: 30+ min)
-    task_time_limit=2100,          # 35 min hard kill
+    task_soft_time_limit=Config.TASK_SOFT_TIME_LIMIT_SECONDS,
+    task_time_limit=Config.TASK_HARD_TIME_LIMIT_SECONDS,
 )
 
 
@@ -235,28 +273,18 @@ def _has_image_extraction_manifest(file_hash):
     return os.path.exists(os.path.join(_get_images_dir(file_hash), IMAGE_MANIFEST_FILENAME))
 
 
-def _rewrite_image_paths(markdown, file_hash):
-    """Rewrite image paths at response time (standalone, no Flask context)."""
-    import re
-    from urllib.parse import quote
-    images_dir = _get_images_dir(file_hash)
-
-    def _replace(match):
-        alt, filename = match.group(1), match.group(2)
-        basename = os.path.basename(filename)
-        if os.path.exists(os.path.join(images_dir, basename)):
-            return f"![{alt}](/download/{file_hash}/images/{quote(basename)})"
-        return match.group(0)
-
-    return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", _replace, markdown)
-
-
 def _is_cached(file_hash, method):
     return os.path.exists(_cached_path(file_hash, method))
 
 
 def _is_extractor_cached(file_hash, method, extract_images=False):
-    if not _is_cached(file_hash, method):
+    output_path = _cached_path(file_hash, method)
+    if not os.path.exists(output_path):
+        return False
+    if not has_valid_native_extractor_artifact(
+        source=method,
+        output_filename=output_path,
+    ):
         return False
     if method == "marker" and extract_images:
         return _has_image_extraction_manifest(file_hash)
@@ -326,6 +354,12 @@ def _clear_cached_outputs(file_hash, clear_cache_scope):
                 f"{prefix}grobid.md",
                 f"{prefix}docling.md",
                 f"{prefix}marker.md",
+                f"{prefix}grobid.md.page-coverage.json",
+                f"{prefix}docling.md.page-coverage.json",
+                f"{prefix}marker.md.page-coverage.json",
+                f"{prefix}grobid.md.native.*",
+                f"{prefix}docling.md.native.*",
+                f"{prefix}marker.md.native.*",
             ])
 
     removed_files = 0
@@ -532,6 +566,37 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
         except Exception as exc:
             logger.warning("Failed to upload artifact for method %s: %s", method, exc)
 
+        if method not in EXTRACTOR_METHODS:
+            continue
+        try:
+            manifest, native_bytes = load_native_extractor_artifact(
+                source=method,
+                output_filename=path,
+            )
+            native_key = audit_logger.upload_artifact(
+                manifest["native_filename"],
+                native_bytes,
+                subdir=f"native/{method}",
+            )
+            manifest_key = audit_logger.upload_artifact(
+                native_manifest_path(path).name,
+                native_manifest_path(path).read_bytes(),
+                subdir=f"native/{method}",
+            )
+            if native_key and manifest_key:
+                artifacts.setdefault("native", {})[method] = {
+                    "artifact": native_key,
+                    "manifest": manifest_key,
+                    "sha256": manifest["native_sha256"],
+                    "media_type": manifest["native_media_type"],
+                }
+        except Exception as exc:
+            logger.warning(
+                "Failed to upload native artifact for method %s: %s",
+                method,
+                type(exc).__name__,
+            )
+
     if merge:
         merged_path = result.get("merged_cache_path") or _cached_path(result.get("file_hash"), "merged")
         if merged_path and os.path.exists(merged_path):
@@ -583,19 +648,70 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
     return artifacts
 
 
-def _build_llm(model=None, reasoning_effort=None):
+def _build_llm():
     from app.services.llm_service import LLM
 
     return LLM(
         api_key=Config.OPENAI_API_KEY,
-        model=model or Config.LLM_MODEL_ZONE_RESOLUTION,
-        reasoning_effort=reasoning_effort or Config.LLM_REASONING_EFFORT,
-        conflict_batch_size=Config.LLM_CONFLICT_BATCH_SIZE,
-        conflict_max_workers=Config.LLM_CONFLICT_MAX_WORKERS,
-        conflict_retry_rounds=Config.LLM_CONFLICT_RETRY_ROUNDS,
         openai_timeout_seconds=Config.LLM_OPENAI_TIMEOUT_SECONDS,
         openai_max_retries=Config.LLM_OPENAI_MAX_RETRIES,
     )
+
+
+def _build_merge_llm_or_none(log=None):
+    """Build the selector client; baseline delivery does not require a model."""
+
+    log = log or logger
+    if not Config.OPENAI_API_KEY:
+        return None
+    try:
+        return _build_llm()
+    except Exception as exc:
+        log.warning(
+            "Selector unavailable; continuing with deterministic/baseline merge: %s",
+            type(exc).__name__,
+        )
+        return None
+
+
+def _compute_llm_accounting(llm, log=None):
+    """Return cost plus usage without ever discarding observed token usage."""
+
+    log = log or logger
+    usage_summary = llm.usage.summary()
+    if usage_summary["total_tokens"] <= 0:
+        return None, None
+    try:
+        from app.services.llm_service import compute_cost
+
+        return compute_cost(usage_summary, Config.LLM_PRICING)
+    except Exception as exc:
+        log.error("Failed to compute LLM cost; preserving raw usage: %s", exc)
+        return None, usage_summary
+
+
+def _record_llm_cost_alert(cost_usd, usage, log=None):
+    """Emit a structured warning without changing or truncating the job."""
+
+    log = log or logger
+    threshold = Config.LLM_COST_ALERT_USD_PER_JOB
+    triggered = cost_usd is not None and cost_usd >= threshold
+    if isinstance(usage, dict):
+        usage["cost_alert_threshold_usd"] = threshold
+        usage["cost_alert_triggered"] = triggered
+    if triggered:
+        log.warning(
+            "LLM per-job cost alert: $%.4f reached the $%.4f threshold",
+            cost_usd,
+            threshold,
+            extra={
+                "_event": "llm_cost_alert",
+                "_llm_cost_usd": cost_usd,
+                "_llm_cost_alert_threshold_usd": threshold,
+                "_llm_total_tokens": usage.get("total_tokens", 0),
+            },
+        )
+    return triggered
 
 
 def _review_images_with_text_context(images, llm, log=None):
@@ -804,6 +920,7 @@ def extract_pdf(
             extract_images=extract_images,
             review_images=review_images,
             _shared=_shared,
+            job_started_monotonic=total_start,
         )
 
         artifacts_json = _upload_artifacts(audit_logger, result, merge, pdf_path=pdf_path)
@@ -868,13 +985,16 @@ def extract_pdf(
         fail_llm_usage = None
         fail_llm_cost = None
         if _shared.get("llm") is not None:
-            try:
-                from app.services.llm_service import compute_cost
-                fail_summary = _shared["llm"].usage.summary()
-                if fail_summary["total_tokens"] > 0:
-                    fail_llm_cost, fail_llm_usage = compute_cost(fail_summary, Config.LLM_PRICING)
-            except Exception:
-                pass
+            fail_llm_cost, fail_llm_usage = _compute_llm_accounting(
+                _shared["llm"],
+                log=adapter,
+            )
+            if fail_llm_usage is not None:
+                _record_llm_cost_alert(
+                    fail_llm_cost,
+                    fail_llm_usage,
+                    log=adapter,
+                )
 
         if db_session:
             _safe_upsert_extraction_run(
@@ -919,7 +1039,16 @@ def extract_pdf(
             os.remove(pdf_path)
 
 
-def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, adapter=None, extract_images=False):
+def _run_single_extractor(
+    method,
+    pdf_path,
+    file_hash,
+    config,
+    audit_logger,
+    adapter=None,
+    extract_images=False,
+    force_full_page_ocr=False,
+):
     """Run one extractor and return (method, output_text, cached_flag).
 
     This is a standalone function so it can be dispatched to a ThreadPoolExecutor.
@@ -932,14 +1061,22 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
 
     extract_images = bool(extract_images)
 
-    if _is_extractor_cached(file_hash, method, extract_images=extract_images):
+    if not force_full_page_ocr and _is_extractor_cached(
+        file_hash, method, extract_images=extract_images
+    ):
         _safe_log_event(audit_logger, stage, "cache_hit", detail=f"Using cached {method} output")
         log.info(
             "Cache hit for %s", method,
             extra={"_event": "extractor_cache_hit", "_extractor": method, "_cached": True},
         )
         with open(output_path, "r", encoding="utf-8") as f:
-            return method, f.read(), True
+            text = f.read()
+        return method, _require_usable_extractor_text(
+            method,
+            text,
+            cached=True,
+            output_path=output_path,
+        ), True
 
     started = time.monotonic()
     _safe_log_event(audit_logger, stage, "started")
@@ -960,7 +1097,10 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
             )
         elif method == "docling":
             from app.services.docling_service import Docling
-            extractor = Docling(device=config.DOCLING_DEVICE)
+            docling_options = {"device": config.DOCLING_DEVICE}
+            if force_full_page_ocr:
+                docling_options["force_full_page_ocr"] = True
+            extractor = Docling(**docling_options)
         elif method == "marker":
             from app.services.marker_service import Marker
             extractor = Marker(
@@ -1009,7 +1149,80 @@ def _run_single_extractor(method, pdf_path, file_hash, config, audit_logger, ada
         raise
 
     with open(output_path, "r", encoding="utf-8") as f:
-        return method, f.read(), False
+        text = f.read()
+    return method, _require_usable_extractor_text(
+        method,
+        text,
+        cached=False,
+        output_path=output_path,
+    ), False
+
+
+def _is_transient_extractor_failure(exc):
+    """Classify the narrow failures eligible for one immediate route retry."""
+
+    if isinstance(exc, EmptyExtractorOutputError):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    try:
+        import requests
+
+        if isinstance(
+            exc,
+            (requests.exceptions.Timeout, requests.exceptions.ConnectionError),
+        ):
+            return True
+    except ImportError:
+        pass
+    message = str(exc).casefold()
+    return any(
+        token in message
+        for token in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "connection refused",
+            "service unavailable",
+            "worker_not_ready",
+            "http 502",
+            "http 503",
+            "http 504",
+        )
+    )
+
+
+def _discard_failed_extractor_cache(file_hash, method):
+    """Remove one failed generation so recovery cannot replay partial bytes."""
+
+    output_path = _cached_path(file_hash, method)
+    paths = (
+        output_path,
+        native_manifest_path(output_path),
+        native_artifact_path(output_path, method),
+        page_coverage_sidecar_path(output_path),
+    )
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "Cannot remove failed %s artifact %s; skipping its recovery route: %s",
+                method,
+                path,
+                type(exc).__name__,
+            )
+            return False
+    return True
+
+
+def _recovery_time_available(job_started_monotonic):
+    elapsed = time.monotonic() - job_started_monotonic
+    remaining = Config.TASK_SOFT_TIME_LIMIT_SECONDS - elapsed
+    return remaining > Config.EXTRACTION_FINALIZATION_RESERVE_SECONDS
 
 
 def _run_extraction(
@@ -1024,6 +1237,7 @@ def _run_extraction(
     extract_images=False,
     review_images=None,
     _shared=None,
+    job_started_monotonic=None,
 ):
     """Inner extraction logic, separated so caller can wrap with finally."""
 
@@ -1036,6 +1250,12 @@ def _run_extraction(
     extractions = {}
     methods_used = []
     cached_methods = []
+    extractor_failures = {}
+    extraction_errors = {}
+    retried_extractors = []
+    emergency_ocr_used = False
+    if job_started_monotonic is None:
+        job_started_monotonic = time.monotonic()
 
     # --- Stage tracking for granular progress reporting -----------------------
     all_stages = (
@@ -1046,6 +1266,37 @@ def _run_extraction(
         + ["finalizing"]
     )
     completed_stages = []
+    failed_stages = []
+
+    def _record_extractor_failure(method, exc):
+        error_message = summarize_error_message(exc)[:1000]
+        extractor_failures[method] = {
+            "error_code": type(exc).__name__,
+            "message": error_message,
+        }
+        extraction_errors[method] = exc
+        if method not in failed_stages:
+            failed_stages.append(method)
+        if method not in completed_stages:
+            completed_stages.append(method)
+
+    def _record_extractor_success(method, text, was_cached):
+        text = _require_usable_extractor_text(
+            method,
+            text,
+            cached=was_cached,
+            output_path=_cached_path(file_hash, method) if was_cached else None,
+        )
+        extractions[method] = text
+        extractor_failures.pop(method, None)
+        extraction_errors.pop(method, None)
+        failed_stages[:] = [item for item in failed_stages if item != method]
+        if method not in methods_used:
+            methods_used.append(method)
+        if was_cached and method not in cached_methods:
+            cached_methods.append(method)
+        if method not in completed_stages:
+            completed_stages.append(method)
 
     # Determine parallel execution strategy
     non_cached = [
@@ -1063,6 +1314,7 @@ def _run_extraction(
             "stage": current_stage,
             "stage_display": display_text,
             "stages_completed": list(completed_stages),
+            "stages_failed": list(failed_stages),
             "stages_pending": pending,
             "stages_total": len(all_stages),
             "stages_done": len(completed_stages),
@@ -1081,7 +1333,6 @@ def _run_extraction(
         # Run GROBID in a thread while CPU extractors run sequentially in main thread
         _emit_progress("grobid", "Running extractions (parallel)")
         log.info("Running GROBID in parallel with %s", cpu_methods)
-        errors = []
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="grobid") as pool:
             grobid_future = pool.submit(
                 _run_single_extractor, "grobid", pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
@@ -1094,51 +1345,113 @@ def _run_extraction(
                     m, text, was_cached = _run_single_extractor(
                         method, pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
                     )
-                    extractions[m] = text
-                    methods_used.append(m)
-                    if was_cached:
-                        cached_methods.append(m)
-                    completed_stages.append(method)
+                    _record_extractor_success(m, text, was_cached)
                 except Exception as exc:
-                    errors.append((method, exc))
+                    _record_extractor_failure(method, exc)
 
             # Collect GROBID result
             try:
                 m, text, was_cached = grobid_future.result(timeout=Config.GROBID_REQUEST_TIMEOUT + 60)
-                extractions[m] = text
-                methods_used.append(m)
-                if was_cached:
-                    cached_methods.append(m)
-                completed_stages.append("grobid")
+                _record_extractor_success(m, text, was_cached)
             except Exception as exc:
-                errors.append(("grobid", exc))
+                _record_extractor_failure("grobid", exc)
 
         # Also pick up any cached-only methods not in non_cached
         for method in methods:
             if method not in methods_used and _is_extractor_cached(file_hash, method, extract_images=extract_images):
-                m, text, _ = _run_single_extractor(
-                    method, pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
-                )
-                extractions[m] = text
-                methods_used.append(m)
-                cached_methods.append(m)
-                completed_stages.append(method)
-
-        if errors:
-            # Raise the first error (same behavior as sequential)
-            raise errors[0][1]
+                try:
+                    m, text, _ = _run_single_extractor(
+                        method, pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
+                    )
+                    _record_extractor_success(m, text, True)
+                except Exception as exc:
+                    _record_extractor_failure(method, exc)
     else:
         # Sequential fallback (no GROBID work, or only one method)
         for method in methods:
-            _emit_progress(method, f"Running {method.upper()} extraction")
-            m, text, was_cached = _run_single_extractor(
-                method, pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
+            try:
+                _emit_progress(method, f"Running {method.upper()} extraction")
+                m, text, was_cached = _run_single_extractor(
+                    method, pdf_path, file_hash, Config, audit_logger, adapter, extract_images,
+                )
+                _record_extractor_success(m, text, was_cached)
+            except Exception as exc:
+                _record_extractor_failure(method, exc)
+
+    for method in sorted(extractor_failures):
+        failure = extraction_errors[method]
+        if not _is_transient_extractor_failure(failure):
+            continue
+        if not _recovery_time_available(job_started_monotonic):
+            _safe_log_event(
+                audit_logger,
+                f"extract_{method}",
+                "retry_skipped",
+                detail="finalization reserve reached",
             )
-            extractions[m] = text
-            methods_used.append(m)
-            if was_cached:
-                cached_methods.append(m)
-            completed_stages.append(method)
+            break
+        if not _discard_failed_extractor_cache(file_hash, method):
+            _safe_log_event(
+                audit_logger,
+                f"extract_{method}",
+                "retry_skipped",
+                detail="failed artifact could not be removed",
+            )
+            continue
+        retried_extractors.append(method)
+        _safe_log_event(audit_logger, f"extract_{method}", "retry_started")
+        try:
+            m, text, was_cached = _run_single_extractor(
+                method,
+                pdf_path,
+                file_hash,
+                Config,
+                audit_logger,
+                adapter,
+                extract_images,
+            )
+            _record_extractor_success(m, text, was_cached)
+            _safe_log_event(audit_logger, f"extract_{method}", "retry_completed")
+        except Exception as exc:
+            _record_extractor_failure(method, exc)
+
+    if not extractions and (methods or merge) and _recovery_time_available(
+        job_started_monotonic
+    ):
+        emergency_ocr_used = _discard_failed_extractor_cache(file_hash, "docling")
+    if not extractions and emergency_ocr_used:
+        _safe_log_event(audit_logger, "extract_docling", "emergency_ocr_started")
+        try:
+            m, text, was_cached = _run_single_extractor(
+                "docling",
+                pdf_path,
+                file_hash,
+                Config,
+                audit_logger,
+                adapter,
+                False,
+                force_full_page_ocr=True,
+            )
+            _record_extractor_success(m, text, was_cached)
+            _safe_log_event(audit_logger, "extract_docling", "emergency_ocr_completed")
+        except Exception as exc:
+            _record_extractor_failure("docling", exc)
+
+    if not extractions and (methods or merge):
+        if extraction_errors:
+            raise next(iter(extraction_errors.values()))
+        raise ValueError("No extractor produced a usable artifact")
+    if extractor_failures:
+        log.warning(
+            "Continuing with %d completed extractor(s); failed methods=%s",
+            len(extractions),
+            sorted(extractor_failures),
+            extra={
+                "_event": "extractor_partial_success",
+                "_available_extractors": sorted(extractions),
+                "_failed_extractors": sorted(extractor_failures),
+            },
+        )
 
     # --- Optional LLM merge ---------------------------------------------------
 
@@ -1148,35 +1461,99 @@ def _run_extraction(
     consensus_metrics = None
     llm = None
     if merge and extractions:
-        if not Config.OPENAI_API_KEY:
-            raise ValueError("merge=true but OPENAI_API_KEY is not set")
-
         version = Config.EXTRACTION_CONFIG_VERSION
-        cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(methods))}"
+        # Bind merge cache paths to the exact source set that completed. A retry
+        # that restores a missing extractor must not reuse a partial-source merge.
+        cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(extractions))}"
         merged_cache_path = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_merged.md")
 
         metrics_cache_path = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_consensus_metrics.json")
+        possible_audit = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_audit.json")
+        merged_alias_path = _cached_path(file_hash, "merged")
+        source_artifacts = {
+            source: SourceArtifact.from_text(source, extractions[source])
+            for source in EXTRACTOR_METHODS
+            if source in extractions
+        }
+
+        # Native receipts and skeleton identities are inputs to the merge cache,
+        # not merely diagnostics produced after a miss.  Rebuild their compact
+        # identities before looking at an existing bundle so a changed native
+        # artifact can never reuse a merge produced from an older outline.
+        from app.services.document_skeleton import (
+            build_document_skeleton,
+            load_runtime_native_structures,
+        )
+        from app.services.native_extractor_artifact import sha256_file
+
+        runtime_output_paths = {
+            source: _cached_path(file_hash, source)
+            for source in source_artifacts
+        }
+        runtime_native_structures, runtime_native_structure_failures = (
+            load_runtime_native_structures(
+                source_artifacts,
+                runtime_output_paths,
+                expected_pdf_sha256=sha256_file(pdf_path),
+            )
+        )
+        runtime_skeletons = {}
+        for source, artifact in sorted(source_artifacts.items()):
+            try:
+                runtime_skeletons[source] = build_document_skeleton(
+                    artifact,
+                    runtime_native_structures.get(source),
+                )
+            except Exception as exc:
+                runtime_native_structure_failures[source] = type(exc).__name__
+                runtime_skeletons[source] = build_document_skeleton(artifact, None)
+        runtime_native_receipts = {
+            source: native.receipt_digest
+            for source, native in sorted(runtime_native_structures.items())
+        }
+        runtime_skeleton_ids = {
+            source: skeleton.skeleton_id
+            for source, skeleton in sorted(runtime_skeletons.items())
+        }
+        runtime_skeleton_projection_ids = {
+            source: skeleton.projection_id
+            for source, skeleton in sorted(runtime_skeletons.items())
+        }
 
         stage = "llm_merge"
+        cache_is_valid = False
         if os.path.exists(merged_cache_path):
+            try:
+                merged_md, consensus_metrics, consensus_audit = load_merge_bundle(
+                    merged_path=merged_cache_path,
+                    metrics_path=metrics_cache_path,
+                    audit_path=possible_audit,
+                    artifacts=source_artifacts,
+                    expected_contract_id=Config.MERGE_CONTRACT_ID,
+                    expected_native_structure_receipt_digests=(
+                        runtime_native_receipts
+                    ),
+                    expected_skeleton_candidate_ids=runtime_skeleton_ids,
+                    expected_skeleton_candidate_projection_ids=(
+                        runtime_skeleton_projection_ids
+                    ),
+                )
+                audit_cache_path = possible_audit
+                cache_is_valid = True
+            except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+                log.warning(
+                    "Ignoring incomplete or inconsistent merge bundle: %s",
+                    type(exc).__name__,
+                )
+
+        if cache_is_valid:
             cached_methods.append("merged")
             _safe_log_event(audit_logger, stage, "cache_hit", detail="Using cached merged output")
-            with open(merged_cache_path, "r", encoding="utf-8") as f:
-                merged_md = f.read()
-            possible_audit = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_audit.json")
-            if os.path.exists(possible_audit):
-                audit_cache_path = possible_audit
-            if os.path.exists(metrics_cache_path):
-                with open(metrics_cache_path, "r", encoding="utf-8") as f:
-                    consensus_metrics = json.load(f)
             completed_stages.append("llm_merge")
         else:
             _emit_progress("llm_merge", "Merging extraction outputs with LLM")
 
-            llm = _build_llm(
-                model=Config.LLM_MODEL_ZONE_RESOLUTION,
-                reasoning_effort=Config.LLM_REASONING_EFFORT,
-            )
+            llm = _build_merge_llm_or_none(log)
             if _shared is not None:
                 _shared["llm"] = llm
 
@@ -1187,49 +1564,96 @@ def _run_extraction(
             started = time.monotonic()
             _safe_log_event(audit_logger, stage, "started")
             try:
-                if not (Config.CONSENSUS_ENABLED
-                        and grobid_text and docling_text and marker_text):
-                    raise ValueError(
-                        "Merge requires consensus pipeline with all 3 extractors "
-                        "(CONSENSUS_ENABLED=true, grobid, docling, marker)"
-                    )
+                if not source_artifacts:
+                    raise ValueError("Merge requires at least one extractor artifact")
 
-                from app.services.consensus_service import merge_with_consensus
-                log.info("Attempting consensus merge...")
-                consensus_md, consensus_metrics, consensus_audit = merge_with_consensus(
-                    grobid_text, docling_text, marker_text, llm,
+                from app.services.merge_service import (
+                    completion_evidence_for_runtime_artifacts,
+                    merge_finished_extractor_outputs,
+                )
+                runtime_completion_evidence = completion_evidence_for_runtime_artifacts(
+                    source_artifacts,
+                    pdf_path=pdf_path,
+                    output_paths=runtime_output_paths,
+                )
+                log.info("Attempting source-backed merge...")
+                consensus_md, consensus_metrics, consensus_audit = (
+                    merge_finished_extractor_outputs(
+                        grobid_text,
+                        docling_text,
+                        marker_text,
+                        llm,
+                        completion_evidence=runtime_completion_evidence,
+                        native_structures=runtime_native_structures,
+                        native_structure_failures=(
+                            runtime_native_structure_failures
+                        ),
+                        benchmark_mode=Config.PDFX_BENCHMARK_MODE,
+                    )
                 )
                 if consensus_metrics is not None:
-                    audit_cache_path = os.path.join(
-                        Config.CACHE_FOLDER, f"{cache_key}_audit.json",
-                    )
-                    with open(audit_cache_path, "w", encoding="utf-8") as f:
-                        json.dump(consensus_audit or [], f, indent=2, ensure_ascii=False)
+                    audit_cache_path = possible_audit
+                if consensus_metrics is not None and Config.PDFX_BENCHMARK_MODE:
+                    consensus_metrics["runtime_execution"] = {
+                        "extractor_failures": {
+                            method: {
+                                "error_code": failure.get("error_code")
+                            }
+                            for method, failure in sorted(extractor_failures.items())
+                        },
+                        "retried_extractors": list(retried_extractors),
+                        "emergency_ocr_used": emergency_ocr_used,
+                        "cached_methods": list(cached_methods),
+                        "merge_compute_duration_s": round(
+                            time.monotonic() - started, 3
+                        ),
+                        "stage_events": (
+                            audit_logger.timing_events()
+                            if audit_logger is not None
+                            and hasattr(audit_logger, "timing_events")
+                            else []
+                        ),
+                    }
 
                 if consensus_md is not None:
                     merged_md = consensus_md
                     log.info(
-                        "Consensus merge succeeded",
+                        "Source-backed merge succeeded",
                         extra={
-                            "_event": "consensus_classify_summary",
-                            "_conflict_count": consensus_metrics.get("conflict", 0),
-                            "_agree_exact": consensus_metrics.get("agree_exact", 0),
-                            "_agree_near": consensus_metrics.get("agree_near", 0),
-                            "_gap": consensus_metrics.get("gap", 0),
-                            "_conflict_ratio": consensus_metrics.get("conflict_ratio", 0.0),
-                            "_alignment_confidence": consensus_metrics.get("alignment_confidence", 0.0),
+                            "_event": "source_merge_summary",
+                            "_candidate_region_count": consensus_metrics.get(
+                                "candidate_region_count", 0
+                            ),
+                            "_deterministic_region_count": consensus_metrics.get(
+                                "region_decision_counts", {}
+                            ).get("deterministic", 0),
+                            "_model_selected_region_count": consensus_metrics.get(
+                                "region_decision_counts", {}
+                            ).get("model_selected", 0),
+                            "_unresolved_region_count": consensus_metrics.get(
+                                "unresolved_region_count", 0
+                            ),
+                            "_merge_quality": consensus_metrics.get("merge_quality"),
+                            "_qualification_outcome": consensus_metrics.get(
+                                "qualification_outcome"
+                            ),
                         },
                     )
                 else:
                     reason = (consensus_metrics or {}).get("failure_reason", "unknown")
                     raise ValueError(f"Consensus pipeline failed: {reason}")
 
-                with open(merged_cache_path, "w", encoding="utf-8") as f:
-                    f.write(merged_md)
-                with open(_cached_path(file_hash, "merged"), "w", encoding="utf-8") as f:
-                    f.write(merged_md)
-                with open(metrics_cache_path, "w", encoding="utf-8") as f:
-                    json.dump(consensus_metrics, f, ensure_ascii=False)
+                persist_merge_bundle(
+                    merged_path=merged_cache_path,
+                    metrics_path=metrics_cache_path,
+                    audit_path=audit_cache_path,
+                    text=merged_md,
+                    metrics=consensus_metrics,
+                    audit=consensus_audit or [],
+                    artifacts=source_artifacts,
+                    expected_contract_id=Config.MERGE_CONTRACT_ID,
+                    alias_path=merged_alias_path,
+                )
 
                 merge_duration = round(time.monotonic() - started, 3)
                 _safe_log_event(
@@ -1261,10 +1685,7 @@ def _run_extraction(
             if not Config.OPENAI_API_KEY:
                 raise ValueError("review_images=true but OPENAI_API_KEY is not set")
             if llm is None:
-                llm = _build_llm(
-                    model=Config.IMAGE_TEXT_REVIEW_MODEL,
-                    reasoning_effort=Config.IMAGE_TEXT_REVIEW_REASONING,
-                )
+                llm = _build_llm()
                 if _shared is not None:
                     _shared["llm"] = llm
 
@@ -1291,11 +1712,11 @@ def _run_extraction(
     llm_cost_usd = None
     llm_usage_json = None
     if llm is not None:
-        try:
-            from app.services.llm_service import compute_cost
+        llm_cost_usd, llm_usage_json = _compute_llm_accounting(llm, log=log)
+        if llm_usage_json is not None:
+            _record_llm_cost_alert(llm_cost_usd, llm_usage_json, log=log)
             usage_summary = llm.usage.summary()
-            if usage_summary["total_tokens"] > 0:
-                llm_cost_usd, llm_usage_json = compute_cost(usage_summary, Config.LLM_PRICING)
+            if llm_cost_usd is not None:
                 log.info(
                     "LLM cost tracking: $%.4f (%d tokens)",
                     llm_cost_usd, usage_summary["total_tokens"],
@@ -1305,14 +1726,9 @@ def _run_extraction(
                         "_llm_total_tokens": usage_summary["total_tokens"],
                     },
                 )
-        except Exception as exc:
-            log.warning("Failed to compute LLM cost: %s", exc)
 
-    # Rewrite image paths in merged output preview at response time
     merged_preview = merged_md
     if merged_preview:
-        if extract_images:
-            merged_preview = _rewrite_image_paths(merged_preview, file_hash)
         if len(merged_preview) > 1000:
             merged_preview = merged_preview[:1000] + "..."
 
@@ -1320,8 +1736,16 @@ def _run_extraction(
 
     result = {
         "status": "success",
+        "extraction_status": (
+            "partial_success" if extractor_failures else "complete_success"
+        ),
         "file_hash": file_hash,
         "methods_used": methods_used,
+        "available_extractors": sorted(extractions),
+        "failed_extractors": sorted(extractor_failures),
+        "extractor_failures": extractor_failures,
+        "retried_extractors": retried_extractors,
+        "emergency_ocr_used": emergency_ocr_used,
         "cached_methods": cached_methods,
         "extractions": {m: extractions[m][:500] + "..." if len(extractions[m]) > 500 else extractions[m]
                         for m in extractions},
@@ -1337,6 +1761,15 @@ def _run_extraction(
 
     if consensus_metrics is not None:
         result["consensus_metrics"] = consensus_metrics
+    if merged_cache_path:
+        result["merge_contract_id"] = Config.MERGE_CONTRACT_ID
+        result["merge_metrics_path"] = metrics_cache_path
+        result["merge_audit_path"] = audit_cache_path
+        result["native_structure_receipt_digests"] = runtime_native_receipts
+        result["document_skeleton_candidate_ids"] = runtime_skeleton_ids
+        result["document_skeleton_candidate_projection_ids"] = (
+            runtime_skeleton_projection_ids
+        )
 
     if llm_usage_json is not None:
         result["llm_usage_json"] = llm_usage_json

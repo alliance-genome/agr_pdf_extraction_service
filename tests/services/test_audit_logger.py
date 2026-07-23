@@ -48,6 +48,20 @@ def test_flush_writes_ndjson(mock_build_s3):
     assert second["status"] == "completed"
     assert second["duration_s"] == 1.23
 
+    assert audit.timing_events() == [
+        {
+            "ts": first["ts"],
+            "stage": "extract_grobid",
+            "status": "started",
+        },
+        {
+            "ts": second["ts"],
+            "stage": "extract_grobid",
+            "status": "completed",
+            "duration_s": 1.23,
+        },
+    ]
+
 
 @patch("app.services.audit_logger.build_s3_client")
 def test_flush_on_event_updates_ndjson_after_each_event(mock_build_s3):

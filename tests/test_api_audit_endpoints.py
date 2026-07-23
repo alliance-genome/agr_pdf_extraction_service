@@ -30,7 +30,6 @@ def client(monkeypatch):
     app.config["GROBID_INCLUDE_RAW_CITATIONS"] = False
     app.config["DOCLING_DEVICE"] = "cpu"
     app.config["MARKER_DEVICE"] = "cpu"
-    app.config["CONSENSUS_ENABLED"] = True
     app.config["CONSENSUS_NEAR_THRESHOLD"] = 0.92
     app.config["CONSENSUS_LEVENSHTEIN_THRESHOLD"] = 0.90
     app.config["CONSENSUS_CONFLICT_RATIO_FALLBACK"] = 0.4
@@ -311,6 +310,7 @@ def test_get_extraction_status_prefers_db(client):
     assert payload["extract_images"] is True
     assert payload["log_s3_key"] == "pdfx/audit/2026/02/11/test.ndjson"
     assert "grobid" in payload["artifacts_json"]
+    assert payload["available_extractors"] == ["grobid"]
     assert payload["image_count"] == 2
     assert payload["consensus_metrics_json"]["total_blocks"] == 100
     assert payload["consensus_metrics_json"]["degradation_metrics"]["quality_score"] == 0.995
@@ -600,6 +600,7 @@ def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(c
         "extract_images": True,
         "llm_usage_json": {"total_tokens": 123},
         "llm_cost_usd": 0.42,
+        "available_extractors": ["docling"],
     }
 
     with patch("celery_app.celery.AsyncResult", return_value=mock_result):
@@ -617,6 +618,7 @@ def test_get_extraction_status_uses_celery_success_when_db_row_is_stale_queued(c
     assert payload["image_count"] == 1
     assert payload["llm_usage_json"]["total_tokens"] == 123
     assert payload["llm_cost_usd"] == 0.42
+    assert payload["available_extractors"] == ["docling"]
 
 
 def test_get_extraction_status_returns_failed_job_as_poll_result(client):
@@ -768,6 +770,92 @@ def test_get_extraction_status_maps_revoked_to_cancelled(client):
     payload = response.get_json()
     assert payload["process_id"] == process_id
     assert payload["status"] == "cancelled"
+
+
+def test_merged_download_uses_verified_bundle_bytes(client, tmp_path):
+    process_id = str(uuid.uuid4())
+    source_paths = {}
+    for source in ("grobid", "docling", "marker"):
+        path = tmp_path / f"{source}.md"
+        path.write_text(f"# Title\n\n{source} output.", encoding="utf-8")
+        source_paths[source] = str(path)
+    mock_result = MagicMock()
+    mock_result.state = "SUCCESS"
+    mock_result.result = {
+        "merge_contract_id": "pdfx-native-skeleton-selection",
+        "merged_cache_path": str(tmp_path / "merged.md"),
+        "merge_metrics_path": str(tmp_path / "metrics.json"),
+        "merge_audit_path": str(tmp_path / "audit.json"),
+        "available_extractors": ["grobid", "docling", "marker"],
+        "native_structure_receipt_digests": {},
+        "document_skeleton_candidate_ids": {
+            "grobid": "a" * 64,
+            "docling": "b" * 64,
+            "marker": "c" * 64,
+        },
+        "document_skeleton_candidate_projection_ids": {
+            "grobid": "d" * 64,
+            "docling": "e" * 64,
+            "marker": "f" * 64,
+        },
+        "download_paths": source_paths,
+        "file_hash": "merged-hash",
+    }
+
+    with (
+        patch("celery_app.celery.AsyncResult", return_value=mock_result),
+        patch(
+            "app.api.load_merge_bundle",
+            return_value=("# Title\n\nVerified merge.", {}, []),
+        ) as mock_load,
+    ):
+        response = client.get(f"/api/v1/extract/{process_id}/download/merged")
+
+    assert response.status_code == 200
+    assert response.data == b"# Title\n\nVerified merge."
+    mock_load.assert_called_once()
+
+
+def test_merge_download_rejects_incomplete_bundle_metadata(client, tmp_path):
+    process_id = str(uuid.uuid4())
+    mock_result = MagicMock()
+    mock_result.state = "SUCCESS"
+    mock_result.result = {
+        "merged_cache_path": str(tmp_path / "merged.md"),
+        "download_paths": {},
+        "file_hash": "merge-hash",
+    }
+
+    with patch("celery_app.celery.AsyncResult", return_value=mock_result):
+        response = client.get(f"/api/v1/extract/{process_id}/download/merged")
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "Merge bundle metadata is incomplete"
+
+
+def test_merge_download_requires_explicit_completed_source_set(client, tmp_path):
+    process_id = str(uuid.uuid4())
+    source = tmp_path / "grobid.md"
+    source.write_text("# Title\n\nSource.", encoding="utf-8")
+    mock_result = MagicMock()
+    mock_result.state = "SUCCESS"
+    mock_result.result = {
+        "merge_contract_id": "pdfx-native-skeleton-selection",
+        "merged_cache_path": str(tmp_path / "merged.md"),
+        "merge_metrics_path": str(tmp_path / "metrics.json"),
+        "merge_audit_path": str(tmp_path / "audit.json"),
+        "native_structure_receipt_digests": {},
+        "document_skeleton_candidate_ids": {"grobid": "a" * 64},
+        "document_skeleton_candidate_projection_ids": {"grobid": "b" * 64},
+        "download_paths": {"grobid": str(source)},
+        "file_hash": "merge-hash",
+    }
+
+    with patch("celery_app.celery.AsyncResult", return_value=mock_result):
+        response = client.get(f"/api/v1/extract/{process_id}/download/merged")
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "Merge bundle verification failed"
 
 
 @patch("celery_app.extract_pdf.apply_async")

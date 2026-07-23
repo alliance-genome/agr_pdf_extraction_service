@@ -2,6 +2,7 @@ import pytest
 from app.services import marker_service
 from app.services.marker_service import Marker
 
+
 class DummyMarker(Marker):
     def extract(self, pdf_path, output_path):
         with open(output_path, "w") as f:
@@ -40,3 +41,15 @@ def test_marker_model_cache_is_shared_across_converter_options(monkeypatch):
     assert first is not second
     assert first.artifact_dict is second.artifact_dict
     assert model_calls == [("cuda", "float16")]
+
+
+def test_marker_clean_markdown_removes_internal_spans_without_page_comments():
+    source = (
+        '<span id="page-1-0">Body with *italics*.</span>\n\n'
+        '<span id="page-2-0">Second page.</span>'
+    )
+
+    result = marker_service._clean_publication_markdown(source)
+
+    assert result == "Body with *italics*.\n\nSecond page."
+    assert "<!-- page:" not in result

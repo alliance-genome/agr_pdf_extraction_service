@@ -14,6 +14,7 @@
 
 x-shared-env: &shared-env
   GROBID_URL: http://grobid:8070
+  PDFALTO_TIMEOUT_SECONDS: ${PDFALTO_TIMEOUT_SECONDS:-900}
   CELERY_BROKER_URL: redis://redis:6379/0
   CELERY_RESULT_BACKEND: redis://redis:6379/1
   DATABASE_URL: postgresql://pdfx:${POSTGRES_PASSWORD:-pdfx}@postgres:5432/pdfx
@@ -78,8 +79,6 @@ services:
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
       # Keep synchronous web UI runs within the same safety envelope as Celery.
-      MICRO_CONFLICT_MAX_WORKERS: "2"
-      LLM_CONFLICT_MAX_WORKERS: "16"
       AUDIT_FLUSH_ON_EVENT: "true"
     volumes: *shared-volumes
     depends_on:
@@ -134,8 +133,6 @@ services:
       NUMEXPR_NUM_THREADS: "8"
       DOCLING_NUM_THREADS: "8"
       # --- Consensus/observability safety on the single-GPU backend ---
-      MICRO_CONFLICT_MAX_WORKERS: "2"
-      LLM_CONFLICT_MAX_WORKERS: "16"
       AUDIT_FLUSH_ON_EVENT: "true"
     volumes: *shared-volumes
     depends_on:

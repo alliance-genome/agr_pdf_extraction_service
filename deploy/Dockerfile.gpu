@@ -4,6 +4,8 @@
 # Uses CUDA 12.8 runtime + Python 3.11 for PyTorch GPU inference.
 # Marker/Surya and Docling both benefit from GPU acceleration.
 
+FROM grobid/grobid:0.8.2-crf AS grobid-pdfalto
+
 FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -78,6 +80,7 @@ RUN python3.11 -m pip uninstall -y onnxruntime-gpu 2>/dev/null || true; \
 RUN python3.11 -m pip install --no-cache-dir 'numpy<2.4' 'Pillow<11.0.0,>=10.2.0'
 
 # Copy application code
+COPY --from=grobid-pdfalto /opt/grobid/grobid-home/pdfalto/lin-64/pdfalto /usr/local/bin/pdfalto
 COPY . .
 
 # Create data directories

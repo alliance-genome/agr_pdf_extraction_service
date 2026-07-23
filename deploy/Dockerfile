@@ -2,6 +2,8 @@
 # CPU-first deployment -- no GPU required
 # Adapted from ai_curation_prototype/backend/docling-service/Dockerfile
 
+FROM grobid/grobid:0.8.2-crf AS grobid-pdfalto
+
 FROM python:3.11-slim
 
 # Install system dependencies
@@ -38,6 +40,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
+COPY --from=grobid-pdfalto /opt/grobid/grobid-home/pdfalto/lin-64/pdfalto /usr/local/bin/pdfalto
 COPY . .
 
 # Create data directories

@@ -20,6 +20,7 @@ extraction_cache
 
 .env
 SSH_ACCESS.md
+goal.md
 tests
 README.md
 docs

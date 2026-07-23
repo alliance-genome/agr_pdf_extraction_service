@@ -16,6 +16,7 @@ Endpoints:
     GET  /api/v1/extract/<process_id>/artifacts/urls    - Pre-signed URLs for all artifact keys
 """
 
+import io
 import os
 import uuid
 import json
@@ -30,6 +31,8 @@ from app.error_utils import summarize_error_message
 from app.image_metadata import copy_image_metadata, normalize_image_manifest_entry
 from app.models import ExtractionRun, get_session
 from app.services.audit_logger import build_s3_client
+from app.services.merge_artifact import load_merge_bundle
+from app.services.source_contracts import SourceArtifact
 
 logger = logging.getLogger(__name__)
 
@@ -531,42 +534,14 @@ def health():
 
 @api.route("/config", methods=["GET"])
 def get_config():
-    """Return current LLM model and reasoning config for verification.
-
-    This endpoint lets operators confirm that per-call-type model overrides
-    are actually loaded into the running process (e.g., after container
-    restart vs. recreate).
-    """
+    """Return the exact reachable runtime model policy."""
     from config import Config
+    from app.services.model_policy import resolved_runtime_model_map
+
+    role_map = resolved_runtime_model_map()
     return jsonify({
-        "llm_model_default": Config.LLM_MODEL,
-        "llm_reasoning_default": Config.LLM_REASONING_EFFORT,
-        "per_call_type": {
-            "zone_resolution": {
-                "model": Config.LLM_MODEL_ZONE_RESOLUTION,
-                "reasoning": Config.LLM_REASONING_ZONE_RESOLUTION or Config.LLM_REASONING_EFFORT,
-            },
-            "conflict_batch": {
-                "model": Config.LLM_MODEL_CONFLICT_BATCH,
-                "reasoning": Config.LLM_REASONING_CONFLICT_BATCH or Config.LLM_REASONING_EFFORT,
-            },
-            "general_rescue": {
-                "model": Config.LLM_MODEL_GENERAL_RESCUE,
-                "reasoning": Config.LLM_REASONING_GENERAL_RESCUE or Config.LLM_REASONING_EFFORT,
-            },
-            "numeric_rescue": {
-                "model": Config.LLM_MODEL_NUMERIC_RESCUE,
-                "reasoning": Config.LLM_REASONING_NUMERIC_RESCUE or Config.LLM_REASONING_EFFORT,
-            },
-            "header_hierarchy": {
-                "model": Config.HIERARCHY_LLM_MODEL,
-                "reasoning": Config.HIERARCHY_LLM_REASONING,
-            },
-            "image_text_review": {
-                "model": Config.IMAGE_TEXT_REVIEW_MODEL,
-                "reasoning": Config.IMAGE_TEXT_REVIEW_REASONING,
-            },
-        },
+        "merge_contract_id": Config.MERGE_CONTRACT_ID,
+        "resolved_runtime_models": role_map,
     })
 
 
@@ -813,6 +788,11 @@ def get_extraction_status(process_id):
             "consensus_metrics_json": run["consensus_metrics_json"],
             "llm_cost_usd": run["llm_cost_usd"],
             "llm_usage_json": run["llm_usage_json"],
+            "available_extractors": sorted(
+                method
+                for method in VALID_METHODS
+                if method in (run["artifacts_json"] or {})
+            ),
         }
         if run["error_code"] or run["error_message"]:
             response["error_code"] = run["error_code"]
@@ -836,6 +816,11 @@ def get_extraction_status(process_id):
                         response["review_images"] = result.result.get("review_images", response["review_images"])
                         response["llm_usage_json"] = result.result.get("llm_usage_json") or response["llm_usage_json"]
                         response["llm_cost_usd"] = result.result.get("llm_cost_usd") or response["llm_cost_usd"]
+                        response["available_extractors"] = sorted(
+                            method
+                            for method in result.result.get("available_extractors", [])
+                            if method in VALID_METHODS
+                        )
                     return jsonify(response), 200
 
                 if result.state == "FAILURE":
@@ -913,6 +898,11 @@ def get_extraction_status(process_id):
             payload["ended_at"] = result.result.get("ended_at")
             payload["log_s3_key"] = result.result.get("log_s3_key")
             payload["image_count"] = _count_images(result.result)
+            payload["available_extractors"] = sorted(
+                method
+                for method in result.result.get("available_extractors", [])
+                if method in VALID_METHODS
+            )
         return jsonify(payload), 200
 
     if result.state == "FAILURE":
@@ -1071,20 +1061,79 @@ def download_result(process_id, method):
         data = result.result
         download_paths = data.get("download_paths", {})
         file_hash = data.get("file_hash", "")
+        verified_merge_payload = None
+
+        if method in {"merged", "audit"} and data.get("merged_cache_path"):
+            contract_id = data.get("merge_contract_id")
+            merged_path = data.get("merged_cache_path")
+            metrics_path = data.get("merge_metrics_path")
+            audit_path = data.get("merge_audit_path")
+            native_receipts = data.get("native_structure_receipt_digests")
+            skeleton_ids = data.get("document_skeleton_candidate_ids")
+            skeleton_projection_ids = data.get(
+                "document_skeleton_candidate_projection_ids"
+            )
+            if not all((contract_id, merged_path, metrics_path, audit_path)) or not all(
+                isinstance(value, dict)
+                for value in (native_receipts, skeleton_ids, skeleton_projection_ids)
+            ):
+                return jsonify({"error": "Merge bundle metadata is incomplete"}), 409
+            try:
+                artifacts = {}
+                completed_sources = data.get("available_extractors")
+                if not isinstance(completed_sources, list):
+                    raise ValueError("merge result completed source set is invalid")
+                completed_sources = [
+                    source
+                    for source in completed_sources
+                    if source in VALID_METHODS
+                ]
+                if not completed_sources:
+                    raise ValueError("merge result has no completed source set")
+                for source in completed_sources:
+                    source_path = download_paths.get(source)
+                    if not source_path:
+                        raise ValueError(f"missing merge source path: {source}")
+                    with open(source_path, "r", encoding="utf-8") as handle:
+                        artifacts[source] = SourceArtifact.from_text(source, handle.read())
+                merged_text, _metrics, merge_audit = load_merge_bundle(
+                    merged_path=merged_path,
+                    metrics_path=metrics_path,
+                    audit_path=audit_path,
+                    artifacts=artifacts,
+                    expected_contract_id=contract_id,
+                    expected_native_structure_receipt_digests=native_receipts,
+                    expected_skeleton_candidate_ids=skeleton_ids,
+                    expected_skeleton_candidate_projection_ids=(
+                        skeleton_projection_ids
+                    ),
+                )
+                verified_merge_payload = (
+                    merged_text.encode("utf-8")
+                    if method == "merged"
+                    else json.dumps(
+                        merge_audit,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+            except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "Merge download bundle verification failed for %s: %s",
+                    process_id,
+                    type(exc).__name__,
+                )
+                return jsonify({"error": "Merge bundle verification failed"}), 409
 
         if method == "merged":
             filepath = data.get("merged_cache_path")
-            if not filepath:
-                version = current_app.config["EXTRACTION_CONFIG_VERSION"]
-                methods_used = data.get("methods_used", [])
-                cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(methods_used))}"
-                filepath = os.path.join(current_app.config["CACHE_FOLDER"], f"{cache_key}_merged.md")
         elif method == "audit":
             filepath = download_paths.get("audit")
         else:
             filepath = download_paths.get(method)
 
-        if filepath and os.path.exists(filepath):
+        if verified_merge_payload is not None or (filepath and os.path.exists(filepath)):
             if method == "audit":
                 download_name = f"{file_hash}_audit.json"
                 mimetype = "application/json"
@@ -1092,11 +1141,16 @@ def download_result(process_id, method):
                 download_name = f"{file_hash}_{method}.md"
                 mimetype = "text/markdown"
             return send_file(
-                filepath,
+                io.BytesIO(verified_merge_payload)
+                if verified_merge_payload is not None
+                else filepath,
                 as_attachment=True,
                 download_name=download_name,
                 mimetype=mimetype,
             )
+
+        if method in {"merged", "audit"} and data.get("merged_cache_path"):
+            return jsonify({"error": "Committed merge bundle not found"}), 404
 
     # Fallback: look up S3 artifact from DB
     run = _get_run_by_process_id(process_id)

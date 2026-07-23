@@ -5,6 +5,7 @@ from celery_app import (
     _preload_marker_models_for_worker,
     celery,
 )
+from app.services.model_policy import validate_runtime_model_policy
 
 
 def main(argv=None):
@@ -14,6 +15,7 @@ def main(argv=None):
     this process. Keeping preload and Celery startup together lets the first
     real Marker task reuse the in-memory converter cache.
     """
+    validate_runtime_model_policy()
     _configure_torch_for_worker_process()
     _preload_marker_models_for_worker()
     celery.worker_main(argv or [

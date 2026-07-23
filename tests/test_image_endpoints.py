@@ -22,7 +22,6 @@ def client():
     app.config["GROBID_INCLUDE_RAW_CITATIONS"] = False
     app.config["DOCLING_DEVICE"] = "cpu"
     app.config["MARKER_DEVICE"] = "cpu"
-    app.config["CONSENSUS_ENABLED"] = True
     app.config["CONSENSUS_NEAR_THRESHOLD"] = 0.92
     app.config["CONSENSUS_LEVENSHTEIN_THRESHOLD"] = 0.90
     app.config["CONSENSUS_CONFLICT_RATIO_FALLBACK"] = 0.4
@@ -58,36 +57,43 @@ def app_with_images(client):
 
 
 class TestImageDownloadEndpoint:
-    def test_image_download_valid(self, client, app_with_images):
-        """Valid hash + filename should return 200 with image content."""
+    @patch("app.api._get_run_by_process_id", return_value=None)
+    @patch("celery_app.celery.AsyncResult")
+    def test_image_download_valid(self, async_result, _run, client, app_with_images):
+        """A completed process ID serves its locally cached image."""
         fh = app_with_images["file_hash"]
         fn = app_with_images["image_filename"]
-        response = client.get(f"/download/{fh}/images/{fn}")
+        async_result.return_value = MagicMock(
+            state="SUCCESS",
+            result={"file_hash": fh},
+        )
+        response = client.get(f"/api/v1/extract/process-1/images/{fn}")
         assert response.status_code == 200
         assert response.content_type == "image/png"
         assert len(response.data) > 0
 
-    def test_image_download_not_found(self, client, app_with_images):
+    @patch("app.api._get_run_by_process_id", return_value=None)
+    @patch("celery_app.celery.AsyncResult")
+    def test_image_download_not_found(self, async_result, _run, client, app_with_images):
         """Non-existent image should return 404."""
         fh = app_with_images["file_hash"]
-        response = client.get(f"/download/{fh}/images/nonexistent.png")
-        assert response.status_code == 404
-
-    def test_image_download_wrong_hash(self, client):
-        """Wrong hash should return 404."""
-        response = client.get("/download/badhash/images/figure.png")
+        async_result.return_value = MagicMock(
+            state="SUCCESS",
+            result={"file_hash": fh},
+        )
+        response = client.get("/api/v1/extract/process-1/images/nonexistent.png")
         assert response.status_code == 404
 
     def test_image_download_traversal_blocked(self, client, app_with_images):
         """Path traversal attempts should be blocked."""
-        fh = app_with_images["file_hash"]
-        response = client.get(f"/download/{fh}/images/../../etc/passwd")
+        response = client.get("/api/v1/extract/process-1/images/../../etc/passwd")
         assert response.status_code in (400, 404)
 
     def test_image_download_traversal_encoded(self, client, app_with_images):
         """URL-encoded path traversal should also be blocked."""
-        fh = app_with_images["file_hash"]
-        response = client.get(f"/download/{fh}/images/..%2F..%2Fetc%2Fpasswd")
+        response = client.get(
+            "/api/v1/extract/process-1/images/..%2F..%2Fetc%2Fpasswd"
+        )
         assert response.status_code in (400, 404)
 
 
@@ -109,22 +115,3 @@ class TestImageListFromCachedJob:
         with client.application.app_context():
             images = list_images("unknown_hash_xyz")
             assert images == []
-
-
-class TestRewrittenUrlsStable:
-    def test_same_hash_same_urls(self, client):
-        """Same file hash should always produce the same image URLs."""
-        from app.utils import rewrite_image_paths, get_images_dir
-
-        with client.application.app_context():
-            file_hash = "stabletest"
-            images_dir = get_images_dir(file_hash)
-            os.makedirs(images_dir, exist_ok=True)
-            with open(os.path.join(images_dir, "fig.png"), "wb") as f:
-                f.write(b"\x89PNG")
-
-            md = "![alt](fig.png)"
-            result1 = rewrite_image_paths(md, file_hash)
-            result2 = rewrite_image_paths(md, file_hash)
-            assert result1 == result2
-            assert f"/download/{file_hash}/images/fig.png" in result1

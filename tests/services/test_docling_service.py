@@ -1,9 +1,6 @@
 import sys
 import types
 
-import pytest
-
-
 def _install_docling_stubs():
     """Provide lightweight docling stubs so unit tests run without heavy deps."""
     if "docling.document_converter" in sys.modules:
@@ -32,6 +29,7 @@ def _install_docling_stubs():
             self.accelerator_options = kwargs.get("accelerator_options")
             self.ocr_batch_size = kwargs.get("ocr_batch_size")
             self.layout_batch_size = kwargs.get("layout_batch_size")
+            self.generate_parsed_pages = False
             self.do_ocr = None
             self.ocr_options = None
 
@@ -135,16 +133,28 @@ class _FakeDocument:
         image_placeholder="",
         page_break_placeholder="",
         text_width=-1,
-        page_no=None,
     ):
         kwargs = {
             "image_placeholder": image_placeholder,
             "page_break_placeholder": page_break_placeholder,
             "text_width": text_width,
-            "page_no": page_no,
         }
         self.calls.append(kwargs)
-        return f"Page {page_no} body"
+        return "# Title\n\nBody with *italics*."
+
+    def export_to_dict(self, **kwargs):
+        self.export_dict_kwargs = kwargs
+        return {
+            "schema_name": "DoclingDocument",
+            "texts": [
+                {
+                    "self_ref": f"#/texts/{page - 1}",
+                    "text": f"page {page}",
+                    "prov": [{"page_no": page}],
+                }
+                for page in (1, 2, 3)
+            ],
+        }
 
 
 class _FakeConverter:
@@ -159,7 +169,7 @@ class _FakeConverter:
         return self._Result(self._doc)
 
 
-def test_docling_extract_writes_page_markers(monkeypatch, tmp_path):
+def test_docling_extract_writes_clean_markdown_and_native_document(monkeypatch, tmp_path):
     fake_doc = _FakeDocument()
     monkeypatch.setattr(
         "app.services.docling_service._get_converter",
@@ -174,39 +184,28 @@ def test_docling_extract_writes_page_markers(monkeypatch, tmp_path):
     docling.extract(str(pdf_path), str(output_path))
 
     content = output_path.read_text(encoding="utf-8")
-    assert "<!-- page: 1 -->" in content
-    assert "<!-- page: 2 -->" in content
-    assert "<!-- page: 3 -->" in content
-    assert "Page 1 body" in content
-    assert "Page 2 body" in content
-    assert "Page 3 body" in content
+    assert content == "# Title\n\nBody with *italics*."
+    assert "<!-- page:" not in content
+    assert fake_doc.calls == [{
+        "image_placeholder": "",
+        "page_break_placeholder": "",
+        "text_width": -1,
+    }]
+    assert fake_doc.export_dict_kwargs == {
+        "mode": "json",
+        "by_alias": True,
+        "exclude_none": True,
+    }
 
-    assert len(fake_doc.calls) == 3
-    assert fake_doc.calls[0]["page_no"] == 1
-    assert fake_doc.calls[1]["page_no"] == 2
-    assert fake_doc.calls[2]["page_no"] == 3
+    from app.services.native_extractor_artifact import load_native_extractor_artifact
 
-
-def test_docling_extract_requires_page_no_support(monkeypatch, tmp_path):
-    class _NoPageNoDocument:
-        def num_pages(self):
-            return 1
-
-        def export_to_markdown(self, image_placeholder="", page_break_placeholder="", text_width=-1):
-            return "content"
-
-    monkeypatch.setattr(
-        "app.services.docling_service._get_converter",
-        lambda *_args, **_kwargs: _FakeConverter(_NoPageNoDocument()),
+    manifest, native = load_native_extractor_artifact(
+        source="docling", output_filename=output_path
     )
-
-    docling = Docling()
-    pdf_path = tmp_path / "test.pdf"
-    output_path = tmp_path / "output.md"
-    pdf_path.write_bytes(b"dummy pdf content")
-
-    with pytest.raises(RuntimeError, match="missing export_to_markdown\\(page_no=...\\)"):
-        docling.extract(str(pdf_path), str(output_path))
+    assert b'"schema_name":"DoclingDocument"' in native
+    assert manifest["expected_page_count"] == 3
+    assert manifest["covered_pages"] == [1, 2, 3]
+    assert manifest["options"]["native_style_cell_collection"] == "word_cells"
 
 
 def test_docling_converter_pins_rapidocr_onnxruntime_cpu(monkeypatch):
@@ -228,11 +227,35 @@ def test_docling_converter_pins_rapidocr_onnxruntime_cpu(monkeypatch):
 
     pipeline_options = created["format_options"]["pdf"].kwargs["pipeline_options"]
     assert pipeline_options.accelerator_options.device == "cuda"
+    assert pipeline_options.generate_parsed_pages is True
     assert pipeline_options.do_ocr is True
     assert pipeline_options.ocr_options.kwargs["backend"] == "onnxruntime"
+    assert pipeline_options.ocr_options.kwargs["force_full_page_ocr"] is False
     rapidocr_params = pipeline_options.ocr_options.kwargs["rapidocr_params"]
     assert rapidocr_params["EngineConfig.onnxruntime.use_cuda"] is False
     assert rapidocr_params["Det.model_type"].value == "medium"
     assert rapidocr_params["Rec.model_type"].value == "medium"
     assert rapidocr_params["Det.lang_type"].value == "en"
     assert rapidocr_params["Rec.lang_type"].value == "en"
+
+
+def test_emergency_docling_converter_forces_full_page_ocr(monkeypatch):
+    created = []
+
+    class _CapturingConverter:
+        def __init__(self, format_options):
+            created.append(format_options)
+
+    monkeypatch.setattr("app.services.docling_service.DocumentConverter", _CapturingConverter)
+    _cached_converters.clear()
+
+    normal = _get_converter("cpu", num_threads=2)
+    emergency = _get_converter(
+        "cpu",
+        num_threads=2,
+        force_full_page_ocr=True,
+    )
+
+    assert normal is not emergency
+    options = created[-1]["pdf"].kwargs["pipeline_options"].ocr_options
+    assert options.kwargs["force_full_page_ocr"] is True

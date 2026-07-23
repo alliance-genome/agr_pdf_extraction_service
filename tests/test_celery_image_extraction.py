@@ -1,7 +1,315 @@
 import sys
+import time
 from types import SimpleNamespace
 
+import pytest
+
 import celery_app
+from app.services.native_extractor_artifact import persist_native_extractor_artifact
+
+
+class _ProgressTask:
+    def __init__(self):
+        self.updates = []
+
+    def update_state(self, **payload):
+        self.updates.append(payload)
+
+
+def test_cache_without_native_artifact_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    cache_path = celery_app._cached_path("cached-empty", "grobid")
+    with open(cache_path, "w", encoding="utf-8") as handle:
+        handle.write(" \n\t")
+
+    assert not celery_app._is_extractor_cached(
+        "cached-empty", "grobid", extract_images=False
+    )
+
+
+def test_extraction_continues_when_one_of_three_methods_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+
+    def fake_extract(method, *_args, **_kwargs):
+        if method == "docling":
+            raise RuntimeError("synthetic docling failure")
+        return method, f"# {method}\n\nUsable output.", False
+
+    monkeypatch.setattr(celery_app, "_run_single_extractor", fake_extract)
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\nfocused worker fixture")
+
+    result = celery_app._run_extraction(
+        _ProgressTask(),
+        str(input_pdf),
+        ["grobid", "docling", "marker"],
+        False,
+        file_hash="partial-success",
+    )
+
+    assert result["status"] == "success"
+    assert result["extraction_status"] == "partial_success"
+    assert result["available_extractors"] == ["grobid", "marker"]
+    assert result["failed_extractors"] == ["docling"]
+    assert result["extractor_failures"]["docling"]["error_code"] == "RuntimeError"
+    assert result["methods_used"] == ["marker", "grobid"]
+
+
+def test_candidate_merge_uses_two_valid_sources_when_third_is_whitespace(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    monkeypatch.setattr(celery_app.Config, "OPENAI_API_KEY", "")
+
+    valid = (
+        "# Source title\n\n"
+        "## Abstract\n\n"
+        "This complete source-backed abstract contains enough publication words "
+        "to satisfy the absolute article floor while exercising partial extractor "
+        "delivery without asking a model to generate any document text. The exact "
+        "same bytes are available from two successful extraction methods for this "
+        "focused worker integration check.\n\n"
+        "## Results\n\n"
+        "The result remains deterministic, source proven, auditable, and suitable "
+        "for persistence in the candidate artifact bundle after one extractor "
+        "returns only whitespace.\n\n"
+        "## References\n\n"
+        "1. Example reference for the focused integration fixture.\n"
+    )
+
+    def fake_extract(method, *_args, **_kwargs):
+        text = "  \n\t" if method == "docling" else valid
+        return method, text, False
+
+    monkeypatch.setattr(celery_app, "_run_single_extractor", fake_extract)
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\npartial merge fixture")
+
+    result = celery_app._run_extraction(
+        _ProgressTask(),
+        str(input_pdf),
+        ["grobid", "docling", "marker"],
+        True,
+        file_hash="two-valid-one-empty",
+    )
+
+    assert result["status"] == "success"
+    assert result["extraction_status"] == "partial_success"
+    assert result["available_extractors"] == ["grobid", "marker"]
+    assert result["failed_extractors"] == ["docling"]
+    assert result["extractor_failures"]["docling"]["error_code"] == (
+        "EmptyExtractorOutputError"
+    )
+    assert result["consensus_metrics"]["source_count"] == 2
+    assert result["consensus_metrics"]["available_extractors"] == [
+        "grobid",
+        "marker",
+    ]
+    assert result["consensus_metrics"]["missing_extractors"] == ["docling"]
+
+
+def test_extraction_fails_when_no_requested_method_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    monkeypatch.setattr(
+        celery_app,
+        "_run_single_extractor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("all failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="all failed"):
+        celery_app._run_extraction(
+            _ProgressTask(),
+            str(tmp_path / "input.pdf"),
+            ["marker"],
+            False,
+            file_hash="no-success",
+        )
+
+
+def test_transient_extractor_failure_is_retried_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    calls = []
+
+    def fake_extract(method, *_args, **_kwargs):
+        calls.append(method)
+        if len(calls) == 1:
+            raise TimeoutError("temporary timeout")
+        return method, "# Recovered\n\nUsable source.", False
+
+    monkeypatch.setattr(celery_app, "_run_single_extractor", fake_extract)
+
+    result = celery_app._run_extraction(
+        _ProgressTask(),
+        str(tmp_path / "input.pdf"),
+        ["grobid"],
+        False,
+        file_hash="retry-success",
+    )
+
+    assert calls == ["grobid", "grobid"]
+    assert result["retried_extractors"] == ["grobid"]
+    assert result["available_extractors"] == ["grobid"]
+    assert result["failed_extractors"] == []
+    assert result["emergency_ocr_used"] is False
+
+
+def test_retry_does_not_spend_finalization_reserve(tmp_path, monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    monkeypatch.setattr(celery_app.Config, "TASK_SOFT_TIME_LIMIT_SECONDS", 10)
+    monkeypatch.setattr(
+        celery_app.Config,
+        "EXTRACTION_FINALIZATION_RESERVE_SECONDS",
+        5,
+    )
+    calls = []
+
+    def fail(method, *_args, **_kwargs):
+        calls.append(method)
+        raise TimeoutError("temporary timeout")
+
+    monkeypatch.setattr(celery_app, "_run_single_extractor", fail)
+
+    with pytest.raises(TimeoutError, match="temporary timeout"):
+        celery_app._run_extraction(
+            _ProgressTask(),
+            str(tmp_path / "input.pdf"),
+            ["grobid"],
+            False,
+            file_hash="reserve",
+            job_started_monotonic=time.monotonic() - 6,
+        )
+
+    assert calls == ["grobid"]
+
+
+def test_failed_cache_cleanup_does_not_defeat_partial_delivery(tmp_path, monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    calls = []
+
+    def fake_extract(method, *_args, **_kwargs):
+        calls.append(method)
+        if method == "grobid":
+            raise TimeoutError("temporary timeout")
+        return method, "# Available\n\nUsable source.", False
+
+    monkeypatch.setattr(celery_app, "_run_single_extractor", fake_extract)
+    monkeypatch.setattr(
+        celery_app,
+        "_discard_failed_extractor_cache",
+        lambda *_args: False,
+    )
+
+    result = celery_app._run_extraction(
+        _ProgressTask(),
+        str(tmp_path / "input.pdf"),
+        ["grobid", "docling"],
+        False,
+        file_hash="cleanup-partial",
+    )
+
+    assert calls == ["grobid", "docling"]
+    assert result["available_extractors"] == ["docling"]
+    assert result["failed_extractors"] == ["grobid"]
+    assert result["retried_extractors"] == []
+
+
+def test_all_normal_failures_use_one_forced_full_page_docling_ocr(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    calls = []
+
+    def fake_extract(method, *_args, **kwargs):
+        calls.append((method, kwargs.get("force_full_page_ocr", False)))
+        if method == "docling" and kwargs.get("force_full_page_ocr") is True:
+            return method, "# OCR recovery\n\nUsable source.", False
+        raise ValueError("permanent normal failure")
+
+    monkeypatch.setattr(celery_app, "_run_single_extractor", fake_extract)
+
+    result = celery_app._run_extraction(
+        _ProgressTask(),
+        str(tmp_path / "input.pdf"),
+        ["marker"],
+        False,
+        file_hash="emergency-ocr",
+    )
+
+    assert calls == [("marker", False), ("docling", True)]
+    assert result["available_extractors"] == ["docling"]
+    assert result["failed_extractors"] == ["marker"]
+    assert result["emergency_ocr_used"] is True
+
+
+def test_candidate_worker_can_merge_without_openai_credentials(monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "OPENAI_API_KEY", "")
+
+    assert celery_app._build_merge_llm_or_none() is None
+
+
+def test_candidate_worker_can_merge_when_client_construction_fails(monkeypatch):
+    monkeypatch.setattr(celery_app.Config, "OPENAI_API_KEY", "present")
+    monkeypatch.setattr(
+        celery_app,
+        "_build_llm",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("client unavailable")),
+    )
+
+    assert celery_app._build_merge_llm_or_none() is None
+
+
+def test_llm_accounting_preserves_raw_usage_when_pricing_fails(monkeypatch):
+    summary = {
+        "total_prompt_tokens": 10,
+        "total_completion_tokens": 5,
+        "total_cached_tokens": 0,
+        "total_tokens": 15,
+        "breakdown": {
+            "candidate_selection": {
+                "model": "unknown-model",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "cached_tokens": 0,
+                "calls": 1,
+            }
+        },
+    }
+    llm = SimpleNamespace(usage=SimpleNamespace(summary=lambda: summary))
+    log = SimpleNamespace(error=lambda *args, **kwargs: None)
+    monkeypatch.setattr(celery_app.Config, "LLM_PRICING", {})
+
+    cost, usage = celery_app._compute_llm_accounting(llm, log=log)
+
+    assert cost is None
+    assert usage == summary
+
+
+def test_llm_cost_alert_is_structured_and_never_changes_usage(monkeypatch):
+    warnings = []
+    log = SimpleNamespace(
+        warning=lambda *args, **kwargs: warnings.append((args, kwargs))
+    )
+    usage = {"total_tokens": 123}
+    monkeypatch.setattr(celery_app.Config, "LLM_COST_ALERT_USD_PER_JOB", 0.5)
+
+    triggered = celery_app._record_llm_cost_alert(0.75, usage, log=log)
+
+    assert triggered is True
+    assert usage == {
+        "total_tokens": 123,
+        "cost_alert_threshold_usd": 0.5,
+        "cost_alert_triggered": True,
+    }
+    assert warnings[0][1]["extra"]["_event"] == "llm_cost_alert"
 
 
 def test_marker_cache_requires_images_when_requested(tmp_path, monkeypatch):
@@ -12,6 +320,19 @@ def test_marker_cache_requires_images_when_requested(tmp_path, monkeypatch):
     marker_path = celery_app._cached_path(file_hash, "marker")
     with open(marker_path, "w", encoding="utf-8") as f:
         f.write("Marker output")
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"pdf fixture")
+    persist_native_extractor_artifact(
+        source="marker",
+        output_filename=marker_path,
+        native_bytes=b"{}",
+        native_media_type="application/json",
+        pdf_path=pdf_path,
+        extractor_versions={"marker-pdf": "1.10.2"},
+        options={"disable_links": True},
+        expected_page_count=1,
+        covered_pages=[1],
+    )
 
     assert celery_app._is_extractor_cached(file_hash, "marker", extract_images=False) is True
     assert celery_app._is_extractor_cached(file_hash, "marker", extract_images=True) is False
@@ -107,7 +428,7 @@ def test_upload_artifacts_tags_image_objects(tmp_path, monkeypatch):
                 "figure_decision_source": "llm_text",
                 "image_reviewed": True,
                 "image_review_method": "llm_text",
-                "image_review_model": "gpt-5.4-mini",
+                "image_review_model": "gpt-5.6-luna",
                 "image_review_classification": "scientific_figure",
                 "image_review_is_scientific_figure": True,
                 "image_review_confidence": 0.98,
@@ -138,7 +459,7 @@ def test_upload_artifacts_tags_image_objects(tmp_path, monkeypatch):
 
 
 def test_review_images_with_text_context_applies_llm_decision(monkeypatch):
-    monkeypatch.setattr(celery_app.Config, "IMAGE_TEXT_REVIEW_MODEL", "gpt-5.4-mini")
+    monkeypatch.setattr(celery_app.Config, "IMAGE_TEXT_REVIEW_MODEL", "gpt-5.6-luna")
 
     class FakeReview:
         def model_dump(self):
@@ -206,7 +527,7 @@ def test_skipping_image_review_strips_cached_llm_metadata(tmp_path, monkeypatch)
             "heuristic_is_likely_figure": true,
             "image_reviewed": true,
             "image_review_method": "llm_text",
-            "image_review_model": "gpt-5.4-mini",
+            "image_review_model": "gpt-5.6-luna",
             "image_review_classification": "scientific_figure",
             "image_review_is_scientific_figure": true,
             "image_review_confidence": 0.99,

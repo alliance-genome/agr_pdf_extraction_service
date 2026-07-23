@@ -71,7 +71,7 @@ def test_upload_limit_is_500_mib_across_backend_configs():
     assert "MAX_MULTIPART_OVERHEAD_BYTES" in stack_text
     assert 'Value: "524288000"' in stack_text
     assert 'Value: "10485760"' in stack_text
-    assert "| `MAX_CONTENT_LENGTH` | `524288000` | Max upload size in bytes (500 MiB) |" in readme
+    assert "| `MAX_CONTENT_LENGTH` | `500 MiB` | Backend upload limit |" in readme
 
 
 def test_pdfx_stack_supports_image_retention_and_tagged_uploads():
@@ -281,7 +281,7 @@ def test_gpu_compose_keeps_web_app_cpu_only_and_worker_ocr_overridable():
 def test_marker_requirement_uses_modern_converter_api_version():
     requirements = REQUIREMENTS_PATH.read_text()
 
-    assert "marker-pdf>=1.10.2,<1.11" in requirements
+    assert "marker-pdf==1.10.2" in requirements
 
 
 def test_docling_ocr_backend_has_cpu_onnxruntime_requirement():

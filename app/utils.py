@@ -1,7 +1,5 @@
 import os
-import re
 import hashlib
-from urllib.parse import quote
 
 from flask import current_app as app
 
@@ -55,17 +53,3 @@ def list_images(file_hash):
 
 def has_image_extraction_manifest(file_hash):
     return os.path.exists(os.path.join(get_images_dir(file_hash), IMAGE_MANIFEST_FILENAME))
-
-
-def rewrite_image_paths(markdown, file_hash):
-    """Rewrite ![alt](filename) to ![alt](/download/{hash}/images/{filename}) at response time."""
-    images_dir = get_images_dir(file_hash)
-
-    def _replace(match):
-        alt, filename = match.group(1), match.group(2)
-        basename = os.path.basename(filename)
-        if os.path.exists(os.path.join(images_dir, basename)):
-            return f"![{alt}](/download/{file_hash}/images/{quote(basename)})"
-        return match.group(0)
-
-    return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", _replace, markdown)

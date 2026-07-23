@@ -2,10 +2,12 @@ import os
 from flask import Flask
 from config import Config
 from app.logging_config import setup_logging
+from app.services.model_policy import validate_runtime_model_policy
 
 
 def create_app():
     setup_logging(component="app")
+    validate_runtime_model_policy()
     app = Flask(__name__)
     app.config.from_object(Config)
 
