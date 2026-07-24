@@ -580,7 +580,11 @@ def test_alliance_error_delivery_replaces_prior_repetition_style_ledger(
     marker, artifact, marker_native = _plain_marker_with_native_dpp()
     repetition_calls = 0
     report_calls = 0
+    reconciliation_reasons = []
     real_abc_markdown_report = merge_service_module.abc_markdown_report
+    real_reconcile_native_emphasis_fallback = (
+        merge_service_module.reconcile_native_emphasis_fallback
+    )
 
     def repetition_once(_text, _artifacts):
         nonlocal repetition_calls
@@ -599,6 +603,15 @@ def test_alliance_error_delivery_replaces_prior_repetition_style_ledger(
             }
         return report
 
+    def record_fallback_reconciliation(text, skeletons, artifacts, *, reason):
+        reconciliation_reasons.append(reason)
+        return real_reconcile_native_emphasis_fallback(
+            text,
+            skeletons,
+            artifacts,
+            reason=reason,
+        )
+
     monkeypatch.setattr(
         merge_service_module,
         "repetition_diagnostics_metric",
@@ -608,6 +621,11 @@ def test_alliance_error_delivery_replaces_prior_repetition_style_ledger(
         merge_service_module,
         "abc_markdown_report",
         reject_first_precommit_report,
+    )
+    monkeypatch.setattr(
+        merge_service_module,
+        "reconcile_native_emphasis_fallback",
+        record_fallback_reconciliation,
     )
 
     merged, metrics, audit = merge_source_artifacts(
@@ -628,6 +646,10 @@ def test_alliance_error_delivery_replaces_prior_repetition_style_ledger(
     assert "alliance_error_source_delivery:marker" in metrics["warnings"]
     assert "rendered_output_rejected:excess_repetition" not in metrics["warnings"]
     assert metrics["abc_markdown"]["error_rule_ids"] == []
+    assert reconciliation_reasons == [
+        "baseline_fallback_after_repetition",
+        "alliance_error_source_delivery",
+    ]
     fallback_events = [
         event
         for event in metrics["document_skeleton_transformations"]
