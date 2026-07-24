@@ -451,10 +451,7 @@ def test_baseline_retained_native_italics_reconcile_without_replacement():
     assert receipt["all_native_body_italics_retained"] is True
 
 
-def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(
-    monkeypatch,
-    tmp_path,
-):
+def _plain_marker_with_native_dpp():
     marker = "# Title\n\n## Results\n\nGene dpp is active.\n"
     artifact = SourceArtifact.from_text("marker", marker)
     marker_native = NativeStructureArtifact.for_test(
@@ -484,6 +481,14 @@ def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(
             }],
         }).encode("utf-8"),
     )
+    return marker, artifact, marker_native
+
+
+def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(
+    monkeypatch,
+    tmp_path,
+):
+    marker, artifact, marker_native = _plain_marker_with_native_dpp()
     calls = 0
 
     def repetition_once(_text, _artifacts):
@@ -566,6 +571,97 @@ def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(
             expected_contract_id=Config.MERGE_CONTRACT_ID,
             skeletons=skeletons,
         )
+
+
+def test_alliance_error_delivery_replaces_prior_repetition_style_ledger(
+    monkeypatch,
+    tmp_path,
+):
+    marker, artifact, marker_native = _plain_marker_with_native_dpp()
+    repetition_calls = 0
+    report_calls = 0
+    real_abc_markdown_report = merge_service_module.abc_markdown_report
+
+    def repetition_once(_text, _artifacts):
+        nonlocal repetition_calls
+        repetition_calls += 1
+        return [{"kind": "paragraph"}] if repetition_calls == 1 else []
+
+    def reject_first_precommit_report(text):
+        nonlocal report_calls
+        report_calls += 1
+        report = real_abc_markdown_report(text)
+        if report_calls == 1:
+            return {
+                **report,
+                "valid": False,
+                "error_rule_ids": ["forced_zero_error_delivery_regression"],
+            }
+        return report
+
+    monkeypatch.setattr(
+        merge_service_module,
+        "repetition_diagnostics_metric",
+        repetition_once,
+    )
+    monkeypatch.setattr(
+        merge_service_module,
+        "abc_markdown_report",
+        reject_first_precommit_report,
+    )
+
+    merged, metrics, audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": artifact}
+        ),
+        native_structures={"marker": marker_native},
+        baseline_requirements=FRAGMENT_REQUIREMENTS,
+        benchmark_mode=True,
+    )
+
+    assert merged == marker.replace("# Title", "## Title", 1)
+    assert metrics["merge_quality"] == "baseline_fallback"
+    assert "alliance_error_source_delivery:marker" in metrics["warnings"]
+    assert "rendered_output_rejected:excess_repetition" not in metrics["warnings"]
+    assert metrics["abc_markdown"]["error_rule_ids"] == []
+    fallback_events = [
+        event
+        for event in metrics["document_skeleton_transformations"]
+        if event.get("operation") == "native_emphasis_projection"
+    ]
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["reason"] == "alliance_error_source_delivery"
+    assert fallback_events[0]["fallback_output_sha256"] == metrics["output_digest"]
+    assert not any(
+        event.get("reason") == "baseline_fallback_after_repetition"
+        for event in metrics["document_skeleton_transformations"]
+    )
+    assert any(
+        event.get("operation") == "selected_document_skeleton"
+        for event in metrics["document_skeleton_transformations"]
+    )
+    assert not any(
+        entry.get("transformation") == "native_emphasis_projection"
+        for entry in audit
+    )
+
+    skeletons = {"marker": build_document_skeleton(artifact, marker_native)}
+    manifest_path = persist_merge_bundle(
+        merged_path=str(tmp_path / "merged.md"),
+        metrics_path=str(tmp_path / "metrics.json"),
+        audit_path=str(tmp_path / "audit.json"),
+        text=merged,
+        metrics=metrics,
+        audit=audit,
+        artifacts={"marker": artifact},
+        skeletons=skeletons,
+        expected_contract_id=Config.MERGE_CONTRACT_ID,
+    )
+    assert Path(manifest_path).is_file()
 
 
 def test_explicit_marker_emphasis_projects_onto_one_exact_plain_target():
