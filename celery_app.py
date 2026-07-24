@@ -1503,6 +1503,8 @@ def _run_extraction(
                 expected_pdf_sha256=sha256_file(pdf_path),
             )
         )
+        # Persistence replay must use skeletons built from the same native inputs
+        # that merge_source_artifacts receives below.
         runtime_skeletons = {}
         for source, artifact in sorted(source_artifacts.items()):
             try:
