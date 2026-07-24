@@ -4914,6 +4914,58 @@ def project_native_emphasis(
     )
 
 
+def reconcile_native_emphasis_fallback(
+    text: str,
+    skeletons: Mapping[SourceName, DocumentSkeleton],
+    artifacts: Mapping[SourceName, SourceArtifact],
+    *,
+    reason: str,
+) -> list[dict]:
+    """Close every style claim when a late fallback replaces the styled output.
+
+    Projection receipts from the rejected output cannot describe the complete
+    source that is ultimately delivered.  A fallback therefore records every
+    claim as conservatively declined and binds that ledger to the actual output.
+    It never modifies publication text or re-runs the projection that triggered
+    the fallback.
+    """
+
+    inventory = _projection_claim_inventory(skeletons, artifacts)
+    output_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    events = []
+    for source in sorted(inventory.donors):
+        claims = [
+            *(claim for donor in inventory.donors[source] for claim in donor.claims),
+            *(claim for claim, _unplaced_reason in inventory.unplaced[source]),
+        ]
+        for claim in sorted(claims, key=lambda item: item.claim_id):
+            events.append(
+                {
+                    "operation": "native_emphasis_projection",
+                    "audit_span_emitted": False,
+                    "phase": "result",
+                    "outcome": "declined",
+                    "reason": reason,
+                    "reconciliation_method": (
+                        "baseline-fallback-style-ledger-v1"
+                    ),
+                    "fallback_output_sha256": output_digest,
+                    "donor_source": source,
+                    "donor_occurrence_id": claim.original_occurrence_id,
+                    "native_emphasis_occurrence_id": claim.span.occurrence_id,
+                    "native_evidence_kind": claim.evidence_kind,
+                    "protected_claim": claim.protected,
+                    "positive_style_claim_id": claim.claim_id,
+                    "direct_native_donor": (
+                        claim.source_unit_id.startswith("native:")
+                        or claim.placement_kind
+                        == "native_text_donor_character_alignment"
+                    ),
+                }
+            )
+    return events
+
+
 _TITLE_FRONT_HEADING_LIMIT = 12
 _TITLE_FRONT_TEXT_LIMIT = 3000
 
