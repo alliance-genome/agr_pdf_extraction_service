@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import app.services.merge_service as merge_service_module
 from app.services.merge_service import (
     BoundedCandidateSelector,
     completion_evidence_for_finished_artifacts,
@@ -22,7 +23,7 @@ from app.services.source_contracts import (
 )
 from app.services.llm_service import CandidateSelectionFailure
 from app.services.document_skeleton import NativeStructureArtifact, build_document_skeleton
-from app.services.merge_artifact import validate_merge_artifacts
+from app.services.merge_artifact import persist_merge_bundle, validate_merge_artifacts
 from config import Config
 from app.services.page_coverage import (
     PAGE_COVERAGE_METHOD,
@@ -448,6 +449,123 @@ def test_baseline_retained_native_italics_reconcile_without_replacement():
     assert receipt["canonical_output_emphasis_interval_count"] == 1
     assert receipt["auxiliary_positive_emphasis_count"] == 0
     assert receipt["all_native_body_italics_retained"] is True
+
+
+def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(
+    monkeypatch,
+    tmp_path,
+):
+    marker = "# Title\n\n## Results\n\nGene dpp is active.\n"
+    artifact = SourceArtifact.from_text("marker", marker)
+    marker_native = NativeStructureArtifact.for_test(
+        "marker",
+        artifact,
+        json.dumps({
+            "block_type": "Document",
+            "children": [{
+                "block_type": "Page",
+                "children": [
+                    {
+                        "id": "/page/0/Title/0",
+                        "block_type": "Title",
+                        "html": "<h1>Title</h1>",
+                    },
+                    {
+                        "id": "/page/0/SectionHeader/1",
+                        "block_type": "SectionHeader",
+                        "html": "<h2>Results</h2>",
+                    },
+                    {
+                        "id": "/page/0/Text/2",
+                        "block_type": "Text",
+                        "html": "<p>Gene <i>dpp</i> is active.</p>",
+                    },
+                ],
+            }],
+        }).encode("utf-8"),
+    )
+    calls = 0
+
+    def repetition_once(_text, _artifacts):
+        nonlocal calls
+        calls += 1
+        return [{"kind": "paragraph"}] if calls == 1 else []
+
+    monkeypatch.setattr(
+        merge_service_module,
+        "repetition_diagnostics_metric",
+        repetition_once,
+    )
+
+    merged, metrics, audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": artifact}
+        ),
+        native_structures={"marker": marker_native},
+        baseline_requirements=FRAGMENT_REQUIREMENTS,
+        benchmark_mode=True,
+    )
+
+    assert merged == marker
+    assert metrics["merge_quality"] == "baseline_fallback"
+    assert "rendered_output_rejected:excess_repetition" in metrics["warnings"]
+    assert metrics["repetition_diagnostics"] == []
+    receipt = metrics["italic_preservation"]
+    assert receipt["native_body_emphasis_count"] == 1
+    assert receipt["retained_native_body_emphasis_count"] == 0
+    assert receipt["native_body_exclusion_reason_counts"] == {
+        "baseline_fallback_after_repetition": 1
+    }
+    fallback_events = [
+        event
+        for event in metrics["document_skeleton_transformations"]
+        if event.get("reconciliation_method")
+        == "baseline-fallback-style-ledger-v1"
+    ]
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["outcome"] == "declined"
+    assert fallback_events[0]["fallback_output_sha256"] == metrics["output_digest"]
+    assert not any(
+        entry.get("transformation") == "native_emphasis_projection"
+        for entry in audit
+    )
+    skeletons = {"marker": build_document_skeleton(artifact, marker_native)}
+    manifest_path = persist_merge_bundle(
+        merged_path=str(tmp_path / "merged.md"),
+        metrics_path=str(tmp_path / "metrics.json"),
+        audit_path=str(tmp_path / "audit.json"),
+        text=merged,
+        metrics=metrics,
+        audit=audit,
+        artifacts={"marker": artifact},
+        skeletons=skeletons,
+        expected_contract_id=Config.MERGE_CONTRACT_ID,
+    )
+    assert Path(manifest_path).is_file()
+
+    tampered = copy.deepcopy(metrics)
+    next(
+        event
+        for event in tampered["document_skeleton_transformations"]
+        if event.get("reconciliation_method")
+        == "baseline-fallback-style-ledger-v1"
+    )["fallback_output_sha256"] = "0" * 64
+    with pytest.raises(
+        ValueError,
+        match="fallback style reconciliation replay failed",
+    ):
+        validate_merge_artifacts(
+            merged,
+            tampered,
+            audit,
+            artifacts={"marker": artifact},
+            expected_contract_id=Config.MERGE_CONTRACT_ID,
+            skeletons=skeletons,
+        )
 
 
 def test_explicit_marker_emphasis_projects_onto_one_exact_plain_target():
