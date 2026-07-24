@@ -1236,6 +1236,7 @@ def persist_merge_bundle(
     metrics: Mapping,
     audit: Sequence[Mapping],
     artifacts: Mapping[SourceName, SourceArtifact],
+    skeletons: Mapping[SourceName, DocumentSkeleton],
     expected_contract_id: str,
     alias_path: str | None = None,
 ) -> str:
@@ -1247,6 +1248,7 @@ def persist_merge_bundle(
         audit,
         artifacts=artifacts,
         expected_contract_id=expected_contract_id,
+        skeletons=skeletons,
     )
     merged_bytes = text.encode("utf-8")
     metrics_bytes = _json_bytes(dict(metrics))

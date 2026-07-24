@@ -1657,6 +1657,7 @@ def _run_extraction(
                     metrics=consensus_metrics,
                     audit=consensus_audit or [],
                     artifacts=source_artifacts,
+                    skeletons=runtime_skeletons,
                     expected_contract_id=Config.MERGE_CONTRACT_ID,
                     alias_path=merged_alias_path,
                 )

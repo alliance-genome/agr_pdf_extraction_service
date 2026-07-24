@@ -23,7 +23,7 @@ from app.services.source_contracts import (
 )
 from app.services.llm_service import CandidateSelectionFailure
 from app.services.document_skeleton import NativeStructureArtifact, build_document_skeleton
-from app.services.merge_artifact import validate_merge_artifacts
+from app.services.merge_artifact import persist_merge_bundle, validate_merge_artifacts
 from config import Config
 from app.services.page_coverage import (
     PAGE_COVERAGE_METHOD,
@@ -451,7 +451,10 @@ def test_baseline_retained_native_italics_reconcile_without_replacement():
     assert receipt["all_native_body_italics_retained"] is True
 
 
-def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(monkeypatch):
+def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(
+    monkeypatch,
+    tmp_path,
+):
     marker = "# Title\n\n## Results\n\nGene dpp is active.\n"
     artifact = SourceArtifact.from_text("marker", marker)
     marker_native = NativeStructureArtifact.for_test(
@@ -530,6 +533,19 @@ def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(monkeypat
         entry.get("transformation") == "native_emphasis_projection"
         for entry in audit
     )
+    skeletons = {"marker": build_document_skeleton(artifact, marker_native)}
+    manifest_path = persist_merge_bundle(
+        merged_path=str(tmp_path / "merged.md"),
+        metrics_path=str(tmp_path / "metrics.json"),
+        audit_path=str(tmp_path / "audit.json"),
+        text=merged,
+        metrics=metrics,
+        audit=audit,
+        artifacts={"marker": artifact},
+        skeletons=skeletons,
+        expected_contract_id=Config.MERGE_CONTRACT_ID,
+    )
+    assert Path(manifest_path).is_file()
 
     tampered = copy.deepcopy(metrics)
     next(
@@ -548,7 +564,7 @@ def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(monkeypat
             audit,
             artifacts={"marker": artifact},
             expected_contract_id=Config.MERGE_CONTRACT_ID,
-            skeletons={"marker": build_document_skeleton(artifact, marker_native)},
+            skeletons=skeletons,
         )
 
 

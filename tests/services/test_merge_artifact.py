@@ -390,6 +390,10 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
         metrics=metrics,
         audit=audit,
         artifacts=artifacts,
+        skeletons={
+            source: build_document_skeleton(artifact, None)
+            for source, artifact in artifacts.items()
+        },
         expected_contract_id=CONTRACT_ID,
     )
     assert manifest == bundle_manifest_path(merged)
@@ -473,7 +477,12 @@ def test_manifest_binds_the_exact_source_generation(tmp_path):
     persist_merge_bundle(
         merged_path=str(merged), metrics_path=str(metric_file),
         audit_path=str(audit_file), text=text, metrics=metrics, audit=audit,
-        artifacts=artifacts, expected_contract_id=CONTRACT_ID,
+        artifacts=artifacts,
+        skeletons={
+            source: build_document_skeleton(artifact, None)
+            for source, artifact in artifacts.items()
+        },
+        expected_contract_id=CONTRACT_ID,
     )
     newer = {"grobid": SourceArtifact.from_text("grobid", text + "changed")}
     with pytest.raises(ValueError, match="source digest"):
@@ -492,7 +501,13 @@ def test_alias_commit_is_digest_checked(tmp_path):
     manifest = persist_merge_bundle(
         merged_path=str(merged), metrics_path=str(tmp_path / "metrics.json"),
         audit_path=str(tmp_path / "audit.json"), text=text, metrics=metrics,
-        audit=audit, artifacts=artifacts, expected_contract_id=CONTRACT_ID,
+        audit=audit,
+        artifacts=artifacts,
+        skeletons={
+            source: build_document_skeleton(artifact, None)
+            for source, artifact in artifacts.items()
+        },
+        expected_contract_id=CONTRACT_ID,
     )
     alias = tmp_path / "alias.md"
     persist_merge_alias(str(alias), text, metrics, bundle_manifest_path=manifest)
@@ -517,6 +532,10 @@ def test_alias_commit_requires_its_exact_bundle_manifest(tmp_path, mutation):
         metrics=metrics,
         audit=audit,
         artifacts=artifacts,
+        skeletons={
+            source: build_document_skeleton(artifact, None)
+            for source, artifact in artifacts.items()
+        },
         expected_contract_id=CONTRACT_ID,
     )
     alias = tmp_path / "alias.md"
