@@ -329,6 +329,7 @@ def test_get_extraction_status_falls_back_to_celery_when_db_row_missing(client):
 
     assert response.status_code == 200
     payload = response.get_json()
+    assert set(payload) == {"process_id", "status"}
     assert payload["process_id"] == unknown_id
     assert payload["status"] == "pending"
 
