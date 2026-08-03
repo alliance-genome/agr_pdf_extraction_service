@@ -720,6 +720,92 @@ class TestExtractStatusEndpoint:
         assert resp.json()["status"] == "running"
         main_mod.lifecycle.touch.assert_called_once()
 
+    def test_unknown_backend_pending_does_not_create_active_tracker(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "unknown-pending-job"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+
+        class _DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                # Celery reports PENDING for both queued and unknown task IDs.
+                return {"process_id": process_id, "status": "pending"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "pending"
+        assert process_id not in main_mod.job_trackers
+        assert main_mod._active_backend_jobs() == 0
+        main_mod.lifecycle.touch.assert_not_called()
+
+    def test_database_backed_pending_remains_tracked(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "database-pending-job"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+
+        class _DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "process_id": process_id,
+                    "status": "pending",
+                    "started_at": None,
+                    "artifacts_json": None,
+                }
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _DummyResponse()
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "pending"
+        assert main_mod.job_trackers[process_id].status == "pending"
+        assert main_mod._active_backend_jobs() == 1
+        main_mod.lifecycle.touch.assert_called_once()
+
     def test_replay_submission_error_returns_failed(self, client, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.READY
@@ -1500,6 +1586,62 @@ class TestExtractCancelEndpoint:
         assert main_mod.job_trackers[process_id].status == "running"
         assert main_mod.job_trackers[process_id].last_progress_at > 0
         assert main_mod._active_backend_jobs() == 1
+
+    def test_reconciler_expires_unchanged_pending_status(self, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "phantom-pending-job"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="pending",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_signature="pending||None",
+            last_progress_at=0,
+        )
+
+        class _DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"process_id": process_id, "status": "pending"}
+
+        class _DummyClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, _url):
+                return _DummyResponse()
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.httpx, "AsyncClient", _DummyClient)
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+        monkeypatch.setattr(main_mod.settings, "HEALTHCHECK_BEARER_TOKEN", "")
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert "Progress monitoring timeout" in main_mod.replay_submission_errors[process_id]
+        assert main_mod.job_trackers[process_id].status == "failed"
+        assert main_mod._active_backend_jobs() == 0
 
     def test_reconciler_clears_stale_job_when_backend_completed(self, monkeypatch):
         import app.main as main_mod

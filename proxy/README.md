@@ -105,6 +105,13 @@ payload has entered the proxy queue/cache.
 
 Returns granular progress through the extraction pipeline:
 
+Celery reports `PENDING` for both a queued task and an unknown task ID. The
+proxy therefore returns an untracked backend `pending` response to the caller
+without treating that arbitrary ID as active work. Known submitted jobs remain
+tracked. An unchanged bare `pending` fallback cannot renew the reconciler's
+stale deadline, while database-backed queued jobs and concrete running/progress
+states retain their existing protection.
+
 **While EC2 is starting (job queued locally):**
 ```json
 {
