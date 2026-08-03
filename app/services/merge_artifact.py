@@ -25,6 +25,7 @@ from app.services.semantic_payload import SEMANTIC_PAYLOAD_CONTRACT_VERSION
 from app.services.document_skeleton import (
     DocumentSkeleton,
     project_native_emphasis,
+    reconcile_native_emphasis_fallback,
 )
 
 
@@ -669,7 +670,31 @@ def _validate_positive_style_overlay_receipts(
             selected_from_trace = selected_path[0]
         if selected_from_trace != selected_id:
             raise ValueError("positive style numeric choice does not match projection")
-    if skeletons is not None:
+    fallback_events = [
+        event
+        for event in native_events
+        if event.get("reconciliation_method")
+        == "baseline-fallback-style-ledger-v1"
+    ]
+    if fallback_events:
+        if len(fallback_events) != len(native_events) or skeletons is None:
+            raise ValueError("fallback style reconciliation receipt is inconsistent")
+        reasons = {event.get("reason") for event in fallback_events}
+        if len(reasons) != 1 or not all(
+            event.get("outcome") == "declined"
+            and event.get("audit_span_emitted") is False
+            for event in fallback_events
+        ):
+            raise ValueError("fallback style reconciliation receipt is malformed")
+        expected_fallback_events = reconcile_native_emphasis_fallback(
+            output.decode("utf-8", errors="strict"),
+            skeletons,
+            artifacts,
+            reason=next(iter(reasons)),
+        )
+        if expected_fallback_events != native_events:
+            raise ValueError("fallback style reconciliation replay failed")
+    elif skeletons is not None:
         recorded_style_selections: dict[str, dict] = {}
         for event in native_events:
             selection_id = event.get("style_selection_id")
@@ -1211,6 +1236,7 @@ def persist_merge_bundle(
     metrics: Mapping,
     audit: Sequence[Mapping],
     artifacts: Mapping[SourceName, SourceArtifact],
+    skeletons: Mapping[SourceName, DocumentSkeleton],
     expected_contract_id: str,
     alias_path: str | None = None,
 ) -> str:
@@ -1222,6 +1248,7 @@ def persist_merge_bundle(
         audit,
         artifacts=artifacts,
         expected_contract_id=expected_contract_id,
+        skeletons=skeletons,
     )
     merged_bytes = text.encode("utf-8")
     metrics_bytes = _json_bytes(dict(metrics))

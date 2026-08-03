@@ -40,6 +40,7 @@ from app.services.document_skeleton import (
     effective_occurrence_region,
     _projection_claim_inventory,
     project_native_emphasis,
+    reconcile_native_emphasis_fallback,
     render_document_role_slots,
     reconcile_document_transformations,
     render_document_skeleton,
@@ -1389,7 +1390,12 @@ def merge_source_artifacts(
             *finalization_warnings,
         ]
         effective_merge_quality = "baseline_fallback"
-        skeleton_transformations = []
+        skeleton_transformations = reconcile_native_emphasis_fallback(
+            merged_text,
+            skeletons,
+            artifacts,
+            reason="baseline_fallback_after_repetition",
+        )
 
     # Alliance errors are categorically forbidden for every persisted outcome,
     # including the complete-source failsafe.  If the selected merge still has
@@ -1425,6 +1431,15 @@ def merge_source_artifacts(
             *zero_error_warnings,
         ]
         effective_merge_quality = "baseline_fallback"
+        skeleton_transformations = [
+            *skeleton_transformations,
+            *reconcile_native_emphasis_fallback(
+                merged_text,
+                skeletons,
+                artifacts,
+                reason="alliance_error_source_delivery",
+            ),
+        ]
 
     if (
         structural_resolution_failure is not None
