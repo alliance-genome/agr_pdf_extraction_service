@@ -913,6 +913,7 @@ async def get_extraction_status(
 
     # Forward to EC2.
     try:
+        was_tracked = process_id in job_trackers
         backend_process_id = proxy_to_backend_process.get(process_id, process_id)
         headers = {"Authorization": authorization} if authorization else {}
         async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
@@ -930,9 +931,14 @@ async def get_extraction_status(
             if backend_process_id != process_id:
                 # Keep caller-visible process_id stable when replay rewrites backend IDs.
                 payload["process_id"] = process_id
-            _update_tracker_from_payload(process_id, payload)
             status_value = str(payload.get("status", "")).strip().lower()
-            if status_value in ACTIVE_JOB_STATUSES:
+            # Celery uses PENDING for both a real queued task and an unknown ID.
+            # A bare PENDING response must not turn an arbitrary status poll into
+            # proxy-owned active work that blocks the GPU idle-stop guard.
+            ambiguous_unknown_pending = _is_ambiguous_backend_pending(payload) and not was_tracked
+            if not ambiguous_unknown_pending:
+                _update_tracker_from_payload(process_id, payload)
+            if status_value in ACTIVE_JOB_STATUSES and not ambiguous_unknown_pending:
                 lifecycle.touch()
             _mark_terminal_cleanup_if_needed(process_id, payload)
 
@@ -1460,6 +1466,7 @@ async def _refresh_stale_backend_status(process_id: str, tracker: JobTracker, *,
         )
         return False
 
+    previous_progress_at = tracker.last_progress_at
     _update_tracker_from_payload(process_id, payload)
     status = str(payload.get("status", "")).strip().lower()
     if status in TERMINAL_JOB_STATUSES:
@@ -1467,6 +1474,13 @@ async def _refresh_stale_backend_status(process_id: str, tracker: JobTracker, *,
         return True
 
     if status in ACTIVE_JOB_STATUSES:
+        if _is_ambiguous_backend_pending(payload) and tracker.last_progress_at <= previous_progress_at:
+            logger.warning(
+                "job=%s event=ambiguous_pending_still_stale stale_age_seconds=%.0f",
+                process_id,
+                age,
+            )
+            return False
         tracker.last_progress_at = time.time()
         logger.info(
             "job=%s event=backend_still_processing status=%s stale_age_seconds=%.0f",
@@ -1535,6 +1549,12 @@ def _update_tracker_from_payload(process_id: str, payload: dict[str, Any]) -> No
     if signature != tracker.last_progress_signature:
         tracker.last_progress_signature = signature
         tracker.last_progress_at = tracker.last_seen_at
+
+
+def _is_ambiguous_backend_pending(payload: dict[str, Any]) -> bool:
+    """Return whether a response is Celery's bare PENDING/unknown fallback."""
+    status = str(payload.get("status", "")).strip().lower()
+    return status == "pending" and set(payload).issubset({"process_id", "status"})
 
 
 def _mark_terminal_cleanup_if_needed(process_id: str, payload: dict[str, Any]) -> None:

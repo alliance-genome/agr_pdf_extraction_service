@@ -113,6 +113,9 @@ timeout count, backend replacement count, backend state, and active job counts.
 - Failed replay submissions must remove durable queue metadata before exposing
   terminal status; otherwise status polling may keep reporting `queued` and the
   idle stop guard may see phantom work.
+- Celery `PENDING` means either queued or unknown. An untracked status poll that
+  receives bare `pending` must not create active proxy work, and an unchanged
+  bare `pending` fallback must not renew the reconciler progress deadline.
 - Backend `worker_not_ready` with healthy EC2 status checks usually means the
   application stack is still starting, not hardware failure.
 - If host `nvidia-smi` works but `torch.cuda.is_available()` is false inside
