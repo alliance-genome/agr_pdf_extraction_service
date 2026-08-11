@@ -33,15 +33,20 @@ class EC2Manager:
 
     def get_instance_state(self) -> tuple[str, str | None]:
         """Return (state_name, private_ip) for the managed backend."""
+        state, private_ip, _instance_id = self.get_instance_snapshot()
+        return state, private_ip
+
+    def get_instance_snapshot(self) -> tuple[str, str | None, str | None]:
+        """Return one coherent (state, private_ip, instance_id) observation."""
         if self.uses_auto_scaling:
-            return self._get_asg_instance_state()
+            return self._get_asg_instance_snapshot()
 
         resp = self._client.describe_instances(InstanceIds=[self._instance_id])
         inst = resp["Reservations"][0]["Instances"][0]
         state = inst["State"]["Name"]
         ip = inst.get("PrivateIpAddress")
         self._current_instance_id = self._instance_id
-        return state, ip
+        return state, ip, self._instance_id
 
     def start_instance(self) -> None:
         if self.uses_auto_scaling:
@@ -55,20 +60,38 @@ class EC2Manager:
         logger.info("Starting EC2 instance %s", self._instance_id)
         self._client.start_instances(InstanceIds=[self._instance_id])
 
-    def stop_instance(self) -> None:
+    def stop_instance(self, expected_instance_id: str) -> bool:
+        """Stop only the explicitly expected current backend instance.
+        """
         if self.uses_auto_scaling:
+            _state, _ip, current_instance_id = self.get_instance_snapshot()
+            if current_instance_id != expected_instance_id:
+                logger.warning(
+                    "Refusing to scale backend ASG to zero: expected instance %s, current instance %s",
+                    expected_instance_id,
+                    current_instance_id,
+                )
+                return False
             logger.info("Scaling backend Auto Scaling group %s to desired capacity 0", self._asg_name)
             self._autoscaling.set_desired_capacity(
                 AutoScalingGroupName=self._asg_name,
                 DesiredCapacity=0,
             )
             self._current_instance_id = None
-            return
+            return True
 
+        if expected_instance_id != self._instance_id:
+            logger.warning(
+                "Refusing to stop legacy backend: expected instance %s, configured instance %s",
+                expected_instance_id,
+                self._instance_id,
+            )
+            return False
         logger.info("Stopping EC2 instance %s", self._instance_id)
         self._client.stop_instances(InstanceIds=[self._instance_id])
+        return True
 
-    def mark_unhealthy(self) -> bool:
+    def mark_unhealthy(self, expected_instance_id: str) -> bool:
         """Ask Auto Scaling to replace the current backend instance.
 
         Returns True when a replacement signal was sent. Legacy single-instance
@@ -78,16 +101,21 @@ class EC2Manager:
             logger.warning("Backend startup failed in legacy EC2 mode; no Auto Scaling replacement is available")
             return False
 
-        instance_id = self._current_instance_id
-        if not instance_id:
-            try:
-                self.get_instance_state()
-                instance_id = self._current_instance_id
-            except Exception as exc:
-                logger.warning("Could not resolve ASG instance to mark unhealthy: %s", exc)
+        try:
+            _state, _ip, instance_id = self.get_instance_snapshot()
+        except Exception as exc:
+            logger.warning("Could not resolve ASG instance to mark unhealthy: %s", exc)
+            return False
 
         if not instance_id:
             logger.warning("No ASG backend instance is available to mark unhealthy")
+            return False
+        if instance_id != expected_instance_id:
+            logger.warning(
+                "Refusing stale backend replacement request: expected instance %s, current instance %s",
+                expected_instance_id,
+                instance_id,
+            )
             return False
 
         logger.error(
@@ -101,7 +129,7 @@ class EC2Manager:
         )
         return True
 
-    def _get_asg_instance_state(self) -> tuple[str, str | None]:
+    def _get_asg_instance_snapshot(self) -> tuple[str, str | None, str | None]:
         resp = self._autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[self._asg_name])
         groups = resp.get("AutoScalingGroups", [])
         if not groups:
@@ -116,7 +144,7 @@ class EC2Manager:
         if not instances:
             desired = int(group.get("DesiredCapacity", 0))
             self._current_instance_id = None
-            return ("stopped" if desired == 0 else "pending", None)
+            return ("stopped" if desired == 0 else "pending", None, None)
 
         def _priority(asg_instance):
             lifecycle = asg_instance.get("LifecycleState", "")
@@ -133,4 +161,4 @@ class EC2Manager:
         inst = ec2_resp["Reservations"][0]["Instances"][0]
         state = inst["State"]["Name"]
         ip = inst.get("PrivateIpAddress")
-        return state, ip
+        return state, ip, instance_id

@@ -1,6 +1,7 @@
 import io
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -120,6 +121,141 @@ def test_submit_extraction_honors_client_supplied_process_id(mock_apply_async, c
     assert run is not None
     assert run.status == "queued"
     session.close()
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_duplicate_submission_reuses_existing_process_without_republishing(mock_apply_async, client):
+    process_id = str(uuid.uuid4())
+    mock_apply_async.return_value = SimpleNamespace(id=process_id)
+
+    first = client.post(
+        "/api/v1/extract",
+        data={"file": (io.BytesIO(b"%PDF first"), "first.pdf"), "process_id": process_id},
+        content_type="multipart/form-data",
+    )
+    second = client.post(
+        "/api/v1/extract",
+        data={"file": (io.BytesIO(b"%PDF duplicate"), "duplicate.pdf"), "process_id": process_id},
+        content_type="multipart/form-data",
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.get_json()["process_id"] == process_id
+    assert second.get_json()["status"] == "pending"
+    assert mock_apply_async.call_count == 1
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_concurrent_duplicate_submissions_have_one_publisher(mock_apply_async, tmp_path, monkeypatch):
+    process_id = str(uuid.uuid4())
+    mock_apply_async.return_value = SimpleNamespace(id=process_id)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'submissions.db'}")
+    monkeypatch.setenv("AUDIT_S3_BUCKET", "test-bucket")
+    reset_db_engine()
+    Base.metadata.create_all(bind=get_engine())
+    app = create_app()
+    app.config.update(
+        TESTING=True,
+        UPLOAD_FOLDER=str(tmp_path / "uploads"),
+        AUDIT_S3_BUCKET="test-bucket",
+        AUDIT_S3_BUCKET_SSM_PARAM="",
+    )
+
+    def _submit(label):
+        with app.test_client() as thread_client:
+            return thread_client.post(
+                "/api/v1/extract",
+                data={
+                    "file": (io.BytesIO(f"%PDF {label}".encode()), f"{label}.pdf"),
+                    "process_id": process_id,
+                },
+                content_type="multipart/form-data",
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(_submit, ("first", "second")))
+
+    assert sorted(response.status_code for response in responses) == [202, 202]
+    assert mock_apply_async.call_count == 1
+    reset_db_engine()
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_terminal_duplicate_submission_returns_existing_failure(mock_apply_async, client):
+    process_id = str(uuid.uuid4())
+    session = get_session()
+    session.add(
+        ExtractionRun(
+            process_id=process_id,
+            status="failed",
+            error_code="ValueError",
+            error_message="deterministic markup provenance is invalid",
+            ended_at=datetime.now(timezone.utc),
+        )
+    )
+    session.commit()
+    session.close()
+
+    response = client.post(
+        "/api/v1/extract",
+        data={"file": (io.BytesIO(b"%PDF duplicate"), "duplicate.pdf"), "process_id": process_id},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["status"] == "failed"
+    assert response.get_json()["error"] == "deterministic markup provenance is invalid"
+    mock_apply_async.assert_not_called()
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_publish_failure_leaves_reclaimable_submission_claim(mock_apply_async, client):
+    process_id = str(uuid.uuid4())
+    mock_apply_async.side_effect = [ConnectionError("Redis unavailable"), SimpleNamespace(id=process_id)]
+
+    failed = client.post(
+        "/api/v1/extract",
+        data={"file": (io.BytesIO(b"%PDF first"), "first.pdf"), "process_id": process_id},
+        content_type="multipart/form-data",
+    )
+    retried = client.post(
+        "/api/v1/extract",
+        data={"file": (io.BytesIO(b"%PDF retry"), "retry.pdf"), "process_id": process_id},
+        content_type="multipart/form-data",
+    )
+
+    assert failed.status_code == 503
+    assert retried.status_code == 202
+    assert mock_apply_async.call_count == 2
+    session = get_session()
+    assert session.get(ExtractionRun, process_id).status == "queued"
+    session.close()
+
+
+@patch("celery_app.extract_pdf.apply_async")
+def test_stale_prepublish_claim_can_be_recovered(mock_apply_async, client, monkeypatch):
+    process_id = str(uuid.uuid4())
+    monkeypatch.setattr("app.api.Config.SUBMISSION_CLAIM_STALE_SECONDS", 30)
+    session = get_session()
+    session.add(
+        ExtractionRun(
+            process_id=process_id,
+            status="submitting",
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=31),
+        )
+    )
+    session.commit()
+    session.close()
+
+    response = client.post(
+        "/api/v1/extract",
+        data={"file": (io.BytesIO(b"%PDF retry"), "retry.pdf"), "process_id": process_id},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 202
+    mock_apply_async.assert_called_once()
 
 
 def test_submit_extraction_rejects_invalid_client_process_id(client):
@@ -264,10 +400,19 @@ def test_submit_extraction_returns_503_when_enqueue_fails(mock_apply_async, clie
     payload = response.get_json()
     assert "enqueue" in payload["error"].lower() or "redis" in payload["error"].lower()
 
-    # No orphan DB row should exist
+    # Keep the failed pre-publish claim so a retry using this stable process ID
+    # can reclaim it without racing another publisher.
     session = get_session()
-    assert session.query(ExtractionRun).count() == 0
+    run = session.query(ExtractionRun).one()
+    assert run.status == "submission_failed"
+    assert run.error_code == "publish_failed"
+    process_id = str(run.process_id)
     session.close()
+
+    status_response = client.get(f"/api/v1/extract/{process_id}")
+    assert status_response.status_code == 200
+    assert status_response.get_json()["status"] == "failed"
+    assert status_response.get_json()["error_code"] == "publish_failed"
 
 
 def test_get_extraction_status_prefers_db(client):
@@ -748,6 +893,42 @@ def test_cancel_extraction_returns_409_for_terminal_job(mock_revoke, client):
     mock_revoke.assert_not_called()
 
 
+@patch("celery_app.celery.control.revoke")
+@patch("app.api._mark_run_cancelled", return_value=False)
+@patch("app.api._get_run_by_process_id")
+def test_cancel_race_returns_first_committed_terminal_state(mock_get_run, _mock_cancel, mock_revoke, client):
+    process_id = str(uuid.uuid4())
+    mock_get_run.side_effect = [
+        {"process_id": process_id, "status": "running"},
+        {"process_id": process_id, "status": "succeeded"},
+    ]
+
+    response = client.post(f"/api/v1/extract/{process_id}/cancel")
+
+    assert response.status_code == 409
+    assert response.get_json()["status"] == "complete"
+    mock_revoke.assert_called_once()
+
+
+@patch("celery_app.celery.control.revoke")
+@patch("app.api._mark_run_cancelled", return_value=False)
+@patch("app.api._get_run_by_process_id")
+def test_cancel_write_failure_remains_nonterminal(mock_get_run, _mock_cancel, mock_revoke, client):
+    process_id = str(uuid.uuid4())
+    running = {"process_id": process_id, "status": "running"}
+    mock_get_run.side_effect = [running, running]
+
+    response = client.post(f"/api/v1/extract/{process_id}/cancel")
+
+    assert response.status_code == 202
+    assert response.get_json() == {
+        "process_id": process_id,
+        "status": "cancel_requested",
+        "message": "Cancellation requested; authoritative terminal state is pending.",
+    }
+    mock_revoke.assert_called_once()
+
+
 def test_get_extraction_status_maps_revoked_to_cancelled(client):
     process_id = str(uuid.uuid4())
 
@@ -1028,8 +1209,8 @@ def test_merged_download_uses_durable_db_artifact_after_celery_result_expires(
 
 @patch("celery_app.extract_pdf.apply_async")
 @patch("app.api._get_db_session", return_value=None)
-def test_submit_extraction_works_when_db_unavailable(mock_db_session, mock_apply_async, client):
-    """Core extraction should still enqueue even if the DB is completely unavailable."""
+def test_submit_extraction_fails_closed_when_idempotency_db_is_unavailable(mock_db_session, mock_apply_async, client):
+    """Publishing without the RDS ownership claim would permit duplicates."""
     mock_apply_async.return_value = SimpleNamespace(id="process-id-placeholder")
 
     response = client.post(
@@ -1038,10 +1219,8 @@ def test_submit_extraction_works_when_db_unavailable(mock_db_session, mock_apply
         content_type="multipart/form-data",
     )
 
-    assert response.status_code == 202
-    payload = response.get_json()
-    assert "process_id" in payload
-    mock_apply_async.assert_called_once()
+    assert response.status_code == 503
+    mock_apply_async.assert_not_called()
 
 
 @patch("app.api.build_s3_client")

@@ -1,7 +1,8 @@
 fastapi
 uvicorn[standard]
 httpx
-boto3
+boto3>=1.43.68,<2
+psycopg2-binary>=2.9.10,<3
 PyJWT[crypto]
 cryptography
 requests

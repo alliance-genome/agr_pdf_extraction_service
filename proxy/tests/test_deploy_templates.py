@@ -141,6 +141,24 @@ def test_proxy_idle_timeout_defaults_to_two_hours():
     assert 'Default: "120"' in stack_text
 
 
+def test_review_operational_limits_are_in_proxy_task_templates():
+    task_template = json.loads(
+        (Path(__file__).resolve().parents[1] / "deploy" / "task-definition.template.json").read_text()
+    )
+    environment = {
+        item["name"]: item["value"]
+        for item in task_template["containerDefinitions"][0]["environment"]
+    }
+    stack_text = (
+        Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-stack.yaml"
+    ).read_text()
+
+    assert environment["REPLAY_RETRY_DELAY_SECONDS"] == "30"
+    assert environment["SHARED_RUNNING_MAX_AGE_MINUTES"] == "60"
+    assert "Name: REPLAY_RETRY_DELAY_SECONDS" in stack_text
+    assert "Name: SHARED_RUNNING_MAX_AGE_MINUTES" in stack_text
+
+
 def test_backend_deploy_supports_prebuilt_gpu_image():
     script_path = Path(__file__).resolve().parents[2] / "deploy" / "deploy.sh"
     script = script_path.read_text()
@@ -195,6 +213,7 @@ def test_deploy_script_supports_environment_scoped_resources():
     assert '"${AWS_CMD[@]}" ssm get-parameter' in script
     assert "read_optional_param()" in script
     assert 'ensure_ssm_param "${SSM_PREFIX}/asg-startup-replacement-attempts" "1"' in script
+    assert 'require_ssm_param "${SSM_PREFIX}/database-url"' in script
     assert 'if $DRY_RUN; then' in script
     assert "Would create placeholder SSM parameter" in script
     assert '"minimumHealthyPercent":100' in script
@@ -382,6 +401,12 @@ def test_task_definition_is_environment_parameterized():
     assert container["name"] == "${CONTAINER_NAME}"
     assert {"name": "QUEUE_S3_PREFIX", "value": "${QUEUE_S3_PREFIX}"} in container["environment"]
     assert {"name": "QUEUE_S3_REGION", "value": "${QUEUE_S3_REGION}"} in container["environment"]
+    assert {"name": "QUEUE_CLAIM_TTL_SECONDS", "value": "900"} in container["environment"]
+    assert {"name": "ACCEPTED_STATUS_RETENTION_SECONDS", "value": "604800"} in container["environment"]
+    assert {"name": "ACCEPTED_CLEANUP_BATCH_SIZE", "value": "25"} in container["environment"]
+    assert {"name": "STATUS_DB_TIMEOUT_SECONDS", "value": "5"} in container["environment"]
+    assert {"name": "STATUS_ERROR_MESSAGE_MAX_CHARS", "value": "4000"} in container["environment"]
+    assert {"name": "PROXY_SHUTDOWN_GRACE_SECONDS", "value": "90"} in container["environment"]
     assert {"name": "MAX_UPLOAD_BYTES", "value": "524288000"} in container["environment"]
     assert {"name": "MAX_MULTIPART_OVERHEAD_BYTES", "value": "10485760"} in container["environment"]
     assert container["secrets"][0]["valueFrom"].startswith("${SSM_PREFIX}/")
@@ -390,6 +415,8 @@ def test_task_definition_is_environment_parameterized():
         "name": "ASG_STARTUP_REPLACEMENT_ATTEMPTS",
         "valueFrom": "${SSM_PREFIX}/asg-startup-replacement-attempts",
     } in container["secrets"]
+    assert {"name": "STATUS_DATABASE_URL", "valueFrom": "${SSM_PREFIX}/database-url"} in container["secrets"]
+    assert container["stopTimeout"] == 120
     assert container["logConfiguration"]["options"]["awslogs-group"] == "${LOG_GROUP}"
 
 
@@ -433,6 +460,8 @@ def test_iam_policy_is_environment_parameterized_and_allows_image_tags():
     assert "ecr:GetDownloadUrlForLayer" in stack_text
     assert "repository/${BackendImageRepositoryName}" in stack_text
     assert "QueueRetentionDays" in stack_text
-    assert "pdfx-expire-proxy-queue" in stack_text
+    assert "pdfx-expire-proxy-queue-jobs" in stack_text
+    assert "pdfx-expire-proxy-queue-payloads" in stack_text
+    assert "pdfx-expire-proxy-queue-claims" in stack_text
     assert "ProxyTaskEphemeralStorageGiB" in stack_text
     assert "EphemeralStorage:" in stack_text

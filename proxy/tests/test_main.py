@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 
 from app.state_machine import InstanceState
 
@@ -28,6 +29,7 @@ def _patch_singletons(monkeypatch):
     mock_lifecycle.state = InstanceState.STOPPED
     mock_lifecycle.idle_seconds = 0.0
     mock_lifecycle.active_jobs = 0
+    mock_lifecycle.stale_monitor_exits_total = 0
     mock_lifecycle.private_ip = None
     mock_lifecycle.ensure_running = AsyncMock()
     mock_lifecycle.sync_state_from_ec2 = AsyncMock()
@@ -48,6 +50,7 @@ def _patch_singletons(monkeypatch):
     main_mod.pending_cancel_requests.clear()
     main_mod.cancelled_jobs.clear()
     main_mod.job_trackers.clear()
+    main_mod.accepting_queue_claims = True
 
 
 @pytest.fixture
@@ -57,6 +60,27 @@ def client():
 
 
 class TestHealthEndpoint:
+    def test_replacement_guard_requires_reachable_shared_zero_work(self, monkeypatch):
+        import app.main as main_mod
+
+        lookup = MagicMock(side_effect=[(True, True), (False, None), (True, False)])
+        monkeypatch.setattr(main_mod.status_reader, "_database_url", "postgresql://configured")
+        monkeypatch.setattr(main_mod.status_reader, "has_active_work", lookup)
+
+        assert main_mod._can_replace_backend() is False
+        assert main_mod._can_replace_backend() is False
+        assert main_mod._can_replace_backend() is True
+
+    def test_replacement_guard_preserves_legacy_behavior_without_direct_reader(self, monkeypatch):
+        import app.main as main_mod
+
+        monkeypatch.setattr(main_mod.status_reader, "_database_url", "")
+        lookup = MagicMock()
+        monkeypatch.setattr(main_mod.status_reader, "has_active_work", lookup)
+
+        assert main_mod._can_replace_backend() is True
+        lookup.assert_not_called()
+
     def test_health_live_returns_ok(self, client):
         resp = client.get("/api/v1/health/live")
         assert resp.status_code == 200
@@ -262,7 +286,7 @@ class TestExtractEndpoint:
         assert main_mod.job_queue.size == 0
         main_mod.lifecycle.ensure_running.assert_not_called()
 
-    def test_extract_requeues_when_immediate_forward_fails(self, client, monkeypatch):
+    def test_extract_retains_durable_queue_when_first_handoff_is_transient(self, client, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.READY
         main_mod.lifecycle.sync_state_from_ec2 = AsyncMock()
@@ -282,10 +306,11 @@ class TestExtractEndpoint:
         data = resp.json()
         assert data["status"] == "queued"
         assert data["progress"]["stage"] in {"queued", "ec2_starting"}
-        main_mod.lifecycle.sync_state_from_ec2.assert_called_once()
-        main_mod.lifecycle.ensure_running.assert_called()
+        main_mod.lifecycle.sync_state_from_ec2.assert_not_called()
+        assert main_mod.job_queue.has_job(data["process_id"]) is True
+        assert data["process_id"] in main_mod.job_payload_cache
 
-    def test_extract_non_retriable_error_clears_cached_payload(self, client, monkeypatch):
+    def test_extract_permanent_rejection_is_recorded_after_durable_handoff(self, client, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.READY
         main_mod.job_payload_cache.clear()
@@ -295,6 +320,7 @@ class TestExtractEndpoint:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         monkeypatch.setattr(main_mod, "_forward_extraction", _forward_unauthorized)
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", lambda: None)
 
         resp = client.post(
             "/api/v1/extract",
@@ -303,9 +329,16 @@ class TestExtractEndpoint:
             data={"methods": "grobid,docling,marker", "merge": "true"},
         )
 
-        assert resp.status_code == 401
-        assert main_mod.job_payload_cache == {}
-        assert main_mod.job_trackers == {}
+        assert resp.status_code == 202
+        process_id = resp.json()["process_id"]
+        asyncio.run(main_mod._replay_when_ready())
+        status = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert status.status_code == 200
+        assert status.json()["status"] == "failed"
+        assert status.json()["error"] == "Unauthorized"
 
     def test_extract_queue_full_on_retry_clears_cached_payload(self, client, monkeypatch):
         from app.job_queue import QueueFullError
@@ -651,6 +684,183 @@ class TestExtractStatusEndpoint:
         main_mod.lifecycle.touch.assert_not_called()
         main_mod.lifecycle.ensure_running.assert_not_called()
 
+    def test_fresh_proxy_returns_pending_for_durably_accepted_job_when_rds_unreachable(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-after-rollout"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.record_accepted(process_id)
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(False, None)),
+        )
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["process_id"] == process_id
+        assert resp.json()["status"] == "pending"
+        assert "temporarily unavailable" in resp.json()["message"].lower()
+        main_mod.lifecycle.ensure_running.assert_not_called()
+
+    def test_fresh_proxy_returns_authoritative_terminal_failure_without_gpu_wake(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-failed-after-rollout"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.record_accepted(process_id)
+        authoritative = {
+            "process_id": process_id,
+            "status": "failed",
+            "error_code": "ValueError",
+            "error": "deterministic markup provenance is invalid",
+            "started_at": "2026-08-03T16:00:01Z",
+            "ended_at": "2026-08-03T16:44:00Z",
+        }
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, authoritative)),
+        )
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == authoritative
+        main_mod.lifecycle.ensure_running.assert_not_called()
+
+    def test_authoritative_nonterminal_job_returns_live_backend_progress(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-live-progress"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.job_queue.record_accepted(process_id)
+        authoritative = {
+            "process_id": process_id,
+            "status": "started",
+            "started_at": "2026-08-11T20:00:00Z",
+        }
+        live_progress = {
+            "process_id": process_id,
+            "status": "progress",
+            "progress": {
+                "stage": "docling",
+                "stage_display": "Extracting document structure",
+                "stages_completed": ["grobid"],
+                "stages_pending": ["marker"],
+                "stages_total": 3,
+                "stages_done": 1,
+                "percent": 33,
+            },
+        }
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, authoritative)),
+        )
+        backend_lookup = AsyncMock(return_value=(200, live_progress))
+        monkeypatch.setattr(main_mod, "_fetch_backend_status_payload", backend_lookup)
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == live_progress
+        backend_lookup.assert_awaited_once_with(process_id, authorization="Bearer test")
+
+    def test_authoritative_nonterminal_job_falls_back_to_rds_when_backend_unreachable(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-progress-fallback"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        authoritative = {"process_id": process_id, "status": "started"}
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, authoritative)),
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_fetch_backend_status_payload",
+            AsyncMock(side_effect=OSError("backend unavailable")),
+        )
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == authoritative
+
+    def test_authoritative_terminal_status_wins_before_queue_ack(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-before-queue-ack"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.enqueue(process_id, b"%PDF", {})
+        authoritative = {
+            "process_id": process_id,
+            "status": "failed",
+            "error_code": "ValueError",
+            "error": "deterministic markup provenance is invalid",
+        }
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, authoritative)),
+        )
+        replay = MagicMock()
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", replay)
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == authoritative
+        assert main_mod.job_queue.has_job(process_id) is False
+        main_mod.lifecycle.ensure_running.assert_not_awaited()
+        replay.assert_not_called()
+
+    def test_rds_finds_terminal_job_even_after_accepted_marker_expires(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "rds-only-complete"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        authoritative = {
+            "process_id": process_id,
+            "status": "complete",
+            "artifacts_json": {"merged": {"s3_key": "pdfx/audit/result.md"}},
+        }
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, authoritative)),
+        )
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == authoritative
+        main_mod.lifecycle.ensure_running.assert_not_called()
+
     def test_unknown_job_when_ec2_stopped_can_explicitly_wake(self, client, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.STOPPED
@@ -755,8 +965,8 @@ class TestExtractStatusEndpoint:
             headers={"Authorization": "Bearer test"},
         )
 
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "pending"
+        assert resp.status_code == 404
+        assert resp.json()["status"] == "unknown"
         assert process_id not in main_mod.job_trackers
         assert main_mod._active_backend_jobs() == 0
         main_mod.lifecycle.touch.assert_not_called()
@@ -1159,6 +1369,65 @@ class TestExtractCancelEndpoint:
         assert payload["status"] == "cancelled"
         assert payload["message"] == "User requested stop"
 
+        # A replacement proxy has no local terminal cache, but the durable
+        # cancellation record still makes a repeat request terminal.
+        main_mod.cancelled_jobs.clear()
+        repeat = client.post(
+            "/api/v1/extract/queued-cancel-2/cancel",
+            headers={"Authorization": "Bearer test"},
+            json={"reason": "repeat"},
+        )
+        assert repeat.status_code == 409
+        assert repeat.json()["status"] == "cancelled"
+
+    def test_accepted_cancel_intent_survives_proxy_restart(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-cancel-after-rollout"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.record_accepted(process_id)
+        active_status = {"process_id": process_id, "status": "started"}
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, active_status)),
+        )
+
+        cancel_resp = client.post(
+            f"/api/v1/extract/{process_id}/cancel",
+            headers={"Authorization": "Bearer test"},
+            json={"reason": "No longer needed"},
+        )
+
+        assert cancel_resp.status_code == 202
+        assert cancel_resp.json()["status"] == "cancel_requested"
+        assert main_mod.job_queue.get_durable_phase(process_id) == "cancel_requested"
+        main_mod.lifecycle.ensure_running.assert_awaited_once()
+
+        # Simulate replacement task memory while keeping the durable queue store.
+        main_mod.pending_cancel_requests.clear()
+        main_mod.job_trackers.clear()
+        main_mod.lifecycle.state = InstanceState.READY
+        forward_cancel = AsyncMock(
+            return_value=JSONResponse(
+                status_code=202,
+                content={"process_id": process_id, "status": "cancelled"},
+            )
+        )
+        monkeypatch.setattr(main_mod, "_forward_cancel_to_backend", forward_cancel)
+
+        status_resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert status_resp.status_code == 202
+        forward_cancel.assert_awaited_once_with(
+            process_id,
+            authorization="Bearer test",
+            reason="No longer needed",
+        )
+
     def test_cancel_proxies_to_backend_using_mapped_process_id(self, client, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.READY
@@ -1268,7 +1537,7 @@ class TestExtractCancelEndpoint:
         )
         assert "replay-cancel-1" not in main_mod.pending_cancel_requests
 
-    def test_replay_marks_all_drained_jobs_inflight_before_forward(self, monkeypatch):
+    def test_replay_claims_one_job_at_a_time(self, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.READY
         main_mod.job_queue.enqueue("race-a", b"a", {})
@@ -1286,92 +1555,67 @@ class TestExtractCancelEndpoint:
         asyncio.run(main_mod._replay_when_ready())
 
         assert len(observed_inflight_snapshots) == 2
-        first_call_process_id, first_call_inflight = observed_inflight_snapshots[0]
-        second_process_id = "race-b" if first_call_process_id == "race-a" else "race-a"
-        assert second_process_id in first_call_inflight
+        assert all(inflight == {process_id} for process_id, inflight in observed_inflight_snapshots)
 
     def test_replay_acknowledges_jobs_after_backend_accepts(self, monkeypatch):
-        from app.job_queue import QueuedJob
+        from app.job_queue import JobQueue
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
-        job = QueuedJob(
-            job_id="replay-ack-1",
-            pdf_data=b"%PDF ack",
-            form_fields={},
-            filename="ack.pdf",
-        )
-        acknowledged = []
+        queue = JobQueue(max_size=2)
+        queue.enqueue("replay-ack-1", b"%PDF ack", {}, filename="ack.pdf")
+        events = []
+        original_record = queue.record_accepted
+        original_ack = queue.acknowledge_claim
 
-        class _AckQueue:
-            def drain(self):
-                return [job]
+        def _record(job_id):
+            events.append(("accepted", job_id))
+            return original_record(job_id)
 
-            def acknowledge(self, job_id):
-                acknowledged.append(job_id)
-                return True
+        def _ack(job):
+            events.append(("acknowledged", job.job_id))
+            return original_ack(job)
 
-        monkeypatch.setattr(main_mod, "job_queue", _AckQueue())
+        monkeypatch.setattr(queue, "record_accepted", _record)
+        monkeypatch.setattr(queue, "acknowledge_claim", _ack)
+        monkeypatch.setattr(main_mod, "job_queue", queue)
         monkeypatch.setattr(main_mod, "_forward_extraction", AsyncMock(return_value=None))
         monkeypatch.setattr(main_mod, "_forward_cancel_to_backend", AsyncMock(return_value=MagicMock()))
 
         asyncio.run(main_mod._replay_when_ready())
 
-        assert acknowledged == ["replay-ack-1"]
+        assert events == [
+            ("accepted", "replay-ack-1"),
+            ("acknowledged", "replay-ack-1"),
+        ]
+        assert queue.get_durable_phase("replay-ack-1") == "accepted"
+        assert queue.has_job("replay-ack-1") is False
 
-    def test_failed_replay_removes_queue_metadata_before_status(self, client, monkeypatch):
-        from app.job_queue import QueuedJob
+    def test_interrupted_replay_retries_with_backoff_without_new_traffic(self, client, monkeypatch):
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
-        job = QueuedJob(
-            job_id="replay-fail-1",
-            pdf_data=b"%PDF fail",
-            form_fields={},
-            filename="fail.pdf",
-        )
-        queued = {"replay-fail-1"}
-        removed = []
-
-        class _ReplayQueue:
-            @property
-            def size(self):
-                return len(queued)
-
-            def drain(self):
-                return [job]
-
-            def acknowledge(self, job_id):
-                raise AssertionError("failed replay must not acknowledge")
-
-            def remove_job(self, job_id):
-                removed.append(job_id)
-                queued.discard(job_id)
-                return True
-
-            def has_job(self, job_id):
-                return job_id in queued
-
-        monkeypatch.setattr(main_mod, "job_queue", _ReplayQueue())
-        monkeypatch.setattr(
-            main_mod,
-            "_forward_extraction",
-            AsyncMock(side_effect=RuntimeError("backend rejected upload")),
-        )
+        main_mod.job_queue.enqueue("replay-fail-1", b"%PDF fail", {}, filename="fail.pdf")
+        forward = AsyncMock(side_effect=[RuntimeError("backend unavailable"), None])
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+        retry_sleep = AsyncMock()
+        monkeypatch.setattr(main_mod.asyncio, "sleep", retry_sleep)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_RETRY_DELAY_SECONDS", 7)
 
         asyncio.run(main_mod._replay_when_ready())
 
-        assert removed == ["replay-fail-1"]
-        assert main_mod.replay_submission_errors["replay-fail-1"] == "backend rejected upload"
-        assert queued == set()
+        assert forward.await_count == 2
+        retry_sleep.assert_awaited_once_with(7)
+        assert main_mod.job_queue.has_job("replay-fail-1") is False
+        assert main_mod.job_queue.get_durable_phase("replay-fail-1") == "accepted"
+        assert "replay-fail-1" not in main_mod.replay_submission_errors
 
         resp = client.get(
             "/api/v1/extract/replay-fail-1",
             headers={"Authorization": "Bearer test"},
         )
         assert resp.status_code == 200
-        assert resp.json()["status"] == "failed"
-        assert "backend rejected upload" in resp.json()["error"]
+        assert resp.json()["status"] == "pending"
 
     def test_replay_keeps_queue_while_asg_replacement_is_starting(self, monkeypatch):
         import app.main as main_mod
@@ -1392,7 +1636,7 @@ class TestExtractCancelEndpoint:
         forward_mock.assert_awaited_once()
         assert main_mod.job_queue.size == 0
 
-    def test_replay_startup_failure_deletes_drained_remote_payloads(self, monkeypatch):
+    def test_replay_startup_failure_retains_durable_queue(self, monkeypatch):
         from app.job_queue import QueuedJob
         import app.main as main_mod
 
@@ -1421,12 +1665,9 @@ class TestExtractCancelEndpoint:
 
         asyncio.run(main_mod._replay_when_ready())
 
-        assert main_mod.replay_submission_errors["startup-failed-job"] == (
-            "EC2 startup failed before queued replay."
-        )
-        assert "startup-failed-job" not in main_mod.job_payload_cache
-        cleanup_mock.assert_called_once_with(delete_remote=True)
-        assert removed_jobs == ["startup-failed-job"]
+        assert "startup-failed-job" not in main_mod.replay_submission_errors
+        cleanup_mock.assert_not_called()
+        assert removed_jobs == []
 
     def test_ensure_queued_jobs_replaying_starts_replay_for_durable_leftovers(self, monkeypatch):
         import app.main as main_mod
@@ -1504,6 +1745,7 @@ class TestExtractCancelEndpoint:
             status="running",
             first_seen_at=0,
             last_seen_at=0,
+            last_progress_signature="running||None|None|None",
             last_progress_at=0,
         )
 
@@ -1531,7 +1773,7 @@ class TestExtractCancelEndpoint:
         main_mod.lifecycle.ensure_running.assert_awaited_once()
         main_mod._ensure_replay_task.assert_called_once()
 
-    def test_reconciler_keeps_stale_job_active_when_backend_still_running(self, monkeypatch):
+    def test_reconciler_releases_unchanged_running_status_from_local_stop_guard(self, monkeypatch):
         import app.main as main_mod
 
         process_id = "stale-running-job"
@@ -1543,6 +1785,7 @@ class TestExtractCancelEndpoint:
             status="running",
             first_seen_at=0,
             last_seen_at=0,
+            last_progress_signature="running||None|None|None",
             last_progress_at=0,
         )
 
@@ -1582,10 +1825,9 @@ class TestExtractCancelEndpoint:
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(main_mod._reconciler_loop())
 
-        assert process_id not in main_mod.replay_submission_errors
-        assert main_mod.job_trackers[process_id].status == "running"
-        assert main_mod.job_trackers[process_id].last_progress_at > 0
-        assert main_mod._active_backend_jobs() == 1
+        assert "Progress monitoring timeout" in main_mod.replay_submission_errors[process_id]
+        assert main_mod.job_trackers[process_id].status == "failed"
+        assert main_mod._active_backend_jobs() == 0
 
     def test_reconciler_expires_unchanged_pending_status(self, monkeypatch):
         import app.main as main_mod
@@ -1599,7 +1841,7 @@ class TestExtractCancelEndpoint:
             status="pending",
             first_seen_at=0,
             last_seen_at=0,
-            last_progress_signature="pending||None",
+            last_progress_signature="pending||None|None|None",
             last_progress_at=0,
         )
 
@@ -1642,6 +1884,112 @@ class TestExtractCancelEndpoint:
         assert "Progress monitoring timeout" in main_mod.replay_submission_errors[process_id]
         assert main_mod.job_trackers[process_id].status == "failed"
         assert main_mod._active_backend_jobs() == 0
+
+    def test_reconciler_never_terminalizes_durably_accepted_job_during_status_outage(self, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-rds-outage"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.record_accepted(process_id)
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="running",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_at=0,
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(False, None)),
+        )
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert process_id not in main_mod.job_trackers
+        assert main_mod.job_queue.get_durable_phase(process_id) == "accepted"
+
+    def test_reconciler_does_not_renew_unchanged_authoritative_running_row(self, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-rds-running-stale"
+        started_at = "2026-08-11T19:00:00Z"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.record_accepted(process_id)
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="started",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_signature=f"started||None|{started_at}|None",
+            last_progress_at=0,
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, {
+                "process_id": process_id,
+                "status": "started",
+                "started_at": started_at,
+            })),
+        )
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert process_id not in main_mod.job_trackers
+        assert main_mod.job_queue.get_durable_phase(process_id) == "accepted"
+
+    def test_cleanup_pass_eventually_removes_only_terminal_proven_records(self, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.job_queue.record_accepted("accepted-terminal")
+        main_mod.job_queue.record_accepted("accepted-active")
+        main_mod.job_queue.record_cancel_requested("cancel-unconfirmed", "User cancelled")
+        main_mod.job_queue.record_failed("proxy-failed", "permanent rejection")
+        for record in main_mod.job_queue._durable_phases.values():
+            record["recorded_at"] = 0
+
+        async def _lookup(process_id):
+            if process_id == "accepted-terminal":
+                return True, {"process_id": process_id, "status": "complete"}
+            return True, {"process_id": process_id, "status": "started"}
+
+        monkeypatch.setattr(main_mod, "_lookup_authoritative_status", _lookup)
+        monkeypatch.setattr(main_mod.settings, "ACCEPTED_STATUS_RETENTION_SECONDS", 60)
+        monkeypatch.setattr(main_mod.settings, "ACCEPTED_CLEANUP_BATCH_SIZE", 25)
+
+        asyncio.run(main_mod._cleanup_expired_durable_records())
+
+        assert main_mod.job_queue.get_durable_phase("accepted-terminal") is None
+        assert main_mod.job_queue.get_durable_phase("proxy-failed") is None
+        assert main_mod.job_queue.get_durable_phase("accepted-active") == "accepted"
+        assert main_mod.job_queue.get_durable_phase("cancel-unconfirmed") == "cancel_requested"
 
     def test_reconciler_clears_stale_job_when_backend_completed(self, monkeypatch):
         import app.main as main_mod

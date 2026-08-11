@@ -42,6 +42,29 @@ Index("idx_extraction_run_md5", ExtractionRun.source_pdf_md5)
 Index("idx_extraction_run_status", ExtractionRun.status)
 
 
+TERMINAL_EXTRACTION_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+
+
+def update_extraction_run_if_nonterminal(session, process_id, values):
+    """Atomically update a run only while no terminal transition has won.
+
+    Worker finalization, cancellation, and late nonterminal writes share this
+    conditional update so the first committed terminal state is immutable.
+    Returns ``(updated, current_run)`` after committing the attempted change.
+    """
+    updated = (
+        session.query(ExtractionRun)
+        .filter(
+            ExtractionRun.process_id == process_id,
+            ExtractionRun.status.notin_(TERMINAL_EXTRACTION_STATUSES),
+        )
+        .update(values, synchronize_session=False)
+    )
+    session.commit()
+    session.expire_all()
+    return updated == 1, session.get(ExtractionRun, process_id)
+
+
 _ENGINE = None
 _SESSION_FACTORY = None
 _DATABASE_URL = None

@@ -21,15 +21,18 @@ import os
 import uuid
 import json
 import logging
+import contextlib
 from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, request, jsonify, send_file, current_app
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from werkzeug.utils import secure_filename
 
+from config import Config
 from app.error_utils import summarize_error_message
 from app.image_metadata import copy_image_metadata, normalize_image_manifest_entry
-from app.models import ExtractionRun, get_session
+from app.models import ExtractionRun, get_session, update_extraction_run_if_nonterminal
 from app.services.audit_logger import build_s3_client
 from app.services.merge_artifact import load_merge_bundle
 from app.services.source_contracts import SourceArtifact
@@ -95,8 +98,10 @@ def _to_iso(dt):
 
 
 def _map_db_status(status):
-    if status == "queued":
+    if status in {"submitting", "queued"}:
         return "pending"
+    if status == "submission_failed":
+        return "failed"
     if status == "running":
         return "started"
     if status == "succeeded":
@@ -112,14 +117,39 @@ def _get_db_session():
         return None
 
 
-def _insert_queued_run(process_id, reference_curie, mod_abbreviation, extract_images=False, review_images=False):
+def _run_submission_snapshot(run):
+    if run is None:
+        return None
+    return {
+        "process_id": str(run.process_id),
+        "status": str(run.status),
+        "reference_curie": run.reference_curie,
+        "mod_abbreviation": run.mod_abbreviation,
+        "extract_images": bool(run.extract_images),
+        "review_images": bool(run.review_images),
+        "started_at": run.started_at,
+        "error_code": run.error_code,
+        "error_message": run.error_message,
+    }
+
+
+def _claim_submission(
+    process_id,
+    reference_curie,
+    mod_abbreviation,
+    *,
+    extract_images=False,
+    review_images=False,
+):
+    """Atomically own the right to publish one Celery task for process_id."""
     db_session = _get_db_session()
     if not db_session:
-        return
+        return None, None, "database_unavailable"
+
+    claimed_at = datetime.now(timezone.utc)
 
     try:
-        existing = db_session.get(ExtractionRun, process_id)
-        if existing is None:
+        try:
             db_session.add(ExtractionRun(
                 process_id=process_id,
                 reference_curie=reference_curie,
@@ -127,20 +157,144 @@ def _insert_queued_run(process_id, reference_curie, mod_abbreviation, extract_im
                 config_version=current_app.config.get("EXTRACTION_CONFIG_VERSION"),
                 extract_images=bool(extract_images),
                 review_images=bool(review_images),
-                status="queued",
+                status="submitting",
+                started_at=claimed_at,
             ))
             db_session.commit()
-    except Exception as exc:
-        logger.warning("Failed to insert queued extraction_run row for %s: %s", process_id, exc)
-        try:
+            return claimed_at, None, None
+        except IntegrityError:
             db_session.rollback()
-        except Exception:
-            pass
+        existing = db_session.get(ExtractionRun, process_id)
+        if existing is None:
+            return None, None, "claim_conflict_without_row"
+
+        existing_snapshot = _run_submission_snapshot(existing)
+        existing_started_at = existing.started_at
+        if existing_started_at is not None and existing_started_at.tzinfo is None:
+            existing_started_at = existing_started_at.replace(tzinfo=timezone.utc)
+        stale_before = claimed_at - timedelta(seconds=max(1, Config.SUBMISSION_CLAIM_STALE_SECONDS))
+        reclaimable = existing.status == "submission_failed" or (
+            existing.status == "submitting"
+            and (existing_started_at is None or existing_started_at <= stale_before)
+        )
+        if not reclaimable:
+            return None, existing_snapshot, None
+
+        query = db_session.query(ExtractionRun).filter(
+            ExtractionRun.process_id == process_id,
+            ExtractionRun.status == existing.status,
+        )
+        if existing.started_at is None:
+            query = query.filter(ExtractionRun.started_at.is_(None))
+        else:
+            query = query.filter(ExtractionRun.started_at == existing.started_at)
+        updated = query.update(
+            {
+                ExtractionRun.status: "submitting",
+                ExtractionRun.started_at: claimed_at,
+                ExtractionRun.ended_at: None,
+                ExtractionRun.error_code: None,
+                ExtractionRun.error_message: None,
+                ExtractionRun.reference_curie: reference_curie,
+                ExtractionRun.mod_abbreviation: mod_abbreviation,
+                ExtractionRun.extract_images: bool(extract_images),
+                ExtractionRun.review_images: bool(review_images),
+            },
+            synchronize_session=False,
+        )
+        db_session.commit()
+        if updated == 1:
+            return claimed_at, None, None
+        current = db_session.get(ExtractionRun, process_id)
+        return None, _run_submission_snapshot(current), None
+    except Exception as exc:
+        logger.warning("Failed to claim extraction submission %s: %s", process_id, exc)
+        with contextlib.suppress(Exception):
+            db_session.rollback()
+        return None, None, "database_unavailable"
     finally:
-        try:
+        with contextlib.suppress(Exception):
             db_session.close()
-        except Exception:
-            pass
+
+
+def _finish_submission_claim(process_id, claimed_at):
+    db_session = _get_db_session()
+    if not db_session:
+        return False
+    try:
+        updated = db_session.query(ExtractionRun).filter(
+            ExtractionRun.process_id == process_id,
+            ExtractionRun.status == "submitting",
+            ExtractionRun.started_at == claimed_at,
+        ).update(
+            {
+                ExtractionRun.status: "queued",
+                ExtractionRun.started_at: None,
+            },
+            synchronize_session=False,
+        )
+        db_session.commit()
+        return updated == 1
+    except Exception as exc:
+        logger.warning("Failed to finalize submission claim for %s: %s", process_id, exc)
+        with contextlib.suppress(Exception):
+            db_session.rollback()
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            db_session.close()
+
+
+def _mark_submission_failed(process_id, claimed_at, error_message):
+    db_session = _get_db_session()
+    if not db_session:
+        return
+    try:
+        db_session.query(ExtractionRun).filter(
+            ExtractionRun.process_id == process_id,
+            ExtractionRun.status == "submitting",
+            ExtractionRun.started_at == claimed_at,
+        ).update(
+            {
+                ExtractionRun.status: "submission_failed",
+                ExtractionRun.ended_at: datetime.now(timezone.utc),
+                ExtractionRun.error_code: "publish_failed",
+                ExtractionRun.error_message: error_message,
+            },
+            synchronize_session=False,
+        )
+        db_session.commit()
+    except Exception as exc:
+        logger.warning("Failed to record submission failure for %s: %s", process_id, exc)
+        with contextlib.suppress(Exception):
+            db_session.rollback()
+    finally:
+        with contextlib.suppress(Exception):
+            db_session.close()
+
+
+def _existing_submission_response(run):
+    status = str(run.get("status") or "pending")
+    mapped_status = {
+        "submitting": "pending",
+        "queued": "pending",
+        "running": "started",
+        "succeeded": "complete",
+    }.get(status, status)
+    payload = {
+        "process_id": run["process_id"],
+        "status": mapped_status,
+        "reference_curie": run.get("reference_curie"),
+        "mod_abbreviation": run.get("mod_abbreviation"),
+        "extract_images": run.get("extract_images", False),
+        "review_images": run.get("review_images", False),
+    }
+    if run.get("error_code"):
+        payload["error_code"] = run["error_code"]
+    if run.get("error_message"):
+        payload["error"] = summarize_error_message(run["error_message"])
+    status_code = 200 if status in {"succeeded", "failed", "cancelled"} else 202
+    return jsonify(payload), status_code
 
 
 def _get_run_by_process_id(process_id):
@@ -397,30 +551,30 @@ def _image_retention_ttl_seconds():
 
 
 def _mark_run_cancelled(process_id, reason):
-    """Best-effort mark extraction_run row as cancelled."""
+    """Atomically make cancellation the first terminal transition, if possible."""
     db_session = _get_db_session()
     if not db_session:
-        return
+        return False
 
     try:
-        run = db_session.get(ExtractionRun, process_id)
-        if run is None:
-            return
-
-        if run.status in {"succeeded", "failed", "cancelled"}:
-            return
-
-        run.status = "cancelled"
-        run.ended_at = datetime.now(timezone.utc)
-        run.error_code = "cancelled"
-        run.error_message = reason
-        db_session.commit()
+        updated, _current = update_extraction_run_if_nonterminal(
+            db_session,
+            process_id,
+            {
+                ExtractionRun.status: "cancelled",
+                ExtractionRun.ended_at: datetime.now(timezone.utc),
+                ExtractionRun.error_code: "cancelled",
+                ExtractionRun.error_message: reason,
+            },
+        )
+        return updated
     except Exception as exc:
         logger.warning("Failed to mark extraction_run cancelled for %s: %s", process_id, exc)
         try:
             db_session.rollback()
         except Exception:
             pass
+        return False
     finally:
         try:
             db_session.close()
@@ -690,15 +844,34 @@ def submit_extraction():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    claimed_at, existing_run, claim_error = _claim_submission(
+        process_id,
+        reference_curie,
+        mod_abbreviation,
+        extract_images=extract_images,
+        review_images=review_images,
+    )
+    if claim_error:
+        logger.error("Cannot claim extraction submission %s: %s", process_id, claim_error)
+        return jsonify({
+            "process_id": process_id,
+            "error": "Status database unavailable; extraction was not enqueued.",
+        }), 503
+    if existing_run is not None:
+        return _existing_submission_response(existing_run)
+
     filename = secure_filename(file.filename)
     upload_dir = current_app.config["UPLOAD_FOLDER"]
     os.makedirs(upload_dir, exist_ok=True)
     pdf_path = os.path.join(upload_dir, f"{process_id}_{filename}")
-    file.save(pdf_path)
+    try:
+        file.save(pdf_path)
+    except Exception as exc:
+        _mark_submission_failed(process_id, claimed_at, "Failed to persist uploaded PDF before publish")
+        logger.error("Failed to save uploaded PDF for %s: %s", process_id, exc)
+        return jsonify({"process_id": process_id, "error": "Failed to persist uploaded PDF."}), 500
 
-    # --- Enqueue Celery task FIRST --------------------------------------------
-    # Enqueue before DB insert so we never create an orphan "queued" row
-    # that has no corresponding Celery task.
+    # --- Publish only after winning the durable submission claim --------------
     from celery_app import extract_pdf
 
     try:
@@ -720,16 +893,12 @@ def submit_extraction():
         logger.error("Failed to enqueue extraction task: %s", exc)
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
+        _mark_submission_failed(process_id, claimed_at, "Failed to publish extraction task")
         return jsonify({"error": "Failed to enqueue extraction task. Is Redis available?"}), 503
 
-    # Best effort: create queued DB row after successful enqueue.
-    _insert_queued_run(
-        process_id,
-        reference_curie,
-        mod_abbreviation,
-        extract_images=extract_images,
-        review_images=review_images,
-    )
+    # Only the owner of this exact pre-publish claim may move it to queued.
+    # A worker that already changed it to running is deliberately not reset.
+    _finish_submission_claim(process_id, claimed_at)
 
     logger.info(
         "Queued extraction %s for %s (methods=%s, merge=%s, clear_cache_scope=%s, extract_images=%s, review_images=%s, reference_curie=%s, mod=%s)",
@@ -943,7 +1112,20 @@ def cancel_extraction(process_id):
     except Exception as exc:
         logger.warning("Failed to revoke extraction task %s: %s", process_id, exc)
 
-    _mark_run_cancelled(process_id, reason)
+    transitioned = _mark_run_cancelled(process_id, reason)
+    if not transitioned:
+        current = _get_run_by_process_id(process_id)
+        if current and current["status"] in {"succeeded", "failed", "cancelled"}:
+            return jsonify({
+                "process_id": process_id,
+                "status": _map_db_status(current["status"]),
+                "message": f"Job already terminal ({current['status']})",
+            }), 409
+        return jsonify({
+            "process_id": process_id,
+            "status": "cancel_requested",
+            "message": "Cancellation requested; authoritative terminal state is pending.",
+        }), 202
 
     return jsonify({
         "process_id": process_id,

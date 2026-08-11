@@ -20,6 +20,7 @@ from app.config import settings
 from app.ec2_manager import EC2Manager
 from app.job_queue import BaseJobQueue, QueueFullError, QueuedJob, build_job_queue
 from app.state_machine import InstanceState, LifecycleManager
+from app.status_reader import RDSStatusReader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ ec2_mgr = EC2Manager()
 lifecycle = LifecycleManager(ec2_mgr)
 cognito_auth = CognitoAuth()
 job_queue: BaseJobQueue = build_job_queue(max_size=settings.MAX_QUEUED_JOBS)
+status_reader = RDSStatusReader()
 
 # Tracks queued proxy process IDs -> backend process IDs after replay.
 proxy_to_backend_process: dict[str, str] = {}
@@ -48,6 +50,8 @@ cancelled_jobs: dict[str, str] = {}
 replay_task: asyncio.Task | None = None
 reconciler_task: asyncio.Task | None = None
 canary_task: asyncio.Task | None = None
+proxy_owner_id = str(uuid.uuid4())
+accepting_queue_claims = True
 
 
 ACTIVE_JOB_STATUSES = {
@@ -278,7 +282,25 @@ def _can_stop_ec2() -> bool:
     return True
 
 
+def _can_replace_backend() -> bool:
+    """Allow startup destruction only when shared RDS has no fresh running work."""
+    if not status_reader.configured:
+        # Production deployment requires this setting. Preserve legacy/local
+        # lifecycle behavior when the optional direct reader is not configured.
+        logger.warning("Allowing exact-target backend replacement without a configured status database")
+        return True
+    reachable, active = status_reader.has_active_work()
+    if not reachable or active is None:
+        logger.warning("Refusing backend replacement: shared active-work state is unavailable")
+        return False
+    if active:
+        logger.warning("Refusing backend replacement: shared active work is present")
+        return False
+    return True
+
+
 lifecycle.set_stop_guard(_can_stop_ec2)
+lifecycle.set_replacement_guard(_can_replace_backend)
 
 
 def _backend_ready_for_proxy() -> bool:
@@ -433,10 +455,42 @@ def _queued_response(process_id: str, status_value: str = "queued") -> JSONRespo
     )
 
 
+async def _lookup_authoritative_status(process_id: str) -> tuple[bool, dict[str, Any] | None]:
+    """Run the bounded synchronous RDS lookup outside the event loop."""
+    return await asyncio.to_thread(status_reader.lookup, process_id)
+
+
+async def _cleanup_expired_durable_records() -> None:
+    """Eventually remove only expired records with current terminal proof."""
+    records = await asyncio.to_thread(
+        job_queue.list_expired_durable_records,
+        settings.ACCEPTED_STATUS_RETENTION_SECONDS,
+        settings.ACCEPTED_CLEANUP_BATCH_SIZE,
+    )
+    for record in records:
+        process_id = str(record.get("process_id") or "")
+        phase = str(record.get("phase") or "")
+        if not process_id:
+            continue
+        terminal = phase in {"cancelled", "failed"}
+        if not terminal and phase in {"accepted", "cancel_requested"}:
+            reachable, payload = await _lookup_authoritative_status(process_id)
+            status = str((payload or {}).get("status") or "").strip().lower()
+            terminal = reachable and payload is not None and status in TERMINAL_JOB_STATUSES
+        if terminal:
+            await asyncio.to_thread(
+                job_queue.cleanup_durable_record,
+                process_id,
+                settings.ACCEPTED_STATUS_RETENTION_SECONDS,
+                terminal=True,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Kick off EC2 state sync and reconciliation loops on boot."""
-    global reconciler_task, canary_task
+    global reconciler_task, canary_task, replay_task, accepting_queue_claims
+    accepting_queue_claims = True
 
     startup_replay_task = asyncio.create_task(_sync_state_then_replay_startup_queue())
     reconciler_task = asyncio.create_task(_reconciler_loop())
@@ -447,6 +501,18 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        accepting_queue_claims = False
+        if replay_task and not replay_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(replay_task),
+                    timeout=max(0, settings.PROXY_SHUTDOWN_GRACE_SECONDS),
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Shutdown grace expired with a replay handoff in progress; claim will be reclaimable")
+                replay_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await replay_task
         for task in (startup_replay_task, reconciler_task, canary_task):
             if task and not task.done():
                 task.cancel()
@@ -666,6 +732,7 @@ async def metrics():
         "ec2_stop_blocked_total": lifecycle.stop_blocked_total,
         "ec2_startup_timeout_total": lifecycle.startup_timeout_total,
         "ec2_replacement_requests_total": lifecycle.replacement_requests_total,
+        "ec2_stale_monitor_exits_total": lifecycle.stale_monitor_exits_total,
         "canary": canary_state,
     }
 
@@ -725,6 +792,8 @@ async def submit_extraction(
     authorization: str = Header(None),
 ):
     _require_auth(authorization)
+    if not accepting_queue_claims:
+        raise HTTPException(status_code=503, detail="Proxy task is draining; retry on the replacement task.")
     lifecycle.touch()
     _validate_upload_size(file)
 
@@ -749,48 +818,8 @@ async def submit_extraction(
 
     _record_job_event(process_id, "queued")
 
-    # If EC2 is ready, forward immediately.
-    # If forwarding fails due transient startup/transport issue, queue and recover.
-    if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
-        try:
-            await file.seek(0)
-            return await _forward_extraction(
-                process_id,
-                file.file,
-                filename,
-                form_fields,
-                authorization=authorization,
-            )
-        except HTTPException as exc:
-            if exc.status_code in {401, 403, 422}:
-                _drop_submission_state(process_id)
-                raise
-            logger.warning(
-                "Immediate forward failed for process %s; queueing for replay. detail=%s",
-                process_id,
-                exc.detail,
-            )
-            try:
-                await lifecycle.sync_state_from_ec2()
-            except Exception:
-                logger.debug("sync_state_from_ec2 failed during forward recovery", exc_info=True)
-            try:
-                queued_job = await job_queue.enqueue_upload(
-                    process_id,
-                    file,
-                    form_fields,
-                    filename,
-                    authorization=authorization,
-                )
-                job_payload_cache[process_id] = queued_job
-            except QueueFullError:
-                _drop_submission_state(process_id)
-                raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
-            await lifecycle.ensure_running()
-            _ensure_replay_task()
-            return _queued_response(process_id, status_value="queued")
-
-    # Otherwise, queue the job and ensure EC2 is starting.
+    # Persist every upload before forwarding so a proxy exit at any handoff
+    # boundary leaves replayable work instead of an in-memory-only request.
     try:
         queued_job = await job_queue.enqueue_upload(
             process_id,
@@ -804,10 +833,12 @@ async def submit_extraction(
         _drop_submission_state(process_id)
         raise HTTPException(status_code=429, detail="Too many queued jobs. Try again later.")
 
-    await lifecycle.ensure_running()
+    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        await lifecycle.ensure_running()
     _ensure_replay_task()
 
-    return _queued_response(process_id, status_value="warming_up")
+    status_value = "queued" if lifecycle.state in (InstanceState.READY, InstanceState.BUSY) else "warming_up"
+    return _queued_response(process_id, status_value=status_value)
 
 
 # --- Extract: poll status (auth required, proxied to EC2) ---
@@ -820,29 +851,91 @@ async def get_extraction_status(
 ):
     _require_auth(authorization)
 
-    if process_id in cancelled_jobs:
-        reason = cancelled_jobs[process_id]
-        return {
-            "process_id": process_id,
-            "status": "cancelled",
-            "state": lifecycle.state.value,
-            "message": reason,
-            "progress": _progress_payload("cancelled", "Job cancelled", 0),
-        }
+    try:
+        durable_phase = await asyncio.to_thread(job_queue.get_durable_phase, process_id)
+    except Exception as exc:
+        logger.warning("Failed durable phase lookup for %s: %s", process_id, exc)
+        durable_phase = None
 
-    if process_id in replay_submission_errors:
-        error_message = replay_submission_errors[process_id]
-        return {
-            "process_id": process_id,
-            "status": "failed",
-            "state": lifecycle.state.value,
-            "error": error_message,
-            "message": "Failed to submit queued job to backend.",
-            "progress": _progress_payload("failed", "Queued job submission failed", 0),
-        }
+    durable_record = None
+    if durable_phase in {"accepted", "cancel_requested", "cancelled", "failed"}:
+        try:
+            durable_record = await asyncio.to_thread(job_queue.get_durable_record, process_id)
+        except Exception as exc:
+            logger.warning("Failed durable terminal lookup for %s: %s", process_id, exc)
 
-    # If the job is still queued locally, report that.
-    if job_queue.has_job(process_id):
+    # RDS is authoritative whenever it has a row, including when a proxy died
+    # after backend acceptance but before queue acknowledgement.
+    authoritative_reachable, authoritative_payload = await _lookup_authoritative_status(process_id)
+    if authoritative_reachable and authoritative_payload is not None:
+        status_value = str(authoritative_payload.get("status", "")).strip().lower()
+        _update_tracker_from_payload(process_id, authoritative_payload)
+        _mark_terminal_cleanup_if_needed(process_id, authoritative_payload)
+        if status_value in TERMINAL_JOB_STATUSES:
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    job_queue.cleanup_durable_record,
+                    process_id,
+                    settings.ACCEPTED_STATUS_RETENTION_SECONDS,
+                    terminal=True,
+                )
+        if durable_phase in {"cancel_requested", "cancelled"} and status_value in ACTIVE_JOB_STATUSES:
+            reason = str((durable_record or {}).get("message") or "Cancelled by user request")
+            if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
+                return await _forward_cancel_to_backend(
+                    process_id,
+                    authorization=authorization,
+                    reason=reason,
+                )
+            lifecycle.touch()
+            await lifecycle.ensure_running()
+            return {
+                "process_id": process_id,
+                "status": "cancel_requested",
+                "state": lifecycle.state.value,
+                "message": reason,
+            }
+        if durable_phase in {"queued", "claimed"}:
+            await _ensure_queued_jobs_replaying("authoritative status with unacknowledged queue record", known_queued=True)
+        elif (
+            status_value in ACTIVE_JOB_STATUSES
+            and durable_phase == "accepted"
+            and lifecycle.state not in (InstanceState.READY, InstanceState.BUSY)
+        ):
+            lifecycle.touch()
+            await lifecycle.ensure_running()
+        if (
+            status_value in ACTIVE_JOB_STATUSES
+            and lifecycle.state in (InstanceState.READY, InstanceState.BUSY)
+        ):
+            try:
+                status_code, backend_payload = await _fetch_backend_status_payload(
+                    process_id,
+                    authorization=authorization,
+                )
+                backend_status = str(backend_payload.get("status", "")).strip().lower()
+                if status_code < 400 and backend_status in ACTIVE_JOB_STATUSES | TERMINAL_JOB_STATUSES:
+                    _update_tracker_from_payload(process_id, backend_payload)
+                    if backend_status in ACTIVE_JOB_STATUSES:
+                        lifecycle.touch()
+                    _mark_terminal_cleanup_if_needed(process_id, backend_payload)
+                    return JSONResponse(status_code=status_code, content=backend_payload)
+                logger.warning(
+                    "Backend status detail unavailable for authoritative job %s: HTTP %s status=%s",
+                    process_id,
+                    status_code,
+                    backend_status,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Backend status detail lookup failed for authoritative job %s; using RDS: %s",
+                    process_id,
+                    exc,
+                )
+        return JSONResponse(status_code=200, content=authoritative_payload)
+
+    # Without an authoritative row, durable unaccepted work remains queued.
+    if durable_phase in {"queued", "claimed"} or job_queue.has_job(process_id):
         lifecycle.touch()
         await _ensure_queued_jobs_replaying("queued status poll", known_queued=True)
         await _refresh_backend_health_snapshot_for_queue()
@@ -884,6 +977,97 @@ async def get_extraction_status(
             "message": display,
             "progress": _progress_payload("queued", display, 0),
         }
+
+    # In-memory terminal caches are only fallbacks when RDS has no row or is
+    # unavailable; they must never mask reachable authoritative truth.
+    if process_id in cancelled_jobs:
+        reason = cancelled_jobs[process_id]
+        return {
+            "process_id": process_id,
+            "status": "cancelled",
+            "state": lifecycle.state.value,
+            "message": reason,
+            "progress": _progress_payload("cancelled", "Job cancelled", 0),
+        }
+
+    if process_id in replay_submission_errors:
+        error_message = replay_submission_errors[process_id]
+        return {
+            "process_id": process_id,
+            "status": "failed",
+            "state": lifecycle.state.value,
+            "error": error_message,
+            "message": "Failed to submit queued job to backend.",
+            "progress": _progress_payload("failed", "Queued job submission failed", 0),
+        }
+
+    if durable_phase == "cancelled":
+        with suppress(Exception):
+            await asyncio.to_thread(
+                job_queue.cleanup_durable_record,
+                process_id,
+                settings.ACCEPTED_STATUS_RETENTION_SECONDS,
+                terminal=True,
+            )
+        return {
+            "process_id": process_id,
+            "status": "cancelled",
+            "state": lifecycle.state.value,
+            "message": str((durable_record or {}).get("message") or "Job cancelled before backend handoff."),
+            "progress": _progress_payload("cancelled", "Job cancelled", 0),
+        }
+
+    if durable_phase == "cancel_requested":
+        reason = str((durable_record or {}).get("message") or "Cancelled by user request")
+        lifecycle.touch()
+        await lifecycle.ensure_running()
+        return {
+            "process_id": process_id,
+            "status": "cancel_requested",
+            "state": lifecycle.state.value,
+            "message": reason,
+        }
+
+    if durable_phase == "failed":
+        detail = str((durable_record or {}).get("message") or "Backend permanently rejected queued job.")
+        with suppress(Exception):
+            await asyncio.to_thread(
+                job_queue.cleanup_durable_record,
+                process_id,
+                settings.ACCEPTED_STATUS_RETENTION_SECONDS,
+                terminal=True,
+            )
+        return {
+            "process_id": process_id,
+            "status": "failed",
+            "state": lifecycle.state.value,
+            "error": detail,
+            "message": "Failed to submit queued job to backend.",
+            "progress": _progress_payload("failed", "Queued job submission failed", 0),
+        }
+
+    if durable_phase == "accepted":
+        display = "Authoritative job status is temporarily unavailable"
+        _record_job_event(process_id, "pending")
+        return {
+            "process_id": process_id,
+            "status": "pending",
+            "state": lifecycle.state.value,
+            "message": display,
+            "progress": _progress_payload("pending", display, 0),
+        }
+
+    if authoritative_reachable and authoritative_payload is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "process_id": process_id,
+                "status": "unknown",
+                "state": lifecycle.state.value,
+                "message": "Job was not found in durable queue or authoritative status storage.",
+                "progress": _progress_payload("unknown", "Job not found", 0),
+            },
+        )
 
     # Only known active jobs, or explicit wake requests, may wake the backend.
     # Unknown/stale status polling must not keep the GPU instance warm forever.
@@ -936,9 +1120,19 @@ async def get_extraction_status(
             # A bare PENDING response must not turn an arbitrary status poll into
             # proxy-owned active work that blocks the GPU idle-stop guard.
             ambiguous_unknown_pending = _is_ambiguous_backend_pending(payload) and not was_tracked
-            if not ambiguous_unknown_pending:
-                _update_tracker_from_payload(process_id, payload)
-            if status_value in ACTIVE_JOB_STATUSES and not ambiguous_unknown_pending:
+            if ambiguous_unknown_pending:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "process_id": process_id,
+                        "status": "unknown",
+                        "state": lifecycle.state.value,
+                        "message": "Backend has no durable status record for this process ID.",
+                        "progress": _progress_payload("unknown", "Job not found", 0),
+                    },
+                )
+            _update_tracker_from_payload(process_id, payload)
+            if status_value in ACTIVE_JOB_STATUSES:
                 lifecycle.touch()
             _mark_terminal_cleanup_if_needed(process_id, payload)
 
@@ -978,6 +1172,12 @@ async def _forward_cancel_to_backend(
         _mark_terminal_cleanup_if_needed(process_id, payload)
         status_value = str(payload.get("status", "")).strip().lower()
         if status_value in {"cancelled", "canceled"}:
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    job_queue.record_cancelled,
+                    process_id,
+                    str(payload.get("message") or reason),
+                )
             _record_job_cancelled(process_id, str(payload.get("message") or reason))
         elif status_value == "cancel_requested":
             pending_cancel_requests[process_id] = reason
@@ -1006,7 +1206,14 @@ async def cancel_extraction(
             },
         )
 
-    if _remove_queued_job(process_id):
+    try:
+        durable_phase = await asyncio.to_thread(job_queue.get_durable_phase, process_id)
+    except Exception:
+        durable_phase = None
+
+    if durable_phase == "queued" and _remove_queued_job(process_id):
+        with suppress(Exception):
+            await asyncio.to_thread(job_queue.record_cancelled, process_id, reason)
         _clear_terminal_state(process_id)
         replay_inflight_jobs.discard(process_id)
         proxy_to_backend_process.pop(process_id, None)
@@ -1020,7 +1227,9 @@ async def cancel_extraction(
             },
         )
 
-    if process_id in replay_inflight_jobs:
+    if durable_phase == "claimed" or process_id in replay_inflight_jobs:
+        with suppress(Exception):
+            await asyncio.to_thread(job_queue.record_cancel_requested, process_id, reason)
         pending_cancel_requests[process_id] = reason
         _record_job_event(process_id, "cancel_requested", reason=reason)
         return JSONResponse(
@@ -1032,7 +1241,49 @@ async def cancel_extraction(
             },
         )
 
+    _authoritative_reachable, authoritative_payload = await _lookup_authoritative_status(process_id)
+    authoritative_status = str((authoritative_payload or {}).get("status") or "").lower()
+    known_active = authoritative_status in ACTIVE_JOB_STATUSES
+    if authoritative_status in TERMINAL_JOB_STATUSES:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "process_id": process_id,
+                "status": authoritative_status,
+                "message": "Extraction is already terminal.",
+            },
+        )
+
+    if durable_phase in {"cancelled", "failed"} and authoritative_payload is None:
+        durable_record = await asyncio.to_thread(job_queue.get_durable_record, process_id)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "process_id": process_id,
+                "status": durable_phase,
+                "message": str(
+                    (durable_record or {}).get("message")
+                    or "Extraction is already terminal."
+                ),
+            },
+        )
+
+    if durable_phase in {"accepted", "cancel_requested"} or known_active:
+        await asyncio.to_thread(job_queue.record_cancel_requested, process_id, reason)
+        pending_cancel_requests[process_id] = reason
+
     if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
+        if durable_phase in {"accepted", "cancel_requested"} or known_active:
+            lifecycle.touch()
+            await lifecycle.ensure_running()
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "process_id": process_id,
+                    "status": "cancel_requested",
+                    "message": reason,
+                },
+            )
         return JSONResponse(
             status_code=503,
             content={
@@ -1305,13 +1556,15 @@ async def _forward_extraction(
 
 def _ensure_replay_task() -> None:
     global replay_task
+    if not accepting_queue_claims:
+        return
     if replay_task and not replay_task.done():
         return
     replay_task = asyncio.create_task(_replay_when_ready())
 
 
 async def _replay_when_ready():
-    """Wait for EC2 to become ready, then replay all queued jobs."""
+    """Wait for EC2, then claim and hand off queued jobs one at a time."""
     startup_attempts = 1 + max(0, settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS)
     replay_wait_seconds = (
         settings.STARTUP_TIMEOUT_MINUTES * 60 * startup_attempts
@@ -1323,23 +1576,22 @@ async def _replay_when_ready():
         if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
             break
         if lifecycle.state == InstanceState.STOPPED:
-            jobs = job_queue.drain()
-            _mark_drained_jobs_failed(jobs, "EC2 startup failed before queued replay.")
-            logger.error("EC2 startup failed. Marked %d queued jobs as failed.", len(jobs))
+            logger.warning("Backend startup stopped before replay; retaining durable queued work")
             return
         await asyncio.sleep(5)
     else:
-        jobs = job_queue.drain()
-        _mark_drained_jobs_failed(jobs, "EC2 startup timed out before queued replay.")
-        logger.error("Timed out waiting for EC2. Marked %d queued jobs as failed.", len(jobs))
+        logger.warning("Timed out waiting for backend; retaining durable queued work")
         return
 
-    jobs = job_queue.drain()
-    logger.info("Replaying %d queued jobs to EC2", len(jobs))
-    for job in jobs:
+    while accepting_queue_claims:
+        job = await asyncio.to_thread(
+            job_queue.claim_next,
+            proxy_owner_id,
+            settings.QUEUE_CLAIM_TTL_SECONDS,
+        )
+        if job is None:
+            return
         replay_inflight_jobs.add(job.job_id)
-
-    for job in jobs:
         _record_job_event(job.job_id, "replayed")
         job_payload_cache[job.job_id] = job
         try:
@@ -1351,12 +1603,18 @@ async def _replay_when_ready():
                     job.form_fields,
                     authorization=job.authorization,
                 )
-            try:
-                job_queue.acknowledge(job.job_id)
-            except Exception as exc:
-                logger.error("Failed to acknowledge replayed job %s: %s", job.job_id, exc)
-            if job.job_id in pending_cancel_requests:
-                reason = pending_cancel_requests.pop(job.job_id)
+            # The accepted marker must exist before queue metadata is removed.
+            await asyncio.to_thread(job_queue.record_accepted, job.job_id)
+            handoff_record = await asyncio.to_thread(job_queue.get_durable_record, job.job_id)
+            handoff_phase = str((handoff_record or {}).get("phase") or "")
+            acknowledged = await asyncio.to_thread(job_queue.acknowledge_claim, job)
+            if not acknowledged:
+                logger.warning("Replay claim changed before acknowledgement for %s", job.job_id)
+            if job.job_id in pending_cancel_requests or handoff_phase in {"cancel_requested", "cancelled"}:
+                reason = pending_cancel_requests.pop(
+                    job.job_id,
+                    str((handoff_record or {}).get("message") or "Cancelled by user request"),
+                )
                 try:
                     await _forward_cancel_to_backend(
                         job.job_id,
@@ -1366,9 +1624,27 @@ async def _replay_when_ready():
                 except Exception as cancel_exc:
                     logger.error("Failed to enforce pending cancellation for %s: %s", job.job_id, cancel_exc)
                     pending_cancel_requests[job.job_id] = reason
+        except HTTPException as exc:
+            if exc.status_code in {400, 401, 403, 413, 415, 422}:
+                detail = str(exc.detail)
+                logger.error("Permanent backend rejection for queued job %s: %s", job.job_id, detail)
+                await asyncio.to_thread(job_queue.record_failed, job.job_id, detail)
+                await asyncio.to_thread(job_queue.remove_job, job.job_id)
+                await asyncio.to_thread(job_queue.release_claim, job)
+                _mark_job_failed(job.job_id, detail)
+            else:
+                logger.warning("Transient replay failure for %s; retaining queue record: %s", job.job_id, exc)
+                await asyncio.to_thread(job_queue.release_claim, job)
+                await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
+                continue
+        except asyncio.CancelledError:
+            await asyncio.to_thread(job_queue.release_claim, job)
+            raise
         except Exception as exc:
-            logger.error("Failed to replay job %s: %s", job.job_id, exc)
-            _mark_job_failed(job.job_id, str(exc))
+            logger.warning("Replay handoff interrupted for %s; retaining queue record: %s", job.job_id, exc)
+            await asyncio.to_thread(job_queue.release_claim, job)
+            await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
+            continue
         finally:
             job.cleanup()
             replay_inflight_jobs.discard(job.job_id)
@@ -1383,6 +1659,13 @@ async def _reconciler_loop():
         await asyncio.sleep(interval)
         now = time.time()
 
+        try:
+            await _cleanup_expired_durable_records()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Expired durable-status cleanup pass failed")
+
         for process_id, tracker in list(job_trackers.items()):
             if process_id in replay_submission_errors:
                 continue
@@ -1394,6 +1677,22 @@ async def _reconciler_loop():
                 continue
 
             if await _refresh_stale_backend_status(process_id, tracker, age=age):
+                continue
+
+            try:
+                durable_phase = await asyncio.to_thread(job_queue.get_durable_phase, process_id)
+            except Exception:
+                durable_phase = None
+            if durable_phase in {"accepted", "cancel_requested"}:
+                # A monitoring outage is not terminal job evidence. Keep the
+                # durable accepted ID discoverable, but release the stale local
+                # stop guard until RDS or backend progress changes again.
+                job_trackers.pop(process_id, None)
+                logger.warning(
+                    "job=%s event=accepted_status_stale_local_guard_released phase=%s",
+                    process_id,
+                    durable_phase,
+                )
                 continue
 
             if settings.RECONCILER_REQUEUE_ONCE and not tracker.requeue_attempted and process_id in job_payload_cache:
@@ -1440,6 +1739,23 @@ async def _reconciler_loop():
 
 async def _refresh_stale_backend_status(process_id: str, tracker: JobTracker, *, age: float) -> bool:
     """Reconcile a quiet proxy tracker with backend truth before failing it."""
+    authoritative_reachable, authoritative_payload = await _lookup_authoritative_status(process_id)
+    if authoritative_reachable and authoritative_payload is not None:
+        previous_progress_at = tracker.last_progress_at
+        _update_tracker_from_payload(process_id, authoritative_payload)
+        status = str(authoritative_payload.get("status", "")).strip().lower()
+        if status in TERMINAL_JOB_STATUSES:
+            _mark_terminal_cleanup_if_needed(process_id, authoritative_payload)
+            return True
+        if status in ACTIVE_JOB_STATUSES and tracker.last_progress_at > previous_progress_at:
+            logger.info(
+                "job=%s event=rds_progress_changed status=%s stale_age_seconds=%.0f",
+                process_id,
+                status,
+                age,
+            )
+            return True
+
     if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY) or not lifecycle.private_ip:
         return False
 
@@ -1474,16 +1790,15 @@ async def _refresh_stale_backend_status(process_id: str, tracker: JobTracker, *,
         return True
 
     if status in ACTIVE_JOB_STATUSES:
-        if _is_ambiguous_backend_pending(payload) and tracker.last_progress_at <= previous_progress_at:
+        if tracker.last_progress_at <= previous_progress_at:
             logger.warning(
-                "job=%s event=ambiguous_pending_still_stale stale_age_seconds=%.0f",
+                "job=%s event=backend_status_unchanged stale_age_seconds=%.0f",
                 process_id,
                 age,
             )
             return False
-        tracker.last_progress_at = time.time()
         logger.info(
-            "job=%s event=backend_still_processing status=%s stale_age_seconds=%.0f",
+            "job=%s event=backend_progress_changed status=%s stale_age_seconds=%.0f",
             process_id,
             status,
             age,
@@ -1542,7 +1857,9 @@ def _update_tracker_from_payload(process_id: str, payload: dict[str, Any]) -> No
     progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
     stage = str(progress.get("stage", "")).strip().lower()
     percent = progress.get("percent")
-    signature = f"{status}|{stage}|{percent}"
+    started_at = payload.get("started_at")
+    ended_at = payload.get("ended_at")
+    signature = f"{status}|{stage}|{percent}|{started_at}|{ended_at}"
 
     tracker.status = status
     tracker.last_seen_at = time.time()
