@@ -22,6 +22,10 @@ class RDSStatusReader:
     def __init__(self, database_url: str | None = None):
         self._database_url = database_url if database_url is not None else settings.STATUS_DATABASE_URL
 
+    @property
+    def configured(self) -> bool:
+        return bool(self._database_url)
+
     def _connect(self):
         dsn = self._database_url.replace("postgresql+psycopg2://", "postgresql://", 1)
         timeout = max(1, settings.STATUS_DB_TIMEOUT_SECONDS)
@@ -57,7 +61,7 @@ class RDSStatusReader:
             return False, None
 
     def has_active_work(self) -> tuple[bool, bool | None]:
-        """Return fail-closed shared RDS work evidence for destructive actions."""
+        """Return fresh running-work evidence for destructive startup actions."""
         if not self._database_url:
             return False, None
         try:
@@ -68,9 +72,13 @@ class RDSStatusReader:
                         SELECT EXISTS (
                             SELECT 1
                               FROM extraction_run
-                             WHERE status IN ('submitting', 'queued', 'running')
+                             WHERE status = 'running'
+                               AND started_at IS NOT NULL
+                               AND started_at >= CURRENT_TIMESTAMP
+                                   - (%s * INTERVAL '1 minute')
                         )
-                        """
+                        """,
+                        (max(1, settings.SHARED_RUNNING_MAX_AGE_MINUTES),),
                     )
                     row = cursor.fetchone()
             return True, bool(row and row[0])
@@ -84,7 +92,7 @@ class RDSStatusReader:
         payload["process_id"] = str(payload["process_id"])
         payload["status"] = {
             "submitting": "pending",
-            "submission_failed": "pending",
+            "submission_failed": "failed",
             "queued": "pending",
             "running": "started",
             "succeeded": "complete",

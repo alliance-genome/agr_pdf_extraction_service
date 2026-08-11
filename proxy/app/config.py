@@ -49,10 +49,12 @@ class Settings:
         os.environ.get("ACCEPTED_STATUS_RETENTION_SECONDS", str(7 * 24 * 60 * 60))
     )
     ACCEPTED_CLEANUP_BATCH_SIZE: int = int(os.environ.get("ACCEPTED_CLEANUP_BATCH_SIZE", "25"))
+    REPLAY_RETRY_DELAY_SECONDS: int = int(os.environ.get("REPLAY_RETRY_DELAY_SECONDS", "30"))
 
     STATUS_DATABASE_URL: str = os.environ.get("STATUS_DATABASE_URL", os.environ.get("DATABASE_URL", "")).strip()
     STATUS_DB_TIMEOUT_SECONDS: int = int(os.environ.get("STATUS_DB_TIMEOUT_SECONDS", "5"))
     STATUS_ERROR_MESSAGE_MAX_CHARS: int = int(os.environ.get("STATUS_ERROR_MESSAGE_MAX_CHARS", "4000"))
+    SHARED_RUNNING_MAX_AGE_MINUTES: int = int(os.environ.get("SHARED_RUNNING_MAX_AGE_MINUTES", "60"))
 
     STUCK_PENDING_MINUTES: int = int(os.environ.get("STUCK_PENDING_MINUTES", "20"))
     RECONCILER_INTERVAL_SECONDS: int = int(os.environ.get("RECONCILER_INTERVAL_SECONDS", "60"))

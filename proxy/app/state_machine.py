@@ -320,8 +320,11 @@ class LifecycleManager:
                 replacement_requested = False
                 if can_replace:
                     if not await self._shared_work_allows_replacement():
-                        await self._record_stale_monitor_exit(generation, "shared_active_work_or_unknown")
-                        return
+                        logger.warning(
+                            "Deferring backend replacement while shared running-work state is active or unavailable"
+                        )
+                        deadline = time.time() + max(1, settings.STARTUP_TIMEOUT_MINUTES * 60)
+                        continue
                     async with self._transition_lock:
                         if not self._owns_startup(generation):
                             await self._record_stale_monitor_exit(generation, "replacement_guard_superseded")
@@ -360,8 +363,11 @@ class LifecycleManager:
                     return
 
                 if not await self._shared_work_allows_replacement():
-                    await self._record_stale_monitor_exit(generation, "shared_active_work_or_unknown")
-                    return
+                    logger.warning(
+                        "Deferring terminal startup stop while shared running-work state is active or unavailable"
+                    )
+                    deadline = time.time() + max(1, settings.STARTUP_TIMEOUT_MINUTES * 60)
+                    continue
                 async with self._transition_lock:
                     if not self._owns_startup(generation):
                         await self._record_stale_monitor_exit(generation, "stop_guard_superseded")

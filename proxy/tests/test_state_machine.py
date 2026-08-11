@@ -220,23 +220,60 @@ class TestLifecycleManager:
         assert mgr.startup_timeout_total == 1
         assert mgr.replacement_requests_total == 0
 
-    def test_timeout_refuses_destructive_action_when_shared_work_is_active(self, monkeypatch):
+    def test_timeout_defers_and_rechecks_when_shared_work_is_active(self, monkeypatch):
         mgr, ec2 = self._make_manager(InstanceState.STARTING)
         mgr._startup_generation = 1
         mgr._startup_instance_id = "i-current"
-        mgr.set_replacement_guard(lambda: False)
+        replacement_guard = MagicMock(side_effect=[False, asyncio.CancelledError()])
+        mgr.set_replacement_guard(replacement_guard)
         ec2.get_instance_snapshot.return_value = ("running", "10.0.0.5", "i-current")
         ec2.mark_unhealthy.return_value = True
         mgr._check_health = AsyncMock(return_value=False)
 
+        clock = {"now": 0.0}
+
+        def _advancing_time():
+            clock["now"] += 1.0
+            return clock["now"]
+
+        monkeypatch.setattr("app.state_machine.time.time", _advancing_time)
         monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 0)
         monkeypatch.setattr("app.state_machine.settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS", 1)
 
-        asyncio.run(mgr._poll_until_healthy(1))
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(mgr._poll_until_healthy(1))
 
+        assert replacement_guard.call_count == 2
         ec2.mark_unhealthy.assert_not_called()
         ec2.stop_instance.assert_not_called()
-        assert mgr.stale_monitor_exits_total == 1
+        assert mgr.stale_monitor_exits_total == 0
+
+    def test_terminal_startup_stop_defers_instead_of_abandoning_monitor(self, monkeypatch):
+        mgr, ec2 = self._make_manager(InstanceState.STARTING)
+        mgr._startup_generation = 1
+        mgr._startup_instance_id = "i-current"
+        replacement_guard = MagicMock(side_effect=[False, asyncio.CancelledError()])
+        mgr.set_replacement_guard(replacement_guard)
+        ec2.get_instance_snapshot.return_value = ("running", "10.0.0.5", "i-current")
+        mgr._check_health = AsyncMock(return_value=False)
+
+        clock = {"now": 0.0}
+
+        def _advancing_time():
+            clock["now"] += 1.0
+            return clock["now"]
+
+        monkeypatch.setattr("app.state_machine.time.time", _advancing_time)
+        monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 0)
+        monkeypatch.setattr("app.state_machine.settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS", 0)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(mgr._poll_until_healthy(1))
+
+        assert replacement_guard.call_count == 2
+        ec2.mark_unhealthy.assert_not_called()
+        ec2.stop_instance.assert_not_called()
+        assert mgr.stale_monitor_exits_total == 0
 
     def test_timeout_health_recheck_prevents_asg_replacement(self, monkeypatch):
         mgr, ec2 = self._make_manager(InstanceState.STARTING)

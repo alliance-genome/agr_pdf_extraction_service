@@ -111,6 +111,40 @@ def test_active_work_lookup_is_shared_and_fail_closed(monkeypatch):
     assert reader.has_active_work() == (False, None)
 
 
+def test_active_work_lookup_only_counts_fresh_running_rows(monkeypatch):
+    connection = _Connection((False,))
+    monkeypatch.setattr("app.status_reader.psycopg2.connect", lambda *_args, **_kwargs: connection)
+    monkeypatch.setattr("app.status_reader.settings.SHARED_RUNNING_MAX_AGE_MINUTES", 60)
+    reader = RDSStatusReader("postgresql://app@db.example/pdfx")
+
+    assert reader.configured is True
+    assert reader.has_active_work() == (True, False)
+    assert "status = 'running'" in connection.cursor_instance.query
+    assert "started_at >= CURRENT_TIMESTAMP" in connection.cursor_instance.query
+    assert "'queued'" not in connection.cursor_instance.query
+    assert connection.cursor_instance.params == (60,)
+
+
+def test_unconfigured_reader_is_explicit(monkeypatch):
+    reader = RDSStatusReader("")
+
+    assert reader.configured is False
+    assert reader.has_active_work() == (False, None)
+
+
+def test_submission_publish_failure_is_client_visible_failure():
+    payload = RDSStatusReader._to_payload({
+        "process_id": "job-publish-failed",
+        "status": "submission_failed",
+        "error_code": "publish_failed",
+        "error_message": "Failed to publish extraction task",
+    })
+
+    assert payload["status"] == "failed"
+    assert payload["error_code"] == "publish_failed"
+    assert payload["error"] == "Failed to publish extraction task"
+
+
 def test_direct_status_error_shape_uses_backend_compatible_bound(monkeypatch):
     monkeypatch.setattr("app.status_reader.settings.STATUS_ERROR_MESSAGE_MAX_CHARS", 10)
 

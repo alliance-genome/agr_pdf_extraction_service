@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from celery import Celery
-from celery.exceptions import Ignore, Reject, Retry
+from celery.exceptions import Ignore, Retry
 from celery.signals import setup_logging as celery_setup_logging, worker_process_init
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -499,6 +499,9 @@ def _upsert_extraction_run(
         db_session.commit()
         return run
 
+    if not values:
+        return run
+
     updated, current = update_extraction_run_if_nonterminal(
         db_session,
         process_id,
@@ -562,6 +565,10 @@ class TerminalStatePersistenceError(RuntimeError):
     """A task cannot acknowledge until RDS contains a terminal row."""
 
 
+class StatusDatabaseUnavailable(RuntimeError):
+    """A delivery cannot safely proceed without authoritative RDS ownership."""
+
+
 def _persist_terminal_extraction_run(db_session, **kwargs):
     """Commit and verify one first-writer-wins terminal transition."""
     session = db_session or _get_db_session()
@@ -594,6 +601,23 @@ def _retry_terminal_state_persistence(task, process_id, cause=None):
     )
     error = TerminalStatePersistenceError(
         f"terminal RDS state unavailable for process_id={process_id}"
+    )
+    if cause is not None:
+        error.__cause__ = cause
+    raise task.retry(exc=error, countdown=delay, max_retries=None)
+
+
+def _retry_status_database(task, process_id, phase, cause=None):
+    """Retry with backoff instead of tight reject/requeue during an RDS outage."""
+    delay = max(1, Config.TERMINAL_STATE_RETRY_DELAY_SECONDS)
+    logger.error(
+        "Status database unavailable for %s process_id=%s; retrying in %ss",
+        phase,
+        process_id,
+        delay,
+    )
+    error = StatusDatabaseUnavailable(
+        f"status database unavailable for {phase} process_id={process_id}"
     )
     if cause is not None:
         error.__cause__ = cause
@@ -857,12 +881,16 @@ def _live_attempt_claim(process_id):
     try:
         engine = get_engine()
     except Exception as exc:
-        raise Reject(reason="status database unavailable for live-attempt ownership", requeue=True) from exc
+        raise StatusDatabaseUnavailable("live-attempt ownership engine unavailable") from exc
     if engine.dialect.name == "postgresql":
+        connection = None
         try:
             connection = engine.connect()
+            connection = connection.execution_options(isolation_level="AUTOCOMMIT")
         except Exception as exc:
-            raise Reject(reason="status database unavailable for live-attempt ownership", requeue=True) from exc
+            if connection is not None:
+                connection.close()
+            raise StatusDatabaseUnavailable("live-attempt ownership connection unavailable") from exc
         acquired = False
         try:
             try:
@@ -873,10 +901,7 @@ def _live_attempt_claim(process_id):
                     ).scalar()
                 )
             except Exception as exc:
-                raise Reject(
-                    reason="status database unavailable for live-attempt ownership",
-                    requeue=True,
-                ) from exc
+                raise StatusDatabaseUnavailable("live-attempt ownership query unavailable") from exc
             yield acquired
         finally:
             if acquired:
@@ -936,42 +961,45 @@ def extract_pdf(
     source_referencefile_id=None,
 ):
     process_id = str(process_id or uuid.uuid4())
-    with _live_attempt_claim(process_id) as acquired:
-        if not acquired:
-            logger.info("Duplicate live delivery suppressed for process_id=%s", process_id)
-            # A normal return would store Celery SUCCESS under the shared task
-            # ID and make status polling report completion while the owner runs.
-            raise Ignore()
-        try:
-            terminal = _terminal_delivery_result(process_id)
-        except Exception as exc:
-            raise Reject(reason="status database unavailable for terminal-state check", requeue=True) from exc
-        if terminal is not None:
-            logger.info("Terminal delivery no-op for process_id=%s status=%s", process_id, terminal["status"])
-            # A prior terminal commit may have become ambiguous only during its
-            # verification read. Its retry retained the stable input, so this
-            # authoritative terminal redelivery owns cleanup before IGNORE.
+    try:
+        with _live_attempt_claim(process_id) as acquired:
+            if not acquired:
+                logger.info("Duplicate live delivery suppressed for process_id=%s", process_id)
+                # A normal return would store Celery SUCCESS under the shared task
+                # ID and make status polling report completion while the owner runs.
+                raise Ignore()
             try:
-                if pdf_path and os.path.exists(pdf_path):
-                    os.remove(pdf_path)
-            except OSError as exc:
-                logger.warning("Failed to remove retained terminal input %s: %s", pdf_path, exc)
-            # Preserve the existing result-backend state for this stable task ID.
-            raise Ignore()
-        return _extract_pdf_impl(
-            self,
-            pdf_path,
-            methods,
-            merge=merge,
-            clear_cache=clear_cache,
-            clear_cache_scope=clear_cache_scope,
-            extract_images=extract_images,
-            review_images=review_images,
-            process_id=process_id,
-            reference_curie=reference_curie,
-            mod_abbreviation=mod_abbreviation,
-            source_referencefile_id=source_referencefile_id,
-        )
+                terminal = _terminal_delivery_result(process_id)
+            except Exception as exc:
+                raise StatusDatabaseUnavailable("terminal-state check unavailable") from exc
+            if terminal is not None:
+                logger.info("Terminal delivery no-op for process_id=%s status=%s", process_id, terminal["status"])
+                # A prior terminal commit may have become ambiguous only during its
+                # verification read. Its retry retained the stable input, so this
+                # authoritative terminal redelivery owns cleanup before IGNORE.
+                try:
+                    if pdf_path and os.path.exists(pdf_path):
+                        os.remove(pdf_path)
+                except OSError as exc:
+                    logger.warning("Failed to remove retained terminal input %s: %s", pdf_path, exc)
+                # Preserve the existing result-backend state for this stable task ID.
+                raise Ignore()
+            return _extract_pdf_impl(
+                self,
+                pdf_path,
+                methods,
+                merge=merge,
+                clear_cache=clear_cache,
+                clear_cache_scope=clear_cache_scope,
+                extract_images=extract_images,
+                review_images=review_images,
+                process_id=process_id,
+                reference_curie=reference_curie,
+                mod_abbreviation=mod_abbreviation,
+                source_referencefile_id=source_referencefile_id,
+            )
+    except StatusDatabaseUnavailable as exc:
+        _retry_status_database(self, process_id, "delivery ownership", cause=exc)
 
 
 def _extract_pdf_impl(

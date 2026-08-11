@@ -141,6 +141,24 @@ def test_proxy_idle_timeout_defaults_to_two_hours():
     assert 'Default: "120"' in stack_text
 
 
+def test_review_operational_limits_are_in_proxy_task_templates():
+    task_template = json.loads(
+        (Path(__file__).resolve().parents[1] / "deploy" / "task-definition.template.json").read_text()
+    )
+    environment = {
+        item["name"]: item["value"]
+        for item in task_template["containerDefinitions"][0]["environment"]
+    }
+    stack_text = (
+        Path(__file__).resolve().parents[2] / "deploy" / "aws" / "pdfx-stack.yaml"
+    ).read_text()
+
+    assert environment["REPLAY_RETRY_DELAY_SECONDS"] == "30"
+    assert environment["SHARED_RUNNING_MAX_AGE_MINUTES"] == "60"
+    assert "Name: REPLAY_RETRY_DELAY_SECONDS" in stack_text
+    assert "Name: SHARED_RUNNING_MAX_AGE_MINUTES" in stack_text
+
+
 def test_backend_deploy_supports_prebuilt_gpu_image():
     script_path = Path(__file__).resolve().parents[2] / "deploy" / "deploy.sh"
     script = script_path.read_text()

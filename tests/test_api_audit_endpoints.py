@@ -406,7 +406,13 @@ def test_submit_extraction_returns_503_when_enqueue_fails(mock_apply_async, clie
     run = session.query(ExtractionRun).one()
     assert run.status == "submission_failed"
     assert run.error_code == "publish_failed"
+    process_id = str(run.process_id)
     session.close()
+
+    status_response = client.get(f"/api/v1/extract/{process_id}")
+    assert status_response.status_code == 200
+    assert status_response.get_json()["status"] == "failed"
+    assert status_response.get_json()["error_code"] == "publish_failed"
 
 
 def test_get_extraction_status_prefers_db(client):

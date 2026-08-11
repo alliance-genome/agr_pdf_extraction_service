@@ -915,6 +915,8 @@ Resources:
               Value: !Ref AWS::Region
             - Name: QUEUE_CLAIM_TTL_SECONDS
               Value: "900"
+            - Name: REPLAY_RETRY_DELAY_SECONDS
+              Value: "30"
             - Name: ACCEPTED_STATUS_RETENTION_SECONDS
               Value: "604800"
             - Name: ACCEPTED_CLEANUP_BATCH_SIZE
@@ -923,6 +925,8 @@ Resources:
               Value: "5"
             - Name: STATUS_ERROR_MESSAGE_MAX_CHARS
               Value: "4000"
+            - Name: SHARED_RUNNING_MAX_AGE_MINUTES
+              Value: "60"
             - Name: PROXY_SHUTDOWN_GRACE_SECONDS
               Value: "90"
             - Name: MIN_UPTIME_MINUTES

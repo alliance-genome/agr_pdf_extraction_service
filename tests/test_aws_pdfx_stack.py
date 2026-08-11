@@ -100,9 +100,11 @@ def test_proxy_has_read_only_status_path_and_shutdown_handoff_configuration():
     assert 'ValueFrom: !Sub "/${SsmParameterPath}/database-url"' in template
     assert "Name: STATUS_DB_TIMEOUT_SECONDS" in template
     assert "Name: QUEUE_CLAIM_TTL_SECONDS" in template
+    assert "Name: REPLAY_RETRY_DELAY_SECONDS" in template
     assert "Name: ACCEPTED_STATUS_RETENTION_SECONDS" in template
     assert "Name: ACCEPTED_CLEANUP_BATCH_SIZE" in template
     assert "Name: STATUS_ERROR_MESSAGE_MAX_CHARS" in template
+    assert "Name: SHARED_RUNNING_MAX_AGE_MINUTES" in template
     assert "Name: PROXY_SHUTDOWN_GRACE_SECONDS" in template
     assert "StopTimeout: 120" in template
     assert "SourceSecurityGroupId: !Ref ProxySecurityGroup" in template

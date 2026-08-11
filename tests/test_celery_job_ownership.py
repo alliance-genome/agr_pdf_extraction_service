@@ -133,6 +133,71 @@ def test_worker_loss_redelivery_is_explicitly_enabled():
     assert celery_app.celery.conf.task_reject_on_worker_lost is True
 
 
+def test_postgres_live_attempt_lock_uses_autocommit(monkeypatch):
+    class _Result:
+        @staticmethod
+        def scalar():
+            return True
+
+    class _Connection:
+        def __init__(self):
+            self.options = {}
+            self.queries = []
+            self.closed = False
+
+        def execution_options(self, **kwargs):
+            self.options.update(kwargs)
+            return self
+
+        def execute(self, query, params):
+            self.queries.append((str(query), params))
+            return _Result()
+
+        def close(self):
+            self.closed = True
+
+    connection = _Connection()
+
+    class _Engine:
+        dialect = type("Dialect", (), {"name": "postgresql"})()
+
+        @staticmethod
+        def connect():
+            return connection
+
+    monkeypatch.setattr(celery_app, "get_engine", lambda: _Engine())
+
+    with celery_app._live_attempt_claim("job-autocommit") as acquired:
+        assert acquired is True
+
+    assert connection.options == {"isolation_level": "AUTOCOMMIT"}
+    assert "pg_try_advisory_lock" in connection.queries[0][0]
+    assert "pg_advisory_unlock" in connection.queries[1][0]
+    assert connection.closed is True
+
+
+def test_status_database_outage_uses_delayed_task_retry(monkeypatch):
+    monkeypatch.setattr(
+        celery_app,
+        "get_engine",
+        lambda: (_ for _ in ()).throw(OSError("RDS unavailable")),
+    )
+    monkeypatch.setattr(celery_app.Config, "TERMINAL_STATE_RETRY_DELAY_SECONDS", 9)
+    celery_app.extract_pdf.push_request(retries=0, called_directly=False, is_eager=True)
+    try:
+        with pytest.raises(Retry) as retry:
+            celery_app.extract_pdf.run(
+                "/tmp/retained-during-rds-outage.pdf",
+                ["grobid"],
+                process_id="00000000-0000-0000-0000-000000000011",
+            )
+    finally:
+        celery_app.extract_pdf.pop_request()
+
+    assert retry.value.when == 9
+    assert isinstance(retry.value.exc, celery_app.StatusDatabaseUnavailable)
+
+
 def test_terminal_persistence_retry_remains_available_after_default_retry_limit():
     assert celery_app.extract_pdf.max_retries is None
     celery_app.extract_pdf.push_request(retries=4, called_directly=False, is_eager=True)

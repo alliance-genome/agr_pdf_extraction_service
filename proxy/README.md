@@ -259,11 +259,13 @@ All settings come from environment variables. In production, values are injected
 | `QUEUE_S3_PREFIX` | No | `pdfx-proxy-queue` | S3 prefix for durable queue metadata and PDF payload objects |
 | `QUEUE_S3_REGION` | No | — | Optional S3 region override |
 | `QUEUE_CLAIM_TTL_SECONDS` | No | `900` | Lease duration for one ECS replay owner; expired claims are conditionally reclaimable after task loss |
+| `REPLAY_RETRY_DELAY_SECONDS` | No | `30` | Backoff before durable queued work retries a transient backend handoff without waiting for new traffic |
 | `ACCEPTED_STATUS_RETENTION_SECONDS` | No | `604800` | Minimum age before a caller-proven terminal accepted/status marker may be removed; active markers are preserved |
 | `ACCEPTED_CLEANUP_BATCH_SIZE` | No | `25` | Maximum expired accepted/status markers revalidated against RDS per reconciler pass |
 | `STATUS_DATABASE_URL` | Production | — | Existing backend RDS URL used only by read-only status sessions; injected from SSM in ECS |
 | `STATUS_DB_TIMEOUT_SECONDS` | No | `5` | Connection and statement timeout for the always-on authoritative status lookup |
 | `STATUS_ERROR_MESSAGE_MAX_CHARS` | No | `4000` | Maximum error text returned by direct RDS status, matching the backend response bound |
+| `SHARED_RUNNING_MAX_AGE_MINUTES` | No | `60` | Maximum age of an unchanged RDS `running` row that can block exact-target startup replacement; exceeds the 35-minute backend hard limit |
 | `PROXY_SHUTDOWN_GRACE_SECONDS` | No | `90` | Grace for an in-progress replay handoff before cancellation releases its claim |
 | `STUCK_PENDING_MINUTES` | No | `20` | Age threshold for stale pending/running jobs |
 | `RECONCILER_INTERVAL_SECONDS` | No | `60` | Background reconciler interval |
@@ -275,6 +277,10 @@ All settings come from environment variables. In production, values are injected
 ## Deployment
 
 The proxy is deployed as an ECS Fargate service behind an ALB.
+
+Production allocates 50 GiB of Fargate ephemeral storage. Durable S3 queue
+uploads spool at most the configured 500 MiB request limit at a time, leaving
+ample scratch headroom during burst replay and overlapping task deployments.
 
 ### Prerequisites
 

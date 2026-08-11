@@ -64,11 +64,22 @@ class TestHealthEndpoint:
         import app.main as main_mod
 
         lookup = MagicMock(side_effect=[(True, True), (False, None), (True, False)])
+        monkeypatch.setattr(main_mod.status_reader, "_database_url", "postgresql://configured")
         monkeypatch.setattr(main_mod.status_reader, "has_active_work", lookup)
 
         assert main_mod._can_replace_backend() is False
         assert main_mod._can_replace_backend() is False
         assert main_mod._can_replace_backend() is True
+
+    def test_replacement_guard_preserves_legacy_behavior_without_direct_reader(self, monkeypatch):
+        import app.main as main_mod
+
+        monkeypatch.setattr(main_mod.status_reader, "_database_url", "")
+        lookup = MagicMock()
+        monkeypatch.setattr(main_mod.status_reader, "has_active_work", lookup)
+
+        assert main_mod._can_replace_backend() is True
+        lookup.assert_not_called()
 
     def test_health_live_returns_ok(self, client):
         resp = client.get("/api/v1/health/live")
@@ -724,6 +735,75 @@ class TestExtractStatusEndpoint:
         assert resp.status_code == 200
         assert resp.json() == authoritative
         main_mod.lifecycle.ensure_running.assert_not_called()
+
+    def test_authoritative_nonterminal_job_returns_live_backend_progress(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-live-progress"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        main_mod.lifecycle.ec2_base_url = "http://172.31.1.100:5000"
+        main_mod.job_queue.record_accepted(process_id)
+        authoritative = {
+            "process_id": process_id,
+            "status": "started",
+            "started_at": "2026-08-11T20:00:00Z",
+        }
+        live_progress = {
+            "process_id": process_id,
+            "status": "progress",
+            "progress": {
+                "stage": "docling",
+                "stage_display": "Extracting document structure",
+                "stages_completed": ["grobid"],
+                "stages_pending": ["marker"],
+                "stages_total": 3,
+                "stages_done": 1,
+                "percent": 33,
+            },
+        }
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, authoritative)),
+        )
+        backend_lookup = AsyncMock(return_value=(200, live_progress))
+        monkeypatch.setattr(main_mod, "_fetch_backend_status_payload", backend_lookup)
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == live_progress
+        backend_lookup.assert_awaited_once_with(process_id, authorization="Bearer test")
+
+    def test_authoritative_nonterminal_job_falls_back_to_rds_when_backend_unreachable(self, client, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-progress-fallback"
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.lifecycle.private_ip = "172.31.1.100"
+        authoritative = {"process_id": process_id, "status": "started"}
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, authoritative)),
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_fetch_backend_status_payload",
+            AsyncMock(side_effect=OSError("backend unavailable")),
+        )
+
+        resp = client.get(
+            f"/api/v1/extract/{process_id}",
+            headers={"Authorization": "Bearer test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == authoritative
 
     def test_authoritative_terminal_status_wins_before_queue_ack(self, client, monkeypatch):
         import app.main as main_mod
@@ -1511,20 +1591,23 @@ class TestExtractCancelEndpoint:
         assert queue.get_durable_phase("replay-ack-1") == "accepted"
         assert queue.has_job("replay-ack-1") is False
 
-    def test_interrupted_replay_releases_claim_and_retains_queue(self, client, monkeypatch):
+    def test_interrupted_replay_retries_with_backoff_without_new_traffic(self, client, monkeypatch):
         import app.main as main_mod
 
         main_mod.lifecycle.state = InstanceState.READY
         main_mod.job_queue.enqueue("replay-fail-1", b"%PDF fail", {}, filename="fail.pdf")
-        monkeypatch.setattr(
-            main_mod,
-            "_forward_extraction",
-            AsyncMock(side_effect=RuntimeError("backend rejected upload")),
-        )
+        forward = AsyncMock(side_effect=[RuntimeError("backend unavailable"), None])
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+        retry_sleep = AsyncMock()
+        monkeypatch.setattr(main_mod.asyncio, "sleep", retry_sleep)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_RETRY_DELAY_SECONDS", 7)
 
         asyncio.run(main_mod._replay_when_ready())
 
-        assert main_mod.job_queue.has_job("replay-fail-1") is True
+        assert forward.await_count == 2
+        retry_sleep.assert_awaited_once_with(7)
+        assert main_mod.job_queue.has_job("replay-fail-1") is False
+        assert main_mod.job_queue.get_durable_phase("replay-fail-1") == "accepted"
         assert "replay-fail-1" not in main_mod.replay_submission_errors
 
         resp = client.get(
@@ -1532,7 +1615,7 @@ class TestExtractCancelEndpoint:
             headers={"Authorization": "Bearer test"},
         )
         assert resp.status_code == 200
-        assert resp.json()["status"] == "queued"
+        assert resp.json()["status"] == "pending"
 
     def test_replay_keeps_queue_while_asg_replacement_is_starting(self, monkeypatch):
         import app.main as main_mod
@@ -1662,6 +1745,7 @@ class TestExtractCancelEndpoint:
             status="running",
             first_seen_at=0,
             last_seen_at=0,
+            last_progress_signature="running||None|None|None",
             last_progress_at=0,
         )
 
@@ -1689,7 +1773,7 @@ class TestExtractCancelEndpoint:
         main_mod.lifecycle.ensure_running.assert_awaited_once()
         main_mod._ensure_replay_task.assert_called_once()
 
-    def test_reconciler_keeps_stale_job_active_when_backend_still_running(self, monkeypatch):
+    def test_reconciler_releases_unchanged_running_status_from_local_stop_guard(self, monkeypatch):
         import app.main as main_mod
 
         process_id = "stale-running-job"
@@ -1701,6 +1785,7 @@ class TestExtractCancelEndpoint:
             status="running",
             first_seen_at=0,
             last_seen_at=0,
+            last_progress_signature="running||None|None|None",
             last_progress_at=0,
         )
 
@@ -1740,10 +1825,9 @@ class TestExtractCancelEndpoint:
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(main_mod._reconciler_loop())
 
-        assert process_id not in main_mod.replay_submission_errors
-        assert main_mod.job_trackers[process_id].status == "running"
-        assert main_mod.job_trackers[process_id].last_progress_at > 0
-        assert main_mod._active_backend_jobs() == 1
+        assert "Progress monitoring timeout" in main_mod.replay_submission_errors[process_id]
+        assert main_mod.job_trackers[process_id].status == "failed"
+        assert main_mod._active_backend_jobs() == 0
 
     def test_reconciler_expires_unchanged_pending_status(self, monkeypatch):
         import app.main as main_mod
@@ -1757,7 +1841,7 @@ class TestExtractCancelEndpoint:
             status="pending",
             first_seen_at=0,
             last_seen_at=0,
-            last_progress_signature="pending||None",
+            last_progress_signature="pending||None|None|None",
             last_progress_at=0,
         )
 
@@ -1835,8 +1919,51 @@ class TestExtractCancelEndpoint:
             asyncio.run(main_mod._reconciler_loop())
 
         assert process_id not in main_mod.replay_submission_errors
-        assert main_mod.job_trackers[process_id].status == "running"
-        assert main_mod.job_trackers[process_id].last_progress_at > 0
+        assert process_id not in main_mod.job_trackers
+        assert main_mod.job_queue.get_durable_phase(process_id) == "accepted"
+
+    def test_reconciler_does_not_renew_unchanged_authoritative_running_row(self, monkeypatch):
+        import app.main as main_mod
+
+        process_id = "accepted-rds-running-stale"
+        started_at = "2026-08-11T19:00:00Z"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.record_accepted(process_id)
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="started",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_signature=f"started||None|{started_at}|None",
+            last_progress_at=0,
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(True, {
+                "process_id": process_id,
+                "status": "started",
+                "started_at": started_at,
+            })),
+        )
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert process_id not in main_mod.job_trackers
+        assert main_mod.job_queue.get_durable_phase(process_id) == "accepted"
 
     def test_cleanup_pass_eventually_removes_only_terminal_proven_records(self, monkeypatch):
         import app.main as main_mod

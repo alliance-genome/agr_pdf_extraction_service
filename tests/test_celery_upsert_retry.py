@@ -118,6 +118,20 @@ def test_statusless_update_cannot_mutate_terminal_fields(run_session):
     assert run.log_s3_key == "pdfx/audit/original.ndjson"
 
 
+def test_empty_existing_upsert_is_a_noop(run_session):
+    run = ExtractionRun(
+        process_id="00000000-0000-0000-0000-000000000010",
+        status="running",
+    )
+    run_session.add(run)
+    run_session.commit()
+
+    result = celery_app._upsert_extraction_run(run_session, process_id=run.process_id)
+
+    assert result is run
+    assert run.status == "running"
+
+
 def test_upsert_success_clears_stale_error_fields(run_session):
     run = ExtractionRun(
         process_id="00000000-0000-0000-0000-000000000004",

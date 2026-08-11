@@ -98,8 +98,10 @@ def _to_iso(dt):
 
 
 def _map_db_status(status):
-    if status in {"submitting", "submission_failed", "queued"}:
+    if status in {"submitting", "queued"}:
         return "pending"
+    if status == "submission_failed":
+        return "failed"
     if status == "running":
         return "started"
     if status == "succeeded":

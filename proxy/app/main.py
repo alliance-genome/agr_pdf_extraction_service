@@ -283,7 +283,12 @@ def _can_stop_ec2() -> bool:
 
 
 def _can_replace_backend() -> bool:
-    """Allow startup destruction only when shared RDS proves no active work."""
+    """Allow startup destruction only when shared RDS has no fresh running work."""
+    if not status_reader.configured:
+        # Production deployment requires this setting. Preserve legacy/local
+        # lifecycle behavior when the optional direct reader is not configured.
+        logger.warning("Allowing exact-target backend replacement without a configured status database")
+        return True
     reachable, active = status_reader.has_active_work()
     if not reachable or active is None:
         logger.warning("Refusing backend replacement: shared active-work state is unavailable")
@@ -899,6 +904,34 @@ async def get_extraction_status(
         ):
             lifecycle.touch()
             await lifecycle.ensure_running()
+        if (
+            status_value in ACTIVE_JOB_STATUSES
+            and lifecycle.state in (InstanceState.READY, InstanceState.BUSY)
+        ):
+            try:
+                status_code, backend_payload = await _fetch_backend_status_payload(
+                    process_id,
+                    authorization=authorization,
+                )
+                backend_status = str(backend_payload.get("status", "")).strip().lower()
+                if status_code < 400 and backend_status in ACTIVE_JOB_STATUSES | TERMINAL_JOB_STATUSES:
+                    _update_tracker_from_payload(process_id, backend_payload)
+                    if backend_status in ACTIVE_JOB_STATUSES:
+                        lifecycle.touch()
+                    _mark_terminal_cleanup_if_needed(process_id, backend_payload)
+                    return JSONResponse(status_code=status_code, content=backend_payload)
+                logger.warning(
+                    "Backend status detail unavailable for authoritative job %s: HTTP %s status=%s",
+                    process_id,
+                    status_code,
+                    backend_status,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Backend status detail lookup failed for authoritative job %s; using RDS: %s",
+                    process_id,
+                    exc,
+                )
         return JSONResponse(status_code=200, content=authoritative_payload)
 
     # Without an authoritative row, durable unaccepted work remains queued.
@@ -1602,14 +1635,16 @@ async def _replay_when_ready():
             else:
                 logger.warning("Transient replay failure for %s; retaining queue record: %s", job.job_id, exc)
                 await asyncio.to_thread(job_queue.release_claim, job)
-                return
+                await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
+                continue
         except asyncio.CancelledError:
             await asyncio.to_thread(job_queue.release_claim, job)
             raise
         except Exception as exc:
             logger.warning("Replay handoff interrupted for %s; retaining queue record: %s", job.job_id, exc)
             await asyncio.to_thread(job_queue.release_claim, job)
-            return
+            await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
+            continue
         finally:
             job.cleanup()
             replay_inflight_jobs.discard(job.job_id)
@@ -1650,10 +1685,11 @@ async def _reconciler_loop():
                 durable_phase = None
             if durable_phase in {"accepted", "cancel_requested"}:
                 # A monitoring outage is not terminal job evidence. Keep the
-                # durable accepted ID active until RDS or the backend supplies truth.
-                tracker.last_progress_at = now
+                # durable accepted ID discoverable, but release the stale local
+                # stop guard until RDS or backend progress changes again.
+                job_trackers.pop(process_id, None)
                 logger.warning(
-                    "job=%s event=accepted_status_temporarily_unavailable phase=%s",
+                    "job=%s event=accepted_status_stale_local_guard_released phase=%s",
                     process_id,
                     durable_phase,
                 )
@@ -1711,16 +1747,14 @@ async def _refresh_stale_backend_status(process_id: str, tracker: JobTracker, *,
         if status in TERMINAL_JOB_STATUSES:
             _mark_terminal_cleanup_if_needed(process_id, authoritative_payload)
             return True
-        if status in ACTIVE_JOB_STATUSES:
-            tracker.last_progress_at = time.time()
+        if status in ACTIVE_JOB_STATUSES and tracker.last_progress_at > previous_progress_at:
             logger.info(
-                "job=%s event=rds_still_processing status=%s stale_age_seconds=%.0f",
+                "job=%s event=rds_progress_changed status=%s stale_age_seconds=%.0f",
                 process_id,
                 status,
                 age,
             )
             return True
-        tracker.last_progress_at = previous_progress_at
 
     if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY) or not lifecycle.private_ip:
         return False
@@ -1756,16 +1790,15 @@ async def _refresh_stale_backend_status(process_id: str, tracker: JobTracker, *,
         return True
 
     if status in ACTIVE_JOB_STATUSES:
-        if _is_ambiguous_backend_pending(payload) and tracker.last_progress_at <= previous_progress_at:
+        if tracker.last_progress_at <= previous_progress_at:
             logger.warning(
-                "job=%s event=ambiguous_pending_still_stale stale_age_seconds=%.0f",
+                "job=%s event=backend_status_unchanged stale_age_seconds=%.0f",
                 process_id,
                 age,
             )
             return False
-        tracker.last_progress_at = time.time()
         logger.info(
-            "job=%s event=backend_still_processing status=%s stale_age_seconds=%.0f",
+            "job=%s event=backend_progress_changed status=%s stale_age_seconds=%.0f",
             process_id,
             status,
             age,
@@ -1824,7 +1857,9 @@ def _update_tracker_from_payload(process_id: str, payload: dict[str, Any]) -> No
     progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
     stage = str(progress.get("stage", "")).strip().lower()
     percent = progress.get("percent")
-    signature = f"{status}|{stage}|{percent}"
+    started_at = payload.get("started_at")
+    ended_at = payload.get("ended_at")
+    signature = f"{status}|{stage}|{percent}|{started_at}|{ended_at}"
 
     tracker.status = status
     tracker.last_seen_at = time.time()
