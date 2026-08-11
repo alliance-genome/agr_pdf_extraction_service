@@ -16,6 +16,10 @@ byte assembly itself. No model response can insert publication text.
   GROBID, Docling, and Marker with Docker Compose.
 - The proxy replays queued work only after the backend and Marker worker report
   ready.
+- Backend submission claims the caller-supplied process ID in RDS before
+  publishing Celery work. PostgreSQL advisory ownership excludes simultaneous
+  deliveries; worker-process loss releases that ownership so late-ack
+  redelivery can recover, while terminal rows remain immutable.
 - Completed artifacts and audit logs are stored in S3. The GPU backend returns
   to zero desired capacity when idle.
 
@@ -177,8 +181,16 @@ Key settings:
 | `TASK_SOFT_TIME_LIMIT_SECONDS` | `1800` | Overall Celery soft deadline |
 | `TASK_HARD_TIME_LIMIT_SECONDS` | `2100` | Overall Celery hard deadline |
 | `EXTRACTION_FINALIZATION_RESERVE_SECONDS` | `300` | Recovery stops to preserve finalization time |
+| `SUBMISSION_CLAIM_STALE_SECONDS` | `120` | Age at which a crashed pre-Celery-publish ownership claim may be reclaimed by the same stable process ID |
+| `TERMINAL_STATE_RETRY_DELAY_SECONDS` | `30` | Delay before redelivering completed work whose required terminal RDS transition could not be committed |
+| `TASK_REJECT_ON_WORKER_LOST` | `true` | Requeue late-ack work when its worker process disappears so the stable process ID can take over after advisory-lock release |
 | `MAX_CONTENT_LENGTH` | `500 MiB` | Backend upload limit |
 | `PDFX_MARKER_READY_FILE` | cache path | Worker-process Marker readiness receipt |
+
+Terminal-state redelivery is intentionally fail-closed rather than count-limited:
+the stable task keeps its input and retries at the configured delay until RDS
+records a first-writer-wins terminal state. A task never acknowledges completion
+while its authoritative row is still active.
 
 ## Development and validation
 

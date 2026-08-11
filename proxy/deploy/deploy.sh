@@ -87,6 +87,14 @@ read_param() {
     "${AWS_CMD[@]}" ssm get-parameter --name "$1" --query "Parameter.Value" --output text
 }
 
+require_ssm_param() {
+    local name="$1"
+    if ! "${AWS_CMD[@]}" ssm get-parameter --name "$name" >/dev/null; then
+        echo "ERROR: required SSM parameter ${name} is missing or unreadable." >&2
+        return 1
+    fi
+}
+
 read_optional_param() {
     local name="$1"
     local err_file
@@ -161,6 +169,7 @@ ensure_ssm_param "${SSM_PREFIX}/backend-asg-name"
 ensure_ssm_param "${SSM_PREFIX}/cognito-accepted-scopes"
 ensure_ssm_param "${SSM_PREFIX}/cognito-accepted-client-ids"
 ensure_ssm_param "${SSM_PREFIX}/asg-startup-replacement-attempts" "1"
+require_ssm_param "${SSM_PREFIX}/database-url"
 
 BACKEND_ASG_NAME=$(read_optional_param "${SSM_PREFIX}/backend-asg-name")
 EC2_INSTANCE_RESOURCE="${EC2_INSTANCE_ID//[[:space:]]/}"

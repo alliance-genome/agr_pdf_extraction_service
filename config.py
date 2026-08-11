@@ -28,6 +28,11 @@ class Config:
     CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
     CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
     HEALTH_BUSY_RUN_MAX_AGE_SECONDS = int(os.environ.get("HEALTH_BUSY_RUN_MAX_AGE_SECONDS", 6 * 60 * 60))
+    SUBMISSION_CLAIM_STALE_SECONDS = int(os.environ.get("SUBMISSION_CLAIM_STALE_SECONDS", 120))
+    TERMINAL_STATE_RETRY_DELAY_SECONDS = int(os.environ.get("TERMINAL_STATE_RETRY_DELAY_SECONDS", 30))
+    TASK_REJECT_ON_WORKER_LOST = os.environ.get("TASK_REJECT_ON_WORKER_LOST", "true").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
     # ---- Database --------------------------------------------------------
     DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://pdfx:pdfx@localhost:5432/pdfx")

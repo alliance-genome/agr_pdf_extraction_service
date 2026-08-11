@@ -31,13 +31,18 @@ class LifecycleManager:
         self._last_activity: float = time.time()
         self._ready_since: Optional[float] = None
         self._startup_task: Optional[asyncio.Task] = None
+        self._transition_lock = asyncio.Lock()
+        self._startup_generation: int = 0
+        self._startup_instance_id: Optional[str] = None
         self._idle_task: Optional[asyncio.Task] = None
         self._active_jobs: int = 0
         self._stop_guard: Optional[Callable[[], bool]] = None
+        self._replacement_guard: Optional[Callable[[], bool]] = None
         self._stop_events_total: int = 0
         self._stop_blocked_total: int = 0
         self._startup_timeout_total: int = 0
         self._replacement_requests_total: int = 0
+        self._stale_monitor_exits_total: int = 0
         self._last_health_status_code: Optional[int] = None
         self._last_health_checks: dict = {}
         self._last_health_reason: Optional[str] = None
@@ -81,6 +86,10 @@ class LifecycleManager:
         return self._replacement_requests_total
 
     @property
+    def stale_monitor_exits_total(self) -> int:
+        return self._stale_monitor_exits_total
+
+    @property
     def last_health_status_code(self) -> Optional[int]:
         return self._last_health_status_code
 
@@ -100,6 +109,20 @@ class LifecycleManager:
     def set_stop_guard(self, guard: Callable[[], bool]) -> None:
         """Register callback that must return True before EC2 can stop."""
         self._stop_guard = guard
+
+    def set_replacement_guard(self, guard: Callable[[], bool]) -> None:
+        """Register the shared-active-work precondition for startup destruction."""
+        self._replacement_guard = guard
+
+    async def _shared_work_allows_replacement(self) -> bool:
+        if self._replacement_guard is None:
+            logger.error("No shared-work replacement guard is configured; refusing destructive action")
+            return False
+        try:
+            return bool(await asyncio.to_thread(self._replacement_guard))
+        except Exception as exc:
+            logger.error("Shared-work replacement guard failed: %s", exc)
+            return False
 
     def touch(self) -> None:
         """Reset the idle timer. Call on every incoming request."""
@@ -129,100 +152,245 @@ class LifecycleManager:
 
     async def ensure_running(self) -> None:
         """Start EC2 if stopped. Idempotent if already starting/running."""
-        if self._state in (InstanceState.READY, InstanceState.BUSY):
-            return
-        if self._state == InstanceState.STARTING:
-            return  # already booting
-
-        # Check actual EC2 state first
-        ec2_state, ip = self._ec2.get_instance_state()
-        if ec2_state == "running" and ip:
-            self._private_ip = ip
-            if await self._check_health():
-                self._state = InstanceState.READY
-                if self._ready_since is None:
-                    self._ready_since = time.time()
-                self._start_idle_monitor()
+        async with self._transition_lock:
+            if self._state in (InstanceState.READY, InstanceState.BUSY):
                 return
+            if self._startup_task and not self._startup_task.done():
+                return
+            self._begin_startup_locked()
 
-        if ec2_state == "stopped":
-            self._ec2.start_instance()
-
+    def _begin_startup_locked(self, instance_id: str | None = None) -> int:
+        """Create the sole monitor for a new authoritative startup generation."""
+        self._startup_generation += 1
+        generation = self._startup_generation
+        self._startup_instance_id = instance_id
         self._state = InstanceState.STARTING
+        self._private_ip = None
+        self._ready_since = None
         self._clear_health_snapshot()
-        self._startup_task = asyncio.create_task(self._poll_until_healthy())
+        self._startup_task = asyncio.create_task(self._poll_until_healthy(generation))
+        return generation
 
-    async def _poll_until_healthy(self) -> None:
+    def _owns_startup(self, generation: int) -> bool:
+        return self._state == InstanceState.STARTING and self._startup_generation == generation
+
+    async def _record_stale_monitor_exit(self, generation: int, reason: str) -> None:
+        self._stale_monitor_exits_total += 1
+        logger.info(
+            "event=stale_startup_monitor_exit generation=%s current_generation=%s reason=%s",
+            generation,
+            self._startup_generation,
+            reason,
+        )
+
+    async def _set_ready_if_owner(
+        self,
+        generation: int,
+        private_ip: str,
+        instance_id: str | None,
+    ) -> bool:
+        async with self._transition_lock:
+            if not self._owns_startup(generation):
+                return False
+            current_task = asyncio.current_task()
+            old_task = self._startup_task
+            self._startup_generation += 1
+            self._startup_instance_id = instance_id
+            self._startup_task = None
+            self._state = InstanceState.READY
+            self._private_ip = private_ip
+            self._ready_since = time.time()
+            if old_task and old_task is not current_task and not old_task.done():
+                old_task.cancel()
+            self._start_idle_monitor()
+            return True
+
+    async def _poll_until_healthy(self, generation: int | None = None) -> None:
         """Poll EC2 health endpoint until ready or timeout."""
+        current_task = asyncio.current_task()
+        if generation is None:
+            async with self._transition_lock:
+                if self._startup_generation == 0:
+                    self._startup_generation = 1
+                generation = self._startup_generation
+                self._state = InstanceState.STARTING
+                self._startup_task = current_task
+
         deadline = time.time() + settings.STARTUP_TIMEOUT_MINUTES * 60
         poll_interval = settings.HEALTH_POLL_INTERVAL_SECONDS
         start_requested = False
         replacement_attempts = 0
+        target_instance_id = self._startup_instance_id
 
-        while True:
-            while time.time() < deadline:
-                try:
-                    ec2_state, ip = self._ec2.get_instance_state()
-                    if ec2_state == "stopped" and not start_requested:
-                        # If the first observed state was "stopping", issue start once
-                        # after AWS transitions to fully "stopped".
-                        logger.info("EC2 reached stopped during startup poll; issuing start request.")
-                        self._ec2.start_instance()
-                        start_requested = True
-                    if ip:
-                        self._private_ip = ip
-                    if ec2_state == "running" and ip:
-                        if await self._check_health():
-                            logger.info("EC2 instance healthy at %s", ip)
-                            self._state = InstanceState.READY
-                            self._ready_since = time.time()
-                            self._start_idle_monitor()
+        try:
+            while True:
+                while time.time() < deadline:
+                    async with self._transition_lock:
+                        if not self._owns_startup(generation):
+                            await self._record_stale_monitor_exit(generation, "generation_superseded")
                             return
-                except Exception as exc:
-                    logger.debug("Health poll error (expected during startup): %s", exc)
+                    try:
+                        ec2_state, ip, instance_id = await asyncio.to_thread(
+                            self._ec2.get_instance_snapshot
+                        )
+                        async with self._transition_lock:
+                            if not self._owns_startup(generation):
+                                await self._record_stale_monitor_exit(generation, "snapshot_superseded")
+                                return
+                            if instance_id and target_instance_id is None:
+                                target_instance_id = instance_id
+                                self._startup_instance_id = instance_id
+                            if ip:
+                                self._private_ip = ip
 
-                await asyncio.sleep(poll_interval)
+                        if ec2_state == "stopped" and not start_requested:
+                            logger.info("EC2 reached stopped during startup poll; issuing start request.")
+                            await asyncio.to_thread(self._ec2.start_instance)
+                            start_requested = True
+                        if ec2_state == "running" and ip and await self._check_health(ip):
+                            logger.info("EC2 instance healthy at %s", ip)
+                            if await self._set_ready_if_owner(generation, ip, instance_id):
+                                return
+                            await self._record_stale_monitor_exit(generation, "healthy_but_superseded")
+                            return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.debug("Health poll error (expected during startup): %s", exc)
 
-            logger.error("EC2 startup timed out after %d minutes", settings.STARTUP_TIMEOUT_MINUTES)
-            self._startup_timeout_total += 1
-            can_wait_for_replacement = replacement_attempts < settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS
-            replacement_requested = False
+                    await asyncio.sleep(poll_interval)
 
-            if can_wait_for_replacement:
+                async with self._transition_lock:
+                    if not self._owns_startup(generation):
+                        await self._record_stale_monitor_exit(generation, "deadline_superseded")
+                        return
+                    self._startup_timeout_total += 1
+                logger.error("EC2 startup timed out after %d minutes", settings.STARTUP_TIMEOUT_MINUTES)
+
                 try:
-                    replacement_requested = self._ec2.mark_unhealthy()
-                    if replacement_requested:
-                        self._replacement_requests_total += 1
+                    ec2_state, ip, current_instance_id = await asyncio.to_thread(
+                        self._ec2.get_instance_snapshot
+                    )
                 except Exception as exc:
-                    logger.error("Failed to request backend replacement after startup timeout: %s", exc)
+                    logger.error("Failed to refresh backend identity after startup timeout: %s", exc)
+                    ec2_state, ip, current_instance_id = "unknown", None, None
 
-            if replacement_requested:
-                replacement_attempts += 1
-                logger.warning(
-                    "Waiting for ASG backend replacement attempt %d/%d",
-                    replacement_attempts,
-                    settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS,
+                async with self._transition_lock:
+                    if not self._owns_startup(generation):
+                        await self._record_stale_monitor_exit(generation, "timeout_snapshot_superseded")
+                        return
+
+                if target_instance_id and current_instance_id != target_instance_id:
+                    await self._record_stale_monitor_exit(generation, "instance_identity_changed")
+                    return
+                if target_instance_id is None and current_instance_id:
+                    target_instance_id = current_instance_id
+                    async with self._transition_lock:
+                        if self._owns_startup(generation):
+                            self._startup_instance_id = current_instance_id
+
+                if ec2_state == "running" and ip and await self._check_health(ip):
+                    if await self._set_ready_if_owner(generation, ip, current_instance_id):
+                        return
+                    await self._record_stale_monitor_exit(generation, "timeout_health_superseded")
+                    return
+
+                # Re-read identity after the awaited health call. EC2Manager also
+                # validates the exact target immediately before the AWS mutation.
+                try:
+                    _state, _ip, verified_instance_id = await asyncio.to_thread(
+                        self._ec2.get_instance_snapshot
+                    )
+                except Exception as exc:
+                    logger.error("Failed final backend identity check: %s", exc)
+                    verified_instance_id = None
+
+                async with self._transition_lock:
+                    if not self._owns_startup(generation):
+                        await self._record_stale_monitor_exit(generation, "final_check_superseded")
+                        return
+                if target_instance_id and verified_instance_id != target_instance_id:
+                    await self._record_stale_monitor_exit(generation, "final_identity_changed")
+                    return
+
+                can_replace = (
+                    target_instance_id is not None
+                    and replacement_attempts < settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS
                 )
-                self._state = InstanceState.STARTING
-                self._private_ip = None
-                self._ready_since = None
-                self._clear_health_snapshot()
-                start_requested = False
-                deadline = time.time() + settings.STARTUP_TIMEOUT_MINUTES * 60
-                continue
+                replacement_requested = False
+                if can_replace:
+                    if not await self._shared_work_allows_replacement():
+                        await self._record_stale_monitor_exit(generation, "shared_active_work_or_unknown")
+                        return
+                    async with self._transition_lock:
+                        if not self._owns_startup(generation):
+                            await self._record_stale_monitor_exit(generation, "replacement_guard_superseded")
+                            return
+                    try:
+                        replacement_requested = await asyncio.to_thread(
+                            self._ec2.mark_unhealthy,
+                            target_instance_id,
+                        )
+                    except Exception as exc:
+                        logger.error("Failed to request backend replacement after startup timeout: %s", exc)
 
-            try:
-                self._ec2.stop_instance()
-            except Exception as exc:
-                logger.error("Failed to stop backend after terminal startup failure: %s", exc)
-            break
+                if replacement_requested:
+                    async with self._transition_lock:
+                        if not self._owns_startup(generation):
+                            await self._record_stale_monitor_exit(generation, "replacement_superseded")
+                            return
+                        self._replacement_requests_total += 1
+                        self._startup_instance_id = None
+                        self._private_ip = None
+                        self._ready_since = None
+                        self._clear_health_snapshot()
+                    replacement_attempts += 1
+                    target_instance_id = None
+                    start_requested = False
+                    deadline = time.time() + settings.STARTUP_TIMEOUT_MINUTES * 60
+                    logger.warning(
+                        "Waiting for ASG backend replacement attempt %d/%d",
+                        replacement_attempts,
+                        settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS,
+                    )
+                    continue
 
-        self._state = InstanceState.STOPPED
-        self._private_ip = None
-        self._ready_since = None
-        self._clear_health_snapshot()
+                if target_instance_id is None:
+                    await self._record_stale_monitor_exit(generation, "destructive_target_unresolved")
+                    return
 
-    async def _check_health(self) -> bool:
+                if not await self._shared_work_allows_replacement():
+                    await self._record_stale_monitor_exit(generation, "shared_active_work_or_unknown")
+                    return
+                async with self._transition_lock:
+                    if not self._owns_startup(generation):
+                        await self._record_stale_monitor_exit(generation, "stop_guard_superseded")
+                        return
+
+                try:
+                    stopped = await asyncio.to_thread(
+                        self._ec2.stop_instance,
+                        target_instance_id,
+                    )
+                except Exception as exc:
+                    logger.error("Failed to stop backend after terminal startup failure: %s", exc)
+                    stopped = False
+
+                async with self._transition_lock:
+                    if self._owns_startup(generation) and stopped:
+                        self._startup_generation += 1
+                        self._startup_instance_id = None
+                        self._state = InstanceState.STOPPED
+                        self._private_ip = None
+                        self._ready_since = None
+                        self._clear_health_snapshot()
+                return
+        finally:
+            async with self._transition_lock:
+                if self._startup_task is current_task:
+                    self._startup_task = None
+
+    async def _check_health(self, private_ip: str | None = None) -> bool:
         """Hit the EC2 Flask health endpoint and validate backend availability.
 
         A solo Celery worker can be too busy to answer inspect/ping while it is
@@ -230,14 +398,15 @@ class LifecycleManager:
         broker-unacked running task, treat it as available for submissions so
         queued work is reported honestly instead of as a startup failure.
         """
-        if not self._private_ip:
+        health_ip = private_ip or self._private_ip
+        if not health_ip:
             self._last_health_status_code = None
             self._last_health_checks = {}
             self._last_health_reason = "missing_private_ip"
             return False
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{self.ec2_base_url}/api/v1/health")
+                resp = await client.get(f"http://{health_ip}:{settings.EC2_PORT}/api/v1/health")
             self._last_health_status_code = resp.status_code
 
             payload = resp.json()
@@ -340,15 +509,68 @@ class LifecycleManager:
                     self._stop_blocked_total += 1
                     continue
             if self.idle_seconds >= timeout:
+                try:
+                    ec2_state, ip, instance_id = await asyncio.to_thread(
+                        self._ec2.get_instance_snapshot
+                    )
+                except Exception as exc:
+                    logger.error("Failed to identify idle backend before stop: %s", exc)
+                    continue
+                if ec2_state != "running" or not instance_id:
+                    continue
+                if not ip:
+                    continue
+                try:
+                    health_confirmed = await self._check_health(ip)
+                except Exception:
+                    health_confirmed = False
+                if not health_confirmed:
+                    logger.info(
+                        "event=idle_stop_blocked reason=fresh_health_unavailable instance=%s",
+                        instance_id,
+                    )
+                    self._stop_blocked_total += 1
+                    continue
+                # Health and AWS reads are await boundaries. Recheck process-local
+                # work and current identity immediately before the exact-target stop.
+                if self._state != InstanceState.READY:
+                    continue
+                if self._stop_guard:
+                    try:
+                        if not self._stop_guard():
+                            self._stop_blocked_total += 1
+                            continue
+                    except Exception as exc:
+                        logger.error("Stop guard callback failed during final recheck: %s", exc)
+                        self._stop_blocked_total += 1
+                        continue
+                try:
+                    _state, _ip, verified_instance_id = await asyncio.to_thread(
+                        self._ec2.get_instance_snapshot
+                    )
+                except Exception as exc:
+                    logger.error("Failed final idle backend identity check: %s", exc)
+                    continue
+                if verified_instance_id != instance_id:
+                    logger.info(
+                        "event=stale_idle_stop_exit expected_instance=%s current_instance=%s",
+                        instance_id,
+                        verified_instance_id,
+                    )
+                    continue
                 logger.info(
                     "Idle timeout reached (%.0f seconds). Stopping EC2.",
                     self.idle_seconds,
                 )
                 try:
-                    self._ec2.stop_instance()
-                    self._stop_events_total += 1
+                    stopped = await asyncio.to_thread(self._ec2.stop_instance, instance_id)
+                    if stopped:
+                        self._stop_events_total += 1
                 except Exception as exc:
                     logger.error("Failed to stop EC2: %s", exc)
+                    stopped = False
+                if not stopped:
+                    continue
                 self._state = InstanceState.STOPPED
                 self._private_ip = None
                 self._ready_since = None
@@ -358,30 +580,48 @@ class LifecycleManager:
     async def sync_state_from_ec2(self) -> None:
         """Sync internal state with actual EC2 state. Call on proxy startup."""
         try:
-            ec2_state, ip = self._ec2.get_instance_state()
-            self._private_ip = ip
+            ec2_state, ip, instance_id = await asyncio.to_thread(self._ec2.get_instance_snapshot)
             if ec2_state == "running" and ip:
-                if await self._check_health():
-                    self._state = InstanceState.READY
-                    self._ready_since = time.time()
-                    self._start_idle_monitor()
+                if await self._check_health(ip):
+                    async with self._transition_lock:
+                        old_task = self._startup_task
+                        self._startup_generation += 1
+                        self._startup_instance_id = instance_id
+                        self._startup_task = None
+                        self._state = InstanceState.READY
+                        self._private_ip = ip
+                        self._ready_since = time.time()
+                        if old_task and old_task is not asyncio.current_task() and not old_task.done():
+                            old_task.cancel()
+                        self._start_idle_monitor()
                     logger.info("Synced: EC2 is running and healthy at %s", ip)
                 else:
-                    self._state = InstanceState.STARTING
-                    self._startup_task = asyncio.create_task(self._poll_until_healthy())
+                    async with self._transition_lock:
+                        if not (self._startup_task and not self._startup_task.done()):
+                            self._begin_startup_locked(instance_id)
                     logger.info("Synced: EC2 is running but not yet healthy")
             elif ec2_state in ("pending", "shutting-down", "stopping"):
-                self._state = InstanceState.STARTING
-                self._startup_task = asyncio.create_task(self._poll_until_healthy())
-                self._ready_since = None
-                self._clear_health_snapshot()
+                async with self._transition_lock:
+                    if not (self._startup_task and not self._startup_task.done()):
+                        self._begin_startup_locked(instance_id)
             else:
-                self._state = InstanceState.STOPPED
-                self._ready_since = None
-                self._clear_health_snapshot()
+                async with self._transition_lock:
+                    if self._startup_task and not self._startup_task.done():
+                        return
+                    self._startup_generation += 1
+                    self._startup_instance_id = None
+                    self._state = InstanceState.STOPPED
+                    self._private_ip = None
+                    self._ready_since = None
+                    self._clear_health_snapshot()
                 logger.info("Synced: EC2 is stopped")
         except Exception as exc:
             logger.warning("Failed to sync EC2 state: %s", exc)
-            self._state = InstanceState.STOPPED
-            self._ready_since = None
-            self._clear_health_snapshot()
+            async with self._transition_lock:
+                if not (self._startup_task and not self._startup_task.done()):
+                    self._startup_generation += 1
+                    self._startup_instance_id = None
+                    self._state = InstanceState.STOPPED
+                    self._private_ip = None
+                    self._ready_since = None
+                    self._clear_health_snapshot()

@@ -9,8 +9,9 @@ The PDF extraction backend runs on a GPU instance (currently g5.4xlarge). Leavin
 1. Running cheaply on Fargate (256 CPU / 2048 MB — pennies/hour)
 2. Auto-starting the GPU instance when a job arrives
 3. Queuing jobs while EC2 boots (~2-3 minutes), with optional durable S3 queue
-4. Replaying queued jobs once the backend is healthy
-5. Auto-stopping the GPU instance after an idle timeout
+4. Claiming and replaying durable jobs once the backend is healthy
+5. Reading authoritative job status from the existing RDS table without waking EC2
+6. Auto-stopping the GPU instance after an idle timeout
 
 Callers talk to the proxy at a stable endpoint and never need to know whether the GPU instance is running.
 
@@ -63,7 +64,10 @@ All endpoints except `/api/v1/health/live`, `/api/v1/health`, `/api/v1/health/de
 
 Accepts the same multipart form fields as the backend (`file`, `methods`, `merge`, `clear_cache`, `clear_cache_scope`, `reference_curie`, `mod_abbreviation`).
 
-**If EC2 is running:** the request is forwarded immediately and the backend's 202 response is returned.
+**For every accepted upload:** the proxy first writes the PDF and queue metadata
+to the configured queue. In production, one ECS task then conditionally claims
+that S3 record and forwards it to the backend. This same durable-first path is
+used whether EC2 is already ready or still starting.
 
 **If EC2 is stopped:** the job is queued, EC2 is started, and a 202 response is returned:
 
@@ -86,20 +90,27 @@ Accepts the same multipart form fields as the backend (`file`, `methods`, `merge
 }
 ```
 
-Once EC2 is healthy, all queued jobs are automatically replayed to the backend. Replay failures are marked as explicit `failed` states (no infinite pending loop).
+Once EC2 is healthy, queued jobs are automatically replayed one at a time.
+Transient startup, capacity, network, and backend 5xx failures release the
+claim and retain the queue record. Only proven permanent submission rejection,
+explicit cancellation, or eligible retention cleanup removes unaccepted work.
 
 In S3 queue mode, the proxy stores the PDF upload as a separate object under
 `<QUEUE_S3_PREFIX>/payloads/` and stores only small job metadata under
 `<QUEUE_S3_PREFIX>/jobs/`. This avoids base64-encoding large PDFs into queue
 JSON and keeps Fargate memory bounded while the GPU instance wakes up.
+Per-job leases live under `<QUEUE_S3_PREFIX>/claims/`; a conditional S3 write
+prevents two overlapping ECS tasks from replaying one record. After the backend
+accepts the stable process ID, the proxy writes a secret-free handoff marker
+under `<QUEUE_S3_PREFIX>/accepted/` before acknowledging queue metadata.
 Uploads larger than `MAX_UPLOAD_BYTES` are rejected before backend wake/replay
 so oversized submissions do not fill the durable queue or start the GPU. When
 `Content-Length` is present, the proxy rejects grossly oversized requests before
 multipart parsing, allowing `MAX_MULTIPART_OVERHEAD_BYTES` for boundaries and
 form fields.
-Jobs that stream directly to an already-ready backend are not retained for
-later reconciler requeue; `RECONCILER_REQUEUE_ONCE` applies to jobs whose
-payload has entered the proxy queue/cache.
+`RECONCILER_REQUEUE_ONCE` is disabled by default. Receiver-side idempotency
+means an ambiguous at-least-once replay with the same process ID cannot publish
+a second Celery task or reset a terminal RDS row.
 
 ### Poll Status (`GET /api/v1/extract/{id}`)
 
@@ -111,6 +122,13 @@ without treating that arbitrary ID as active work. Known submitted jobs remain
 tracked. An unchanged bare `pending` fallback cannot renew the reconciler's
 stale deadline, while database-backed queued jobs and concrete running/progress
 states retain their existing protection.
+
+Durable queued, claimed, and accepted phases are checked before an ID is called
+unknown. The proxy then reads the existing `extraction_run` row directly from
+RDS using a bounded read-only session. A reachable RDS row is authoritative,
+including its original terminal error. If RDS is temporarily unreachable, a
+durably accepted ID returns HTTP 200 `pending` with the same process ID instead
+of 404. A truly unknown ID stays 404 and does not wake the GPU backend.
 
 **While EC2 is starting (job queued locally):**
 ```json
@@ -199,7 +217,13 @@ The idle monitor checks every 60 seconds. The worker is only eligible for stop w
 
 When guards pass and idle exceeds `IDLE_TIMEOUT_MINUTES`, the backend is stopped automatically. In legacy mode this calls `StopInstances`; in Auto Scaling mode it sets the backend ASG desired capacity to `0`.
 
-On proxy startup, `sync_state_from_ec2()` checks the actual EC2 state so the proxy's internal state matches reality.
+On proxy startup, `sync_state_from_ec2()` checks the actual EC2 state so the
+proxy's internal state matches reality. `ensure_running()` and startup sync
+share one transition lock and one monotonically increasing startup generation.
+Each monitor owns a generation and exact instance ID; after every health/AWS
+boundary it revalidates both before it can mark or stop an instance. Establishing
+READY invalidates older monitors, so an obsolete deadline cannot replace the
+current healthy backend.
 
 Preferred production mode is `BACKEND_ASG_NAME`. The proxy scales the ASG to desired capacity `1` on wake and discovers the current healthy instance private IP from the ASG. If the backend fails to become healthy before `STARTUP_TIMEOUT_MINUTES`, the proxy marks the current ASG instance `Unhealthy` so EC2 Auto Scaling replaces it from the launch template, then keeps queued replay waiting for up to `ASG_STARTUP_REPLACEMENT_ATTEMPTS` replacement attempts. Keep the ASG `MaxSize` at `1` for strict cost control, or `2` only when deliberately testing launch-before-terminate behavior.
 
@@ -234,6 +258,13 @@ All settings come from environment variables. In production, values are injected
 | `QUEUE_S3_BUCKET` | No | — | S3 bucket for durable queue (`QUEUE_BACKEND=s3`) |
 | `QUEUE_S3_PREFIX` | No | `pdfx-proxy-queue` | S3 prefix for durable queue metadata and PDF payload objects |
 | `QUEUE_S3_REGION` | No | — | Optional S3 region override |
+| `QUEUE_CLAIM_TTL_SECONDS` | No | `900` | Lease duration for one ECS replay owner; expired claims are conditionally reclaimable after task loss |
+| `ACCEPTED_STATUS_RETENTION_SECONDS` | No | `604800` | Minimum age before a caller-proven terminal accepted/status marker may be removed; active markers are preserved |
+| `ACCEPTED_CLEANUP_BATCH_SIZE` | No | `25` | Maximum expired accepted/status markers revalidated against RDS per reconciler pass |
+| `STATUS_DATABASE_URL` | Production | — | Existing backend RDS URL used only by read-only status sessions; injected from SSM in ECS |
+| `STATUS_DB_TIMEOUT_SECONDS` | No | `5` | Connection and statement timeout for the always-on authoritative status lookup |
+| `STATUS_ERROR_MESSAGE_MAX_CHARS` | No | `4000` | Maximum error text returned by direct RDS status, matching the backend response bound |
+| `PROXY_SHUTDOWN_GRACE_SECONDS` | No | `90` | Grace for an in-progress replay handoff before cancellation releases its claim |
 | `STUCK_PENDING_MINUTES` | No | `20` | Age threshold for stale pending/running jobs |
 | `RECONCILER_INTERVAL_SECONDS` | No | `60` | Background reconciler interval |
 | `RECONCILER_REQUEUE_ONCE` | No | `false` | Optional one-time requeue of stale jobs |
@@ -250,8 +281,9 @@ The proxy is deployed as an ECS Fargate service behind an ALB.
 - ECR repository for the proxy image
 - ECS cluster with Fargate capacity
 - Cognito user pool with a resource server and `pdfx-api/extract` scope
-- SSM parameters under the target environment prefix (`/pdfx/*` for prod)
+- SSM parameters under the target environment prefix (`/pdfx/*` for prod), including the existing `database-url` SecureString
 - IAM roles: execution role (ECR pull + SSM read + CloudWatch Logs) and task role (Auto Scaling lifecycle + EC2 describe + SSM read). Legacy single-instance deployments also need EC2 start/stop on the managed instance.
+- Network access from the proxy task security group to the RDS security group on TCP 5432. The proxy image includes the RDS CA bundle and opens each status session with transaction read-only enforcement.
 
 ### Build and Deploy
 

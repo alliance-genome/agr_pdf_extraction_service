@@ -82,10 +82,31 @@ def test_pdfx_stack_supports_image_retention_and_tagged_uploads():
     assert "extracted-image" in template
     assert "pdfx-retention" in template
     assert "temporary" in template
-    assert "pdfx-expire-proxy-queue" in template
+    assert "pdfx-expire-proxy-queue-jobs" in template
+    assert "pdfx-expire-proxy-queue-payloads" in template
+    assert "pdfx-expire-proxy-queue-claims" in template
     assert "ExpirationInDays: !Ref QueueRetentionDays" in template
-    assert 'Prefix: !Sub "${QueuePrefix}/"' in template
+    assert 'Prefix: !Sub "${QueuePrefix}/jobs/"' in template
+    assert 'Prefix: !Sub "${QueuePrefix}/payloads/"' in template
+    assert 'Prefix: !Sub "${QueuePrefix}/claims/"' in template
+    assert 'Prefix: !Sub "${QueuePrefix}/accepted/"' not in template
     assert template.count("s3:PutObjectTagging") >= 2
+
+
+def test_proxy_has_read_only_status_path_and_shutdown_handoff_configuration():
+    template = STACK_PATH.read_text()
+
+    assert "Name: STATUS_DATABASE_URL" in template
+    assert 'ValueFrom: !Sub "/${SsmParameterPath}/database-url"' in template
+    assert "Name: STATUS_DB_TIMEOUT_SECONDS" in template
+    assert "Name: QUEUE_CLAIM_TTL_SECONDS" in template
+    assert "Name: ACCEPTED_STATUS_RETENTION_SECONDS" in template
+    assert "Name: ACCEPTED_CLEANUP_BATCH_SIZE" in template
+    assert "Name: STATUS_ERROR_MESSAGE_MAX_CHARS" in template
+    assert "Name: PROXY_SHUTDOWN_GRACE_SECONDS" in template
+    assert "StopTimeout: 120" in template
+    assert "SourceSecurityGroupId: !Ref ProxySecurityGroup" in template
+    assert "Description: Read-only extraction status from the always-on proxy" in template
 
 
 def test_pdfx_bootstrap_scrubs_storage_env():

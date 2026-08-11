@@ -10,6 +10,92 @@ from botocore.exceptions import ClientError
 from app.job_queue import JobQueue, QueuedJob, QueueFullError, S3JobQueue
 
 
+class _ConditionalS3:
+    """Small shared S3 model with the conditional operations used by claims."""
+
+    def __init__(self):
+        self.objects = {}
+        self.etags = {}
+        self.version = 0
+
+    def _etag(self, key):
+        return self.etags[key]
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        client = self
+
+        class _Paginator:
+            def paginate(self, Bucket, Prefix):
+                keys = sorted(key for bucket, key in client.objects if bucket == Bucket and key.startswith(Prefix))
+                return [{"Contents": [{"Key": key} for key in keys]}] if keys else []
+
+        return _Paginator()
+
+    def list_objects_v2(self, Bucket, Prefix, MaxKeys=1000, ContinuationToken=None):
+        keys = sorted(key for bucket, key in self.objects if bucket == Bucket and key.startswith(Prefix))
+        start = int(ContinuationToken or 0)
+        selected = keys[start:start + MaxKeys]
+        next_index = start + len(selected)
+        response = {
+            "Contents": [{"Key": key} for key in selected],
+            "IsTruncated": next_index < len(keys),
+        }
+        if response["IsTruncated"]:
+            response["NextContinuationToken"] = str(next_index)
+        return response
+
+    def put_object(self, Bucket, Key, Body, IfNoneMatch=None, IfMatch=None, **_kwargs):
+        object_key = (Bucket, Key)
+        current_etag = self.etags.get(object_key)
+        if IfNoneMatch == "*" and object_key in self.objects:
+            self._precondition_failed("PutObject")
+        if IfMatch is not None and current_etag != IfMatch.strip('"'):
+            self._precondition_failed("PutObject")
+        self.version += 1
+        etag = f"etag-{self.version}"
+        self.objects[object_key] = Body if isinstance(Body, bytes) else bytes(Body)
+        self.etags[object_key] = etag
+        return {"ETag": f'"{etag}"'}
+
+    def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None):
+        self.put_object(Bucket=bucket, Key=key, Body=fileobj.read(), **(ExtraArgs or {}))
+
+    def get_object(self, Bucket, Key):
+        object_key = (Bucket, Key)
+        if object_key not in self.objects:
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+                "GetObject",
+            )
+        return {
+            "Body": io.BytesIO(self.objects[object_key]),
+            "ETag": f'"{self.etags[object_key]}"',
+        }
+
+    def download_fileobj(self, bucket, key, fileobj):
+        fileobj.write(self.objects[(bucket, key)])
+
+    def delete_object(self, Bucket, Key, IfMatch=None):
+        object_key = (Bucket, Key)
+        current_etag = self.etags.get(object_key)
+        if IfMatch is not None and current_etag != IfMatch.strip('"'):
+            self._precondition_failed("DeleteObject")
+        self.objects.pop(object_key, None)
+        self.etags.pop(object_key, None)
+
+    def delete_objects(self, Bucket, Delete):
+        for item in Delete["Objects"]:
+            self.delete_object(Bucket=Bucket, Key=item["Key"])
+
+    @staticmethod
+    def _precondition_failed(operation):
+        raise ClientError(
+            {"Error": {"Code": "PreconditionFailed"}, "ResponseMetadata": {"HTTPStatusCode": 412}},
+            operation,
+        )
+
+
 class TestJobQueue:
     def test_enqueue_and_dequeue(self):
         q = JobQueue(max_size=5)
@@ -94,8 +180,127 @@ class TestJobQueue:
         job = q.dequeue()
         assert job.authorization == "Bearer token-abc"
 
+    def test_acceptance_cannot_overwrite_durable_cancellation_intent(self):
+        q = JobQueue(max_size=5)
+        q.record_cancel_requested("job-cancel-race", "User cancelled")
+
+        assert q.record_accepted("job-cancel-race") is False
+        assert q.get_durable_phase("job-cancel-race") == "cancel_requested"
+
 
 class TestS3JobQueue:
+    def test_two_proxy_queues_cannot_claim_the_same_job(self, monkeypatch):
+        shared_s3 = _ConditionalS3()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: shared_s3)
+        first = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        second = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        first.enqueue("job-shared", b"%PDF shared", {"merge": "true"})
+
+        claimed = first.claim_next("proxy-a", lease_seconds=60)
+
+        assert claimed is not None
+        assert claimed.job_id == "job-shared"
+        assert claimed.claim_owner == "proxy-a"
+        assert second.claim_next("proxy-b", lease_seconds=60) is None
+
+    def test_expired_claim_is_atomically_reclaimable(self, monkeypatch):
+        shared_s3 = _ConditionalS3()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: shared_s3)
+        now = {"value": 100.0}
+        monkeypatch.setattr("app.job_queue.time.time", lambda: now["value"])
+        first = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        second = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        first.enqueue("job-stale", b"%PDF stale", {})
+        original = first.claim_next("proxy-a", lease_seconds=10)
+
+        now["value"] = 111.0
+        reclaimed = second.claim_next("proxy-b", lease_seconds=10)
+
+        assert original is not None
+        assert reclaimed is not None
+        assert reclaimed.job_id == original.job_id
+        assert reclaimed.claim_owner == "proxy-b"
+        assert first.release_claim(original) is False
+        assert second.release_claim(reclaimed) is True
+        assert first.has_job("job-stale") is True
+
+    def test_accepted_handoff_is_secret_free_before_queue_ack(self, monkeypatch):
+        shared_s3 = _ConditionalS3()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: shared_s3)
+        queue = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        queue.enqueue(
+            "job-accepted",
+            b"%PDF accepted",
+            {},
+            authorization="Bearer must-not-copy",
+        )
+        claimed = queue.claim_next("proxy-a", lease_seconds=60)
+
+        queue.record_accepted("job-accepted")
+        accepted_key = ("test-bucket", "prefix/accepted/job-accepted.json")
+        accepted_payload = json.loads(shared_s3.objects[accepted_key])
+        assert accepted_payload["process_id"] == "job-accepted"
+        assert accepted_payload["phase"] == "accepted"
+        assert "authorization" not in accepted_payload
+        assert "token" not in json.dumps(accepted_payload).lower()
+        assert queue.has_job("job-accepted") is True
+
+        assert queue.acknowledge_claim(claimed) is True
+        assert queue.has_job("job-accepted") is False
+        assert queue.get_durable_phase("job-accepted") == "accepted"
+
+    def test_s3_acceptance_cannot_overwrite_durable_cancellation_intent(self, monkeypatch):
+        shared_s3 = _ConditionalS3()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: shared_s3)
+        queue = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        queue.record_cancel_requested("job-cancel-race", "User cancelled")
+
+        assert queue.record_accepted("job-cancel-race") is False
+        assert queue.get_durable_phase("job-cancel-race") == "cancel_requested"
+        assert queue.get_durable_record("job-cancel-race")["message"] == "User cancelled"
+
+    def test_release_claim_keeps_unaccepted_job_replayable(self, monkeypatch):
+        shared_s3 = _ConditionalS3()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: shared_s3)
+        queue = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        queue.enqueue("job-capacity", b"%PDF capacity", {})
+        claimed = queue.claim_next("proxy-a", lease_seconds=60)
+
+        assert queue.release_claim(claimed) is True
+        assert queue.has_job("job-capacity") is True
+        assert queue.claim_next("proxy-b", lease_seconds=60).job_id == "job-capacity"
+
+    def test_retention_cleanup_never_deletes_active_accepted_record(self, monkeypatch):
+        shared_s3 = _ConditionalS3()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: shared_s3)
+        now = {"value": 100.0}
+        monkeypatch.setattr("app.job_queue.time.time", lambda: now["value"])
+        queue = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        queue.record_accepted("job-active")
+        now["value"] = 200.0
+
+        assert queue.cleanup_durable_record("job-active", 60, terminal=False) is False
+        assert queue.get_durable_phase("job-active") == "accepted"
+        assert queue.cleanup_durable_record("job-active", 60, terminal=True) is True
+        assert queue.get_durable_phase("job-active") is None
+
+    def test_s3_expired_record_listing_is_bounded_for_eventual_revalidation(self, monkeypatch):
+        shared_s3 = _ConditionalS3()
+        monkeypatch.setattr("app.job_queue.boto3.client", lambda *_args, **_kwargs: shared_s3)
+        now = {"value": 100.0}
+        monkeypatch.setattr("app.job_queue.time.time", lambda: now["value"])
+        queue = S3JobQueue(bucket="test-bucket", prefix="prefix")
+        queue.record_accepted("old-a")
+        queue.record_accepted("old-b")
+        now["value"] = 200.0
+        queue.record_accepted("active")
+
+        first = queue.list_expired_durable_records(retention_seconds=60, limit=1)
+        second = queue.list_expired_durable_records(retention_seconds=60, limit=1)
+
+        assert {first[0]["process_id"], second[0]["process_id"]} == {"old-a", "old-b"}
+        assert queue.get_durable_phase("active") == "accepted"
+
     def test_s3_pointer_job_open_pdf_downloads_lazily_and_cleans_remote(self, monkeypatch):
         class _FakeS3Client:
             def __init__(self):

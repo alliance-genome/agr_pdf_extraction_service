@@ -43,6 +43,9 @@ class QueuedJob:
     pdf_s3_bucket: str | None = None
     pdf_s3_key: str | None = None
     pdf_file_path: str | None = None
+    metadata_key: str | None = None
+    claim_owner: str | None = None
+    claim_etag: str | None = None
 
     def to_json(self) -> str:
         payload = {
@@ -185,6 +188,39 @@ class BaseJobQueue:
         """Mark one queued job as handed off while keeping its payload available."""
         return False
 
+    def claim_next(self, owner_id: str, lease_seconds: int) -> QueuedJob | None:
+        raise NotImplementedError
+
+    def release_claim(self, job: QueuedJob) -> bool:
+        raise NotImplementedError
+
+    def acknowledge_claim(self, job: QueuedJob) -> bool:
+        raise NotImplementedError
+
+    def record_accepted(self, job_id: str) -> bool:
+        raise NotImplementedError
+
+    def record_cancelled(self, job_id: str, reason: str) -> None:
+        raise NotImplementedError
+
+    def record_cancel_requested(self, job_id: str, reason: str) -> None:
+        raise NotImplementedError
+
+    def record_failed(self, job_id: str, reason: str) -> None:
+        raise NotImplementedError
+
+    def get_durable_phase(self, job_id: str) -> str | None:
+        raise NotImplementedError
+
+    def get_durable_record(self, job_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    def cleanup_durable_record(self, job_id: str, retention_seconds: int, *, terminal: bool) -> bool:
+        raise NotImplementedError
+
+    def list_expired_durable_records(self, retention_seconds: int, limit: int) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
     def oldest_age_seconds(self) -> float:
         raise NotImplementedError
 
@@ -199,6 +235,8 @@ class InMemoryJobQueue(BaseJobQueue):
     def __init__(self, max_size: int = 10):
         self._max_size = max_size
         self._queue: deque[QueuedJob] = deque()
+        self._claims: dict[str, tuple[str, float]] = {}
+        self._durable_phases: dict[str, dict[str, Any]] = {}
 
     @property
     def size(self) -> int:
@@ -266,6 +304,105 @@ class InMemoryJobQueue(BaseJobQueue):
     def acknowledge(self, job_id: str) -> bool:
         return False
 
+    def claim_next(self, owner_id: str, lease_seconds: int) -> QueuedJob | None:
+        now = time.time()
+        for job in self._queue:
+            claim = self._claims.get(job.job_id)
+            if claim and claim[1] > now:
+                continue
+            self._claims[job.job_id] = (owner_id, now + max(1, lease_seconds))
+            job.claim_owner = owner_id
+            job.claim_etag = f"memory:{owner_id}:{now}"
+            return job
+        return None
+
+    def release_claim(self, job: QueuedJob) -> bool:
+        claim = self._claims.get(job.job_id)
+        if not claim or claim[0] != job.claim_owner:
+            return False
+        self._claims.pop(job.job_id, None)
+        return True
+
+    def acknowledge_claim(self, job: QueuedJob) -> bool:
+        claim = self._claims.get(job.job_id)
+        if not claim or claim[0] != job.claim_owner:
+            return False
+        removed = self.remove_job(job.job_id)
+        self._claims.pop(job.job_id, None)
+        return removed
+
+    def record_accepted(self, job_id: str) -> bool:
+        existing = self._durable_phases.get(job_id)
+        if existing and existing.get("phase") in {"cancel_requested", "cancelled", "failed"}:
+            return False
+        self._durable_phases[job_id] = {
+            "process_id": job_id,
+            "phase": "accepted",
+            "recorded_at": time.time(),
+        }
+        return True
+
+    def record_cancelled(self, job_id: str, reason: str) -> None:
+        self._durable_phases[job_id] = {
+            "process_id": job_id,
+            "phase": "cancelled",
+            "message": reason,
+            "recorded_at": time.time(),
+        }
+
+    def record_cancel_requested(self, job_id: str, reason: str) -> None:
+        self._durable_phases[job_id] = {
+            "process_id": job_id,
+            "phase": "cancel_requested",
+            "message": reason,
+            "recorded_at": time.time(),
+        }
+
+    def record_failed(self, job_id: str, reason: str) -> None:
+        self._durable_phases[job_id] = {
+            "process_id": job_id,
+            "phase": "failed",
+            "message": reason,
+            "recorded_at": time.time(),
+        }
+
+    def get_durable_phase(self, job_id: str) -> str | None:
+        record = self._durable_phases.get(job_id)
+        if record:
+            return str(record["phase"])
+        if self.has_job(job_id):
+            return "claimed" if job_id in self._claims else "queued"
+        return None
+
+    def get_durable_record(self, job_id: str) -> dict[str, Any] | None:
+        record = self._durable_phases.get(job_id)
+        return dict(record) if record else None
+
+    def cleanup_durable_record(self, job_id: str, retention_seconds: int, *, terminal: bool) -> bool:
+        record = self._durable_phases.get(job_id)
+        if not record or not terminal:
+            return False
+        recorded_at = record.get("recorded_at")
+        age = time.time() - float(recorded_at if recorded_at is not None else time.time())
+        if age < max(0, retention_seconds):
+            return False
+        self._durable_phases.pop(job_id, None)
+        return True
+
+    def list_expired_durable_records(self, retention_seconds: int, limit: int) -> list[dict[str, Any]]:
+        cutoff = time.time() - max(0, retention_seconds)
+        records = [
+            dict(record)
+            for record in self._durable_phases.values()
+            if float(
+                record.get("recorded_at")
+                if record.get("recorded_at") is not None
+                else time.time()
+            ) <= cutoff
+        ]
+        records.sort(key=lambda record: float(record.get("recorded_at") or 0))
+        return records[:max(0, limit)]
+
     def oldest_age_seconds(self) -> float:
         if not self._queue:
             return 0.0
@@ -289,6 +426,7 @@ class S3JobQueue(BaseJobQueue):
         self._max_size = max_size
         kwargs = {"region_name": region_name} if region_name else {}
         self._client = boto3.client("s3", **kwargs)
+        self._accepted_cleanup_cursor: str | None = None
 
     @property
     def durable(self) -> bool:
@@ -299,6 +437,12 @@ class S3JobQueue(BaseJobQueue):
 
     def _payload_prefix(self) -> str:
         return f"{self._prefix}/payloads/"
+
+    def _claim_key(self, job_id: str) -> str:
+        return f"{self._prefix}/claims/{job_id}.json"
+
+    def _accepted_key(self, job_id: str) -> str:
+        return f"{self._prefix}/accepted/{job_id}.json"
 
     def _build_key(self, job: QueuedJob) -> str:
         ts_ms = int(job.queued_at * 1000)
@@ -435,6 +579,7 @@ class S3JobQueue(BaseJobQueue):
         obj = self._client.get_object(Bucket=self._bucket, Key=key)
         raw = obj["Body"].read().decode("utf-8")
         job = QueuedJob.from_json(raw)
+        job.metadata_key = key
         if job.pdf_s3_key:
             bucket = job.pdf_s3_bucket or self._bucket
             tmp = tempfile.NamedTemporaryFile(prefix=f"pdfx-{job.job_id}-", suffix=".pdf", delete=False)
@@ -498,6 +643,257 @@ class S3JobQueue(BaseJobQueue):
                 return True
         return False
 
+    def claim_next(self, owner_id: str, lease_seconds: int) -> QueuedJob | None:
+        """Conditionally claim the oldest available job without deleting it."""
+        for metadata_key in self._iter_keys():
+            suffix = metadata_key.rsplit("_", 1)[-1]
+            job_id = suffix[:-5] if suffix.endswith(".json") else suffix
+            claim_etag = self._acquire_claim(job_id, owner_id, lease_seconds)
+            if claim_etag is None:
+                continue
+            placeholder = QueuedJob(job_id=job_id, pdf_data=b"", form_fields={})
+            placeholder.claim_owner = owner_id
+            placeholder.claim_etag = claim_etag
+            try:
+                job = self._load_job(metadata_key)
+            except QueuePayloadMissingError as exc:
+                logger.warning("%s; deleting orphaned queue metadata %s", exc, metadata_key)
+                self._delete_job_metadata(metadata_key)
+                self.release_claim(placeholder)
+                continue
+            except Exception:
+                self.release_claim(placeholder)
+                raise
+            job.claim_owner = owner_id
+            job.claim_etag = claim_etag
+            return job
+        return None
+
+    def _acquire_claim(self, job_id: str, owner_id: str, lease_seconds: int) -> str | None:
+        claim_key = self._claim_key(job_id)
+        now = time.time()
+        payload = json.dumps(
+            {
+                "process_id": job_id,
+                "owner_id": owner_id,
+                "claimed_at": now,
+                "expires_at": now + max(1, lease_seconds),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        put_args = {
+            "Bucket": self._bucket,
+            "Key": claim_key,
+            "Body": payload,
+            "ContentType": "application/json",
+            "ServerSideEncryption": "AES256",
+        }
+        try:
+            response = self._client.put_object(**put_args, IfNoneMatch="*")
+            return str(response.get("ETag", "")).strip('"')
+        except ClientError as exc:
+            if not _is_s3_precondition_error(exc):
+                raise
+
+        try:
+            existing = self._client.get_object(Bucket=self._bucket, Key=claim_key)
+        except ClientError as exc:
+            if not _is_missing_s3_object_error(exc):
+                raise
+            try:
+                response = self._client.put_object(**put_args, IfNoneMatch="*")
+                return str(response.get("ETag", "")).strip('"')
+            except ClientError as retry_exc:
+                if _is_s3_precondition_error(retry_exc):
+                    return None
+                raise
+
+        existing_payload = json.loads(existing["Body"].read().decode("utf-8"))
+        existing_etag = str(existing.get("ETag", "")).strip('"')
+        if float(existing_payload.get("expires_at") or 0) > now:
+            return None
+        try:
+            response = self._client.put_object(**put_args, IfMatch=existing_etag)
+            return str(response.get("ETag", "")).strip('"')
+        except ClientError as exc:
+            if _is_s3_precondition_error(exc):
+                return None
+            raise
+
+    def release_claim(self, job: QueuedJob) -> bool:
+        if not job.claim_owner or not job.claim_etag:
+            return False
+        claim_key = self._claim_key(job.job_id)
+        try:
+            current = self._client.get_object(Bucket=self._bucket, Key=claim_key)
+            payload = json.loads(current["Body"].read().decode("utf-8"))
+            current_etag = str(current.get("ETag", "")).strip('"')
+            if payload.get("owner_id") != job.claim_owner or current_etag != job.claim_etag:
+                return False
+            self._client.delete_object(
+                Bucket=self._bucket,
+                Key=claim_key,
+                IfMatch=job.claim_etag,
+            )
+            return True
+        except ClientError as exc:
+            if _is_missing_s3_object_error(exc) or _is_s3_precondition_error(exc):
+                return False
+            raise
+
+    def acknowledge_claim(self, job: QueuedJob) -> bool:
+        if not job.metadata_key or not job.claim_owner or not job.claim_etag:
+            return False
+        try:
+            current = self._client.get_object(Bucket=self._bucket, Key=self._claim_key(job.job_id))
+        except ClientError as exc:
+            if _is_missing_s3_object_error(exc):
+                return False
+            raise
+        payload = json.loads(current["Body"].read().decode("utf-8"))
+        current_etag = str(current.get("ETag", "")).strip('"')
+        if payload.get("owner_id") != job.claim_owner or current_etag != job.claim_etag:
+            return False
+        self._delete_job_metadata(job.metadata_key)
+        self.release_claim(job)
+        return True
+
+    def record_accepted(self, job_id: str) -> bool:
+        """Create the accepted marker without overwriting cancellation/failure intent."""
+        payload = self._durable_phase_payload(job_id, "accepted")
+        try:
+            self._client.put_object(
+                Bucket=self._bucket,
+                Key=self._accepted_key(job_id),
+                Body=payload,
+                ContentType="application/json",
+                ServerSideEncryption="AES256",
+                IfNoneMatch="*",
+            )
+            return True
+        except ClientError as exc:
+            if not _is_s3_precondition_error(exc):
+                raise
+        existing = self.get_durable_record(job_id)
+        return bool(existing and existing.get("phase") == "accepted")
+
+    def record_cancelled(self, job_id: str, reason: str) -> None:
+        self._put_durable_phase(job_id, "cancelled", message=reason)
+
+    def record_cancel_requested(self, job_id: str, reason: str) -> None:
+        self._put_durable_phase(job_id, "cancel_requested", message=reason)
+
+    def record_failed(self, job_id: str, reason: str) -> None:
+        self._put_durable_phase(job_id, "failed", message=reason)
+
+    def _put_durable_phase(self, job_id: str, phase: str, **extra: Any) -> None:
+        payload = self._durable_phase_payload(job_id, phase, **extra)
+        self._client.put_object(
+            Bucket=self._bucket,
+            Key=self._accepted_key(job_id),
+            Body=payload,
+            ContentType="application/json",
+            ServerSideEncryption="AES256",
+        )
+
+    @staticmethod
+    def _durable_phase_payload(job_id: str, phase: str, **extra: Any) -> bytes:
+        payload = {
+            "process_id": job_id,
+            "phase": phase,
+            "recorded_at": time.time(),
+            **extra,
+        }
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+    def get_durable_phase(self, job_id: str) -> str | None:
+        record = self.get_durable_record(job_id)
+        if record is not None:
+            return str(record.get("phase") or "") or None
+        if not self.has_job(job_id):
+            return None
+        try:
+            self._client.get_object(Bucket=self._bucket, Key=self._claim_key(job_id))
+            return "claimed"
+        except ClientError as exc:
+            if _is_missing_s3_object_error(exc):
+                return "queued"
+            raise
+
+    def get_durable_record(self, job_id: str) -> dict[str, Any] | None:
+        try:
+            obj = self._client.get_object(Bucket=self._bucket, Key=self._accepted_key(job_id))
+            payload = json.loads(obj["Body"].read().decode("utf-8"))
+            return dict(payload)
+        except ClientError as exc:
+            if not _is_missing_s3_object_error(exc):
+                raise
+        return None
+
+    def cleanup_durable_record(self, job_id: str, retention_seconds: int, *, terminal: bool) -> bool:
+        record = self.get_durable_record(job_id)
+        if record is None or not terminal:
+            return False
+        recorded_at = record.get("recorded_at")
+        age = time.time() - float(recorded_at if recorded_at is not None else time.time())
+        if age < max(0, retention_seconds):
+            return False
+        self._client.delete_object(Bucket=self._bucket, Key=self._accepted_key(job_id))
+        return True
+
+    def list_expired_durable_records(self, retention_seconds: int, limit: int) -> list[dict[str, Any]]:
+        """List a bounded rotating batch for eventual terminal revalidation."""
+        remaining = max(0, limit)
+        if remaining == 0:
+            return []
+        cutoff = time.time() - max(0, retention_seconds)
+        records: list[dict[str, Any]] = []
+        continuation = self._accepted_cleanup_cursor
+        prefix = f"{self._prefix}/accepted/"
+        while remaining > 0:
+            params = {
+                "Bucket": self._bucket,
+                "Prefix": prefix,
+                "MaxKeys": min(1000, remaining),
+            }
+            if continuation:
+                params["ContinuationToken"] = continuation
+            try:
+                response = self._client.list_objects_v2(**params)
+            except Exception:
+                if continuation:
+                    self._accepted_cleanup_cursor = None
+                raise
+            for item in response.get("Contents", []):
+                try:
+                    obj = self._client.get_object(Bucket=self._bucket, Key=item["Key"])
+                    record = json.loads(obj["Body"].read().decode("utf-8"))
+                    recorded_at = record.get("recorded_at")
+                    if float(recorded_at if recorded_at is not None else time.time()) <= cutoff:
+                        records.append(dict(record))
+                        remaining -= 1
+                        if remaining == 0:
+                            break
+                except Exception as exc:
+                    logger.warning("Skipping unreadable durable status record %s: %s", item.get("Key"), exc)
+            if remaining == 0:
+                self._accepted_cleanup_cursor = (
+                    response.get("NextContinuationToken")
+                    if response.get("IsTruncated")
+                    else None
+                )
+                break
+            if not response.get("IsTruncated"):
+                self._accepted_cleanup_cursor = None
+                break
+            continuation = response.get("NextContinuationToken")
+            if not continuation:
+                self._accepted_cleanup_cursor = None
+                break
+        records.sort(key=lambda record: float(record.get("recorded_at") or 0))
+        return records
+
     def oldest_age_seconds(self) -> float:
         keys = self._iter_keys()
         if not keys:
@@ -533,6 +929,13 @@ def _is_missing_s3_object_error(exc: ClientError) -> bool:
     code = str(error.get("Code", "")).strip()
     status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
     return status == 404 or code in {"404", "NoSuchKey", "NotFound"}
+
+
+def _is_s3_precondition_error(exc: ClientError) -> bool:
+    error = exc.response.get("Error", {})
+    code = str(error.get("Code", "")).strip()
+    status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return status == 412 or code in {"412", "PreconditionFailed"}
 
 
 # Backward-compatible alias used by tests/import sites.

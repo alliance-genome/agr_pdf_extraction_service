@@ -37,12 +37,22 @@ class Settings:
     FORWARD_TIMEOUT_SECONDS: int = int(os.environ.get("FORWARD_TIMEOUT_SECONDS", "600"))
     PROXY_BACKEND_READY_TIMEOUT_SECONDS: int = int(os.environ.get("PROXY_BACKEND_READY_TIMEOUT_SECONDS", "30"))
     PROXY_BACKEND_READY_POLL_SECONDS: int = int(os.environ.get("PROXY_BACKEND_READY_POLL_SECONDS", "2"))
+    PROXY_SHUTDOWN_GRACE_SECONDS: int = int(os.environ.get("PROXY_SHUTDOWN_GRACE_SECONDS", "90"))
     ALWAYS_ON_MODE: bool = os.environ.get("ALWAYS_ON_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
     QUEUE_BACKEND: str = os.environ.get("QUEUE_BACKEND", "memory").strip().lower()
     QUEUE_S3_BUCKET: str = os.environ.get("QUEUE_S3_BUCKET", "").strip()
     QUEUE_S3_PREFIX: str = os.environ.get("QUEUE_S3_PREFIX", "pdfx-proxy-queue").strip().strip("/")
     QUEUE_S3_REGION: str = os.environ.get("QUEUE_S3_REGION", "").strip()
+    QUEUE_CLAIM_TTL_SECONDS: int = int(os.environ.get("QUEUE_CLAIM_TTL_SECONDS", "900"))
+    ACCEPTED_STATUS_RETENTION_SECONDS: int = int(
+        os.environ.get("ACCEPTED_STATUS_RETENTION_SECONDS", str(7 * 24 * 60 * 60))
+    )
+    ACCEPTED_CLEANUP_BATCH_SIZE: int = int(os.environ.get("ACCEPTED_CLEANUP_BATCH_SIZE", "25"))
+
+    STATUS_DATABASE_URL: str = os.environ.get("STATUS_DATABASE_URL", os.environ.get("DATABASE_URL", "")).strip()
+    STATUS_DB_TIMEOUT_SECONDS: int = int(os.environ.get("STATUS_DB_TIMEOUT_SECONDS", "5"))
+    STATUS_ERROR_MESSAGE_MAX_CHARS: int = int(os.environ.get("STATUS_ERROR_MESSAGE_MAX_CHARS", "4000"))
 
     STUCK_PENDING_MINUTES: int = int(os.environ.get("STUCK_PENDING_MINUTES", "20"))
     RECONCILER_INTERVAL_SECONDS: int = int(os.environ.get("RECONCILER_INTERVAL_SECONDS", "60"))

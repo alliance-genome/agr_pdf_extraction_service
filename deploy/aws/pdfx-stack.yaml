@@ -287,12 +287,20 @@ Resources:
                 Value: extracted-image
               - Key: pdfx-retention
                 Value: temporary
-          - Id: pdfx-expire-proxy-queue
+          - Id: pdfx-expire-proxy-queue-jobs
             Status: Enabled
             ExpirationInDays: !Ref QueueRetentionDays
-            Prefix: !Sub "${QueuePrefix}/"
+            Prefix: !Sub "${QueuePrefix}/jobs/"
+          - Id: pdfx-expire-proxy-queue-payloads
+            Status: Enabled
+            ExpirationInDays: !Ref QueueRetentionDays
+            Prefix: !Sub "${QueuePrefix}/payloads/"
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 1
+          - Id: pdfx-expire-proxy-queue-claims
+            Status: Enabled
+            ExpirationInDays: !Ref QueueRetentionDays
+            Prefix: !Sub "${QueuePrefix}/claims/"
       Tags:
         - Key: Project
           Value: pdfx
@@ -905,6 +913,18 @@ Resources:
               Value: !Ref QueuePrefix
             - Name: QUEUE_S3_REGION
               Value: !Ref AWS::Region
+            - Name: QUEUE_CLAIM_TTL_SECONDS
+              Value: "900"
+            - Name: ACCEPTED_STATUS_RETENTION_SECONDS
+              Value: "604800"
+            - Name: ACCEPTED_CLEANUP_BATCH_SIZE
+              Value: "25"
+            - Name: STATUS_DB_TIMEOUT_SECONDS
+              Value: "5"
+            - Name: STATUS_ERROR_MESSAGE_MAX_CHARS
+              Value: "4000"
+            - Name: PROXY_SHUTDOWN_GRACE_SECONDS
+              Value: "90"
             - Name: MIN_UPTIME_MINUTES
               Value: "20"
             - Name: STUCK_PENDING_MINUTES
@@ -946,6 +966,8 @@ Resources:
               ValueFrom: !Ref SsmAsgStartupReplacementAttempts
             - Name: MAX_QUEUED_JOBS
               ValueFrom: !Ref SsmMaxQueuedJobs
+            - Name: STATUS_DATABASE_URL
+              ValueFrom: !Sub "/${SsmParameterPath}/database-url"
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -960,6 +982,7 @@ Resources:
             Timeout: 5
             Retries: 3
             StartPeriod: 10
+          StopTimeout: 120
           Essential: true
 
   ProxyTargetGroup:
@@ -1066,6 +1089,11 @@ Resources:
           ToPort: 5432
           SourceSecurityGroupId: !Ref BackendSecurityGroup
           Description: Postgres 5432 from backend GPU instances
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ProxySecurityGroup
+          Description: Read-only extraction status from the always-on proxy
       Tags:
         - Key: Name
           Value: !Sub "${BackendResourceName}-rds-sg"

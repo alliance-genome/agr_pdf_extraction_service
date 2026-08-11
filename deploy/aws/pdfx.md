@@ -164,10 +164,16 @@ instances: AWS can stop a newly prepared instance while cloud-init is still
 running. On the next real start, cloud-init may not rerun user data, but the
 enabled systemd service starts again and completes the idempotent deploy.
 
-Durable proxy queue metadata and PDF payload objects live under `QueuePrefix`
-in the audit bucket and expire after `QueueRetentionDays` as a safety net.
-Normal replay, cancellation, and failure paths should delete queue payloads
-sooner; lifecycle cleanup is for abandoned clients or interrupted cleanup paths.
+Durable proxy queue jobs, PDF payloads, and replay claims live under
+`QueuePrefix` in the audit bucket and expire after `QueueRetentionDays` as a
+safety net. Secret-free accepted handoff records use the `accepted/` subprefix
+and are deliberately excluded from unconditional S3 lifecycle deletion. The
+proxy removes only caller-proven terminal accepted records after
+`ACCEPTED_STATUS_RETENTION_SECONDS`; active records remain available across ECS
+rollouts and RDS outages. A bounded reconciler pass revalidates at most
+`ACCEPTED_CLEANUP_BATCH_SIZE` expired records against RDS each interval so
+terminal markers are eventually removed even after clients stop polling.
+Normal replay, cancellation, and permanent-rejection paths delete queue payloads sooner.
 The proxy enforces `MAX_UPLOAD_BYTES=524288000` before backend wake/replay so
 oversized requests do not fill S3 queue storage or start the GPU only to fail at
 the backend upload cap. `MAX_MULTIPART_OVERHEAD_BYTES=10485760` gives the
@@ -207,6 +213,28 @@ latency. That keeps one pre-initialized backend instance in the ASG warm pool in
 `Stopped` state, so you pay for EBS while idle but not for running GPU compute.
 
 ## Deploy Proxy Changes
+
+Before registering a proxy task definition, verify all of these without
+decrypting or printing secrets:
+
+- `/<ssm-prefix>/database-url` exists; `proxy/deploy/deploy.sh` fails closed if
+  it is missing or unreadable.
+- The proxy task security group is admitted to the RDS security group on TCP
+  5432. The current-account RDS resources were created outside this template,
+  so reconcile that ingress explicitly before rolling the task.
+- Inspect S3 counts under `jobs/`, `claims/`, and `accepted/`, plus the oldest
+  queued record; investigate any active claim older than
+  `QUEUE_CLAIM_TTL_SECONDS`.
+- Check `/api/v1/health` for queue depth, backend health/busy state, and active
+  work. A nonempty queue or active job does not prohibit the rollout, but it
+  requires confirming the old task has the configured 120-second ECS stop
+  timeout and 90-second application handoff grace.
+
+The rolling deployment may overlap two proxy tasks. Conditional per-job S3
+claims prevent double replay; shutdown stops new claim acquisition and either
+finishes the current accepted handoff or releases it for the replacement task.
+Do not change the service or task definition without explicit production
+deployment approval.
 
 After building and pushing an image tag to ECR, roll the PDFX service:
 
@@ -292,11 +320,13 @@ can spend the startup window downloading and installing PyTorch/CUDA again.
 In prebuilt mode, `deploy.sh` includes `docker-compose.gpu.prebuilt.yml` so the
 running containers do not bind-mount checkout source over the image.
 
-If a backend startup fails, the proxy marks the ASG instance unhealthy with
-`SetInstanceHealth`. Auto Scaling then terminates it and launches a replacement
-from the launch template while respecting `BackendMaxSize`. The proxy keeps
-queued replay waiting for `ASG_STARTUP_REPLACEMENT_ATTEMPTS` replacement
-attempts before failing queued work.
+If a current, identity-matched backend remains unhealthy after the final health
+recheck, the owning startup generation may mark that exact ASG instance
+unhealthy with `SetInstanceHealth`. Auto Scaling then launches a replacement
+while respecting `BackendMaxSize`. Stale generations, changed instance IDs,
+and healthy or legitimately busy workers exit without mutation. If replacement
+capacity is unavailable, replay claims are released and unaccepted S3 work is
+retained for a later wake rather than converted to terminal failure.
 
 Scale the backend back down when validation is complete:
 
@@ -317,6 +347,9 @@ aws autoscaling update-auto-scaling-group \
    rollback compatibility.
 3. Validate from AI Curation using its configured Cognito auth path, then run a
    small PDF extraction smoke.
+4. Treat the backend RDS `extraction_run` row as authoritative terminal truth.
+   The always-on proxy uses the existing database URL with a read-only session;
+   it does not create a second terminal-status database.
 
 ## Image Artifact Retention Notes
 

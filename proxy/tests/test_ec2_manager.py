@@ -46,7 +46,7 @@ class TestEC2Manager:
         mock_boto3.client.return_value = mock_client
         from app.ec2_manager import EC2Manager
         mgr = EC2Manager()
-        mgr.stop_instance()
+        mgr.stop_instance(mgr._instance_id)
         mock_client.stop_instances.assert_called_once()
 
     @patch("app.ec2_manager.boto3")
@@ -104,9 +104,12 @@ class TestEC2Manager:
         from app.ec2_manager import EC2Manager
         mgr = EC2Manager()
         mgr._asg_name = "pdfx-backend"
+        mgr.get_instance_snapshot = MagicMock(
+            return_value=("running", "172.31.9.10", "i-asg-instance")
+        )
 
         mgr.start_instance()
-        mgr.stop_instance()
+        mgr.stop_instance("i-asg-instance")
 
         mock_asg.set_desired_capacity.assert_any_call(
             AutoScalingGroupName="pdfx-backend",
@@ -128,11 +131,55 @@ class TestEC2Manager:
         from app.ec2_manager import EC2Manager
         mgr = EC2Manager()
         mgr._asg_name = "pdfx-backend"
-        mgr._current_instance_id = "i-asg-instance"
+        mgr.get_instance_snapshot = MagicMock(
+            return_value=("running", "172.31.9.10", "i-asg-instance")
+        )
 
-        assert mgr.mark_unhealthy() is True
+        assert mgr.mark_unhealthy("i-asg-instance") is True
         mock_asg.set_instance_health.assert_called_once_with(
             InstanceId="i-asg-instance",
+            HealthStatus="Unhealthy",
+            ShouldRespectGracePeriod=False,
+        )
+
+    @patch("app.ec2_manager.boto3")
+    def test_asg_mark_unhealthy_refuses_stale_target(self, mock_boto3):
+        mock_ec2 = MagicMock()
+        mock_asg = MagicMock()
+        mock_boto3.client.side_effect = [mock_ec2, mock_asg]
+
+        from app.ec2_manager import EC2Manager
+        mgr = EC2Manager()
+        mgr._asg_name = "pdfx-backend"
+        mgr.get_instance_snapshot = MagicMock(
+            return_value=("running", "172.31.9.11", "i-replacement")
+        )
+
+        assert mgr.mark_unhealthy("i-stale") is False
+        mock_asg.set_instance_health.assert_not_called()
+
+    @patch("app.ec2_manager.boto3")
+    def test_overlapping_proxy_task_replacement_is_bound_to_exact_instance(self, mock_boto3):
+        mock_ec2 = MagicMock()
+        mock_asg = MagicMock()
+        mock_boto3.client.side_effect = [mock_ec2, mock_asg, mock_ec2, mock_asg]
+
+        from app.ec2_manager import EC2Manager
+
+        first_task = EC2Manager()
+        second_task = EC2Manager()
+        first_task._asg_name = second_task._asg_name = "pdfx-backend"
+        first_task.get_instance_snapshot = MagicMock(
+            return_value=("running", "172.31.9.10", "i-original")
+        )
+        second_task.get_instance_snapshot = MagicMock(
+            return_value=("running", "172.31.9.11", "i-replacement")
+        )
+
+        assert first_task.mark_unhealthy("i-original") is True
+        assert second_task.mark_unhealthy("i-original") is False
+        mock_asg.set_instance_health.assert_called_once_with(
+            InstanceId="i-original",
             HealthStatus="Unhealthy",
             ShouldRespectGracePeriod=False,
         )
