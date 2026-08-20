@@ -112,6 +112,8 @@ def _ensure_tracker(process_id: str) -> JobTracker:
 
 def _record_job_event(process_id: str, event: str, *, reason: str | None = None) -> None:
     tracker = _ensure_tracker(process_id)
+    if event not in TERMINAL_JOB_STATUSES or tracker.status not in TERMINAL_JOB_STATUSES:
+        lifecycle.record_backend_work()
     tracker.status = event
     tracker.last_seen_at = time.time()
     if event in TERMINAL_JOB_STATUSES:
@@ -224,7 +226,10 @@ def _active_backend_jobs() -> int:
             continue
         if tracker.status in ACTIVE_JOB_STATUSES:
             count += 1
-    return max(count, _backend_health_active_jobs())
+    active_jobs = max(count, _backend_health_active_jobs())
+    if active_jobs > 0:
+        lifecycle.record_backend_work()
+    return active_jobs
 
 
 def _positive_int(value: Any) -> int:
@@ -724,8 +729,8 @@ async def metrics():
     return {
         "queue_depth": job_queue.size,
         "queue_durable": job_queue.durable,
-        "backend_idle_seconds": round(lifecycle.idle_seconds, 2),
-        "backend_activity_observed": lifecycle.activity_observed,
+        "backend_work_idle_seconds": round(lifecycle.backend_work_idle_seconds, 2),
+        "backend_work_observed": lifecycle.backend_work_observed,
         "oldest_pending_age_seconds": round(_oldest_pending_age_seconds(), 2),
         "replay_failure_count": len(replay_submission_errors),
         "replay_inflight_count": len(replay_inflight_jobs),
@@ -1866,6 +1871,8 @@ def _update_tracker_from_payload(process_id: str, payload: dict[str, Any]) -> No
     tracker.status = status
     tracker.last_seen_at = time.time()
     if signature != tracker.last_progress_signature:
+        if status in ACTIVE_JOB_STATUSES | TERMINAL_JOB_STATUSES:
+            lifecycle.record_backend_work()
         tracker.last_progress_signature = signature
         tracker.last_progress_at = tracker.last_seen_at
 

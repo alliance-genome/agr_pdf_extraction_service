@@ -29,7 +29,8 @@ class LifecycleManager:
         self._state = InstanceState.STOPPED
         self._private_ip: Optional[str] = None
         self._last_activity: float = time.time()
-        self._activity_observed: bool = False
+        self._last_backend_work: float = time.time()
+        self._backend_work_observed: bool = False
         self._ready_since: Optional[float] = None
         self._startup_task: Optional[asyncio.Task] = None
         self._transition_lock = asyncio.Lock()
@@ -61,8 +62,12 @@ class LifecycleManager:
         return time.time() - self._last_activity
 
     @property
-    def activity_observed(self) -> bool:
-        return self._activity_observed
+    def backend_work_idle_seconds(self) -> float:
+        return time.time() - self._last_backend_work
+
+    @property
+    def backend_work_observed(self) -> bool:
+        return self._backend_work_observed
 
     @property
     def active_jobs(self) -> int:
@@ -132,14 +137,20 @@ class LifecycleManager:
     def touch(self) -> None:
         """Reset the idle timer. Call on every incoming request."""
         self._last_activity = time.time()
-        self._activity_observed = True
+
+    def record_backend_work(self) -> None:
+        """Record extraction work independently from general request activity."""
+        self._last_backend_work = time.time()
+        self._backend_work_observed = True
 
     def job_started(self) -> None:
+        self.record_backend_work()
         self._active_jobs += 1
         self._state = InstanceState.BUSY
 
     def job_finished(self) -> None:
         self._active_jobs = max(0, self._active_jobs - 1)
+        self.record_backend_work()
         self.touch()
         if self._active_jobs == 0 and self._state == InstanceState.BUSY:
             self._state = InstanceState.READY

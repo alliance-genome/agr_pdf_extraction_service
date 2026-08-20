@@ -28,7 +28,9 @@ def _patch_singletons(monkeypatch):
     mock_lifecycle = MagicMock()
     mock_lifecycle.state = InstanceState.STOPPED
     mock_lifecycle.idle_seconds = 0.0
-    mock_lifecycle.activity_observed = False
+    mock_lifecycle.backend_work_idle_seconds = 0.0
+    mock_lifecycle.backend_work_observed = False
+    mock_lifecycle.record_backend_work = MagicMock()
     mock_lifecycle.active_jobs = 0
     mock_lifecycle.stale_monitor_exits_total = 0
     mock_lifecycle.private_ip = None
@@ -538,17 +540,34 @@ class TestExtractEndpoint:
             return True
 
         main_mod.lifecycle.refresh_health_snapshot = AsyncMock(side_effect=_refresh_health_snapshot)
-        main_mod.lifecycle.idle_seconds = 37.5
-        main_mod.lifecycle.activity_observed = True
+        main_mod.lifecycle.backend_work_idle_seconds = 37.5
+        main_mod.lifecycle.backend_work_observed = True
 
         resp = client.get("/api/v1/metrics")
 
         assert resp.status_code == 200
-        assert resp.json()["backend_idle_seconds"] == 37.5
-        assert resp.json()["backend_activity_observed"] is True
+        assert resp.json()["backend_work_idle_seconds"] == 37.5
+        assert resp.json()["backend_work_observed"] is True
         assert resp.json()["active_backend_jobs"] == 1
         assert main_mod._can_stop_ec2() is False
+        main_mod.lifecycle.record_backend_work.assert_called()
         main_mod.lifecycle.refresh_health_snapshot.assert_awaited_once()
+
+    def test_terminal_status_payload_records_backend_work_only_on_transition(self):
+        import app.main as main_mod
+
+        payload = {"status": "complete", "ended_at": "2026-08-20T20:27:50Z"}
+
+        main_mod._update_tracker_from_payload("completed-job", payload)
+        main_mod._mark_terminal_cleanup_if_needed("completed-job", payload)
+
+        main_mod.lifecycle.record_backend_work.assert_called_once()
+        main_mod.lifecycle.record_backend_work.reset_mock()
+
+        main_mod._update_tracker_from_payload("completed-job", payload)
+        main_mod._mark_terminal_cleanup_if_needed("completed-job", payload)
+
+        main_mod.lifecycle.record_backend_work.assert_not_called()
 
 
 class TestExtractStatusEndpoint:
