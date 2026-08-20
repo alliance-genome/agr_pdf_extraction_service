@@ -20,12 +20,14 @@ class TestLifecycleManager:
         ec2 = MagicMock()
         mgr = LifecycleManager(ec2)
         assert mgr.state == InstanceState.STOPPED
+        assert mgr.activity_observed is False
 
     def test_touch_resets_idle_timer(self):
         mgr, _ = self._make_manager()
         mgr._last_activity = 0
         mgr.touch()
         assert mgr._last_activity > 0
+        assert mgr.activity_observed is True
 
     def test_idle_seconds(self):
         mgr, _ = self._make_manager()

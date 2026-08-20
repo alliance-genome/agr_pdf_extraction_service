@@ -29,6 +29,7 @@ class LifecycleManager:
         self._state = InstanceState.STOPPED
         self._private_ip: Optional[str] = None
         self._last_activity: float = time.time()
+        self._activity_observed: bool = False
         self._ready_since: Optional[float] = None
         self._startup_task: Optional[asyncio.Task] = None
         self._transition_lock = asyncio.Lock()
@@ -58,6 +59,10 @@ class LifecycleManager:
     @property
     def idle_seconds(self) -> float:
         return time.time() - self._last_activity
+
+    @property
+    def activity_observed(self) -> bool:
+        return self._activity_observed
 
     @property
     def active_jobs(self) -> int:
@@ -127,6 +132,7 @@ class LifecycleManager:
     def touch(self) -> None:
         """Reset the idle timer. Call on every incoming request."""
         self._last_activity = time.time()
+        self._activity_observed = True
 
     def job_started(self) -> None:
         self._active_jobs += 1

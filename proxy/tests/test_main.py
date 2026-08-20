@@ -28,6 +28,7 @@ def _patch_singletons(monkeypatch):
     mock_lifecycle = MagicMock()
     mock_lifecycle.state = InstanceState.STOPPED
     mock_lifecycle.idle_seconds = 0.0
+    mock_lifecycle.activity_observed = False
     mock_lifecycle.active_jobs = 0
     mock_lifecycle.stale_monitor_exits_total = 0
     mock_lifecycle.private_ip = None
@@ -538,11 +539,13 @@ class TestExtractEndpoint:
 
         main_mod.lifecycle.refresh_health_snapshot = AsyncMock(side_effect=_refresh_health_snapshot)
         main_mod.lifecycle.idle_seconds = 37.5
+        main_mod.lifecycle.activity_observed = True
 
         resp = client.get("/api/v1/metrics")
 
         assert resp.status_code == 200
         assert resp.json()["backend_idle_seconds"] == 37.5
+        assert resp.json()["backend_activity_observed"] is True
         assert resp.json()["active_backend_jobs"] == 1
         assert main_mod._can_stop_ec2() is False
         main_mod.lifecycle.refresh_health_snapshot.assert_awaited_once()

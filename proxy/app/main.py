@@ -725,6 +725,7 @@ async def metrics():
         "queue_depth": job_queue.size,
         "queue_durable": job_queue.durable,
         "backend_idle_seconds": round(lifecycle.idle_seconds, 2),
+        "backend_activity_observed": lifecycle.activity_observed,
         "oldest_pending_age_seconds": round(_oldest_pending_age_seconds(), 2),
         "replay_failure_count": len(replay_submission_errors),
         "replay_inflight_count": len(replay_inflight_jobs),

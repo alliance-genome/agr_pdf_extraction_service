@@ -291,9 +291,10 @@ def _run_check() -> dict[str, Any]:
     has_active_work = _has_active_work(metrics) if metrics_error is None else True
     if metrics_error and treat_metrics_failure_as_idle:
         has_active_work = False
+    activity_observed = metrics.get("backend_activity_observed") is True
     reported_idle_seconds = (
         _nonnegative_metric_value(metrics, "backend_idle_seconds")
-        if metrics_error is None
+        if metrics_error is None and activity_observed
         else None
     )
 
@@ -367,6 +368,7 @@ def _run_check() -> dict[str, Any]:
         "idle_since": idle_since.isoformat() if idle_since else None,
         "metrics_error": metrics_error,
         "has_active_work": has_active_work,
+        "proxy_activity_observed": activity_observed,
         "reported_idle_seconds": reported_idle_seconds,
         "idle_too_long": idle_too_long,
         "absolute_too_long": absolute_too_long,
