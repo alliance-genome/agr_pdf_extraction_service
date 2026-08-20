@@ -7,10 +7,11 @@ running past configured thresholds.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import boto3
@@ -70,6 +71,14 @@ def _has_active_work(metrics: dict[str, Any]) -> bool:
         except (TypeError, ValueError):
             return True
     return False
+
+
+def _nonnegative_metric_value(metrics: dict[str, Any], key: str) -> float | None:
+    try:
+        value = float(metrics[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 def _put_metric(name: str, value: float, dimensions: list[dict[str, str]]) -> None:
@@ -282,6 +291,12 @@ def _run_check() -> dict[str, Any]:
     has_active_work = _has_active_work(metrics) if metrics_error is None else True
     if metrics_error and treat_metrics_failure_as_idle:
         has_active_work = False
+    backend_work_observed = metrics.get("backend_work_observed") is True
+    reported_idle_seconds = (
+        _nonnegative_metric_value(metrics, "backend_work_idle_seconds")
+        if metrics_error is None and backend_work_observed
+        else None
+    )
 
     backend_running = desired > 0 or bool(instance_ids)
     backend_idle = backend_running and not has_active_work
@@ -308,6 +323,11 @@ def _run_check() -> dict[str, Any]:
                     pass
 
     idle_since = _state_since(idle_since_parameter, backend_idle, now)
+    if idle_since and reported_idle_seconds is not None:
+        reported_idle_since = now - timedelta(seconds=reported_idle_seconds)
+        if reported_idle_since > idle_since + timedelta(seconds=1):
+            idle_since = reported_idle_since
+            _write_state_since(idle_since_parameter, idle_since)
     continuous_age = (
         max((now - running_since).total_seconds() / 60.0, 0.0)
         if running_since
@@ -348,6 +368,8 @@ def _run_check() -> dict[str, Any]:
         "idle_since": idle_since.isoformat() if idle_since else None,
         "metrics_error": metrics_error,
         "has_active_work": has_active_work,
+        "proxy_backend_work_observed": backend_work_observed,
+        "reported_idle_seconds": reported_idle_seconds,
         "idle_too_long": idle_too_long,
         "absolute_too_long": absolute_too_long,
         "reset_after_asg_change": reset_after_asg_change,

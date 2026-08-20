@@ -259,6 +259,119 @@ def test_idle_guard_does_not_reset_for_instance_replacement_without_scale_to_zer
     assert ssm.parameters[idle_param] == _iso(stored_since)
 
 
+def test_idle_guard_uses_proxy_idle_clock_when_short_job_falls_between_checks(monkeypatch):
+    now = datetime.now(timezone.utc)
+    stored_since = now - timedelta(minutes=80)
+    current_launch = now - timedelta(minutes=90)
+    running_param = "/pdfx/prod/idle-guard/asg-running-since"
+    idle_param = "/pdfx/prod/idle-guard/asg-idle-since"
+    ssm = FakeSSM({running_param: _iso(stored_since), idle_param: _iso(stored_since)})
+    cw = FakeCloudWatch()
+    clients = {
+        "autoscaling": FakeASG([]),
+        "cloudwatch": cw,
+        "ec2": FakeEC2(current_launch),
+        "ssm": ssm,
+    }
+    module = _load_guard(monkeypatch, clients)
+    monkeypatch.setattr(
+        module,
+        "_fetch_metrics",
+        lambda url, timeout: {
+            "queue_depth": 0,
+            "replay_inflight_count": 0,
+            "active_backend_jobs": 0,
+            "backend_work_idle_seconds": 300,
+            "backend_work_observed": True,
+        },
+    )
+
+    result = module._run_check()
+
+    reconciled_idle_since = module._parse_iso_datetime(ssm.parameters[idle_param])
+    assert result["has_active_work"] is False
+    assert result["proxy_backend_work_observed"] is True
+    assert result["reported_idle_seconds"] == 300
+    assert result["continuous_idle_age_minutes"] == 5.0
+    assert result["idle_too_long"] is False
+    assert cw.value_for("IdleRunningTooLong") == 0.0
+    assert reconciled_idle_since > stored_since
+
+
+def test_idle_guard_preserves_idle_history_after_proxy_restart(monkeypatch):
+    now = datetime.now(timezone.utc)
+    stored_since = now - timedelta(minutes=100)
+    current_launch = now - timedelta(minutes=110)
+    running_param = "/pdfx/prod/idle-guard/asg-running-since"
+    idle_param = "/pdfx/prod/idle-guard/asg-idle-since"
+    ssm = FakeSSM({running_param: _iso(stored_since), idle_param: _iso(stored_since)})
+    cw = FakeCloudWatch()
+    clients = {
+        "autoscaling": FakeASG([]),
+        "cloudwatch": cw,
+        "ec2": FakeEC2(current_launch),
+        "ssm": ssm,
+    }
+    module = _load_guard(monkeypatch, clients)
+    monkeypatch.setattr(
+        module,
+        "_fetch_metrics",
+        lambda url, timeout: {
+            "queue_depth": 0,
+            "replay_inflight_count": 0,
+            "active_backend_jobs": 0,
+            "backend_work_idle_seconds": 5,
+            "backend_work_observed": False,
+        },
+    )
+
+    result = module._run_check()
+
+    assert result["proxy_backend_work_observed"] is False
+    assert result["reported_idle_seconds"] is None
+    assert result["continuous_idle_age_minutes"] >= 99
+    assert result["idle_too_long"] is True
+    assert cw.value_for("IdleRunningTooLong") == 1.0
+    assert ssm.parameters[idle_param] == _iso(stored_since)
+
+
+def test_idle_guard_ignores_recent_non_work_request_activity(monkeypatch):
+    now = datetime.now(timezone.utc)
+    stored_since = now - timedelta(minutes=125)
+    current_launch = now - timedelta(minutes=130)
+    running_param = "/pdfx/prod/idle-guard/asg-running-since"
+    idle_param = "/pdfx/prod/idle-guard/asg-idle-since"
+    ssm = FakeSSM({running_param: _iso(stored_since), idle_param: _iso(stored_since)})
+    cw = FakeCloudWatch()
+    clients = {
+        "autoscaling": FakeASG([]),
+        "cloudwatch": cw,
+        "ec2": FakeEC2(current_launch),
+        "ssm": ssm,
+    }
+    module = _load_guard(monkeypatch, clients)
+    monkeypatch.setattr(
+        module,
+        "_fetch_metrics",
+        lambda url, timeout: {
+            "queue_depth": 0,
+            "replay_inflight_count": 0,
+            "active_backend_jobs": 0,
+            "backend_idle_seconds": 30,
+            "backend_work_idle_seconds": 7500,
+            "backend_work_observed": True,
+        },
+    )
+
+    result = module._run_check()
+
+    assert result["reported_idle_seconds"] == 7500
+    assert result["continuous_idle_age_minutes"] >= 124
+    assert result["idle_too_long"] is True
+    assert cw.value_for("IdleRunningTooLong") == 1.0
+    assert ssm.parameters[idle_param] == _iso(stored_since)
+
+
 def test_idle_guard_still_publishes_metrics_when_activity_lookup_fails(monkeypatch):
     now = datetime.now(timezone.utc)
     stored_since = now - timedelta(minutes=10)

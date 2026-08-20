@@ -20,12 +20,34 @@ class TestLifecycleManager:
         ec2 = MagicMock()
         mgr = LifecycleManager(ec2)
         assert mgr.state == InstanceState.STOPPED
+        assert mgr.backend_work_observed is False
+        assert mgr.backend_work_idle_seconds == 0.0
 
     def test_touch_resets_idle_timer(self):
         mgr, _ = self._make_manager()
         mgr._last_activity = 0
         mgr.touch()
         assert mgr._last_activity > 0
+        assert mgr.backend_work_observed is False
+
+    def test_request_activity_does_not_reset_backend_work_timer(self):
+        mgr, _ = self._make_manager()
+        mgr.record_backend_work(time.time() - 120)
+
+        mgr.touch()
+
+        assert mgr.idle_seconds < 1
+        assert mgr.backend_work_idle_seconds >= 119
+        assert mgr.backend_work_observed is True
+
+    def test_older_observation_does_not_replace_newer_backend_work(self):
+        mgr, _ = self._make_manager()
+        newer = time.time() - 30
+        mgr.record_backend_work(newer)
+
+        mgr.record_backend_work(newer - 300)
+
+        assert mgr._last_backend_work == newer
 
     def test_idle_seconds(self):
         mgr, _ = self._make_manager()
@@ -37,6 +59,7 @@ class TestLifecycleManager:
         mgr.job_started()
         assert mgr.state == InstanceState.BUSY
         assert mgr.active_jobs == 1
+        assert mgr.backend_work_observed is True
 
     def test_job_finished_returns_to_ready(self):
         mgr, _ = self._make_manager(InstanceState.BUSY)
