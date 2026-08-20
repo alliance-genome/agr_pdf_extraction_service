@@ -8,6 +8,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -1858,7 +1859,9 @@ async def _canary_loop():
 
 
 def _update_tracker_from_payload(process_id: str, payload: dict[str, Any]) -> None:
+    tracker_existed = process_id in job_trackers
     tracker = _ensure_tracker(process_id)
+    previous_status = tracker.status
     status = str(payload.get("status", "")).strip().lower() or tracker.status
 
     progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
@@ -1871,7 +1874,22 @@ def _update_tracker_from_payload(process_id: str, payload: dict[str, Any]) -> No
     tracker.status = status
     tracker.last_seen_at = time.time()
     if signature != tracker.last_progress_signature:
-        if status in ACTIVE_JOB_STATUSES | TERMINAL_JOB_STATUSES:
+        if status in ACTIVE_JOB_STATUSES:
+            lifecycle.record_backend_work()
+        elif status in TERMINAL_JOB_STATUSES and isinstance(ended_at, str):
+            try:
+                parsed_ended_at = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                if parsed_ended_at.tzinfo is None:
+                    parsed_ended_at = parsed_ended_at.replace(tzinfo=timezone.utc)
+                lifecycle.record_backend_work(parsed_ended_at.timestamp())
+            except (ValueError, OverflowError, OSError):
+                if tracker_existed and previous_status not in TERMINAL_JOB_STATUSES:
+                    lifecycle.record_backend_work()
+        elif (
+            status in TERMINAL_JOB_STATUSES
+            and tracker_existed
+            and previous_status not in TERMINAL_JOB_STATUSES
+        ):
             lifecycle.record_backend_work()
         tracker.last_progress_signature = signature
         tracker.last_progress_at = tracker.last_seen_at

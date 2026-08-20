@@ -29,7 +29,7 @@ class LifecycleManager:
         self._state = InstanceState.STOPPED
         self._private_ip: Optional[str] = None
         self._last_activity: float = time.time()
-        self._last_backend_work: float = time.time()
+        self._last_backend_work: float = 0.0
         self._backend_work_observed: bool = False
         self._ready_since: Optional[float] = None
         self._startup_task: Optional[asyncio.Task] = None
@@ -63,7 +63,9 @@ class LifecycleManager:
 
     @property
     def backend_work_idle_seconds(self) -> float:
-        return time.time() - self._last_backend_work
+        if not self._backend_work_observed:
+            return 0.0
+        return max(0.0, time.time() - self._last_backend_work)
 
     @property
     def backend_work_observed(self) -> bool:
@@ -138,9 +140,11 @@ class LifecycleManager:
         """Reset the idle timer. Call on every incoming request."""
         self._last_activity = time.time()
 
-    def record_backend_work(self) -> None:
+    def record_backend_work(self, observed_at: float | None = None) -> None:
         """Record extraction work independently from general request activity."""
-        self._last_backend_work = time.time()
+        timestamp = time.time() if observed_at is None else observed_at
+        if not self._backend_work_observed or timestamp > self._last_backend_work:
+            self._last_backend_work = timestamp
         self._backend_work_observed = True
 
     def job_started(self) -> None:

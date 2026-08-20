@@ -3,6 +3,7 @@
 import asyncio
 import json
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from fastapi import HTTPException
@@ -561,7 +562,8 @@ class TestExtractEndpoint:
         main_mod._update_tracker_from_payload("completed-job", payload)
         main_mod._mark_terminal_cleanup_if_needed("completed-job", payload)
 
-        main_mod.lifecycle.record_backend_work.assert_called_once()
+        expected_ended_at = datetime(2026, 8, 20, 20, 27, 50, tzinfo=timezone.utc).timestamp()
+        main_mod.lifecycle.record_backend_work.assert_called_once_with(expected_ended_at)
         main_mod.lifecycle.record_backend_work.reset_mock()
 
         main_mod._update_tracker_from_payload("completed-job", payload)
