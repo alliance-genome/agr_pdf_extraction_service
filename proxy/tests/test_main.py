@@ -537,10 +537,12 @@ class TestExtractEndpoint:
             return True
 
         main_mod.lifecycle.refresh_health_snapshot = AsyncMock(side_effect=_refresh_health_snapshot)
+        main_mod.lifecycle.idle_seconds = 37.5
 
         resp = client.get("/api/v1/metrics")
 
         assert resp.status_code == 200
+        assert resp.json()["backend_idle_seconds"] == 37.5
         assert resp.json()["active_backend_jobs"] == 1
         assert main_mod._can_stop_ec2() is False
         main_mod.lifecycle.refresh_health_snapshot.assert_awaited_once()

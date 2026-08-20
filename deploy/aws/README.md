@@ -73,6 +73,8 @@ Default production-oriented behavior:
 - reset the stored clock if the monitored backend ASG name changes
 - track continuous backend idle time separately, so real extraction work does
   not count against the idle alarm
+- reconcile the stored idle clock with the proxy's shutdown idle timer, so
+  short jobs that finish between scheduled checks still reset the alarm clock
 - alert after 130 minutes with no queued, replaying, or active backend work,
   which is intentionally just beyond the proxy's 120-minute idle-stop window
 - alert after 1440 minutes (24 hours) of continuous backend runtime regardless
