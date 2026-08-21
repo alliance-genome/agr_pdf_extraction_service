@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 
@@ -7,6 +8,7 @@ from app.services.abc_markdown_policy import abc_markdown_report
 from app.services.document_skeleton import (
     NativeEmphasisSpan,
     NativeStructureArtifact,
+    _copy_audit_interval,
     _final_projection_targets,
     _projection_claim_inventory,
     build_document_skeleton,
@@ -28,6 +30,7 @@ from app.services.native_extractor_artifact import (
     sha256_file,
 )
 from app.services.native_style import unavailable_native_style_bytes
+from app.services.merge_artifact import _validate_audit
 
 
 def _native(source, markdown, value, native_style=None):
@@ -52,6 +55,49 @@ def _audit(artifact):
         "region_id": None,
         "decision_method": "baseline_fallback",
     }]
+
+
+def test_clipped_deterministic_marker_rebinds_exact_retained_bytes():
+    artifact = SourceArtifact.from_text("marker", "## Title\n")
+    original = artifact.raw_utf8
+    marker = original[:2]
+    audit = [
+        {
+            "output_byte_start": 0,
+            "output_byte_end": 2,
+            "source": "deterministic_markup",
+            "artifact_digest": hashlib.sha256(marker).hexdigest(),
+            "source_byte_start": 0,
+            "source_byte_end": 2,
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "deterministic",
+            "transformation": "selected_document_skeleton",
+            "transformation_id": "heading-marker",
+        },
+        {
+            "output_byte_start": 2,
+            "output_byte_end": len(original),
+            "source": "marker",
+            "artifact_digest": artifact.digest,
+            "source_byte_start": 2,
+            "source_byte_end": len(original),
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "baseline_fallback",
+        },
+    ]
+    output = bytearray()
+    rewritten = []
+
+    _copy_audit_interval(output, rewritten, original, audit, 1, len(original))
+
+    assert bytes(output) == b"# Title\n"
+    assert rewritten[0]["artifact_digest"] == hashlib.sha256(b"#").hexdigest()
+    assert rewritten[0]["source_byte_start"] == 0
+    assert rewritten[0]["source_byte_end"] == 1
+    assert rewritten[0]["transformation_id"] == "heading-marker"
+    _validate_audit(bytes(output), rewritten, {"marker": artifact})
 
 
 def test_projects_native_page_transitions_without_changing_publication_text():
