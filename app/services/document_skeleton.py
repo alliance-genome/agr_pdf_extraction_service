@@ -5108,6 +5108,24 @@ def project_native_page_markers(
             strict=True,
         )
     ]
+    marker_abstention_reason = None
+    validation_abstained_marker_count = 0
+    if events:
+        original_abc = abc_markdown_report(text)
+        rendered_abc = abc_markdown_report(rendered)
+        introduced_errors = set(rendered_abc["error_rule_ids"]) - set(
+            original_abc["error_rule_ids"]
+        )
+        if introduced_errors or (
+            original_abc["valid"] is True
+            and rendered_abc["valid"] is not True
+        ):
+            validation_abstained_marker_count = len(events)
+            marker_abstention_reason = "abc_validation_regression"
+            rendered = text
+            rewritten_audit = audit
+            decorated_events = []
+            transition_pages = []
     report = {
         "policy_version": "source-audit-native-page-projection-v1",
         "structural_unit_count": len(units),
@@ -5119,8 +5137,10 @@ def project_native_page_markers(
         "unmapped_structural_unit_count": (
             len(units) - len(assignments) - ambiguous_count
         ),
-        "marker_count": len(events),
+        "marker_count": len(decorated_events),
         "projected_pages": transition_pages,
+        "validation_abstained_marker_count": validation_abstained_marker_count,
+        "marker_abstention_reason": marker_abstention_reason,
     }
     return rendered, rewritten_audit, decorated_events, report
 

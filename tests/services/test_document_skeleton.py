@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from app.services.abc_markdown_policy import abc_markdown_report
 from app.services.document_skeleton import (
     NativeEmphasisSpan,
     NativeStructureArtifact,
@@ -187,6 +188,40 @@ def test_native_page_projection_abstains_on_unequal_cross_source_evidence():
     assert events == []
     assert report["ambiguous_structural_unit_count"] == 1
     assert report["marker_count"] == 0
+
+
+def test_native_page_projection_abstains_when_marker_breaks_abc_table():
+    artifact = SourceArtifact.from_text(
+        "marker",
+        "# Title\n\n| A | B |\n|---|---|\n| 1 | 2 |\n",
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    separator_start = artifact.raw_utf8.index(b"|---|---|")
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=2 if occurrence.source_byte_start == separator_start else 1,
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+    original_audit = _audit(artifact)
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        original_audit,
+        {"marker": skeleton},
+    )
+
+    assert rendered == artifact.text
+    assert rewritten_audit == original_audit
+    assert events == []
+    assert report["marker_count"] == 0
+    assert report["validation_abstained_marker_count"] == 2
+    assert report["marker_abstention_reason"] == "abc_validation_regression"
+    assert abc_markdown_report(rendered)["error_rule_ids"] == []
 
 
 def test_native_page_projection_uses_bounded_cross_extractor_alignment():

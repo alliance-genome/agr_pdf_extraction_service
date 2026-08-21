@@ -1739,11 +1739,12 @@ def _run_extraction(
             source: _cached_path(file_hash, source)
             for source in source_artifacts
         }
+        runtime_pdf_sha256 = sha256_file(pdf_path)
         runtime_native_structures, runtime_native_structure_failures = (
             load_runtime_native_structures(
                 source_artifacts,
                 runtime_output_paths,
-                expected_pdf_sha256=sha256_file(pdf_path),
+                expected_pdf_sha256=runtime_pdf_sha256,
             )
         )
         # Persistence replay must use skeletons built from the same native inputs
@@ -2016,6 +2017,7 @@ def _run_extraction(
         result["consensus_metrics"] = consensus_metrics
     if merged_cache_path:
         result["merge_contract_id"] = Config.MERGE_CONTRACT_ID
+        result["source_pdf_sha256"] = runtime_pdf_sha256
         result["merge_metrics_path"] = metrics_cache_path
         result["merge_audit_path"] = audit_cache_path
         result["native_structure_receipt_digests"] = runtime_native_receipts

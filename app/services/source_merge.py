@@ -1523,7 +1523,7 @@ def scan_structural_units(artifact: SourceArtifact) -> tuple[StructuralUnitSpan,
         # structural units so projection cannot affect semantic comparison.
         if (
             equation_close is None
-            and re.fullmatch(r"<!-- page: [1-9]\d* -->", stripped)
+            and re.fullmatch(r"<!-- page: [1-9]\d* -->", content)
         ):
             flush()
             byte_cursor += len(line.encode("utf-8"))

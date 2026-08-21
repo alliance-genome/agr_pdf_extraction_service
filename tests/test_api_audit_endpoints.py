@@ -965,6 +965,7 @@ def test_merged_download_uses_verified_bundle_bytes(client, tmp_path):
     mock_result.state = "SUCCESS"
     mock_result.result = {
         "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
+        "source_pdf_sha256": "f" * 64,
         "merged_cache_path": str(tmp_path / "merged.md"),
         "merge_metrics_path": str(tmp_path / "metrics.json"),
         "merge_audit_path": str(tmp_path / "audit.json"),
@@ -1057,6 +1058,95 @@ def test_merge_download_rejects_legacy_local_contract_and_uses_durable_artifact(
 
     with (
         patch("celery_app.celery.AsyncResult", return_value=mock_result),
+        patch("app.api.load_merge_bundle") as mock_load,
+        patch(
+            "app.api._s3_redirect_for_artifact",
+            return_value=("durable merged output", 200),
+        ) as mock_redirect,
+    ):
+        response = client.get(f"/api/v1/extract/{process_id}/download/merged")
+
+    assert response.status_code == 200
+    assert response.data == b"durable merged output"
+    mock_load.assert_not_called()
+    mock_redirect.assert_called_once_with(
+        "pdfx/audit/2026/07/23/process/merged.md"
+    )
+
+
+def test_merge_download_uses_pdf_digest_when_reloading_native_sidecars(
+    client, tmp_path
+):
+    process_id = str(uuid.uuid4())
+    source = tmp_path / "grobid.md"
+    source.write_text("# Title\n\nSource.", encoding="utf-8")
+    pdf_sha256 = "f" * 64
+    mock_result = MagicMock()
+    mock_result.state = "SUCCESS"
+    mock_result.result = {
+        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
+        "source_pdf_sha256": pdf_sha256,
+        "merged_cache_path": str(tmp_path / "merged.md"),
+        "merge_metrics_path": str(tmp_path / "metrics.json"),
+        "merge_audit_path": str(tmp_path / "audit.json"),
+        "available_extractors": ["grobid"],
+        "native_structure_receipt_digests": {},
+        "document_skeleton_candidate_ids": {"grobid": "a" * 64},
+        "document_skeleton_candidate_projection_ids": {"grobid": "b" * 64},
+        "download_paths": {"grobid": str(source)},
+        "file_hash": "merge-hash",
+    }
+
+    with (
+        patch("celery_app.celery.AsyncResult", return_value=mock_result),
+        patch(
+            "app.services.document_skeleton.load_runtime_native_structures",
+            return_value=({}, {}),
+        ) as mock_native_load,
+        patch(
+            "app.api.load_merge_bundle",
+            return_value=("# Title\n\nVerified merge.", {}, []),
+        ),
+    ):
+        response = client.get(f"/api/v1/extract/{process_id}/download/merged")
+
+    assert response.status_code == 200
+    mock_native_load.assert_called_once()
+    assert mock_native_load.call_args.kwargs["expected_pdf_sha256"] == pdf_sha256
+
+
+def test_merge_download_falls_back_when_native_receipts_do_not_match(
+    client, tmp_path
+):
+    process_id = str(uuid.uuid4())
+    source = tmp_path / "grobid.md"
+    source.write_text("# Title\n\nSource.", encoding="utf-8")
+    mock_result = MagicMock()
+    mock_result.state = "SUCCESS"
+    mock_result.result = {
+        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
+        "source_pdf_sha256": "f" * 64,
+        "merged_cache_path": str(tmp_path / "merged.md"),
+        "merge_metrics_path": str(tmp_path / "metrics.json"),
+        "merge_audit_path": str(tmp_path / "audit.json"),
+        "available_extractors": ["grobid"],
+        "native_structure_receipt_digests": {},
+        "document_skeleton_candidate_ids": {"grobid": "a" * 64},
+        "document_skeleton_candidate_projection_ids": {"grobid": "b" * 64},
+        "download_paths": {"grobid": str(source)},
+        "artifacts_json": {
+            "merged": "pdfx/audit/2026/07/23/process/merged.md",
+        },
+        "file_hash": "merge-hash",
+    }
+    unexpected_native = MagicMock(receipt_digest="c" * 64)
+
+    with (
+        patch("celery_app.celery.AsyncResult", return_value=mock_result),
+        patch(
+            "app.services.document_skeleton.load_runtime_native_structures",
+            return_value=({"grobid": unexpected_native}, {}),
+        ),
         patch("app.api.load_merge_bundle") as mock_load,
         patch(
             "app.api._s3_redirect_for_artifact",

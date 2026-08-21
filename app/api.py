@@ -1248,6 +1248,7 @@ def download_result(process_id, method):
 
         if method in {"merged", "audit"} and data.get("merged_cache_path"):
             contract_id = data.get("merge_contract_id")
+            source_pdf_sha256 = data.get("source_pdf_sha256")
             merged_path = data.get("merged_cache_path")
             metrics_path = data.get("merge_metrics_path")
             audit_path = data.get("merge_audit_path")
@@ -1256,12 +1257,24 @@ def download_result(process_id, method):
             skeleton_projection_ids = data.get(
                 "document_skeleton_candidate_projection_ids"
             )
-            if contract_id != Config.MERGE_CONTRACT_ID or not all(
+            metadata_complete = all(
                 (merged_path, metrics_path, audit_path)
-            ) or not all(
+            ) and (
+                isinstance(source_pdf_sha256, str)
+                and len(source_pdf_sha256) == 64
+            ) and all(
                 isinstance(value, dict)
                 for value in (native_receipts, skeleton_ids, skeleton_projection_ids)
-            ):
+            )
+            if contract_id != Config.MERGE_CONTRACT_ID:
+                local_merge_verification_failed = True
+                logger.warning(
+                    "Merge download contract is stale for %s; expected=%s; "
+                    "trying durable artifact",
+                    process_id,
+                    Config.MERGE_CONTRACT_ID,
+                )
+            elif not metadata_complete:
                 local_merge_verification_failed = True
                 logger.warning(
                     "Merge download bundle metadata is incomplete for %s; "
@@ -1301,6 +1314,7 @@ def download_result(process_id, method):
                                 source: download_paths[source]
                                 for source in artifacts
                             },
+                            expected_pdf_sha256=source_pdf_sha256,
                         )
                     )
                     if {
@@ -1317,7 +1331,14 @@ def download_result(process_id, method):
                                 artifact,
                                 native_structures.get(source),
                             )
-                        except Exception:
+                        except Exception as exc:
+                            logger.warning(
+                                "Merge download skeleton rebuild failed for %s "
+                                "source=%s: %s",
+                                process_id,
+                                source,
+                                type(exc).__name__,
+                            )
                             skeletons[source] = build_document_skeleton(
                                 artifact,
                                 None,

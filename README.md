@@ -101,9 +101,10 @@ Merged Markdown preserves native PDF page boundaries as
 `<!-- page: N -->` transport comments. PDFX projects a boundary from exact
 source/audit overlap first, then from an unambiguous bounded structural
 alignment to another extractor's native occurrence. Conflicting or missing
-page evidence is left unassigned rather than guessed. The comments are excluded
-from publication-content comparison, and their deterministic audit entries and
-projection receipt are replayed during merge-bundle validation.
+page evidence, and placements that would introduce an Alliance Markdown
+validation error, are left unassigned rather than guessed. The comments are
+excluded from publication-content comparison, and their deterministic audit
+entries and projection receipt are replayed during merge-bundle validation.
 
 ### Duplicate-content protection
 
