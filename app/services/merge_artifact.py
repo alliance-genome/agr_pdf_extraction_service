@@ -162,17 +162,21 @@ def _validate_audit(
             elif transformation == "alliance_bibliography_heading_insert":
                 expected_span = (
                     span
-                    if re.fullmatch(rb"\n{0,2}## References\n\n", span) is not None
+                    if span == b"## References\n\n"
                     else None
                 )
             elif transformation == "alliance_figure_legend_heading_insert":
                 expected_span = (
                     span
-                    if re.fullmatch(
-                        rb"\n{0,2}## Figure Legends\n\n", span
-                    )
-                    is not None
+                    if span == b"## Figure Legends\n\n"
                     else None
+                )
+            elif transformation in {
+                "alliance_bibliography_heading_boundary",
+                "alliance_figure_legend_heading_boundary",
+            }:
+                expected_span = (
+                    span if re.fullmatch(rb"\n{1,2}", span) is not None else None
                 )
             elif transformation in {
                 "alliance_heading_depth",

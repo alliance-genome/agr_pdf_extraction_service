@@ -2234,18 +2234,24 @@ def _bibliography_marker_ranges(raw: bytes) -> list[tuple[int, int, bytes, str]]
     return ranges
 
 
-def _canonical_inserted_heading(prefix: bytes, heading: bytes) -> bytes:
+def _canonical_inserted_heading_parts(
+    prefix: bytes,
+    heading: bytes,
+) -> tuple[bytes, bytes]:
+    boundary = b""
     if not prefix:
-        return heading + b"\n\n"
-    if prefix.endswith(b"\n\n"):
-        return heading + b"\n\n"
-    if prefix.endswith(b"\n"):
-        return b"\n" + heading + b"\n\n"
-    return b"\n\n" + heading + b"\n\n"
+        pass
+    elif prefix.endswith(b"\n\n"):
+        pass
+    elif prefix.endswith(b"\n"):
+        boundary = b"\n"
+    else:
+        boundary = b"\n\n"
+    return boundary, heading + b"\n\n"
 
 
-def _canonical_bibliography_heading(prefix: bytes) -> bytes:
-    return _canonical_inserted_heading(prefix, b"## References")
+def _canonical_bibliography_heading_parts(prefix: bytes) -> tuple[bytes, bytes]:
+    return _canonical_inserted_heading_parts(prefix, b"## References")
 
 
 def _figure_caption_marker_ranges(
@@ -2442,13 +2448,29 @@ def _render_figure_legend_slot(
             return text, audit, events
         legend_start = moved_figure_units[0].byte_start
         raw = moved_artifact.raw_utf8
+        boundary, heading = _canonical_inserted_heading_parts(
+            raw[:legend_start], b"## Figure Legends"
+        )
+        if boundary:
+            text, audit, boundary_events = _replace_deterministic_markup(
+                text,
+                audit,
+                [(
+                    legend_start,
+                    legend_start,
+                    boundary,
+                    "alliance_figure_legend_heading_boundary",
+                )],
+            )
+            events.extend(boundary_events)
+            legend_start += len(boundary)
         text, audit, insert_events = _replace_deterministic_markup(
             text,
             audit,
             [(
                 legend_start,
                 legend_start,
-                _canonical_inserted_heading(raw[:legend_start], b"## Figure Legends"),
+                heading,
                 "alliance_figure_legend_heading_insert",
             )],
         )
@@ -5332,6 +5354,14 @@ def project_native_page_markers(
             "reason": boundary["reason"],
             "projection_method": boundary["projection_method"],
         })
+    rendered_abstained_boundaries.sort(
+        key=lambda boundary: (
+            boundary["output_byte_offset"],
+            boundary["page_no"],
+            boundary["reason"],
+            boundary["projection_method"],
+        )
+    )
     try:
         abc_parser_version = runtime_abc_parser_version()
         abc_parser_implementation_sha256 = (
@@ -6128,7 +6158,22 @@ def render_document_role_slots(
                 ]
             )
             raw = text.encode("utf-8")
-            heading = _canonical_bibliography_heading(raw[:reference_start])
+            boundary, heading = _canonical_bibliography_heading_parts(
+                raw[:reference_start]
+            )
+            if boundary:
+                text, audit, boundary_events = _replace_deterministic_markup(
+                    text,
+                    audit,
+                    [(
+                        reference_start,
+                        reference_start,
+                        boundary,
+                        "alliance_bibliography_heading_boundary",
+                    )],
+                )
+                events.extend(boundary_events)
+                reference_start += len(boundary)
             text, audit, insert_events = _replace_deterministic_markup(
                 text,
                 audit,

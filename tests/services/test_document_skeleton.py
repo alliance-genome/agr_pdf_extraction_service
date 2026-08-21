@@ -619,6 +619,47 @@ def test_native_page_projection_records_unproven_page_inside_table():
     }]
 
 
+def test_native_page_projection_sorts_structural_and_reader_abstentions():
+    artifact = SourceArtifact.from_text(
+        "marker",
+        "Intro.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n",
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    table_start = artifact.raw_utf8.index(b"| A | B |")
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    3
+                    if occurrence.source_byte_start >= table_start
+                    else 2
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    assert rendered == artifact.text
+    assert rewritten_audit == _audit(artifact)
+    assert events == []
+    assert [
+        boundary["output_byte_offset"]
+        for boundary in report["abstained_boundaries"]
+    ] == [0, table_start]
+    assert [
+        boundary["reason"]
+        for boundary in report["abstained_boundaries"]
+    ] == ["reader_payload_regression", "protected_structural_block"]
+
+
 def test_native_page_projection_uses_bounded_cross_extractor_alignment():
     final_artifact = SourceArtifact.from_text(
         "grobid", "Long reference title and journal 2024.\n"
@@ -2715,6 +2756,7 @@ def test_role_slot_renderer_moves_native_nonreferences_before_final_bibliography
     assert sum(
         entry["output_byte_end"] - entry["output_byte_start"] for entry in audit
     ) == len(rendered.encode())
+    _validate_audit(rendered.encode(), audit, {"marker": artifact})
 
 
 @pytest.mark.parametrize(
