@@ -625,6 +625,92 @@ def test_positive_style_selection_must_match_its_numeric_sol_trace():
         )
 
 
+def test_positive_style_selection_ignores_late_event_diagnostics():
+    artifact = SourceArtifact.from_text("grobid", "Body\n")
+    audit = [{
+        "output_byte_start": 0,
+        "output_byte_end": len(artifact.raw_utf8),
+        "source": "grobid",
+        "artifact_digest": artifact.digest,
+        "source_byte_start": 0,
+        "source_byte_end": len(artifact.raw_utf8),
+    }]
+    selection_id = "style-selection"
+    request_sha256 = "a" * 64
+    event = {
+        "operation": "native_emphasis_projection",
+        "outcome": "supported",
+        "positive_style_claim_id": "b" * 64,
+        "style_selection_id": selection_id,
+        "style_selection_method": "sol_numbered_choice",
+        "style_selection_candidate_ids": ["target"],
+        "style_selection_candidate_count": 1,
+        "style_selection_none_id": "none",
+        "style_selected_candidate_id": "target",
+        "style_selection_request_sha256": request_sha256,
+        "style_selection_response_choice": 1,
+        "style_selection_model": "gpt-5.6-sol",
+        "style_selection_reasoning_effort": "high",
+        "model_selected_target": True,
+    }
+    enriched_event = {
+        **event,
+        "positive_style_claim_id": "c" * 64,
+        "style_selection_donor_ordinal": 4,
+        "style_selection_target_ordinal": 7,
+        "style_selection_order_crossing": False,
+    }
+    trace = {
+        "tier": "sol",
+        "call_type": "bounded_id_selection_sol",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "outcome": "valid",
+        "request": {
+            "request_sha256": request_sha256,
+            "regions": [{
+                "region_id": selection_id,
+                "keep_baseline_choice": 0,
+                "baseline_candidate_id": "none",
+                "candidates": [
+                    {"candidate_id": "none"},
+                    {"candidate_id": "target"},
+                ],
+                "path_choices": [{"choice": 1, "candidate_ids": ["target"]}],
+            }],
+        },
+        "response": {
+            "request_sha256": request_sha256,
+            "decisions": [{"region_id": selection_id, "choice": 1}],
+        },
+    }
+    metrics = {
+        "document_skeleton_transformations": [event, enriched_event],
+        "model_selection_calls": [trace],
+    }
+
+    _validate_positive_style_overlay_receipts(
+        artifact.raw_utf8,
+        audit,
+        metrics,
+        {"grobid": artifact},
+        None,
+    )
+
+    enriched_event["style_selection_response_choice"] = 0
+    with pytest.raises(
+        ValueError,
+        match="positive style model-selection receipt is inconsistent",
+    ):
+        _validate_positive_style_overlay_receipts(
+            artifact.raw_utf8,
+            audit,
+            metrics,
+            {"grobid": artifact},
+            None,
+        )
+
+
 def test_title_selection_must_match_its_numeric_sol_trace():
     selection_id = "document_title_choice:" + "b" * 24
     request_sha256 = "a" * 64
