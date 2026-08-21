@@ -1422,6 +1422,7 @@ def load_merge_bundle(
     metrics_path: str,
     audit_path: str,
     artifacts: Mapping[SourceName, SourceArtifact],
+    skeletons: Mapping[SourceName, DocumentSkeleton],
     expected_contract_id: str,
     expected_native_structure_receipt_digests: Mapping[SourceName, str],
     expected_skeleton_candidate_ids: Mapping[SourceName, str],
@@ -1435,8 +1436,18 @@ def load_merge_bundle(
     }
     if manifest.get("source_artifact_digests") != expected_source_digests:
         raise ValueError("merge manifest source digest mismatch")
+    runtime_skeleton_ids = {
+        source: skeletons[source].skeleton_id for source in sorted(skeletons)
+    }
+    runtime_skeleton_projection_ids = {
+        source: skeletons[source].projection_id for source in sorted(skeletons)
+    }
     if (
-        manifest.get("native_structure_receipt_digests")
+        set(skeletons) != set(artifacts)
+        or runtime_skeleton_ids != dict(expected_skeleton_candidate_ids)
+        or runtime_skeleton_projection_ids
+        != dict(expected_skeleton_candidate_projection_ids)
+        or manifest.get("native_structure_receipt_digests")
         != dict(expected_native_structure_receipt_digests)
         or manifest.get("document_skeleton_candidate_ids")
         != dict(expected_skeleton_candidate_ids)
@@ -1482,6 +1493,7 @@ def load_merge_bundle(
         audit,
         artifacts=artifacts,
         expected_contract_id=expected_contract_id,
+        skeletons=skeletons,
     )
     return text, metrics, audit
 

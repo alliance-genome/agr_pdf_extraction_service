@@ -23,7 +23,11 @@ from app.services.source_contracts import (
 )
 from app.services.llm_service import CandidateSelectionFailure
 from app.services.document_skeleton import NativeStructureArtifact, build_document_skeleton
-from app.services.merge_artifact import persist_merge_bundle, validate_merge_artifacts
+from app.services.merge_artifact import (
+    load_merge_bundle,
+    persist_merge_bundle,
+    validate_merge_artifacts,
+)
 from config import Config
 from app.services.page_coverage import (
     PAGE_COVERAGE_METHOD,
@@ -338,7 +342,9 @@ def test_candidate_adapter_uses_selection_only_terra_and_emits_span_audit():
         "# Title\n\nGene Gγa is active.\n",
         "# Title\n\nGene G g a is active.\n",
     }
-    assert metrics["merge_contract_id"] == "pdfx-native-skeleton-selection"
+    assert metrics["merge_contract_id"] == (
+        "pdfx-native-skeleton-selection-page-provenance-v1"
+    )
     assert metrics["merge_quality"] == "terra_selected"
     assert metrics["runtime_models"]["source_selection"]["model"] == "gpt-5.6-terra"
     assert metrics["qualification_outcome"] == "failsafe"
@@ -451,7 +457,7 @@ def test_baseline_retained_native_italics_reconcile_without_replacement():
     assert receipt["all_native_body_italics_retained"] is True
 
 
-def test_merge_projects_replayable_native_page_transitions():
+def test_merge_projects_replayable_native_page_transitions(tmp_path):
     marker = "# Title\n\nFirst page text.\n\nSecond page text.\n"
     artifact = SourceArtifact.from_text("marker", marker)
     marker_native = NativeStructureArtifact.for_test(
@@ -509,6 +515,39 @@ def test_merge_projects_replayable_native_page_transitions():
         entry.get("transformation") == "native_page_marker"
         for entry in audit
     )
+
+    skeletons = {"marker": build_document_skeleton(artifact, marker_native)}
+    merged_path = tmp_path / "merged.md"
+    metrics_path = tmp_path / "metrics.json"
+    audit_path = tmp_path / "audit.json"
+    persist_merge_bundle(
+        merged_path=str(merged_path),
+        metrics_path=str(metrics_path),
+        audit_path=str(audit_path),
+        text=merged,
+        metrics=metrics,
+        audit=audit,
+        artifacts={"marker": artifact},
+        skeletons=skeletons,
+        expected_contract_id=Config.MERGE_CONTRACT_ID,
+    )
+    assert load_merge_bundle(
+        merged_path=str(merged_path),
+        metrics_path=str(metrics_path),
+        audit_path=str(audit_path),
+        artifacts={"marker": artifact},
+        skeletons=skeletons,
+        expected_contract_id=Config.MERGE_CONTRACT_ID,
+        expected_native_structure_receipt_digests=metrics[
+            "native_structure_receipt_digests"
+        ],
+        expected_skeleton_candidate_ids=metrics[
+            "document_skeleton_candidate_ids"
+        ],
+        expected_skeleton_candidate_projection_ids=metrics[
+            "document_skeleton_candidate_projection_ids"
+        ],
+    ) == (merged, metrics, audit)
 
 
 def _plain_marker_with_native_dpp():

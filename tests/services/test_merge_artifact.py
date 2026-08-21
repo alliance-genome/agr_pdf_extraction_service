@@ -25,7 +25,8 @@ from app.services.semantic_payload import (
 )
 
 
-CONTRACT_ID = "pdfx-native-skeleton-selection"
+CONTRACT_ID = "pdfx-native-skeleton-selection-page-provenance-v1"
+LEGACY_CONTRACT_ID = "pdfx-native-skeleton-selection"
 
 
 def _empty_native_italic_receipt() -> dict:
@@ -84,8 +85,9 @@ def _case(text: str = "# Title\nBody\n"):
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     artifacts = {"grobid": artifact}
     abc_report = abc_markdown_report(text)
-    skeleton_id = hashlib.sha256(f"skeleton:{digest}".encode()).hexdigest()
-    projection_id = hashlib.sha256(f"projection:{digest}".encode()).hexdigest()
+    skeleton = build_document_skeleton(artifact, None)
+    skeleton_id = skeleton.skeleton_id
+    projection_id = skeleton.projection_id
     metrics = {
         "merge_contract_id": CONTRACT_ID,
         "failed": False,
@@ -138,7 +140,7 @@ def _case(text: str = "# Title\nBody\n"):
         text,
         audit,
         baseline_source="grobid",
-        skeletons={"grobid": build_document_skeleton(artifact, None)},
+        skeletons={"grobid": skeleton},
     )
     metrics["semantic_payload_receipt"] = semantic_receipt.as_metric()
     metrics["semantic_payload_reader"] = semantic_payload_reader_report(
@@ -186,6 +188,13 @@ def _load_expectations(metrics: dict) -> dict:
         "expected_skeleton_candidate_projection_ids": metrics[
             "document_skeleton_candidate_projection_ids"
         ],
+    }
+
+
+def _skeletons(artifacts: dict) -> dict:
+    return {
+        source: build_document_skeleton(artifact, None)
+        for source, artifact in artifacts.items()
     }
 
 
@@ -402,6 +411,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
         metrics_path=str(metric_file),
         audit_path=str(audit_file),
         artifacts=artifacts,
+        skeletons=_skeletons(artifacts),
         expected_contract_id=CONTRACT_ID,
         **_load_expectations(metrics),
     ) == (text, metrics, audit)
@@ -412,6 +422,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id=CONTRACT_ID,
             expected_native_structure_receipt_digests={"grobid": "0" * 64},
             expected_skeleton_candidate_ids=metrics[
@@ -427,6 +438,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id=CONTRACT_ID,
             expected_native_structure_receipt_digests={},
             expected_skeleton_candidate_ids={"grobid": "0" * 64},
@@ -440,6 +452,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id=CONTRACT_ID,
             expected_native_structure_receipt_digests={},
             expected_skeleton_candidate_ids=metrics[
@@ -453,6 +466,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id="pdfx-source-selection",
             **_load_expectations(metrics),
         )
@@ -463,6 +477,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id=CONTRACT_ID,
             **_load_expectations(metrics),
         )
@@ -489,6 +504,39 @@ def test_manifest_binds_the_exact_source_generation(tmp_path):
         load_merge_bundle(
             merged_path=str(merged), metrics_path=str(metric_file),
             audit_path=str(audit_file), artifacts=newer,
+            skeletons=_skeletons(newer),
+            expected_contract_id=CONTRACT_ID,
+            **_load_expectations(metrics),
+        )
+
+
+def test_new_contract_rejects_a_legacy_merge_bundle(tmp_path):
+    text = "# Title\nBody\n"
+    artifacts, metrics, audit = _case(text)
+    metrics["merge_contract_id"] = LEGACY_CONTRACT_ID
+    merged = tmp_path / "merged.md"
+    metric_file = tmp_path / "metrics.json"
+    audit_file = tmp_path / "audit.json"
+    skeletons = _skeletons(artifacts)
+    persist_merge_bundle(
+        merged_path=str(merged),
+        metrics_path=str(metric_file),
+        audit_path=str(audit_file),
+        text=text,
+        metrics=metrics,
+        audit=audit,
+        artifacts=artifacts,
+        skeletons=skeletons,
+        expected_contract_id=LEGACY_CONTRACT_ID,
+    )
+
+    with pytest.raises(ValueError, match="manifest identity"):
+        load_merge_bundle(
+            merged_path=str(merged),
+            metrics_path=str(metric_file),
+            audit_path=str(audit_file),
+            artifacts=artifacts,
+            skeletons=skeletons,
             expected_contract_id=CONTRACT_ID,
             **_load_expectations(metrics),
         )

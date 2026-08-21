@@ -22,7 +22,7 @@ class Config:
     # ---- Cache versioning ----------------------------------------------------
     # Bump this when extractor config changes to invalidate old cached outputs.
     EXTRACTION_CONFIG_VERSION = os.environ.get("EXTRACTION_CONFIG_VERSION", "6")
-    MERGE_CONTRACT_ID = "pdfx-native-skeleton-selection"
+    MERGE_CONTRACT_ID = "pdfx-native-skeleton-selection-page-provenance-v1"
 
     # ---- Celery / Redis ------------------------------------------------------
     CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")

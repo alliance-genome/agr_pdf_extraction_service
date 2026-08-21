@@ -1780,6 +1780,7 @@ def _run_extraction(
                     metrics_path=metrics_cache_path,
                     audit_path=possible_audit,
                     artifacts=source_artifacts,
+                    skeletons=runtime_skeletons,
                     expected_contract_id=Config.MERGE_CONTRACT_ID,
                     expected_native_structure_receipt_digests=(
                         runtime_native_receipts

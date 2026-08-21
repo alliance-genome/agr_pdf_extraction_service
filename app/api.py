@@ -1287,11 +1287,45 @@ def download_result(process_id, method):
                             artifacts[source] = SourceArtifact.from_text(
                                 source, handle.read()
                             )
+                    from app.services.document_skeleton import (
+                        build_document_skeleton,
+                        load_runtime_native_structures,
+                    )
+
+                    native_structures, _native_failures = (
+                        load_runtime_native_structures(
+                            artifacts,
+                            {
+                                source: download_paths[source]
+                                for source in artifacts
+                            },
+                        )
+                    )
+                    if {
+                        source: native.receipt_digest
+                        for source, native in sorted(native_structures.items())
+                    } != native_receipts:
+                        raise ValueError(
+                            "merge native structure receipts do not match local sidecars"
+                        )
+                    skeletons = {}
+                    for source, artifact in sorted(artifacts.items()):
+                        try:
+                            skeletons[source] = build_document_skeleton(
+                                artifact,
+                                native_structures.get(source),
+                            )
+                        except Exception:
+                            skeletons[source] = build_document_skeleton(
+                                artifact,
+                                None,
+                            )
                     merged_text, _metrics, merge_audit = load_merge_bundle(
                         merged_path=merged_path,
                         metrics_path=metrics_path,
                         audit_path=audit_path,
                         artifacts=artifacts,
+                        skeletons=skeletons,
                         expected_contract_id=contract_id,
                         expected_native_structure_receipt_digests=native_receipts,
                         expected_skeleton_candidate_ids=skeleton_ids,

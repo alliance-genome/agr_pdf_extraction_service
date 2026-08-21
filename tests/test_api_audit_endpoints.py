@@ -964,7 +964,7 @@ def test_merged_download_uses_verified_bundle_bytes(client, tmp_path):
     mock_result = MagicMock()
     mock_result.state = "SUCCESS"
     mock_result.result = {
-        "merge_contract_id": "pdfx-native-skeleton-selection",
+        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
         "merged_cache_path": str(tmp_path / "merged.md"),
         "merge_metrics_path": str(tmp_path / "metrics.json"),
         "merge_audit_path": str(tmp_path / "audit.json"),
@@ -996,6 +996,11 @@ def test_merged_download_uses_verified_bundle_bytes(client, tmp_path):
     assert response.status_code == 200
     assert response.data == b"# Title\n\nVerified merge."
     mock_load.assert_called_once()
+    assert set(mock_load.call_args.kwargs["skeletons"]) == {
+        "grobid",
+        "docling",
+        "marker",
+    }
 
 
 def test_merge_download_uses_durable_artifact_when_local_metadata_is_incomplete(
@@ -1038,7 +1043,7 @@ def test_completed_merge_without_local_or_durable_artifact_is_internal_error(
     mock_result = MagicMock()
     mock_result.state = "SUCCESS"
     mock_result.result = {
-        "merge_contract_id": "pdfx-native-skeleton-selection",
+        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
         "merged_cache_path": str(tmp_path / "merged.md"),
         "merge_metrics_path": str(tmp_path / "metrics.json"),
         "merge_audit_path": str(tmp_path / "audit.json"),
