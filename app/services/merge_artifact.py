@@ -20,6 +20,10 @@ from app.services.model_policy import (
 from app.services.abc_markdown_policy import (
     ABC_PARSER_IMPLEMENTATION_SHA256,
     ABC_PARSER_VERSION,
+    RAPIDFUZZ_VERSION,
+    runtime_abc_parser_implementation_sha256,
+    runtime_abc_parser_version,
+    runtime_rapidfuzz_version,
 )
 from app.services.semantic_payload import SEMANTIC_PAYLOAD_CONTRACT_VERSION
 from app.services.document_skeleton import (
@@ -607,6 +611,25 @@ def _validate_native_page_projection_receipts(
         if page_events:
             raise ValueError("native page projection cannot be replayed")
         return
+
+    try:
+        runtime_parser_version = runtime_abc_parser_version()
+        runtime_parser_digest = runtime_abc_parser_implementation_sha256()
+        runtime_fuzzy_version = runtime_rapidfuzz_version()
+    except Exception as exc:
+        raise ValueError(
+            "native page projection replay dependency is unavailable"
+        ) from exc
+    if (
+        runtime_parser_version != ABC_PARSER_VERSION
+        or runtime_parser_digest != ABC_PARSER_IMPLEMENTATION_SHA256
+        or runtime_fuzzy_version != RAPIDFUZZ_VERSION
+        or report.get("abc_parser_version") != runtime_parser_version
+        or report.get("abc_parser_implementation_sha256")
+        != runtime_parser_digest
+        or report.get("rapidfuzz_version") != runtime_fuzzy_version
+    ):
+        raise ValueError("native page projection replay dependency mismatch")
 
     pre_projection = b"".join(
         output[entry["output_byte_start"] : entry["output_byte_end"]]

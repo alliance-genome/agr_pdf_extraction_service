@@ -104,10 +104,16 @@ Merged Markdown preserves native PDF page boundaries as
 source/audit overlap first, then from an unambiguous bounded structural
 alignment to another extractor's native occurrence. Conflicting or missing
 page evidence, transitions inside table/list/reference blocks, and placements
-that would introduce an Alliance Markdown validation error or warning are left
-unassigned rather than guessed. The comments are excluded from
-publication-content comparison, and their deterministic audit entries and
-projection receipt are replayed during merge-bundle validation.
+that would alter Alliance Markdown validation or downstream-reader semantics
+abstain rather than placing an unsafe comment. Because the transport format
+cannot encode an unassigned span directly, every skipped boundary is recorded
+in `native_page_projection.abstained_boundaries` with its final-output byte
+offset, page, evidence method, and reason; consumers must treat the span from
+that boundary to the next recorded or projected boundary as unproven rather
+than inheriting the preceding page. The comments are excluded from
+publication-content comparison, and their deterministic audit entries,
+dependency identities, and projection receipt are replayed during merge-bundle
+validation.
 
 ### Duplicate-content protection
 

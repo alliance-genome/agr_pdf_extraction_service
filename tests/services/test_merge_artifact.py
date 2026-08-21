@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 
+import app.services.merge_artifact as merge_artifact_module
 from app.services.source_contracts import SourceArtifact
 from app.services.merge_artifact import (
+    _validate_native_page_projection_receipts,
     _validate_positive_style_overlay_receipts,
     _validate_title_selection_receipts,
     bundle_manifest_path,
@@ -18,14 +20,17 @@ from app.services.merge_artifact import (
 )
 from app.services.model_policy import resolved_runtime_model_map
 from app.services.abc_markdown_policy import abc_markdown_report
-from app.services.document_skeleton import build_document_skeleton
+from app.services.document_skeleton import (
+    build_document_skeleton,
+    project_native_page_markers,
+)
 from app.services.semantic_payload import (
     build_semantic_payload_receipt,
     semantic_payload_reader_report,
 )
 
 
-CONTRACT_ID = "pdfx-native-skeleton-selection-page-provenance-v2"
+CONTRACT_ID = "pdfx-native-skeleton-selection-page-provenance-v3"
 LEGACY_CONTRACT_ID = "pdfx-native-skeleton-selection"
 
 
@@ -208,6 +213,59 @@ def test_validation_accepts_exact_source_bytes_and_receipts():
         artifacts=artifacts,
         expected_contract_id=CONTRACT_ID,
     ) == metrics["output_digest"]
+
+
+def test_page_projection_replay_rejects_runtime_dependency_drift(monkeypatch):
+    from dataclasses import replace
+
+    text = "# Title\n\nFirst page.\n\nSecond page.\n"
+    artifact = SourceArtifact.from_text("grobid", text)
+    skeleton = build_document_skeleton(artifact, None)
+    second_start = artifact.raw_utf8.index(b"Second page.")
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    2 if occurrence.source_byte_start == second_start else 1
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+    source_audit = [{
+        "output_byte_start": 0,
+        "output_byte_end": len(artifact.raw_utf8),
+        "source": "grobid",
+        "artifact_digest": artifact.digest,
+        "source_byte_start": 0,
+        "source_byte_end": len(artifact.raw_utf8),
+    }]
+    rendered, audit, events, report = project_native_page_markers(
+        text,
+        source_audit,
+        {"grobid": skeleton},
+        {"grobid": artifact},
+    )
+    metrics = {
+        "document_skeleton_transformations": events,
+        "native_page_projection": report,
+    }
+    monkeypatch.setattr(
+        merge_artifact_module,
+        "runtime_rapidfuzz_version",
+        lambda: "0.0.0",
+    )
+
+    with pytest.raises(ValueError, match="replay dependency mismatch"):
+        _validate_native_page_projection_receipts(
+            rendered.encode(),
+            audit,
+            metrics,
+            {"grobid": artifact},
+            {"grobid": skeleton},
+        )
 
 
 def test_unreconciled_native_italic_receipt_delivers_only_as_bound_failsafe():

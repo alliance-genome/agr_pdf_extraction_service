@@ -343,7 +343,7 @@ def test_candidate_adapter_uses_selection_only_terra_and_emits_span_audit():
         "# Title\n\nGene G g a is active.\n",
     }
     assert metrics["merge_contract_id"] == (
-        "pdfx-native-skeleton-selection-page-provenance-v2"
+        "pdfx-native-skeleton-selection-page-provenance-v3"
     )
     assert metrics["merge_quality"] == "terra_selected"
     assert metrics["runtime_models"]["source_selection"]["model"] == "gpt-5.6-terra"

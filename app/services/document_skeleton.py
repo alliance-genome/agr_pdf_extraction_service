@@ -14,7 +14,7 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from pathlib import Path
@@ -22,7 +22,12 @@ from typing import Callable, Literal, Mapping
 
 from rapidfuzz.fuzz import ratio
 
-from app.services.abc_markdown_policy import abc_markdown_report
+from app.services.abc_markdown_policy import (
+    abc_markdown_report,
+    runtime_abc_parser_implementation_sha256,
+    runtime_abc_parser_version,
+    runtime_rapidfuzz_version,
+)
 from app.services.model_policy import MAX_BOUNDED_TARGET_CHOICES
 from app.services.native_extractor_artifact import (
     load_native_extractor_artifact,
@@ -50,6 +55,7 @@ _MARKDOWN_HEADING = re.compile(rb"^ {0,3}(#{1,6})[ \t]+", re.MULTILINE)
 _MARKDOWN_TABLE_ROW = re.compile(rb"^\|.*\|[ \t]*$")
 _MARKDOWN_TABLE_SEPARATOR = re.compile(rb"^\|(?:[ \t]*:?-{3,}:?[ \t]*\|)+[ \t]*$")
 _MARKDOWN_CODE_FENCE = re.compile(rb"^`{3,}[^`]*$")
+_PAGE_TRANSPORT_COMMENT = re.compile(r"^<!-- page: [1-9]\d* -->$")
 _MARKDOWN_INLINE = re.compile(r"[`*_~\[\]()]|<[^>]+>")
 _REFERENCE_MARKER = re.compile(
     rb"^\s*(?:[-+*]|\d+[.)]|\[\d+\]|\[\^\d+\]:)\s+"
@@ -4935,6 +4941,43 @@ def project_native_emphasis(
     )
 
 
+def _page_marker_reader_payload(text: str) -> object | None:
+    """Return reader semantics with transport-only paragraphs removed."""
+
+    try:
+        from agr_abc_document_parsers import read_markdown
+
+        payload = asdict(read_markdown(text))
+    except Exception:
+        return None
+
+    removed = object()
+
+    def normalize(value: object) -> object:
+        if isinstance(value, dict):
+            paragraph_text = value.get("text")
+            if (
+                isinstance(paragraph_text, str)
+                and _PAGE_TRANSPORT_COMMENT.fullmatch(paragraph_text)
+                and {"refs", "named_content"}.issubset(value)
+            ):
+                return removed
+            return {
+                key: normalized
+                for key, child in value.items()
+                if (normalized := normalize(child)) is not removed
+            }
+        if isinstance(value, list):
+            return [
+                normalized
+                for child in value
+                if (normalized := normalize(child)) is not removed
+            ]
+        return value
+
+    return normalize(payload)
+
+
 def project_native_page_markers(
     text: str,
     audit: list[dict],
@@ -5035,7 +5078,7 @@ def project_native_page_markers(
                     aligned_pages.setdefault(final_index, Counter())[page_no] += (
                         round(match.similarity * 1_000)
                     )
-    assignments: list[tuple[StructuralUnitSpan, int, str]] = []
+    assignments: list[tuple[int, StructuralUnitSpan, int, str]] = []
     direct_assignment_count = 0
     exact_match_assignment_count = 0
     aligned_assignment_count = 0
@@ -5086,7 +5129,7 @@ def project_native_page_markers(
         ):
             ambiguous_count += 1
             continue
-        assignments.append((unit, ranked[0][0], assignment_method))
+        assignments.append((unit_index, unit, ranked[0][0], assignment_method))
         if assignment_method == "source_audit":
             direct_assignment_count += 1
         elif assignment_method == "exact_structural_match":
@@ -5123,18 +5166,13 @@ def project_native_page_markers(
             # there changes the list's meaning, even though both documents
             # remain syntactically valid.
             protected_unit_indexes.add(unit_index)
-    unit_indexes = {
-        (unit.byte_start, unit.byte_end): unit_index
-        for unit_index, unit in enumerate(units)
-    }
     first_unit_is_h1 = False
     if units:
         first_heading_match = _MARKDOWN_HEADING.match(
             artifact.raw_utf8[units[0].byte_start : units[0].byte_end]
         )
         first_unit_is_h1 = (
-            units[0].byte_start == 0
-            and units[0].unit_type == "heading"
+            units[0].unit_type == "heading"
             and first_heading_match is not None
             and len(first_heading_match.group(1)) == 1
         )
@@ -5142,23 +5180,35 @@ def project_native_page_markers(
     # initial marker when the first proven unit belongs to another page.
     previous_page: int | None = 1
     observed_page: int | None = 1
-    for unit, page_no, assignment_method in assignments:
+    abstained_boundaries: list[dict] = []
+    for unit_index, unit, page_no, assignment_method in assignments:
         observed_transition = page_no != observed_page
         observed_page = page_no
         if page_no == previous_page:
             continue
-        unit_index = unit_indexes[(unit.byte_start, unit.byte_end)]
         if first_unit_is_h1 and unit_index == 0:
             # A marker before the document title makes the Alliance reader
             # lose the title and body.  Delaying it until just after the title
             # is also unsafe because the reader interprets it as an author.
             if observed_transition:
                 structural_block_abstained_marker_count += 1
+                abstained_boundaries.append({
+                    "pre_projection_output_byte_offset": unit.byte_start,
+                    "page_no": page_no,
+                    "reason": "first_heading_slot",
+                    "projection_method": assignment_method,
+                })
             previous_page = page_no
             continue
         if unit_index in protected_unit_indexes:
             if observed_transition:
                 structural_block_abstained_marker_count += 1
+                abstained_boundaries.append({
+                    "pre_projection_output_byte_offset": unit.byte_start,
+                    "page_no": page_no,
+                    "reason": "protected_structural_block",
+                    "projection_method": assignment_method,
+                })
             continue
         if first_unit_is_h1 and unit_index == 1:
             # Inserting the page comment into the first post-title slot makes
@@ -5167,6 +5217,12 @@ def project_native_page_markers(
             # remain safe to project.
             if observed_transition:
                 structural_block_abstained_marker_count += 1
+                abstained_boundaries.append({
+                    "pre_projection_output_byte_offset": unit.byte_start,
+                    "page_no": page_no,
+                    "reason": "first_post_title_slot",
+                    "projection_method": assignment_method,
+                })
             previous_page = page_no
             continue
         replacements.append((
@@ -5197,6 +5253,7 @@ def project_native_page_markers(
     ]
     marker_abstention_reason = None
     validation_abstained_marker_count = 0
+    reader_payload_abstained_marker_count = 0
     if events:
         rendered_abc = abc_markdown_report(rendered)
         validation_regressed = rendered_abc["failure_code"] is not None
@@ -5221,15 +5278,77 @@ def project_native_page_markers(
                     and rendered_abc["valid"] is not True
                 )
             )
+        reader_payload_regressed = False
+        if not validation_regressed:
+            original_reader_payload = _page_marker_reader_payload(text)
+            rendered_reader_payload = _page_marker_reader_payload(rendered)
+            reader_payload_regressed = (
+                original_reader_payload is None
+                or rendered_reader_payload is None
+                or rendered_reader_payload != original_reader_payload
+            )
+        if validation_regressed or reader_payload_regressed:
+            abstention_reason = (
+                "abc_validation_regression"
+                if validation_regressed
+                else "reader_payload_regression"
+            )
+            abstained_boundaries.extend(
+                {
+                    "pre_projection_output_byte_offset": replacement[0],
+                    "page_no": page_no,
+                    "reason": abstention_reason,
+                    "projection_method": assignment_method,
+                }
+                for replacement, page_no, assignment_method in zip(
+                    replacements,
+                    transition_pages,
+                    transition_methods,
+                    strict=True,
+                )
+            )
         if validation_regressed:
             validation_abstained_marker_count = len(events)
             marker_abstention_reason = "abc_validation_regression"
+        elif reader_payload_regressed:
+            reader_payload_abstained_marker_count = len(events)
+            marker_abstention_reason = "reader_payload_regression"
+        if validation_regressed or reader_payload_regressed:
             rendered = text
             rewritten_audit = audit
             decorated_events = []
             transition_pages = []
+    accepted_replacements = replacements if decorated_events else []
+    rendered_abstained_boundaries = []
+    for boundary in abstained_boundaries:
+        pre_projection_offset = boundary["pre_projection_output_byte_offset"]
+        rendered_abstained_boundaries.append({
+            "output_byte_offset": pre_projection_offset + sum(
+                len(replacement[2])
+                for replacement in accepted_replacements
+                if replacement[0] <= pre_projection_offset
+            ),
+            "page_no": boundary["page_no"],
+            "reason": boundary["reason"],
+            "projection_method": boundary["projection_method"],
+        })
+    try:
+        abc_parser_version = runtime_abc_parser_version()
+        abc_parser_implementation_sha256 = (
+            runtime_abc_parser_implementation_sha256()
+        )
+        rapidfuzz_version = runtime_rapidfuzz_version()
+    except Exception:
+        abc_parser_version = None
+        abc_parser_implementation_sha256 = None
+        rapidfuzz_version = None
     report = {
-        "policy_version": "source-audit-native-page-projection-v2",
+        "policy_version": "source-audit-native-page-projection-v3",
+        "abc_parser_version": abc_parser_version,
+        "abc_parser_implementation_sha256": (
+            abc_parser_implementation_sha256
+        ),
+        "rapidfuzz_version": rapidfuzz_version,
         "structural_unit_count": len(units),
         "mapped_structural_unit_count": len(assignments),
         "direct_audit_assignment_count": direct_assignment_count,
@@ -5242,9 +5361,14 @@ def project_native_page_markers(
         "marker_count": len(decorated_events),
         "projected_pages": transition_pages,
         "validation_abstained_marker_count": validation_abstained_marker_count,
+        "reader_payload_abstained_marker_count": (
+            reader_payload_abstained_marker_count
+        ),
         "structural_block_abstained_marker_count": (
             structural_block_abstained_marker_count
         ),
+        "abstained_boundary_count": len(rendered_abstained_boundaries),
+        "abstained_boundaries": rendered_abstained_boundaries,
         "marker_abstention_reason": marker_abstention_reason,
     }
     return rendered, rewritten_audit, decorated_events, report

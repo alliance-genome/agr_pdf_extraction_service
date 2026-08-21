@@ -1093,7 +1093,7 @@ components:
       properties:
         merge_contract_id:
           type: string
-          example: pdfx-native-skeleton-selection-page-provenance-v2
+          example: pdfx-native-skeleton-selection-page-provenance-v3
           description: Exact source-backed merge contract running in this service.
         resolved_runtime_models:
           type: object
