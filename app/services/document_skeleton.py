@@ -5104,19 +5104,40 @@ def project_native_page_markers(
         if unit.unit_type in protected_block_types:
             protected_unit_indexes.add(unit_index)
             continue
-        if unit.unit_type != "paragraph" or unit_index == 0:
+        if unit_index == 0:
             continue
         previous_unit = units[unit_index - 1]
         separator = artifact.raw_utf8[previous_unit.byte_end : unit.byte_start]
-        if unit_index - 1 in protected_unit_indexes and separator.count(b"\n") < 2:
+        unit_raw = artifact.raw_utf8[unit.byte_start : unit.byte_end]
+        indented = unit_raw.startswith((b" ", b"\t"))
+        if unit_index - 1 in protected_unit_indexes and (
+            indented
+            or (
+                unit.unit_type == "paragraph"
+                and separator.count(b"\n") < 2
+            )
+        ):
             # Markdown permits list item continuation text without another
-            # bullet.  A comment inserted there changes the list's meaning,
-            # even though both documents remain syntactically valid.
+            # bullet, and indented headings, fences, captions, and paragraphs
+            # can remain nested even across blank lines.  A comment inserted
+            # there changes the list's meaning, even though both documents
+            # remain syntactically valid.
             protected_unit_indexes.add(unit_index)
     unit_indexes = {
         (unit.byte_start, unit.byte_end): unit_index
         for unit_index, unit in enumerate(units)
     }
+    first_unit_is_h1 = False
+    if units:
+        first_heading_match = _MARKDOWN_HEADING.match(
+            artifact.raw_utf8[units[0].byte_start : units[0].byte_end]
+        )
+        first_unit_is_h1 = (
+            units[0].byte_start == 0
+            and units[0].unit_type == "heading"
+            and first_heading_match is not None
+            and len(first_heading_match.group(1)) == 1
+        )
     # The downstream Markdown contract defaults to page 1, so only emit an
     # initial marker when the first proven unit belongs to another page.
     previous_page: int | None = 1
@@ -5126,15 +5147,8 @@ def project_native_page_markers(
         observed_page = page_no
         if page_no == previous_page:
             continue
-        heading_match = _MARKDOWN_HEADING.match(
-            artifact.raw_utf8[unit.byte_start : unit.byte_end]
-        )
-        if (
-            unit.byte_start == 0
-            and unit.unit_type == "heading"
-            and heading_match is not None
-            and len(heading_match.group(1)) == 1
-        ):
+        unit_index = unit_indexes[(unit.byte_start, unit.byte_end)]
+        if first_unit_is_h1 and unit_index == 0:
             # A marker before the document title makes the Alliance reader
             # lose the title and body.  Delaying it until just after the title
             # is also unsafe because the reader interprets it as an author.
@@ -5142,10 +5156,18 @@ def project_native_page_markers(
                 structural_block_abstained_marker_count += 1
             previous_page = page_no
             continue
-        unit_index = unit_indexes[(unit.byte_start, unit.byte_end)]
         if unit_index in protected_unit_indexes:
             if observed_transition:
                 structural_block_abstained_marker_count += 1
+            continue
+        if first_unit_is_h1 and unit_index == 1:
+            # Inserting the page comment into the first post-title slot makes
+            # the Alliance reader parse it as a document author.  Once actual
+            # body/front-matter content is established, ordinary page markers
+            # remain safe to project.
+            if observed_transition:
+                structural_block_abstained_marker_count += 1
+            previous_page = page_no
             continue
         replacements.append((
             unit.byte_start,

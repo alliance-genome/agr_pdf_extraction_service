@@ -497,6 +497,51 @@ def test_native_page_projection_delays_marker_past_list_continuation(
     assert report["structural_block_abstained_marker_count"] == 1
 
 
+@pytest.mark.parametrize(
+    "nested_block",
+    [
+        "  ## nested heading",
+        "  ```text\n  nested code\n  ```",
+        "  **Figure 1.** nested caption",
+        "  nested paragraph after a blank line",
+    ],
+)
+def test_native_page_projection_delays_marker_past_nested_list_block(
+    nested_block,
+):
+    separator = "\n\n" if nested_block.startswith("  nested") else "\n"
+    list_block = f"- item first line{separator}{nested_block}"
+    artifact = SourceArtifact.from_text(
+        "marker", f"# Title\n\n{list_block}\n\n## Next\n\nTail.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    nested_start = artifact.raw_utf8.index(nested_block.encode())
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    2 if occurrence.source_byte_start >= nested_start else 1
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, _rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    assert rendered.startswith(f"# Title\n\n{list_block}\n\n")
+    assert f"{list_block}\n\n<!-- page: 2 -->\n## Next" in rendered
+    assert "- item first line\n<!-- page: 2 -->" not in rendered
+    assert [event["page_no"] for event in events] == [2]
+    assert report["structural_block_abstained_marker_count"] == 1
+
+
 def test_native_page_projection_uses_bounded_cross_extractor_alignment():
     final_artifact = SourceArtifact.from_text(
         "grobid", "Long reference title and journal 2024.\n"
