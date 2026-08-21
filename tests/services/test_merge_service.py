@@ -613,6 +613,84 @@ def test_merge_abstains_from_page_marker_in_first_post_title_slot():
     )
 
 
+def test_merge_validates_separate_generated_role_heading_boundaries():
+    marker = (
+        "# Title\n\n## Results\n\nBody.\n\n## References\n\n"
+        "1. Alpha et al. (2024). One.\n\n"
+        "**Figure 1.** Reader-visible caption.\n\n"
+        "| Gene | Value |\n|---|---|\n| dpp | 1 |\n"
+    )
+    artifact = SourceArtifact.from_text("marker", marker)
+    marker_native = NativeStructureArtifact.for_test(
+        "marker",
+        artifact,
+        json.dumps({
+            "block_type": "Document",
+            "children": [{
+                "block_type": "Page",
+                "children": [
+                    {
+                        "id": "/page/0/Title/0",
+                        "block_type": "Title",
+                        "html": "<h1>Title</h1>",
+                    },
+                    {
+                        "id": "/page/0/SectionHeader/1",
+                        "block_type": "SectionHeader",
+                        "html": "<h2>Results</h2>",
+                    },
+                    {
+                        "id": "/page/0/Text/2",
+                        "block_type": "Text",
+                        "html": "<p>Body.</p>",
+                    },
+                    {
+                        "id": "/page/0/SectionHeader/3",
+                        "block_type": "SectionHeader",
+                        "html": "<h2>References</h2>",
+                    },
+                    {
+                        "id": "/page/0/Reference/4",
+                        "block_type": "Reference",
+                        "html": "<p>1. Alpha et al. (2024). One.</p>",
+                    },
+                    {
+                        "id": "/page/0/Caption/5",
+                        "block_type": "Caption",
+                        "html": "<p>Figure 1. Reader-visible caption.</p>",
+                    },
+                ],
+            }],
+        }).encode("utf-8"),
+    )
+
+    merged, metrics, audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": artifact}
+        ),
+        native_structures={"marker": marker_native},
+        baseline_requirements=FRAGMENT_REQUIREMENTS,
+        benchmark_mode=True,
+    )
+
+    operations = {
+        event["operation"]
+        for event in metrics["document_skeleton_transformations"]
+    }
+    assert "alliance_bibliography_heading_boundary" in operations
+    assert any(
+        entry.get("transformation")
+        == "alliance_bibliography_heading_boundary"
+        for entry in audit
+    )
+    assert merged.count("## References") == 1
+    assert merged.count("## Figure Legends") == 1
+
+
 def _plain_marker_with_native_dpp():
     marker = "# Title\n\n## Results\n\nGene dpp is active.\n"
     artifact = SourceArtifact.from_text("marker", marker)
