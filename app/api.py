@@ -1256,7 +1256,9 @@ def download_result(process_id, method):
             skeleton_projection_ids = data.get(
                 "document_skeleton_candidate_projection_ids"
             )
-            if not all((contract_id, merged_path, metrics_path, audit_path)) or not all(
+            if contract_id != Config.MERGE_CONTRACT_ID or not all(
+                (merged_path, metrics_path, audit_path)
+            ) or not all(
                 isinstance(value, dict)
                 for value in (native_receipts, skeleton_ids, skeleton_projection_ids)
             ):
@@ -1326,7 +1328,7 @@ def download_result(process_id, method):
                         audit_path=audit_path,
                         artifacts=artifacts,
                         skeletons=skeletons,
-                        expected_contract_id=contract_id,
+                        expected_contract_id=Config.MERGE_CONTRACT_ID,
                         expected_native_structure_receipt_digests=native_receipts,
                         expected_skeleton_candidate_ids=skeleton_ids,
                         expected_skeleton_candidate_projection_ids=(

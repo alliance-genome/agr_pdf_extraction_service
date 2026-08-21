@@ -143,6 +143,52 @@ def test_native_page_projection_abstains_on_equal_page_evidence():
     assert report["marker_count"] == 0
 
 
+def test_native_page_projection_abstains_on_unequal_cross_source_evidence():
+    grobid = SourceArtifact.from_text("grobid", "AAAAAA")
+    marker = SourceArtifact.from_text("marker", "BBBBB")
+    grobid_skeleton = build_document_skeleton(grobid, None)
+    marker_skeleton = build_document_skeleton(marker, None)
+    grobid_skeleton = replace(
+        grobid_skeleton,
+        occurrences=(replace(grobid_skeleton.occurrences[0], page_no=2),),
+    )
+    marker_skeleton = replace(
+        marker_skeleton,
+        occurrences=(replace(marker_skeleton.occurrences[0], page_no=3),),
+    )
+    text = grobid.text + marker.text
+    audit = [
+        {
+            "output_byte_start": 0,
+            "output_byte_end": len(grobid.raw_utf8),
+            "source": "grobid",
+            "artifact_digest": grobid.digest,
+            "source_byte_start": 0,
+            "source_byte_end": len(grobid.raw_utf8),
+        },
+        {
+            "output_byte_start": len(grobid.raw_utf8),
+            "output_byte_end": len(text.encode("utf-8")),
+            "source": "marker",
+            "artifact_digest": marker.digest,
+            "source_byte_start": 0,
+            "source_byte_end": len(marker.raw_utf8),
+        },
+    ]
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        text,
+        audit,
+        {"grobid": grobid_skeleton, "marker": marker_skeleton},
+    )
+
+    assert rendered == text
+    assert rewritten_audit == audit
+    assert events == []
+    assert report["ambiguous_structural_unit_count"] == 1
+    assert report["marker_count"] == 0
+
+
 def test_native_page_projection_uses_bounded_cross_extractor_alignment():
     final_artifact = SourceArtifact.from_text(
         "grobid", "Long reference title and journal 2024.\n"

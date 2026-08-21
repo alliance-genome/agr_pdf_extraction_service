@@ -1034,6 +1034,45 @@ def test_merge_download_uses_durable_artifact_when_local_metadata_is_incomplete(
     )
 
 
+def test_merge_download_rejects_legacy_local_contract_and_uses_durable_artifact(
+    client, tmp_path
+):
+    process_id = str(uuid.uuid4())
+    mock_result = MagicMock()
+    mock_result.state = "SUCCESS"
+    mock_result.result = {
+        "merge_contract_id": "pdfx-native-skeleton-selection",
+        "merged_cache_path": str(tmp_path / "merged.md"),
+        "merge_metrics_path": str(tmp_path / "metrics.json"),
+        "merge_audit_path": str(tmp_path / "audit.json"),
+        "native_structure_receipt_digests": {},
+        "document_skeleton_candidate_ids": {},
+        "document_skeleton_candidate_projection_ids": {},
+        "download_paths": {},
+        "artifacts_json": {
+            "merged": "pdfx/audit/2026/07/23/process/merged.md",
+        },
+        "file_hash": "legacy-merge-hash",
+    }
+
+    with (
+        patch("celery_app.celery.AsyncResult", return_value=mock_result),
+        patch("app.api.load_merge_bundle") as mock_load,
+        patch(
+            "app.api._s3_redirect_for_artifact",
+            return_value=("durable merged output", 200),
+        ) as mock_redirect,
+    ):
+        response = client.get(f"/api/v1/extract/{process_id}/download/merged")
+
+    assert response.status_code == 200
+    assert response.data == b"durable merged output"
+    mock_load.assert_not_called()
+    mock_redirect.assert_called_once_with(
+        "pdfx/audit/2026/07/23/process/merged.md"
+    )
+
+
 def test_completed_merge_without_local_or_durable_artifact_is_internal_error(
     client, tmp_path
 ):

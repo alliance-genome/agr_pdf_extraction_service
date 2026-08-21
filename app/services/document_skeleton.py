@@ -4929,7 +4929,7 @@ def project_native_page_markers(
     with no native evidence deliberately abstain.
     """
 
-    evidence: list[tuple[int, int, int]] = []
+    evidence: list[tuple[int, int, SourceName, int]] = []
     occurrences_by_source = {
         source: tuple(
             occurrence
@@ -4961,6 +4961,7 @@ def project_native_page_markers(
             evidence.append((
                 output_start + overlap_start - source_start,
                 output_start + overlap_end - source_start,
+                source,
                 occurrence.page_no,
             ))
     evidence.sort()
@@ -5026,12 +5027,14 @@ def project_native_page_markers(
         ):
             evidence_cursor += 1
         scores: Counter[int] = Counter()
+        direct_pages_by_source: dict[SourceName, set[int]] = {}
         cursor = evidence_cursor
         while cursor < len(evidence) and evidence[cursor][0] < unit.byte_end:
-            start, end, page_no = evidence[cursor]
+            start, end, source, page_no = evidence[cursor]
             overlap = min(unit.byte_end, end) - max(unit.byte_start, start)
             if overlap > 0:
                 scores[page_no] += overlap
+                direct_pages_by_source.setdefault(source, set()).add(page_no)
             cursor += 1
         assignment_method = "source_audit"
         if not scores:
@@ -5043,9 +5046,22 @@ def project_native_page_markers(
         if not scores:
             continue
         ranked = scores.most_common()
-        if len(ranked) > 1 and (
-            assignment_method != "source_audit"
-            or ranked[0][1] == ranked[1][1]
+        cross_source_conflict = (
+            assignment_method == "source_audit"
+            and len(
+                {
+                    frozenset(pages)
+                    for pages in direct_pages_by_source.values()
+                }
+            )
+            > 1
+        )
+        if cross_source_conflict or (
+            len(ranked) > 1
+            and (
+                assignment_method != "source_audit"
+                or ranked[0][1] == ranked[1][1]
+            )
         ):
             ambiguous_count += 1
             continue
