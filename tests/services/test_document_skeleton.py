@@ -14,6 +14,7 @@ from app.services.document_skeleton import (
     native_heading_hints,
     native_occurrence_hints,
     project_native_emphasis,
+    project_native_page_markers,
     reconcile_document_transformations,
     render_document_skeleton,
     render_document_role_slots,
@@ -50,6 +51,140 @@ def _audit(artifact):
         "region_id": None,
         "decision_method": "baseline_fallback",
     }]
+
+
+def test_projects_native_page_transitions_without_changing_publication_text():
+    artifact = SourceArtifact.from_text(
+        "docling", "# Title\n\nFirst page text.\n\nSecond page text.\n"
+    )
+    native = _native(
+        "docling",
+        artifact,
+        {
+            "schema_name": "DoclingDocument",
+            "body": {"children": [
+                {"$ref": "#/texts/0"},
+                {"$ref": "#/texts/1"},
+                {"$ref": "#/texts/2"},
+            ]},
+            "texts": [
+                {
+                    "self_ref": "#/texts/0",
+                    "label": "title",
+                    "text": "Title",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "self_ref": "#/texts/1",
+                    "label": "text",
+                    "text": "First page text.",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "self_ref": "#/texts/2",
+                    "label": "text",
+                    "text": "Second page text.",
+                    "prov": [{"page_no": 2}],
+                },
+            ],
+        },
+    )
+    skeleton = build_document_skeleton(artifact, native)
+
+    rendered, audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"docling": skeleton},
+        {"docling": artifact},
+    )
+
+    assert rendered == (
+        "# Title\n\nFirst page text.\n\n<!-- page: 2 -->\nSecond page text.\n"
+    )
+    assert rendered.replace("<!-- page: 2 -->\n", "") == artifact.text
+    assert [event["page_no"] for event in events] == [2]
+    assert report["projected_pages"] == [2]
+    assert report["ambiguous_structural_unit_count"] == 0
+    assert sum(
+        entry["output_byte_end"] - entry["output_byte_start"]
+        for entry in audit
+    ) == len(rendered.encode("utf-8"))
+    assert [unit.comparison_key for unit in scan_structural_units(
+        SourceArtifact.from_text("docling", rendered)
+    )] == [unit.comparison_key for unit in scan_structural_units(artifact)]
+
+
+def test_native_page_projection_abstains_on_equal_page_evidence():
+    artifact = SourceArtifact.from_text("docling", "Ambiguous text.\n")
+    skeleton = build_document_skeleton(artifact, None)
+    occurrence = skeleton.occurrences[0]
+    skeleton = replace(
+        skeleton,
+        occurrences=(
+            replace(occurrence, page_no=1),
+            replace(
+                occurrence,
+                occurrence_id=f"{occurrence.occurrence_id}-page-2",
+                page_no=2,
+            ),
+        ),
+    )
+
+    rendered, audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"docling": skeleton},
+    )
+
+    assert rendered == artifact.text
+    assert audit == _audit(artifact)
+    assert events == []
+    assert report["ambiguous_structural_unit_count"] == 1
+    assert report["marker_count"] == 0
+
+
+def test_native_page_projection_uses_bounded_cross_extractor_alignment():
+    final_artifact = SourceArtifact.from_text(
+        "grobid", "Long reference title and journal 2024.\n"
+    )
+    marker_artifact = SourceArtifact.from_text(
+        "marker", "Long reference title & journal, 2024.\n"
+    )
+    marker_native = _native(
+        "marker",
+        marker_artifact,
+        {
+            "block_type": "Document",
+            "children": [
+                {"block_type": "Page", "children": []},
+                {
+                    "block_type": "Page",
+                    "children": [{
+                    "id": "/page/1/Text/0",
+                    "block_type": "Text",
+                    "html": "<p>Long reference title &amp; journal, 2024.</p>",
+                    }],
+                },
+            ],
+        },
+    )
+    skeletons = {
+        "grobid": build_document_skeleton(final_artifact, None),
+        "marker": build_document_skeleton(marker_artifact, marker_native),
+    }
+
+    rendered, _audit_result, events, report = project_native_page_markers(
+        final_artifact.text,
+        _audit(final_artifact),
+        skeletons,
+        {"grobid": final_artifact, "marker": marker_artifact},
+    )
+
+    assert rendered == (
+        "<!-- page: 2 -->\nLong reference title and journal 2024.\n"
+    )
+    assert [event["page_no"] for event in events] == [2]
+    assert report["bounded_structural_alignment_assignment_count"] == 1
 
 
 def _style(source, text, start, end):

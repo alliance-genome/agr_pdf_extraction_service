@@ -25,6 +25,7 @@ from app.services.semantic_payload import SEMANTIC_PAYLOAD_CONTRACT_VERSION
 from app.services.document_skeleton import (
     DocumentSkeleton,
     project_native_emphasis,
+    project_native_page_markers,
     reconcile_native_emphasis_fallback,
 )
 
@@ -196,6 +197,13 @@ def _validate_audit(
                 expected_span = span if span == b"**Categories:** " else None
             elif transformation == "native_emphasis_projection":
                 expected_span = span if span == b"*" else None
+            elif transformation == "native_page_marker":
+                expected_span = (
+                    span
+                    if re.fullmatch(rb"<!-- page: [1-9]\d* -->\n", span)
+                    is not None
+                    else None
+                )
             else:
                 expected_span = None
             if (
@@ -561,6 +569,68 @@ def _validate_title_selection_receipts(metrics: Mapping) -> None:
             raise ValueError("title numeric choice does not match projection")
 
 
+def _validate_native_page_projection_receipts(
+    output: bytes,
+    audit: Sequence[Mapping],
+    metrics: Mapping,
+    artifacts: Mapping[SourceName, SourceArtifact],
+    skeletons: Mapping[SourceName, DocumentSkeleton] | None,
+) -> None:
+    """Replay native page markers from the source provenance partition."""
+
+    transformations = metrics.get("document_skeleton_transformations", ())
+    page_events = [
+        dict(event)
+        for event in transformations
+        if isinstance(event, Mapping)
+        and event.get("operation") == "native_page_marker"
+    ]
+    report = metrics.get("native_page_projection")
+    if not isinstance(report, Mapping):
+        if page_events or any(
+            entry.get("transformation") == "native_page_marker"
+            for entry in audit
+        ):
+            raise ValueError("native page projection receipt is missing")
+        return
+    if skeletons is None:
+        if page_events:
+            raise ValueError("native page projection cannot be replayed")
+        return
+
+    pre_projection = b"".join(
+        output[entry["output_byte_start"] : entry["output_byte_end"]]
+        for entry in audit
+        if entry.get("transformation") != "native_page_marker"
+    )
+    pre_projection_audit = []
+    cursor = 0
+    for entry in audit:
+        if entry.get("transformation") == "native_page_marker":
+            continue
+        length = entry["output_byte_end"] - entry["output_byte_start"]
+        rewritten = dict(entry)
+        rewritten["output_byte_start"] = cursor
+        cursor += length
+        rewritten["output_byte_end"] = cursor
+        pre_projection_audit.append(rewritten)
+    replayed_text, replayed_audit, replayed_events, replayed_report = (
+        project_native_page_markers(
+            pre_projection.decode("utf-8", errors="strict"),
+            pre_projection_audit,
+            skeletons,
+            artifacts,
+        )
+    )
+    if (
+        replayed_text.encode("utf-8") != output
+        or replayed_audit != list(audit)
+        or replayed_events != page_events
+        or replayed_report != dict(report)
+    ):
+        raise ValueError("native page projection replay failed")
+
+
 def _validate_positive_style_overlay_receipts(
     output: bytes,
     audit: Sequence[Mapping],
@@ -569,6 +639,28 @@ def _validate_positive_style_overlay_receipts(
     skeletons: Mapping[SourceName, DocumentSkeleton] | None,
 ) -> None:
     """Replay the one final-target overlay and bind every emitted delimiter."""
+
+    # Page markers are projected after the positive-style overlay.  Remove
+    # that later deterministic layer before replaying the style stage so its
+    # output digests and byte coordinates remain bound to the original stage.
+    style_output = b"".join(
+        output[entry["output_byte_start"] : entry["output_byte_end"]]
+        for entry in audit
+        if entry.get("transformation") != "native_page_marker"
+    )
+    style_audit = []
+    style_cursor = 0
+    for entry in audit:
+        if entry.get("transformation") == "native_page_marker":
+            continue
+        length = entry["output_byte_end"] - entry["output_byte_start"]
+        rewritten = dict(entry)
+        rewritten["output_byte_start"] = style_cursor
+        style_cursor += length
+        rewritten["output_byte_end"] = style_cursor
+        style_audit.append(rewritten)
+    output = style_output
+    audit = style_audit
 
     transformations = metrics.get("document_skeleton_transformations", ())
     native_events = [
@@ -1202,6 +1294,7 @@ def validate_merge_artifacts(
         "alliance_article_category_marker",
         "alliance_front_list_block_separator",
         "native_emphasis_projection",
+        "native_page_marker",
     }
     if not isinstance(transformation_events, list) or any(
         not isinstance(event, Mapping)
@@ -1234,6 +1327,13 @@ def validate_merge_artifacts(
     ):
         raise ValueError("Alliance transformation receipt mismatch")
     _validate_title_selection_receipts(metrics)
+    _validate_native_page_projection_receipts(
+        text.encode("utf-8"),
+        audit,
+        metrics,
+        artifacts,
+        skeletons,
+    )
     _validate_positive_style_overlay_receipts(
         text.encode("utf-8"),
         audit,

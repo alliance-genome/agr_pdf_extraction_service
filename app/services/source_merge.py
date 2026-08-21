@@ -1518,6 +1518,17 @@ def scan_structural_units(artifact: SourceArtifact) -> tuple[StructuralUnitSpan,
             byte_cursor += len(line.encode("utf-8"))
             continue
 
+        # Page-boundary comments outside literal blocks are transport metadata
+        # for downstream consumers, not publication content. Keep them outside
+        # structural units so projection cannot affect semantic comparison.
+        if (
+            equation_close is None
+            and re.fullmatch(r"<!-- page: [1-9]\d* -->", stripped)
+        ):
+            flush()
+            byte_cursor += len(line.encode("utf-8"))
+            continue
+
         line_type = _classify_line(content)
         if equation_close is not None:
             pending_end = content_end

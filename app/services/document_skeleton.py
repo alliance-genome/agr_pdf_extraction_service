@@ -4914,6 +4914,201 @@ def project_native_emphasis(
     )
 
 
+def project_native_page_markers(
+    text: str,
+    audit: list[dict],
+    skeletons: Mapping[SourceName, DocumentSkeleton],
+    artifacts: Mapping[SourceName, SourceArtifact] | None = None,
+) -> tuple[str, list[dict], list[dict], dict]:
+    """Project native page boundaries onto final source-backed Markdown.
+
+    Audit source spans and skeleton occurrence spans share the same immutable
+    extractor Markdown byte coordinates.  Their overlap therefore provides a
+    deterministic page vote for each final structural unit without rewriting
+    publication text. Cross-source conflicts, equal direct votes, and units
+    with no native evidence deliberately abstain.
+    """
+
+    evidence: list[tuple[int, int, int]] = []
+    occurrences_by_source = {
+        source: tuple(
+            occurrence
+            for occurrence in skeleton.occurrences
+            if type(occurrence.page_no) is int and occurrence.page_no > 0
+        )
+        for source, skeleton in skeletons.items()
+    }
+    for entry in audit:
+        source = entry.get("source")
+        output_start = entry.get("output_byte_start")
+        output_end = entry.get("output_byte_end")
+        source_start = entry.get("source_byte_start")
+        source_end = entry.get("source_byte_end")
+        if (
+            source not in occurrences_by_source
+            or type(output_start) is not int
+            or type(output_end) is not int
+            or type(source_start) is not int
+            or type(source_end) is not int
+            or output_end - output_start != source_end - source_start
+        ):
+            continue
+        for occurrence in occurrences_by_source[source]:
+            overlap_start = max(source_start, occurrence.source_byte_start)
+            overlap_end = min(source_end, occurrence.source_byte_end)
+            if overlap_start >= overlap_end:
+                continue
+            evidence.append((
+                output_start + overlap_start - source_start,
+                output_start + overlap_end - source_start,
+                occurrence.page_no,
+            ))
+    evidence.sort()
+
+    comparison_pages: dict[str, Counter[int]] = {}
+    if artifacts is not None:
+        for source, occurrences in occurrences_by_source.items():
+            source_artifact = artifacts.get(source)
+            if source_artifact is None:
+                continue
+            for occurrence in occurrences:
+                raw = source_artifact.raw_utf8[
+                    occurrence.source_byte_start : occurrence.source_byte_end
+                ]
+                key = _comparison_key(raw.decode("utf-8", errors="strict"))
+                if key:
+                    comparison_pages.setdefault(key, Counter())[occurrence.page_no] += 1
+
+    artifact = SourceArtifact.from_text("marker", text)
+    units = scan_structural_units(artifact)
+    aligned_pages: dict[int, Counter[int]] = {}
+    if artifacts is not None:
+        for source, source_artifact in artifacts.items():
+            skeleton = skeletons.get(source)
+            if skeleton is None:
+                continue
+            occurrence_pages: dict[str, set[int]] = {}
+            for occurrence in skeleton.occurrences:
+                if type(occurrence.page_no) is int and occurrence.page_no > 0:
+                    occurrence_pages.setdefault(occurrence.unit_id, set()).add(
+                        occurrence.page_no
+                    )
+            page_by_unit = {
+                unit_id: next(iter(pages))
+                for unit_id, pages in occurrence_pages.items()
+                if len(pages) == 1
+            }
+            source_units = scan_structural_units(source_artifact)
+            for final_index, match in _align_to_baseline(
+                units,
+                source_units,
+                require_matching_unit_types=False,
+            ).items():
+                if match.ambiguous:
+                    continue
+                page_no = page_by_unit.get(
+                    source_units[match.alternative_index].unit_id
+                )
+                if page_no is not None:
+                    aligned_pages.setdefault(final_index, Counter())[page_no] += (
+                        round(match.similarity * 1_000)
+                    )
+    assignments: list[tuple[StructuralUnitSpan, int, str]] = []
+    direct_assignment_count = 0
+    exact_match_assignment_count = 0
+    aligned_assignment_count = 0
+    ambiguous_count = 0
+    evidence_cursor = 0
+    for unit_index, unit in enumerate(units):
+        while (
+            evidence_cursor < len(evidence)
+            and evidence[evidence_cursor][1] <= unit.byte_start
+        ):
+            evidence_cursor += 1
+        scores: Counter[int] = Counter()
+        cursor = evidence_cursor
+        while cursor < len(evidence) and evidence[cursor][0] < unit.byte_end:
+            start, end, page_no = evidence[cursor]
+            overlap = min(unit.byte_end, end) - max(unit.byte_start, start)
+            if overlap > 0:
+                scores[page_no] += overlap
+            cursor += 1
+        assignment_method = "source_audit"
+        if not scores:
+            scores = comparison_pages.get(unit.comparison_key, Counter())
+            assignment_method = "exact_structural_match"
+        if not scores:
+            scores = aligned_pages.get(unit_index, Counter())
+            assignment_method = "bounded_structural_alignment"
+        if not scores:
+            continue
+        ranked = scores.most_common()
+        if len(ranked) > 1 and (
+            assignment_method != "source_audit"
+            or ranked[0][1] == ranked[1][1]
+        ):
+            ambiguous_count += 1
+            continue
+        assignments.append((unit, ranked[0][0], assignment_method))
+        if assignment_method == "source_audit":
+            direct_assignment_count += 1
+        elif assignment_method == "exact_structural_match":
+            exact_match_assignment_count += 1
+        else:
+            aligned_assignment_count += 1
+
+    replacements: list[tuple[int, int, bytes, str]] = []
+    transition_pages: list[int] = []
+    transition_methods: list[str] = []
+    # The downstream Markdown contract defaults to page 1, so only emit an
+    # initial marker when the first proven unit belongs to another page.
+    previous_page: int | None = 1
+    for unit, page_no, assignment_method in assignments:
+        if page_no == previous_page:
+            continue
+        replacements.append((
+            unit.byte_start,
+            unit.byte_start,
+            f"<!-- page: {page_no} -->\n".encode("ascii"),
+            "native_page_marker",
+        ))
+        transition_pages.append(page_no)
+        transition_methods.append(assignment_method)
+        previous_page = page_no
+
+    rendered, rewritten_audit, events = _replace_deterministic_markup(
+        text, audit, replacements
+    )
+    decorated_events = [
+        {
+            **event,
+            "page_no": page_no,
+            "projection_method": assignment_method,
+        }
+        for event, page_no, assignment_method in zip(
+            events,
+            transition_pages,
+            transition_methods,
+            strict=True,
+        )
+    ]
+    report = {
+        "policy_version": "source-audit-native-page-projection-v1",
+        "structural_unit_count": len(units),
+        "mapped_structural_unit_count": len(assignments),
+        "direct_audit_assignment_count": direct_assignment_count,
+        "exact_structural_match_assignment_count": exact_match_assignment_count,
+        "bounded_structural_alignment_assignment_count": aligned_assignment_count,
+        "ambiguous_structural_unit_count": ambiguous_count,
+        "unmapped_structural_unit_count": (
+            len(units) - len(assignments) - ambiguous_count
+        ),
+        "marker_count": len(events),
+        "projected_pages": transition_pages,
+    }
+    return rendered, rewritten_audit, decorated_events, report
+
+
 def reconcile_native_emphasis_fallback(
     text: str,
     skeletons: Mapping[SourceName, DocumentSkeleton],

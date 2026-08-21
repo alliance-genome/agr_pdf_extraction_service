@@ -451,6 +451,66 @@ def test_baseline_retained_native_italics_reconcile_without_replacement():
     assert receipt["all_native_body_italics_retained"] is True
 
 
+def test_merge_projects_replayable_native_page_transitions():
+    marker = "# Title\n\nFirst page text.\n\nSecond page text.\n"
+    artifact = SourceArtifact.from_text("marker", marker)
+    marker_native = NativeStructureArtifact.for_test(
+        "marker",
+        artifact,
+        json.dumps({
+            "block_type": "Document",
+            "children": [
+                {
+                    "block_type": "Page",
+                    "children": [
+                        {
+                            "id": "/page/0/Title/0",
+                            "block_type": "Title",
+                            "html": "<h1>Title</h1>",
+                        },
+                        {
+                            "id": "/page/0/Text/1",
+                            "block_type": "Text",
+                            "html": "<p>First page text.</p>",
+                        },
+                    ],
+                },
+                {
+                    "block_type": "Page",
+                    "children": [{
+                        "id": "/page/1/Text/0",
+                        "block_type": "Text",
+                        "html": "<p>Second page text.</p>",
+                    }],
+                },
+            ],
+        }).encode("utf-8"),
+    )
+
+    merged, metrics, audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": artifact}
+        ),
+        native_structures={"marker": marker_native},
+        baseline_requirements=FRAGMENT_REQUIREMENTS,
+        benchmark_mode=True,
+    )
+
+    assert merged == (
+        "# Title\n\nFirst page text.\n\n"
+        "<!-- page: 2 -->\nSecond page text.\n"
+    )
+    assert metrics["native_page_projection"]["projected_pages"] == [2]
+    assert any(
+        entry.get("transformation") == "native_page_marker"
+        for entry in audit
+    )
+
+
 def _plain_marker_with_native_dpp():
     marker = "# Title\n\n## Results\n\nGene dpp is active.\n"
     artifact = SourceArtifact.from_text("marker", marker)
