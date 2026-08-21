@@ -25,7 +25,7 @@ from app.services.semantic_payload import (
 )
 
 
-CONTRACT_ID = "pdfx-native-skeleton-selection-page-provenance-v1"
+CONTRACT_ID = "pdfx-native-skeleton-selection-page-provenance-v2"
 LEGACY_CONTRACT_ID = "pdfx-native-skeleton-selection"
 
 
@@ -748,7 +748,11 @@ def test_positive_style_selection_ignores_late_event_diagnostics():
     enriched_event["style_selection_response_choice"] = 0
     with pytest.raises(
         ValueError,
-        match="positive style model-selection receipt is inconsistent",
+        match=(
+            "positive style model-selection receipt is inconsistent "
+            r"\(call grouping; differing keys: "
+            "style_selection_response_choice"
+        ),
     ):
         _validate_positive_style_overlay_receipts(
             artifact.raw_utf8,

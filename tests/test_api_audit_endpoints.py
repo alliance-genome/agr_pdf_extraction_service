@@ -964,7 +964,7 @@ def test_merged_download_uses_verified_bundle_bytes(client, tmp_path):
     mock_result = MagicMock()
     mock_result.state = "SUCCESS"
     mock_result.result = {
-        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
+        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v2",
         "source_pdf_sha256": "f" * 64,
         "merged_cache_path": str(tmp_path / "merged.md"),
         "merge_metrics_path": str(tmp_path / "metrics.json"),
@@ -1084,7 +1084,7 @@ def test_merge_download_uses_pdf_digest_when_reloading_native_sidecars(
     mock_result = MagicMock()
     mock_result.state = "SUCCESS"
     mock_result.result = {
-        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
+        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v2",
         "source_pdf_sha256": pdf_sha256,
         "merged_cache_path": str(tmp_path / "merged.md"),
         "merge_metrics_path": str(tmp_path / "metrics.json"),
@@ -1124,7 +1124,7 @@ def test_merge_download_falls_back_when_native_receipts_do_not_match(
     mock_result = MagicMock()
     mock_result.state = "SUCCESS"
     mock_result.result = {
-        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
+        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v2",
         "source_pdf_sha256": "f" * 64,
         "merged_cache_path": str(tmp_path / "merged.md"),
         "merge_metrics_path": str(tmp_path / "metrics.json"),
@@ -1172,7 +1172,7 @@ def test_completed_merge_without_local_or_durable_artifact_is_internal_error(
     mock_result = MagicMock()
     mock_result.state = "SUCCESS"
     mock_result.result = {
-        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v1",
+        "merge_contract_id": "pdfx-native-skeleton-selection-page-provenance-v2",
         "merged_cache_path": str(tmp_path / "merged.md"),
         "merge_metrics_path": str(tmp_path / "metrics.json"),
         "merge_audit_path": str(tmp_path / "audit.json"),

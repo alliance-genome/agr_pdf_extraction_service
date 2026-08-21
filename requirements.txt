@@ -16,7 +16,7 @@ pydantic>=2.0
 # Consensus pipeline
 agr-abc-document-parsers==1.6.0
 mistune
-rapidfuzz
+rapidfuzz==3.14.5
 regex  # UAX #29 extended-grapheme boundaries for lossless candidate clipping
 scipy
 numba

@@ -72,6 +72,16 @@ def _style_selection_record(
     }
 
 
+def _differing_mapping_keys(left: Mapping, right: Mapping) -> list[str]:
+    """Return content-free field names whose canonical values differ."""
+
+    return sorted(
+        key
+        for key in set(left) | set(right)
+        if (key in left) != (key in right) or left.get(key) != right.get(key)
+    )
+
+
 def bundle_manifest_path(merged_path: str | os.PathLike[str]) -> str:
     return f"{merged_path}.manifest.json"
 
@@ -704,7 +714,11 @@ def _validate_positive_style_overlay_receipts(
         record = _style_selection_record(event)
         previous = selection_records.setdefault(selection_id, record)
         if previous != record:
-            raise ValueError("positive style model-selection receipt is inconsistent")
+            differing = ",".join(_differing_mapping_keys(previous, record))
+            raise ValueError(
+                "positive style model-selection receipt is inconsistent "
+                f"(call grouping; differing keys: {differing})"
+            )
     model_call_traces = metrics.get("model_selection_calls", [])
     if not isinstance(model_call_traces, list):
         raise ValueError("model-selection trace ledger is missing")
@@ -824,7 +838,13 @@ def _validate_positive_style_overlay_receipts(
                 record["reason"] = event.get("reason")
             previous = recorded_style_selections.setdefault(selection_id, record)
             if previous != record:
-                raise ValueError("positive style model-selection receipt is inconsistent")
+                differing = ",".join(
+                    _differing_mapping_keys(previous, record)
+                )
+                raise ValueError(
+                    "positive style model-selection receipt is inconsistent "
+                    f"(replay grouping; differing keys: {differing})"
+                )
         replayed_text, replayed_audit, replayed_events = project_native_emphasis(
             pre_projection.decode("utf-8", errors="strict"),
             pre_projection_audit,
