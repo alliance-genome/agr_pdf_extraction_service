@@ -312,6 +312,37 @@ def test_native_page_projection_skips_marker_inside_abc_table():
     assert abc_markdown_report(rendered)["error_rule_ids"] == []
 
 
+def test_native_page_projection_abstains_before_byte_zero_h1():
+    artifact = SourceArtifact.from_text(
+        "marker", "# Title\n\nBody on second page.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(occurrence, page_no=2)
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    from agr_abc_document_parsers import read_markdown
+
+    document = read_markdown(rendered)
+    assert rendered == artifact.text
+    assert rewritten_audit == _audit(artifact)
+    assert events == []
+    assert document.title == "Title"
+    assert document.authors == []
+    assert document.sections[0].paragraphs[0].text == "Body on second page."
+    assert report["structural_block_abstained_marker_count"] == 1
+
+
 @pytest.mark.parametrize("failure_mode", ["introduced_warning", "parser_failure"])
 def test_native_page_projection_abstains_on_abc_regression(
     monkeypatch,
@@ -418,7 +449,52 @@ def test_native_page_projection_delays_marker_until_after_structural_block(
     assert f"{block}\n<!-- page: 2 -->\n## Next" in rendered
     assert rendered.startswith(f"# Title\n\n{block}\n")
     assert [event["page_no"] for event in events] == [2]
-    assert report["structural_block_abstained_marker_count"] == len(protected)
+    assert report["structural_block_abstained_marker_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "continuation on page two",
+        "  continuation on page two",
+        "    continuation on page two",
+    ],
+)
+def test_native_page_projection_delays_marker_past_list_continuation(
+    continuation,
+):
+    list_block = f"- item first line\n{continuation}"
+    artifact = SourceArtifact.from_text(
+        "marker", f"# Title\n\n{list_block}\n\n## Next\n\nTail.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    continuation_start = artifact.raw_utf8.index(continuation.encode())
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    2
+                    if occurrence.source_byte_start >= continuation_start
+                    else 1
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, _rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    assert rendered.startswith(f"# Title\n\n{list_block}\n\n")
+    assert f"{list_block}\n\n<!-- page: 2 -->\n## Next" in rendered
+    assert f"- item first line\n<!-- page: 2 -->\n{continuation}" not in rendered
+    assert [event["page_no"] for event in events] == [2]
+    assert report["structural_block_abstained_marker_count"] == 1
 
 
 def test_native_page_projection_uses_bounded_cross_extractor_alignment():

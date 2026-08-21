@@ -5099,14 +5099,53 @@ def project_native_page_markers(
     transition_methods: list[str] = []
     structural_block_abstained_marker_count = 0
     protected_block_types = {"table", "list", "reference"}
+    protected_unit_indexes: set[int] = set()
+    for unit_index, unit in enumerate(units):
+        if unit.unit_type in protected_block_types:
+            protected_unit_indexes.add(unit_index)
+            continue
+        if unit.unit_type != "paragraph" or unit_index == 0:
+            continue
+        previous_unit = units[unit_index - 1]
+        separator = artifact.raw_utf8[previous_unit.byte_end : unit.byte_start]
+        if unit_index - 1 in protected_unit_indexes and separator.count(b"\n") < 2:
+            # Markdown permits list item continuation text without another
+            # bullet.  A comment inserted there changes the list's meaning,
+            # even though both documents remain syntactically valid.
+            protected_unit_indexes.add(unit_index)
+    unit_indexes = {
+        (unit.byte_start, unit.byte_end): unit_index
+        for unit_index, unit in enumerate(units)
+    }
     # The downstream Markdown contract defaults to page 1, so only emit an
     # initial marker when the first proven unit belongs to another page.
     previous_page: int | None = 1
+    observed_page: int | None = 1
     for unit, page_no, assignment_method in assignments:
+        observed_transition = page_no != observed_page
+        observed_page = page_no
         if page_no == previous_page:
             continue
-        if unit.unit_type in protected_block_types:
-            structural_block_abstained_marker_count += 1
+        heading_match = _MARKDOWN_HEADING.match(
+            artifact.raw_utf8[unit.byte_start : unit.byte_end]
+        )
+        if (
+            unit.byte_start == 0
+            and unit.unit_type == "heading"
+            and heading_match is not None
+            and len(heading_match.group(1)) == 1
+        ):
+            # A marker before the document title makes the Alliance reader
+            # lose the title and body.  Delaying it until just after the title
+            # is also unsafe because the reader interprets it as an author.
+            if observed_transition:
+                structural_block_abstained_marker_count += 1
+            previous_page = page_no
+            continue
+        unit_index = unit_indexes[(unit.byte_start, unit.byte_end)]
+        if unit_index in protected_unit_indexes:
+            if observed_transition:
+                structural_block_abstained_marker_count += 1
             continue
         replacements.append((
             unit.byte_start,
