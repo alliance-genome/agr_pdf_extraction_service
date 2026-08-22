@@ -61,11 +61,13 @@ authority for that goal.
   remain recorded on PR #46 and do not justify another code round under the
   Section 11 stop rules.
 - Parser publication remains operationally blocked: PyPI currently resolves
-  only 1.6.0. Chris confirmed that PyPI account `ctabone` has access to
-  `agr-curation-api-client` but not `agr-abc-document-parsers`. Valerio
-  (`@valearna`) was asked on parser PR #2 to review the merged change, publish
-  1.7.0 or identify his preferred release process, and add `ctabone` to the
-  PyPI project. A clean PDFX build/deploy cannot proceed until 1.7.0 is
+  only 1.6.0. Valerio (`@valearna`) approved the change and added PyPI account
+  `ctabone` as an owner. The protected local token is project-scoped to
+  `agr-curation-api-client`; PyPI therefore rejected the 1.7.0 upload before
+  accepting any file with `403 Invalid API Token: project-scoped token is not
+  valid for project: 'agr-abc-document-parsers'`. Publishing now requires a
+  new token scoped to `agr-abc-document-parsers` (kept separately from the
+  existing token). A clean PDFX build/deploy cannot proceed until 1.7.0 is
   published.
 - Exact Debbie PDFs are no longer recoverable from the terminated worker
   volumes or known durable stores. Their three exact MD5 identities are
@@ -512,8 +514,12 @@ Verified state as of 2026-08-22:
 
 - Parser PR #2 is merged and tag `v1.7.0` is pushed:
   <https://github.com/alliance-genome/agr_abc_document_parsers/pull/2>
-- Valerio has been asked to review/publish and add PyPI user `ctabone`:
-  <https://github.com/alliance-genome/agr_abc_document_parsers/pull/2#issuecomment-5381961367>
+- Valerio approved the change and added PyPI user `ctabone` as an owner:
+  <https://github.com/alliance-genome/agr_abc_document_parsers/pull/2#issuecomment-5382525044>
+- The existing `/home/ctabone/.pypi/token` must not be overwritten: it is
+  project-scoped to `agr-curation-api-client`. Store a new parser-scoped token
+  separately at `/home/ctabone/.pypi/agr-abc-document-parsers.token` with mode
+  `0600`; never paste the token into chat or commit it.
 - PDFX PR #46 is open, mergeable, and locally review-complete at
   `a3cf3e38febf9029f0b3725d3bee6a0656b9ff36`:
   <https://github.com/alliance-genome/agr_pdf_extraction_service/pull/46>
