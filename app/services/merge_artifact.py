@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -21,6 +20,7 @@ from app.services.abc_markdown_policy import (
     ABC_PARSER_IMPLEMENTATION_SHA256,
     ABC_PARSER_VERSION,
 )
+from app.services.deterministic_markup import deterministic_markup_span_is_valid
 from app.services.semantic_payload import SEMANTIC_PAYLOAD_CONTRACT_VERSION
 from app.services.document_skeleton import (
     DocumentSkeleton,
@@ -118,93 +118,12 @@ def _validate_audit(
         if source == "deterministic_markup":
             span = output[start:end]
             transformation = entry.get("transformation")
-            if transformation == "trailing_newline_normalization":
-                expected_span = b"\n"
-            elif transformation == "selected_document_skeleton":
-                expected_span = (
-                    span
-                    if 1 <= len(span) <= 6 and set(span) == {ord("#")}
-                    else None
-                )
-            elif transformation == "alliance_table_separator":
-                expected_span = (
-                    span
-                    if re.fullmatch(rb"\n?\|(?:---\|)+\n", span) is not None
-                    else None
-                )
-            elif transformation == "alliance_heading_role_marker":
-                expected_span = (
-                    span
-                    if 1 <= len(span) <= 6 and set(span) == {ord("#")}
-                    else None
-                )
-            elif transformation == "alliance_reference_marker":
-                expected_span = (
-                    span
-                    if re.fullmatch(rb"[1-9]\d*\. ", span) is not None
-                    else None
-                )
-            elif transformation == "alliance_bibliography_heading_insert":
-                expected_span = (
-                    span
-                    if re.fullmatch(rb"\n{0,2}## References\n\n", span) is not None
-                    else None
-                )
-            elif transformation == "alliance_figure_legend_heading_insert":
-                expected_span = (
-                    span
-                    if re.fullmatch(
-                        rb"\n{0,2}## Figure Legends\n\n", span
-                    )
-                    is not None
-                    else None
-                )
-            elif transformation in {
-                "alliance_heading_depth",
-            }:
-                expected_span = (
-                    span
-                    if 1 <= len(span) <= 6 and set(span) == {ord("#")}
-                    else None
-                )
-            elif transformation in {
-                "alliance_figure_label_heading",
-            }:
-                expected_span = span if span == b"### " else None
-            elif transformation == "alliance_table_label_emphasis_marker":
-                expected_span = span if span == b"**" else None
-            elif transformation in {
-                "alliance_figure_label_caption_boundary",
-                "alliance_abstract_heading_separator",
-                "alliance_table_heading_boundary",
-            }:
-                expected_span = span if span == b"\n\n" else None
-            elif transformation in {
-                "alliance_reference_blank_separator",
-                "alliance_front_list_block_separator",
-            }:
-                expected_span = span if span == b"\n" else None
-            elif transformation == "alliance_orcid_url_prefix":
-                expected_span = (
-                    span if span == b"https://orcid.org/" else None
-                )
-            elif transformation == "alliance_abstract_heading_marker":
-                expected_span = span if span == b"## " else None
-            elif transformation == "alliance_affiliation_ordinal_marker":
-                expected_span = span if span == b"." else None
-            elif transformation == "alliance_article_category_marker":
-                expected_span = span if span == b"**Categories:** " else None
-            elif transformation == "native_emphasis_projection":
-                expected_span = span if span == b"*" else None
-            else:
-                expected_span = None
             if (
-                expected_span is None
+                not deterministic_markup_span_is_valid(transformation, span)
                 or (
                     transformation == "trailing_newline_normalization"
                     and deterministic_transformations.count(transformation) >= 1
                 )
-                or span != expected_span
                 or source_start != 0
                 or source_end != len(span)
                 or entry.get("artifact_digest") != _sha256(span)
@@ -1174,6 +1093,7 @@ def validate_merge_artifacts(
     permitted_alliance_operations = {
         "selected_document_skeleton",
         "alliance_table_separator",
+        "alliance_table_separator_boundary",
         "alliance_title_role_order",
         "alliance_title_composite_join",
         "alliance_model_title_selection",
@@ -1183,9 +1103,11 @@ def validate_merge_artifacts(
         "alliance_reference_marker",
         "alliance_bibliography_heading_remove",
         "alliance_bibliography_heading_insert",
+        "alliance_bibliography_heading_boundary",
         "alliance_bibliography_role_order",
         "alliance_figure_legend_role_order",
         "alliance_figure_legend_heading_insert",
+        "alliance_figure_legend_heading_boundary",
         "alliance_figure_label_heading",
         "alliance_figure_label_caption_boundary",
         "alliance_figure_label_bold_remove",

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
+from app.services.deterministic_markup import (
+    deterministic_audit_entry,
+    interval_splits_deterministic_atom,
+)
 
 
 def normalize_trailing_newline(
@@ -27,6 +30,10 @@ def normalize_trailing_newline(
             continue
         clipped = dict(entry)
         if end > retained_end:
+            if interval_splits_deterministic_atom(audit, start, retained_end):
+                raise ValueError(
+                    "newline normalization cannot split deterministic provenance"
+                )
             removed = end - retained_end
             source_start = clipped.get("source_byte_start")
             source_end = clipped.get("source_byte_end")
@@ -41,19 +48,10 @@ def normalize_trailing_newline(
         normalized_audit.append(clipped)
 
     newline = b"\n"
-    normalized_audit.append(
-        {
-            "output_byte_start": retained_end,
-            "output_byte_end": retained_end + 1,
-            "source": "deterministic_markup",
-            "artifact_digest": hashlib.sha256(newline).hexdigest(),
-            "source_byte_start": 0,
-            "source_byte_end": 1,
-            "candidate_id": None,
-            "region_id": None,
-            "decision_method": "deterministic",
-            "transformation": "trailing_newline_normalization",
-        }
-    )
+    normalized_audit.append(deterministic_audit_entry(
+        output_byte_start=retained_end,
+        span=newline,
+        operation="trailing_newline_normalization",
+    ))
     normalized = (retained + newline).decode("utf-8", errors="strict")
     return normalized, normalized_audit, True

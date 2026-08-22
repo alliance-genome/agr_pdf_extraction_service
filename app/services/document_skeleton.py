@@ -23,6 +23,11 @@ from typing import Callable, Literal, Mapping
 from rapidfuzz.fuzz import ratio
 
 from app.services.abc_markdown_policy import abc_markdown_report
+from app.services.deterministic_markup import (
+    deterministic_audit_entry,
+    interval_splits_deterministic_atom,
+    left_owned_boundary_span_is_valid,
+)
 from app.services.model_policy import MAX_BOUNDED_TARGET_CHOICES
 from app.services.native_extractor_artifact import (
     load_native_extractor_artifact,
@@ -1567,6 +1572,10 @@ def _copy_audit_interval(
 ) -> None:
     if start >= end:
         return
+    if interval_splits_deterministic_atom(audit, start, end):
+        raise ConsensusContractError(
+            "composition cannot split deterministic markup atom"
+        )
     copied = start
     for entry in audit:
         entry_start = entry.get("output_byte_start")
@@ -1584,8 +1593,9 @@ def _copy_audit_interval(
         if type(source_start) is not int or type(source_end) is not int:
             raise ConsensusContractError("skeleton source range is invalid")
         clipped = dict(entry)
-        clipped["source_byte_start"] = source_start + overlap_start - entry_start
-        clipped["source_byte_end"] = source_end - (entry_end - overlap_end)
+        if entry.get("source") != "deterministic_markup":
+            clipped["source_byte_start"] = source_start + overlap_start - entry_start
+            clipped["source_byte_end"] = source_end - (entry_end - overlap_end)
         output_start = len(output)
         output.extend(original[overlap_start:overlap_end])
         clipped["output_byte_start"] = output_start
@@ -1697,32 +1707,34 @@ def _render_missing_table_separators(
             cursor,
             position,
         )
-        output_start = len(output)
-        output.extend(separator)
-        transformation_id = _transformation_id(
-            "alliance_table_separator", position, position, separator
+        atoms = (
+            [
+                (b"\n", "alliance_table_separator_boundary"),
+                (separator[1:], "alliance_table_separator"),
+            ]
+            if separator.startswith(b"\n")
+            else [(separator, "alliance_table_separator")]
         )
-        rewritten_audit.append({
-            "output_byte_start": output_start,
-            "output_byte_end": len(output),
-            "source": "deterministic_markup",
-            "artifact_digest": hashlib.sha256(separator).hexdigest(),
-            "source_byte_start": 0,
-            "source_byte_end": len(separator),
-            "candidate_id": None,
-            "region_id": None,
-            "decision_method": "deterministic",
-            "transformation": "alliance_table_separator",
-            "transformation_id": transformation_id,
-        })
-        events.append({
-            "operation": "alliance_table_separator",
-            "audit_span_emitted": True,
-            "table_ordinal": ordinal,
-            "column_count": cell_count,
-            "reason": "alliance_s07_missing_separator",
-            "transformation_id": transformation_id,
-        })
+        for atom, operation in atoms:
+            output_start = len(output)
+            output.extend(atom)
+            transformation_id = _transformation_id(
+                operation, position, position, atom
+            )
+            rewritten_audit.append(deterministic_audit_entry(
+                output_byte_start=output_start,
+                span=atom,
+                operation=operation,
+                transformation_id=transformation_id,
+            ))
+            events.append({
+                "operation": operation,
+                "audit_span_emitted": True,
+                "table_ordinal": ordinal,
+                "column_count": cell_count,
+                "reason": "alliance_s07_missing_separator",
+                "transformation_id": transformation_id,
+            })
         cursor = position
     _copy_audit_interval(
         output,
@@ -1941,19 +1953,12 @@ def render_document_skeleton(
             )
             output_start = len(output)
             output.extend(replacement)
-            rewritten_audit.append({
-                "output_byte_start": output_start,
-                "output_byte_end": len(output),
-                "source": "deterministic_markup",
-                "artifact_digest": hashlib.sha256(replacement).hexdigest(),
-                "source_byte_start": 0,
-                "source_byte_end": len(replacement),
-                "candidate_id": None,
-                "region_id": None,
-                "decision_method": "deterministic",
-                "transformation": "selected_document_skeleton",
-                "transformation_id": transformation_id,
-            })
+            rewritten_audit.append(deterministic_audit_entry(
+                output_byte_start=output_start,
+                span=replacement,
+                operation="selected_document_skeleton",
+                transformation_id=transformation_id,
+            ))
         else:
             transformation_id = _transformation_id(
                 "selected_document_skeleton", start, end, replacement
@@ -2066,19 +2071,12 @@ def _replace_deterministic_markup(
             operation, start, end, replacement
         )
         if replacement:
-            rewritten_audit.append({
-                "output_byte_start": output_start,
-                "output_byte_end": len(output),
-                "source": "deterministic_markup",
-                "artifact_digest": hashlib.sha256(replacement).hexdigest(),
-                "source_byte_start": 0,
-                "source_byte_end": len(replacement),
-                "candidate_id": None,
-                "region_id": None,
-                "decision_method": "deterministic",
-                "transformation": operation,
-                "transformation_id": transformation_id,
-            })
+            rewritten_audit.append(deterministic_audit_entry(
+                output_byte_start=output_start,
+                span=replacement,
+                operation=operation,
+                transformation_id=transformation_id,
+            ))
         events.append({
             "operation": operation,
             "audit_span_emitted": bool(replacement),
@@ -2207,18 +2205,40 @@ def _bibliography_marker_ranges(raw: bytes) -> list[tuple[int, int, bytes, str]]
     return ranges
 
 
-def _canonical_inserted_heading(prefix: bytes, heading: bytes) -> bytes:
-    if not prefix:
-        return heading + b"\n\n"
-    if prefix.endswith(b"\n\n"):
-        return heading + b"\n\n"
-    if prefix.endswith(b"\n"):
-        return b"\n" + heading + b"\n\n"
-    return b"\n\n" + heading + b"\n\n"
+def _canonical_inserted_heading_edits(
+    position: int,
+    prefix: bytes,
+    heading: bytes,
+    *,
+    operation: str,
+    boundary_operation: str,
+) -> list[tuple[int, int, bytes, str]]:
+    """Emit optional left-owned whitespace separately from heading content."""
+
+    edits: list[tuple[int, int, bytes, str]] = []
+    if prefix and not prefix.endswith(b"\n\n"):
+        boundary = b"\n" if prefix.endswith(b"\n") else b"\n\n"
+        if not left_owned_boundary_span_is_valid(
+            boundary_operation, boundary
+        ):
+            raise ConsensusContractError(
+                "inserted heading boundary ownership is invalid"
+            )
+        edits.append((position, position, boundary, boundary_operation))
+    edits.append((position, position, heading + b"\n\n", operation))
+    return edits
 
 
-def _canonical_bibliography_heading(prefix: bytes) -> bytes:
-    return _canonical_inserted_heading(prefix, b"## References")
+def _canonical_bibliography_heading_edits(
+    position: int, prefix: bytes
+) -> list[tuple[int, int, bytes, str]]:
+    return _canonical_inserted_heading_edits(
+        position,
+        prefix,
+        b"## References",
+        operation="alliance_bibliography_heading_insert",
+        boundary_operation="alliance_bibliography_heading_boundary",
+    )
 
 
 def _figure_caption_marker_ranges(
@@ -2418,12 +2438,13 @@ def _render_figure_legend_slot(
         text, audit, insert_events = _replace_deterministic_markup(
             text,
             audit,
-            [(
+            _canonical_inserted_heading_edits(
                 legend_start,
-                legend_start,
-                _canonical_inserted_heading(raw[:legend_start], b"## Figure Legends"),
-                "alliance_figure_legend_heading_insert",
-            )],
+                raw[:legend_start],
+                b"## Figure Legends",
+                operation="alliance_figure_legend_heading_insert",
+                boundary_operation="alliance_figure_legend_heading_boundary",
+            ),
         )
         events.extend(insert_events)
 
@@ -4821,21 +4842,12 @@ def _compile_positive_style_overlay(
                 boundary,
                 str(position),
             )
-            rewritten_audit.append(
-                {
-                    "output_byte_start": marker_start,
-                    "output_byte_end": marker_start + 1,
-                    "source": "deterministic_markup",
-                    "artifact_digest": hashlib.sha256(b"*").hexdigest(),
-                    "source_byte_start": 0,
-                    "source_byte_end": 1,
-                    "candidate_id": None,
-                    "region_id": None,
-                    "decision_method": "deterministic",
-                    "transformation": "native_emphasis_projection",
-                    "transformation_id": transformation_id,
-                }
-            )
+            rewritten_audit.append(deterministic_audit_entry(
+                output_byte_start=marker_start,
+                span=b"*",
+                operation="native_emphasis_projection",
+                transformation_id=transformation_id,
+            ))
             delimiter_records.append((boundary, transformation_id, marker_start))
         target_output_start = delimiter_records[0][2] + 1
         target_output_end = delimiter_records[1][2]
@@ -5668,16 +5680,13 @@ def render_document_role_slots(
                 ]
             )
             raw = text.encode("utf-8")
-            heading = _canonical_bibliography_heading(raw[:reference_start])
             text, audit, insert_events = _replace_deterministic_markup(
                 text,
                 audit,
-                [(
+                _canonical_bibliography_heading_edits(
                     reference_start,
-                    reference_start,
-                    heading,
-                    "alliance_bibliography_heading_insert",
-                )],
+                    raw[:reference_start],
+                ),
             )
             events.extend(insert_events)
 
