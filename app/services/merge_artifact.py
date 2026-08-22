@@ -31,6 +31,13 @@ from app.services.document_skeleton import (
 
 MANIFEST_SCHEMA = "pdfx-source-merge-manifest"
 ALIAS_SCHEMA = "pdfx-source-merge-alias"
+_STYLE_SELECTION_REPLAY_DIAGNOSTICS = frozenset(
+    {
+        "style_selection_donor_ordinal",
+        "style_selection_target_ordinal",
+        "style_selection_order_crossing",
+    }
+)
 
 
 def _sha256(value: bytes) -> str:
@@ -42,6 +49,26 @@ def _json_bytes(value: object) -> bytes:
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("utf-8")
+
+
+def _style_selection_record(
+    event: Mapping,
+    *,
+    include_unit_pair_ambiguous: bool = False,
+) -> dict:
+    """Return call fields while excluding diagnostics rebuilt during replay."""
+
+    return {
+        key: value
+        for key, value in event.items()
+        if key not in _STYLE_SELECTION_REPLAY_DIAGNOSTICS
+        and (
+            key.startswith("style_selection_")
+            or key == "style_selected_candidate_id"
+            or key == "model_selected_target"
+            or (include_unit_pair_ambiguous and key == "unit_pair_ambiguous")
+        )
+    }
 
 
 def bundle_manifest_path(merged_path: str | os.PathLike[str]) -> str:
@@ -582,13 +609,7 @@ def _validate_positive_style_overlay_receipts(
             or event.get("reason") == "model_selection_unavailable"
         ):
             continue
-        record = {
-            key: value
-            for key, value in event.items()
-            if key.startswith("style_selection_")
-            or key == "style_selected_candidate_id"
-            or key == "model_selected_target"
-        }
+        record = _style_selection_record(event)
         previous = selection_records.setdefault(selection_id, record)
         if previous != record:
             raise ValueError("positive style model-selection receipt is inconsistent")
@@ -700,14 +721,10 @@ def _validate_positive_style_overlay_receipts(
             selection_id = event.get("style_selection_id")
             if not isinstance(selection_id, str):
                 continue
-            record = {
-                key: value
-                for key, value in event.items()
-                if key == "unit_pair_ambiguous"
-                or key.startswith("style_selection_")
-                or key == "style_selected_candidate_id"
-                or key == "model_selected_target"
-            }
+            record = _style_selection_record(
+                event,
+                include_unit_pair_ambiguous=True,
+            )
             if (
                 event.get("style_selected_candidate_id")
                 == event.get("style_selection_none_id")
