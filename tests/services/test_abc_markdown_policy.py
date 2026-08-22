@@ -123,3 +123,18 @@ def test_runtime_requirements_pin_exact_replay_dependencies():
         for line in requirements
     )
     assert "rapidfuzz==3.14.5" in requirements
+
+
+def test_installed_runtime_matches_exact_replay_dependencies():
+    assert (
+        abc_markdown_policy.runtime_abc_parser_version()
+        == abc_markdown_policy.ABC_PARSER_VERSION
+    )
+    assert (
+        abc_markdown_policy.runtime_abc_parser_implementation_sha256()
+        == abc_markdown_policy.ABC_PARSER_IMPLEMENTATION_SHA256
+    )
+    assert (
+        abc_markdown_policy.runtime_rapidfuzz_version()
+        == abc_markdown_policy.RAPIDFUZZ_VERSION
+    )

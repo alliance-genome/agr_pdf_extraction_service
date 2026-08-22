@@ -101,6 +101,58 @@ def test_clipped_deterministic_marker_rebinds_exact_retained_bytes():
     _validate_audit(bytes(output), rewritten, {"marker": artifact})
 
 
+@pytest.mark.parametrize(
+    "transformation",
+    [
+        "alliance_bibliography_heading_boundary",
+        "alliance_figure_legend_heading_boundary",
+    ],
+)
+def test_clipped_generated_heading_boundary_rebinds_retained_newline(
+    transformation,
+):
+    artifact = SourceArtifact.from_text("marker", "\n\nBody\n")
+    original = artifact.raw_utf8
+    boundary = original[:2]
+    audit = [
+        {
+            "output_byte_start": 0,
+            "output_byte_end": 2,
+            "source": "deterministic_markup",
+            "artifact_digest": hashlib.sha256(boundary).hexdigest(),
+            "source_byte_start": 0,
+            "source_byte_end": 2,
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "deterministic",
+            "transformation": transformation,
+            "transformation_id": "heading-boundary",
+        },
+        {
+            "output_byte_start": 2,
+            "output_byte_end": len(original),
+            "source": "marker",
+            "artifact_digest": artifact.digest,
+            "source_byte_start": 2,
+            "source_byte_end": len(original),
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "baseline_fallback",
+        },
+    ]
+    output = bytearray()
+    rewritten = []
+
+    _copy_audit_interval(output, rewritten, original, audit, 1, len(original))
+
+    assert bytes(output) == b"\nBody\n"
+    assert rewritten[0]["artifact_digest"] == hashlib.sha256(b"\n").hexdigest()
+    assert rewritten[0]["source_byte_start"] == 0
+    assert rewritten[0]["source_byte_end"] == 1
+    assert rewritten[0]["transformation_id"] == "heading-boundary"
+    _validate_audit(bytes(output), rewritten, {"marker": artifact})
+
+
 def test_clipped_numbered_marker_remains_fail_closed():
     artifact = SourceArtifact.from_text("marker", "12. Reference\n")
     original = artifact.raw_utf8

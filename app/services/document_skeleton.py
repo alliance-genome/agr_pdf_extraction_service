@@ -1602,16 +1602,18 @@ def _copy_audit_interval(
                 "selected_document_skeleton",
                 "alliance_heading_role_marker",
                 "alliance_heading_depth",
+                "alliance_bibliography_heading_boundary",
+                "alliance_figure_legend_heading_boundary",
             }
             and (
                 overlap_start != entry_start or overlap_end != entry_end
             )
         ):
-            # A later heading rewrite can retain only part of an earlier hash
-            # run (for example, one ``#`` from a generated ``##`` heading).
-            # Rebinding is safe only for these semantically equivalent heading
-            # markers. Other generated spans stay bound to their original
-            # bytes and therefore fail closed if clipped.
+            # A later rewrite can retain only part of an earlier hash run or
+            # one newline from a two-newline generated heading boundary.
+            # Rebinding is safe only for these shape-validated heading markers
+            # and whitespace boundaries. Other generated spans stay bound to
+            # their original bytes and therefore fail closed if clipped.
             clipped["artifact_digest"] = hashlib.sha256(copied_span).hexdigest()
             clipped["source_byte_start"] = 0
             clipped["source_byte_end"] = len(copied_span)
@@ -5362,16 +5364,11 @@ def project_native_page_markers(
             boundary["projection_method"],
         )
     )
-    try:
-        abc_parser_version = runtime_abc_parser_version()
-        abc_parser_implementation_sha256 = (
-            runtime_abc_parser_implementation_sha256()
-        )
-        rapidfuzz_version = runtime_rapidfuzz_version()
-    except Exception:
-        abc_parser_version = None
-        abc_parser_implementation_sha256 = None
-        rapidfuzz_version = None
+    abc_parser_version = runtime_abc_parser_version()
+    abc_parser_implementation_sha256 = (
+        runtime_abc_parser_implementation_sha256()
+    )
+    rapidfuzz_version = runtime_rapidfuzz_version()
     report = {
         "policy_version": "source-audit-native-page-projection-v3",
         "abc_parser_version": abc_parser_version,
