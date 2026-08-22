@@ -528,3 +528,91 @@ checklist is approved. PR B additionally requires its bounded inventory and
 scan baseline. Only PR C and PR D wait for the page-transport decision. Any
 proposal to reduce duplicate generation/persistence validation is a separate
 workstream and does not hitchhike into these incident fixes.
+
+## 13. Mandatory Final Review and Proportional PR Iteration
+
+This is the final completion gate for every implementation PR produced from
+this plan. It applies after implementation and focused validation, before the
+PR is presented as ready for human review.
+
+### 13.1 Local final-review gate
+
+- [ ] Run the complete acceptance checklist for the applicable PR and record
+  the results.
+- [ ] Request a read-only review from a **GPT-5.6 Sol sub-agent with xhigh
+  reasoning** against the final branch diff and surrounding code.
+- [ ] The review request **MUST explicitly invoke `$max-review-skill`** and
+  identify this plan, the applicable PR acceptance criteria, the production
+  failure, and behavior that must remain unchanged.
+- [ ] Require the skill's evidence rule and finding labels. The reviewer must
+  not invent theoretical edge cases, generalized frameworks, or tests for
+  unreachable combinations.
+- [ ] Resolve every supported Blocker, Material correction, and High-value
+  simplification with the smallest complete change.
+- [ ] Optional simplifications and unrelated observations are recorded but do
+  not expand the implementation PR.
+- [ ] If material code changes after that review, rerun the affected focused
+  tests and one final Max review of the resulting diff.
+- [ ] Do not open or mark the PR ready until the final verdict is `Accept` or
+  `Accept with follow-ups` with no unresolved Blocker, Material correction, or
+  High-value simplification.
+
+### 13.2 Opening the PR and requesting Claude review
+
+- [ ] Open the PR only after the local final-review gate passes.
+- [ ] Include the applicable acceptance checklist, production evidence, test
+  results, scan/call-count evidence, changed-file justification, and explicit
+  exclusions in the PR description.
+- [ ] Ask Claude to review correctness, behavior preservation, integration,
+  and proportionality against this bounded contract.
+- [ ] Tell Claude explicitly that review comments are not a request to broaden
+  the work into page provenance, parser changes, merge-policy redesign, a
+  general text-edit framework, exhaustive edge-case matrices, fallbacks, or
+  compatibility machinery unless a concrete reachable defect requires it.
+
+Use this framing in the initial Claude request:
+
+> Review this PR against its stated acceptance criteria and the documented
+> production failure. Preserve existing behavior outside that contract.
+> Ground each requested change in a reachable failing path, violated acceptance
+> criterion, existing supported contract, or concrete data-integrity risk.
+> Recommend the smallest complete correction. Do not request speculative edge
+> cases, exhaustive test combinations, generalized editing infrastructure,
+> page-provenance work, parser redesign, fallbacks, migrations, or compatibility
+> layers unless the current diff makes one demonstrably necessary. Mark useful
+> unrelated ideas as non-blocking follow-ups.
+
+### 13.3 Claude iteration stop rules
+
+- [ ] Classify each Claude finding using the same evidence standard as
+  `$max-review-skill`; do not implement a suggestion merely because it was
+  suggested.
+- [ ] Implement supported Blockers and Material corrections. Implement a
+  High-value simplification only when it removes concrete present complexity
+  or risk introduced by this PR.
+- [ ] Do not implement Optional simplifications or outside-scope observations
+  in the incident PR; record them separately if they remain useful.
+- [ ] Request another Claude review only after a material code change that
+  could affect its earlier conclusion. Do not request ceremonial additional
+  rounds after documentation-only replies or disposition of unsupported
+  comments.
+- [ ] Before every additional round, compare the diff with the accepted scope
+  and the Avoidance of Over-Engineering gate. Remove or narrow unsupported
+  growth before asking again.
+- [ ] Stop iterating when no supported Blocker or Material correction remains.
+  Zero comments, theoretical completeness, and reviewer exhaustion are not
+  completion criteria.
+
+If Claude begins expanding scope or producing variants of already-dispositioned
+theoretical concerns, reply with this boundary rather than implementing them:
+
+> Thanks. We are deliberately holding this PR to the documented production
+> failure and accepted checklist. Please identify the concrete reachable path,
+> violated acceptance criterion, existing behavior regression, or
+> data-integrity risk that makes this change necessary now. If none applies, we
+> will record it as a non-blocking follow-up rather than expand this PR.
+
+If a Claude finding does identify a new reachable correctness or data-integrity
+failure, pause the review loop, add that evidence to the plan and acceptance
+criteria, obtain the smallest proportional correction, and rerun the local
+GPT-5.6 Sol/xhigh Max-review gate before returning to Claude.
