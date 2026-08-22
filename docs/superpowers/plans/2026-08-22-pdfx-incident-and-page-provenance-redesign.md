@@ -1,7 +1,7 @@
 # PDFX Incident and Page-Provenance Redesign Plan
 
 **Date:** 2026-08-22  
-**Status:** PR A implementation in progress
+**Status:** PR A local review passed; ready for PR publication
 **Clean implementation base:** `origin/main` at `673ab52`  
 **Reference implementation only:** PR #42 / `fix/style-selection-receipt-consistency`
 
@@ -202,6 +202,11 @@ Current implementation evidence:
   known (`c8081bce…`), but that cache was on the terminated production worker
   and is not in the preserved local capture; recover the cache or obtain the
   source PDF before checking this item.
+- [x] Final local GPT-5.6 Sol/xhigh review invoked `$max-review-skill` and
+  returned `Accept with follow-ups`, with no Blocker, Material correction, or
+  High-value simplification. The reviewer independently reran the 99-test
+  focused slice; unavailable `8394599` release evidence was the sole
+  non-code follow-up.
 
 ### PR B: Repository-wide deterministic transformation contract
 
@@ -559,23 +564,23 @@ PR is presented as ready for human review.
 
 ### 13.1 Local final-review gate
 
-- [ ] Run the complete acceptance checklist for the applicable PR and record
+- [x] Run the complete acceptance checklist for the applicable PR and record
   the results.
-- [ ] Request a read-only review from a **GPT-5.6 Sol sub-agent with xhigh
+- [x] Request a read-only review from a **GPT-5.6 Sol sub-agent with xhigh
   reasoning** against the final branch diff and surrounding code.
-- [ ] The review request **MUST explicitly invoke `$max-review-skill`** and
+- [x] The review request **MUST explicitly invoke `$max-review-skill`** and
   identify this plan, the applicable PR acceptance criteria, the production
   failure, and behavior that must remain unchanged.
-- [ ] Require the skill's evidence rule and finding labels. The reviewer must
+- [x] Require the skill's evidence rule and finding labels. The reviewer must
   not invent theoretical edge cases, generalized frameworks, or tests for
   unreachable combinations.
-- [ ] Resolve every supported Blocker, Material correction, and High-value
+- [x] Resolve every supported Blocker, Material correction, and High-value
   simplification with the smallest complete change.
-- [ ] Optional simplifications and unrelated observations are recorded but do
+- [x] Optional simplifications and unrelated observations are recorded but do
   not expand the implementation PR.
-- [ ] If material code changes after that review, rerun the affected focused
+- [x] If material code changes after that review, rerun the affected focused
   tests and one final Max review of the resulting diff.
-- [ ] Do not open or mark the PR ready until the final verdict is `Accept` or
+- [x] Do not open or mark the PR ready until the final verdict is `Accept` or
   `Accept with follow-ups` with no unresolved Blocker, Material correction, or
   High-value simplification.
 
