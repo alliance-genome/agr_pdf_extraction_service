@@ -61,8 +61,12 @@ authority for that goal.
   remain recorded on PR #46 and do not justify another code round under the
   Section 11 stop rules.
 - Parser publication remains operationally blocked: PyPI currently resolves
-  only 1.6.0 and no publisher credential is materialized on this host. A clean
-  PDFX build/deploy cannot proceed until 1.7.0 is published.
+  only 1.6.0. Chris confirmed that PyPI account `ctabone` has access to
+  `agr-curation-api-client` but not `agr-abc-document-parsers`. Valerio
+  (`@valearna`) was asked on parser PR #2 to review the merged change, publish
+  1.7.0 or identify his preferred release process, and add `ctabone` to the
+  PyPI project. A clean PDFX build/deploy cannot proceed until 1.7.0 is
+  published.
 - Exact Debbie PDFs are no longer recoverable from the terminated worker
   volumes or known durable stores. Their three exact MD5 identities are
   retained for the required post-deployment canary gate; no local replay claim
@@ -498,3 +502,31 @@ supported Blocker or Material correction remains.
 - [x] After the local gate, iterate with Claude only under the bounded rules in
   Section 11. No additional external human approval is required for merge and
   deployment once tests, checks, reviews, and canaries pass.
+
+## 13. Resume Checkpoint
+
+Point a new Codex session at this document and say: **Resume the PDFX primary
+page-provenance goal from Section 13.**
+
+Verified state as of 2026-08-22:
+
+- Parser PR #2 is merged and tag `v1.7.0` is pushed:
+  <https://github.com/alliance-genome/agr_abc_document_parsers/pull/2>
+- Valerio has been asked to review/publish and add PyPI user `ctabone`:
+  <https://github.com/alliance-genome/agr_abc_document_parsers/pull/2#issuecomment-5381961367>
+- PDFX PR #46 is open, mergeable, and locally review-complete at
+  `a3cf3e38febf9029f0b3725d3bee6a0656b9ff36`:
+  <https://github.com/alliance-genome/agr_pdf_extraction_service/pull/46>
+- Do not merge PDFX PR #46 while PyPI still resolves only parser 1.6.0; its
+  production build pins 1.7.0.
+- Do not repeat implementation or review work unless the branch changes or a
+  concrete new finding appears.
+
+Immediate next steps:
+
+1. Confirm PyPI exposes `agr-abc-document-parsers==1.7.0`; install it into a
+   fresh environment and verify the pinned parser implementation digest.
+2. Merge PDFX PR #46 using the already-authorized ruleset bypass, monitor its
+   build/deployment, and verify public service health.
+3. Run the Debbie PDF canaries when their source PDFs are resubmitted or
+   otherwise made available; record sidecar correctness and runtime evidence.
