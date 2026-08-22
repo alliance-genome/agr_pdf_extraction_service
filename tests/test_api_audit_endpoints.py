@@ -964,7 +964,7 @@ def test_merged_download_uses_verified_bundle_bytes(client, tmp_path):
     mock_result = MagicMock()
     mock_result.state = "SUCCESS"
     mock_result.result = {
-        "merge_contract_id": "pdfx-native-skeleton-selection",
+        "merge_contract_id": "pdfx-native-skeleton-primary-page-v1",
         "merged_cache_path": str(tmp_path / "merged.md"),
         "merge_metrics_path": str(tmp_path / "metrics.json"),
         "merge_audit_path": str(tmp_path / "audit.json"),
@@ -979,6 +979,12 @@ def test_merged_download_uses_verified_bundle_bytes(client, tmp_path):
             "grobid": "d" * 64,
             "docling": "e" * 64,
             "marker": "f" * 64,
+        },
+        "pdf_sha256": "1" * 64,
+        "source_page_map_sha256": {
+            "grobid": "2" * 64,
+            "docling": "3" * 64,
+            "marker": "4" * 64,
         },
         "download_paths": source_paths,
         "file_hash": "merged-hash",
@@ -995,6 +1001,48 @@ def test_merged_download_uses_verified_bundle_bytes(client, tmp_path):
 
     assert response.status_code == 200
     assert response.data == b"# Title\n\nVerified merge."
+    mock_load.assert_called_once()
+
+
+def test_page_provenance_download_uses_verified_json_bundle(client, tmp_path):
+    process_id = str(uuid.uuid4())
+    source = tmp_path / "grobid.md"
+    source.write_text("# Title\n\nSource.", encoding="utf-8")
+    merged = tmp_path / "merged.md"
+    page_payload = b'{"schema":"pdfx-merged-page-provenance"}\n'
+    (tmp_path / "merged.md.page-provenance.json").write_bytes(page_payload)
+    mock_result = MagicMock()
+    mock_result.state = "SUCCESS"
+    mock_result.result = {
+        "merge_contract_id": "pdfx-native-skeleton-primary-page-v1",
+        "merged_cache_path": str(merged),
+        "merge_metrics_path": str(tmp_path / "metrics.json"),
+        "merge_audit_path": str(tmp_path / "audit.json"),
+        "available_extractors": ["grobid"],
+        "native_structure_receipt_digests": {},
+        "document_skeleton_candidate_ids": {"grobid": "a" * 64},
+        "document_skeleton_candidate_projection_ids": {"grobid": "b" * 64},
+        "pdf_sha256": "1" * 64,
+        "source_page_map_sha256": {"grobid": "2" * 64},
+        "download_paths": {"grobid": str(source)},
+        "file_hash": "merged-hash",
+    }
+
+    with (
+        patch("celery_app.celery.AsyncResult", return_value=mock_result),
+        patch(
+            "app.api.load_merge_bundle",
+            return_value=("# Title\n\nVerified merge.", {}, []),
+        ) as mock_load,
+    ):
+        response = client.get(
+            f"/api/v1/extract/{process_id}/download/page_provenance"
+        )
+
+    assert response.status_code == 200
+    assert response.data == page_payload
+    assert response.mimetype == "application/json"
+    assert "page_provenance.json" in response.headers["Content-Disposition"]
     mock_load.assert_called_once()
 
 
@@ -1282,6 +1330,9 @@ def test_get_artifact_urls_returns_presigned_urls_for_nested_artifacts(mock_buil
         status="succeeded",
         artifacts_json={
             "grobid": "pdfx/audit/2026/02/11/x/grobid.md",
+            "page_provenance": (
+                "pdfx/audit/2026/02/11/x/page_provenance.json"
+            ),
             "source_pdf": "pdfx/audit/2026/02/11/x/inputs/source.pdf",
             "images": [
                 {
@@ -1310,6 +1361,7 @@ def test_get_artifact_urls_returns_presigned_urls_for_nested_artifacts(mock_buil
     urls = payload["artifact_urls"]
     keys = [item["s3_key"] for item in urls]
     assert "pdfx/audit/2026/02/11/x/grobid.md" in keys
+    assert "pdfx/audit/2026/02/11/x/page_provenance.json" in keys
     assert "pdfx/audit/2026/02/11/x/inputs/source.pdf" in keys
     assert "pdfx/audit/2026/02/11/x/images/fig1.png" in keys
 

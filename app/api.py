@@ -35,6 +35,7 @@ from app.image_metadata import copy_image_metadata, normalize_image_manifest_ent
 from app.models import ExtractionRun, get_session, update_extraction_run_if_nonterminal
 from app.services.audit_logger import build_s3_client
 from app.services.merge_artifact import load_merge_bundle
+from app.services.page_provenance import merged_page_provenance_path
 from app.services.source_contracts import SourceArtifact
 
 logger = logging.getLogger(__name__)
@@ -1229,10 +1230,10 @@ def download_result(process_id, method):
     """
     Download the full markdown output for a completed extraction.
 
-    The method can be 'grobid', 'docling', 'marker', or 'merged'.
+    The method can be an extractor, 'merged', 'audit', or 'page_provenance'.
     Tries local cache first, falls back to S3 artifact if cache is missing.
     """
-    if method not in (*VALID_METHODS, "merged", "audit"):
+    if method not in (*VALID_METHODS, "merged", "audit", "page_provenance"):
         return jsonify({"error": f"Invalid method: {method}"}), 400
 
     from celery_app import celery
@@ -1246,7 +1247,7 @@ def download_result(process_id, method):
         verified_merge_payload = None
         local_merge_verification_failed = False
 
-        if method in {"merged", "audit"} and data.get("merged_cache_path"):
+        if method in {"merged", "audit", "page_provenance"} and data.get("merged_cache_path"):
             contract_id = data.get("merge_contract_id")
             merged_path = data.get("merged_cache_path")
             metrics_path = data.get("merge_metrics_path")
@@ -1256,10 +1257,17 @@ def download_result(process_id, method):
             skeleton_projection_ids = data.get(
                 "document_skeleton_candidate_projection_ids"
             )
+            pdf_sha256 = data.get("pdf_sha256")
+            source_page_map_sha256 = data.get("source_page_map_sha256")
             if not all((contract_id, merged_path, metrics_path, audit_path)) or not all(
                 isinstance(value, dict)
-                for value in (native_receipts, skeleton_ids, skeleton_projection_ids)
-            ):
+                for value in (
+                    native_receipts,
+                    skeleton_ids,
+                    skeleton_projection_ids,
+                    source_page_map_sha256,
+                )
+            ) or not isinstance(pdf_sha256, str):
                 local_merge_verification_failed = True
                 logger.warning(
                     "Merge download bundle metadata is incomplete for %s; "
@@ -1298,17 +1306,22 @@ def download_result(process_id, method):
                         expected_skeleton_candidate_projection_ids=(
                             skeleton_projection_ids
                         ),
+                        expected_pdf_sha256=pdf_sha256,
+                        expected_source_page_map_sha256=source_page_map_sha256,
                     )
-                    verified_merge_payload = (
-                        merged_text.encode("utf-8")
-                        if method == "merged"
-                        else json.dumps(
+                    if method == "merged":
+                        verified_merge_payload = merged_text.encode("utf-8")
+                    elif method == "audit":
+                        verified_merge_payload = json.dumps(
                             merge_audit,
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
                         ).encode("utf-8")
-                    )
+                    else:
+                        verified_merge_payload = merged_page_provenance_path(
+                            merged_path
+                        ).read_bytes()
                 except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
                     local_merge_verification_failed = True
                     logger.warning(
@@ -1322,17 +1335,19 @@ def download_result(process_id, method):
             filepath = data.get("merged_cache_path")
         elif method == "audit":
             filepath = download_paths.get("audit")
+        elif method == "page_provenance":
+            filepath = download_paths.get("page_provenance")
         else:
             filepath = download_paths.get(method)
 
         local_file_available = (
-            method not in {"merged", "audit"}
+            method not in {"merged", "audit", "page_provenance"}
             and filepath
             and os.path.exists(filepath)
         )
         if verified_merge_payload is not None or local_file_available:
-            if method == "audit":
-                download_name = f"{file_hash}_audit.json"
+            if method in {"audit", "page_provenance"}:
+                download_name = f"{file_hash}_{method}.json"
                 mimetype = "application/json"
             else:
                 download_name = f"{file_hash}_{method}.md"
@@ -1359,7 +1374,7 @@ def download_result(process_id, method):
     run = _get_run_by_process_id(process_id)
     if run is None:
         if (
-            method == "merged"
+            method in {"merged", "audit", "page_provenance"}
             and result.state == "SUCCESS"
             and local_merge_verification_failed
         ):
@@ -1369,7 +1384,7 @@ def download_result(process_id, method):
         return jsonify({"error": "process_id not found"}), 404
 
     known_completed_merge = (
-        method == "merged"
+        method in {"merged", "audit", "page_provenance"}
         and result.state == "SUCCESS"
         and local_merge_verification_failed
     )
@@ -1386,7 +1401,7 @@ def download_result(process_id, method):
         if resp:
             return resp
 
-    if method == "merged" and (
+    if method in {"merged", "audit", "page_provenance"} and (
         known_completed_merge
         or run.get("consensus_metrics_json") is not None
     ):

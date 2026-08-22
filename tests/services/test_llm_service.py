@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -66,6 +67,45 @@ def _llm_with_parsed(parsed, *, refusal=None, usage=None):
 
 def _parsed(payload):
     return SimpleNamespace(model_dump=lambda **_kwargs: payload)
+
+
+def _page_request():
+    ranges = [
+        {
+            "range_id": hashlib.sha256(label.encode()).hexdigest(),
+            "byte_start": index,
+            "byte_end": index + 1,
+            "page_choices": [2, 3],
+            "text": label,
+            "preceding_context": "before",
+            "following_context": "after",
+            "preceding_context_byte_start": 0,
+            "preceding_context_byte_end": index,
+            "following_context_byte_start": index + 1,
+            "following_context_byte_end": index + 6,
+            "preceding_anchor": {"page_number": 2, "distance_bytes": 4},
+            "following_anchor": {"page_number": 3, "distance_bytes": 5},
+            "alternative_evidence": [
+                {
+                    "source": "docling",
+                    "page_number": 2,
+                    "source_byte_start": 10,
+                    "source_byte_end": 15,
+                    "excerpt": "proof",
+                }
+            ],
+        }
+        for index, label in enumerate(("alpha", "beta"))
+    ]
+    digest = hashlib.sha256(
+        json.dumps(
+            {"ranges": ranges},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return {"request_sha256": digest, "ranges": ranges}
 
 
 def test_llm_client_uses_bounded_timeout_and_retries():
@@ -192,6 +232,93 @@ def test_sol_selector_uses_exact_5_6_sol_high():
     call = llm.client.chat.completions.parse.call_args.kwargs
     assert call["model"] == "gpt-5.6-sol"
     assert call["reasoning_effort"] == "high"
+
+
+def test_page_selector_returns_only_supplied_pages_with_luna_medium():
+    payload = _page_request()
+    llm = _llm_with_parsed(
+        _parsed(
+            {
+                "request_sha256": payload["request_sha256"],
+                "decisions": tuple(
+                    {"range_id": item["range_id"], "page_number": 2}
+                    for item in payload["ranges"]
+                ),
+            }
+        )
+    )
+
+    decisions, trace = llm.resolve_page_choices(payload)
+
+    assert decisions == {
+        item["range_id"]: 2 for item in payload["ranges"]
+    }
+    call = llm.client.chat.completions.parse.call_args.kwargs
+    assert call["model"] == "gpt-5.6-luna"
+    assert call["reasoning_effort"] == "medium"
+    assert call["response_format"].__name__ == "_PageResolutionResponse"
+    assert trace["outcome"] == "valid"
+    assert "text" not in trace["request"]["ranges"][0]
+    assert trace["request"]["ranges"][0]["text_sha256"]
+    traced = trace["request"]["ranges"][0]
+    assert traced["preceding_anchor"] == {"page_number": 2, "distance_bytes": 4}
+    assert traced["following_anchor"] == {"page_number": 3, "distance_bytes": 5}
+    assert traced["preceding_context_byte_start"] == 0
+    assert traced["preceding_context_byte_end"] == 0
+    assert traced["following_context_byte_start"] == 1
+    assert traced["following_context_byte_end"] == 6
+    assert traced["alternative_evidence"][0] == {
+        "source": "docling",
+        "page_number": 2,
+        "source_byte_start": 10,
+        "source_byte_end": 15,
+        "excerpt_sha256": hashlib.sha256(b"proof").hexdigest(),
+        "excerpt_utf8_bytes": 5,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("wrong_digest", "missing", "duplicate", "invented_page"),
+)
+def test_page_selector_rejects_unbound_or_nonclosed_response(mutation):
+    payload = _page_request()
+    decisions = tuple(
+        {"range_id": item["range_id"], "page_number": 2}
+        for item in payload["ranges"]
+    )
+    response = {
+        "request_sha256": payload["request_sha256"],
+        "decisions": decisions,
+    }
+    if mutation == "wrong_digest":
+        response["request_sha256"] = "0" * 64
+    elif mutation == "missing":
+        response["decisions"] = decisions[:1]
+    elif mutation == "duplicate":
+        response["decisions"] = (decisions[0], decisions[0])
+    else:
+        response["decisions"] = (
+            {**decisions[0], "page_number": 99},
+            decisions[1],
+        )
+    llm = _llm_with_parsed(_parsed(response))
+
+    selected, trace = llm.resolve_page_choices(payload)
+
+    assert selected == {}
+    assert trace["outcome"] == "invalid"
+
+
+def test_page_selector_failure_returns_recorded_fallback_signal():
+    payload = _page_request()
+    llm = _llm_with_parsed(None, refusal="cannot decide")
+
+    selected, trace = llm.resolve_page_choices(payload)
+
+    assert selected == {}
+    assert trace["outcome"] == "refusal"
+    assert llm.selection_call_traces == [trace]
 
 
 def test_bounded_id_choice_returns_existing_skeleton_id_with_sol_high():

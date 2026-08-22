@@ -10,7 +10,7 @@ from app.services.model_policy import (
 )
 
 
-def test_runtime_model_map_contains_only_three_exact_5_6_routes():
+def test_runtime_model_map_contains_only_exact_5_6_routes():
     role_map = resolved_runtime_model_map()
 
     assert role_map == {
@@ -26,12 +26,17 @@ def test_runtime_model_map_contains_only_three_exact_5_6_routes():
             "model": "gpt-5.6-luna",
             "reasoning_effort": "medium",
         },
+        "page_resolution": {
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "medium",
+        },
     }
     assert {item["model"] for item in role_map.values()} == ALLOWED_RUNTIME_MODELS
 
 
 @pytest.mark.parametrize(
-    "role", ["source_selection", "hard_selection", "image_text_review"]
+    "role",
+    ["source_selection", "hard_selection", "image_text_review", "page_resolution"],
 )
 def test_every_route_rejects_old_runtime_model(role):
     with pytest.raises(RuntimeModelPolicyError, match="disallowed runtime model"):

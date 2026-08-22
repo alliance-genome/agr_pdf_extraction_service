@@ -1,11 +1,14 @@
 import sys
 import time
+import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import celery_app
 from app.services.native_extractor_artifact import persist_native_extractor_artifact
+from app.services.page_provenance import build_source_page_provenance_bytes
 
 
 class _ProgressTask:
@@ -80,11 +83,53 @@ def test_candidate_merge_uses_two_valid_sources_when_third_is_whitespace(
         "1. Example reference for the focused integration fixture.\n"
     )
 
-    def fake_extract(method, *_args, **_kwargs):
+    def fake_extract(method, _pdf_path, file_hash, *_args, **_kwargs):
         text = "  \n\t" if method == "docling" else valid
+        if text.strip():
+            Path(celery_app._cached_path(file_hash, method)).write_text(
+                text, encoding="utf-8"
+            )
         return method, text, False
 
     monkeypatch.setattr(celery_app, "_run_single_extractor", fake_extract)
+    monkeypatch.setattr(
+        celery_app,
+        "load_native_extractor_artifact",
+        lambda source, output_filename, **_kwargs: (
+            {
+                "source": source,
+                "page_provenance_sha256": hashlib.sha256(
+                    f"map:{source}".encode()
+                ).hexdigest(),
+            },
+            b"fixture native",
+        ),
+    )
+
+    def fake_page_map(output_filename, *, manifest):
+        size = len(Path(output_filename).read_bytes())
+        return {
+            "expected_page_count": 1,
+            "record_sha256": manifest["page_provenance_sha256"],
+            "ranges": [
+                {
+                    "byte_start": 0,
+                    "byte_end": size,
+                    "page_number": 1,
+                    "candidate_pages": [1],
+                    "method": "direct",
+                    "native_id": None,
+                    "kind": None,
+                    "residual_reason": None,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        celery_app,
+        "load_source_page_provenance",
+        fake_page_map,
+    )
     input_pdf = tmp_path / "input.pdf"
     input_pdf.write_bytes(b"%PDF-1.7\npartial merge fixture")
 
@@ -322,14 +367,32 @@ def test_marker_cache_requires_images_when_requested(tmp_path, monkeypatch):
         f.write("Marker output")
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"pdf fixture")
+    native = b"{}"
+    versions = {"marker-pdf": "1.10.2"}
+    options = {
+        "disable_links": True,
+        "page_provenance": "marker_paginated_v1",
+    }
+    page_provenance = build_source_page_provenance_bytes(
+        source="marker",
+        pdf_sha256=hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+        native_bytes=native,
+        markdown_bytes=Path(marker_path).read_bytes(),
+        expected_page_count=1,
+        extractor_versions=versions,
+        options=options,
+        evidence_ranges=[],
+        residual_reason="fixture",
+    )
     persist_native_extractor_artifact(
         source="marker",
         output_filename=marker_path,
-        native_bytes=b"{}",
+        native_bytes=native,
         native_media_type="application/json",
         pdf_path=pdf_path,
-        extractor_versions={"marker-pdf": "1.10.2"},
-        options={"disable_links": True},
+        extractor_versions=versions,
+        options=options,
+        page_provenance_bytes=page_provenance,
         expected_page_count=1,
         covered_pages=[1],
     )
@@ -498,12 +561,16 @@ def test_upload_artifacts_records_durable_merged_output(tmp_path, monkeypatch):
     monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
     merged_path = tmp_path / "v1_hash_docling_merged.md"
     merged_path.write_text("# Title\n\nMerged.", encoding="utf-8")
+    Path(f"{merged_path}.page-provenance.json").write_bytes(b"{}\n")
 
     class EnabledAuditLogger:
         def upload_artifact(self, filename, content, subdir=None, tags=None):
-            assert filename == "merged.md"
-            assert content == b"# Title\n\nMerged."
-            return "pdfx/audit/process/merged.md"
+            expected = {
+                "merged.md": b"# Title\n\nMerged.",
+                "page_provenance.json": b"{}\n",
+            }
+            assert content == expected[filename]
+            return f"pdfx/audit/process/{filename}"
 
     artifacts = celery_app._upload_artifacts(
         EnabledAuditLogger(),
@@ -517,6 +584,9 @@ def test_upload_artifacts_records_durable_merged_output(tmp_path, monkeypatch):
     )
 
     assert artifacts["merged"] == "pdfx/audit/process/merged.md"
+    assert artifacts["page_provenance"] == (
+        "pdfx/audit/process/page_provenance.json"
+    )
 
 
 def test_review_images_with_text_context_applies_llm_decision(monkeypatch):

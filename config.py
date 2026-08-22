@@ -21,8 +21,8 @@ class Config:
 
     # ---- Cache versioning ----------------------------------------------------
     # Bump this when extractor config changes to invalidate old cached outputs.
-    EXTRACTION_CONFIG_VERSION = os.environ.get("EXTRACTION_CONFIG_VERSION", "6")
-    MERGE_CONTRACT_ID = "pdfx-native-skeleton-selection"
+    EXTRACTION_CONFIG_VERSION = os.environ.get("EXTRACTION_CONFIG_VERSION", "7")
+    MERGE_CONTRACT_ID = "pdfx-native-skeleton-primary-page-v1"
 
     # ---- Celery / Redis ------------------------------------------------------
     CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
@@ -84,6 +84,17 @@ class Config:
 
     IMAGE_TEXT_REVIEW_MODEL = os.environ.get("IMAGE_TEXT_REVIEW_MODEL", "gpt-5.6-luna")
     IMAGE_TEXT_REVIEW_REASONING = os.environ.get("IMAGE_TEXT_REVIEW_REASONING", "medium")
+    PAGE_RESOLUTION_MODEL = os.environ.get("PAGE_RESOLUTION_MODEL", "gpt-5.6-luna")
+    PAGE_RESOLUTION_REASONING = os.environ.get("PAGE_RESOLUTION_REASONING", "medium")
+    PAGE_PROVENANCE_LLM_MAX_RANGES_PER_BATCH = int(
+        os.environ.get("PAGE_PROVENANCE_LLM_MAX_RANGES_PER_BATCH", 24)
+    )
+    PAGE_PROVENANCE_LLM_CONTEXT_BYTES = int(
+        os.environ.get("PAGE_PROVENANCE_LLM_CONTEXT_BYTES", 512)
+    )
+    PAGE_PROVENANCE_LLM_EVIDENCE_BYTES_PER_RANGE = int(
+        os.environ.get("PAGE_PROVENANCE_LLM_EVIDENCE_BYTES_PER_RANGE", 4096)
+    )
 
     # ---- LLM pricing (USD per 1M tokens) ------------------------------------
     LLM_PRICING = {

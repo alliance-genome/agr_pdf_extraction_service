@@ -25,9 +25,51 @@ from app.services.semantic_payload import (
     build_semantic_payload_receipt,
     semantic_payload_reader_report,
 )
+from app.services.page_provenance import (
+    canonical_json_line_sha256,
+    finalize_merged_page_provenance_bytes,
+)
 
 
 CONTRACT_ID = "pdfx-native-skeleton-selection"
+TEST_PDF_SHA256 = hashlib.sha256(b"fixture pdf").hexdigest()
+
+
+def _source_page_map_digests(metrics):
+    return {
+        source: hashlib.sha256(f"page-map:{digest}".encode()).hexdigest()
+        for source, digest in metrics["source_artifact_digests"].items()
+    }
+
+
+def _page_provenance_bytes(text, metrics, audit):
+    raw = text.encode()
+    projected = [
+        {
+            "byte_start": 0,
+            "byte_end": len(raw),
+            "page_number": 1,
+            "candidate_pages": [1],
+            "method": "direct",
+            "source": metrics["baseline_source"],
+            "operation": None,
+            "region_id": None,
+            "evidence_digest": hashlib.sha256(b"fixture evidence").hexdigest(),
+            "_publication_text": True,
+            "_candidate_votes": {},
+            "_candidate_evidence": [],
+        }
+    ]
+    payload, _summary = finalize_merged_page_provenance_bytes(
+        pdf_sha256=TEST_PDF_SHA256,
+        expected_page_count=1,
+        merged_bytes=raw,
+        audit_sha256=canonical_json_line_sha256(audit),
+        merge_contract_id=metrics["merge_contract_id"],
+        source_map_sha256=_source_page_map_digests(metrics),
+        projected_ranges=projected,
+    )
+    return payload
 
 
 def _empty_native_italic_receipt() -> dict:
@@ -188,6 +230,8 @@ def _load_expectations(metrics: dict) -> dict:
         "expected_skeleton_candidate_projection_ids": metrics[
             "document_skeleton_candidate_projection_ids"
         ],
+        "expected_pdf_sha256": TEST_PDF_SHA256,
+        "expected_source_page_map_sha256": _source_page_map_digests(metrics),
     }
 
 
@@ -397,6 +441,9 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             for source, artifact in artifacts.items()
         },
         expected_contract_id=CONTRACT_ID,
+        page_provenance_bytes=_page_provenance_bytes(text, metrics, audit),
+        pdf_sha256=TEST_PDF_SHA256,
+        source_page_map_sha256=_source_page_map_digests(metrics),
     )
     assert manifest == bundle_manifest_path(merged)
     assert load_merge_bundle(
@@ -422,6 +469,8 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             expected_skeleton_candidate_projection_ids=metrics[
                 "document_skeleton_candidate_projection_ids"
             ],
+            expected_pdf_sha256=TEST_PDF_SHA256,
+            expected_source_page_map_sha256=_source_page_map_digests(metrics),
         )
     with pytest.raises(ValueError, match="native skeleton identity"):
         load_merge_bundle(
@@ -435,6 +484,8 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             expected_skeleton_candidate_projection_ids=metrics[
                 "document_skeleton_candidate_projection_ids"
             ],
+            expected_pdf_sha256=TEST_PDF_SHA256,
+            expected_source_page_map_sha256=_source_page_map_digests(metrics),
         )
     with pytest.raises(ValueError, match="native skeleton identity"):
         load_merge_bundle(
@@ -448,6 +499,8 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
                 "document_skeleton_candidate_ids"
             ],
             expected_skeleton_candidate_projection_ids={"grobid": "0" * 64},
+            expected_pdf_sha256=TEST_PDF_SHA256,
+            expected_source_page_map_sha256=_source_page_map_digests(metrics),
         )
     with pytest.raises(ValueError, match="manifest identity"):
         load_merge_bundle(
@@ -458,6 +511,43 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             expected_contract_id="pdfx-source-selection",
             **_load_expectations(metrics),
         )
+    with pytest.raises(ValueError, match="native skeleton identity"):
+        load_merge_bundle(
+            merged_path=str(merged),
+            metrics_path=str(metric_file),
+            audit_path=str(audit_file),
+            artifacts=artifacts,
+            expected_contract_id=CONTRACT_ID,
+            **{
+                **_load_expectations(metrics),
+                "expected_pdf_sha256": "0" * 64,
+            },
+        )
+    with pytest.raises(ValueError, match="native skeleton identity"):
+        load_merge_bundle(
+            merged_path=str(merged),
+            metrics_path=str(metric_file),
+            audit_path=str(audit_file),
+            artifacts=artifacts,
+            expected_contract_id=CONTRACT_ID,
+            **{
+                **_load_expectations(metrics),
+                "expected_source_page_map_sha256": {"grobid": "0" * 64},
+            },
+        )
+    page_path = Path(f"{merged}.page-provenance.json")
+    page_bytes = page_path.read_bytes()
+    page_path.write_bytes(page_bytes + b" ")
+    with pytest.raises(ValueError, match="manifest digest"):
+        load_merge_bundle(
+            merged_path=str(merged),
+            metrics_path=str(metric_file),
+            audit_path=str(audit_file),
+            artifacts=artifacts,
+            expected_contract_id=CONTRACT_ID,
+            **_load_expectations(metrics),
+        )
+    page_path.write_bytes(page_bytes)
     merged.write_text("tampered\n", encoding="utf-8")
     with pytest.raises(ValueError, match="manifest digest"):
         load_merge_bundle(
@@ -468,6 +558,46 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             expected_contract_id=CONTRACT_ID,
             **_load_expectations(metrics),
         )
+
+
+@pytest.mark.parametrize(
+    ("pdf_sha256", "source_page_map_sha256"),
+    [
+        ("0" * 64, None),
+        (TEST_PDF_SHA256, {"grobid": "0" * 64}),
+    ],
+)
+def test_merge_bundle_validates_page_map_against_caller_authority(
+    tmp_path, pdf_sha256, source_page_map_sha256
+):
+    text = "# Title\nBody\n"
+    artifacts, metrics, audit = _case(text)
+    expected_source_maps = _source_page_map_digests(metrics)
+
+    with pytest.raises(ValueError, match="merged page provenance binding"):
+        persist_merge_bundle(
+            merged_path=str(tmp_path / "merged.md"),
+            metrics_path=str(tmp_path / "metrics.json"),
+            audit_path=str(tmp_path / "audit.json"),
+            text=text,
+            metrics=metrics,
+            audit=audit,
+            artifacts=artifacts,
+            skeletons={
+                source: build_document_skeleton(artifact, None)
+                for source, artifact in artifacts.items()
+            },
+            expected_contract_id=CONTRACT_ID,
+            page_provenance_bytes=_page_provenance_bytes(text, metrics, audit),
+            pdf_sha256=pdf_sha256,
+            source_page_map_sha256=(
+                expected_source_maps
+                if source_page_map_sha256 is None
+                else source_page_map_sha256
+            ),
+        )
+
+    assert not (tmp_path / "merged.md").exists()
 
 
 def test_manifest_binds_the_exact_source_generation(tmp_path):
@@ -485,6 +615,9 @@ def test_manifest_binds_the_exact_source_generation(tmp_path):
             for source, artifact in artifacts.items()
         },
         expected_contract_id=CONTRACT_ID,
+        page_provenance_bytes=_page_provenance_bytes(text, metrics, audit),
+        pdf_sha256=TEST_PDF_SHA256,
+        source_page_map_sha256=_source_page_map_digests(metrics),
     )
     newer = {"grobid": SourceArtifact.from_text("grobid", text + "changed")}
     with pytest.raises(ValueError, match="source digest"):
@@ -510,6 +643,9 @@ def test_alias_commit_is_digest_checked(tmp_path):
             for source, artifact in artifacts.items()
         },
         expected_contract_id=CONTRACT_ID,
+        page_provenance_bytes=_page_provenance_bytes(text, metrics, audit),
+        pdf_sha256=TEST_PDF_SHA256,
+        source_page_map_sha256=_source_page_map_digests(metrics),
     )
     alias = tmp_path / "alias.md"
     persist_merge_alias(str(alias), text, metrics, bundle_manifest_path=manifest)
@@ -539,6 +675,9 @@ def test_alias_commit_requires_its_exact_bundle_manifest(tmp_path, mutation):
             for source, artifact in artifacts.items()
         },
         expected_contract_id=CONTRACT_ID,
+        page_provenance_bytes=_page_provenance_bytes(text, metrics, audit),
+        pdf_sha256=TEST_PDF_SHA256,
+        source_page_map_sha256=_source_page_map_digests(metrics),
     )
     alias = tmp_path / "alias.md"
     persist_merge_alias(str(alias), text, metrics, bundle_manifest_path=manifest)

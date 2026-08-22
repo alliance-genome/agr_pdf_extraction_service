@@ -27,6 +27,11 @@ from app.services.document_skeleton import (
     project_native_emphasis,
     reconcile_native_emphasis_fallback,
 )
+from app.services.page_provenance import (
+    MERGED_PAGE_PROVENANCE_MEDIA_TYPE,
+    merged_page_provenance_path,
+    validate_merged_page_provenance_bytes,
+)
 
 
 MANIFEST_SCHEMA = "pdfx-source-merge-manifest"
@@ -1177,6 +1182,9 @@ def persist_merge_bundle(
     artifacts: Mapping[SourceName, SourceArtifact],
     skeletons: Mapping[SourceName, DocumentSkeleton],
     expected_contract_id: str,
+    page_provenance_bytes: bytes,
+    pdf_sha256: str,
+    source_page_map_sha256: Mapping[str, str],
     alias_path: str | None = None,
 ) -> str:
     """Write content first and the visibility manifest last."""
@@ -1192,9 +1200,21 @@ def persist_merge_bundle(
     merged_bytes = text.encode("utf-8")
     metrics_bytes = _json_bytes(dict(metrics))
     audit_bytes = _json_bytes(list(audit))
+    page_payload = json.loads(page_provenance_bytes)
+    validate_merged_page_provenance_bytes(
+        page_provenance_bytes,
+        pdf_sha256=pdf_sha256,
+        merged_sha256=output_digest,
+        merged_size_bytes=len(merged_bytes),
+        audit_sha256=_sha256(audit_bytes),
+        merge_contract_id=expected_contract_id,
+        source_map_sha256=source_page_map_sha256,
+    )
     _atomic_write(merged_path, merged_bytes)
     _atomic_write(metrics_path, metrics_bytes)
     _atomic_write(audit_path, audit_bytes)
+    page_path = merged_page_provenance_path(merged_path)
+    _atomic_write(page_path, page_provenance_bytes)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "contract_id": expected_contract_id,
@@ -1204,6 +1224,12 @@ def persist_merge_bundle(
         "metrics_sha256": _sha256(metrics_bytes),
         "audit_filename": Path(audit_path).name,
         "audit_sha256": _sha256(audit_bytes),
+        "pdf_sha256": page_payload["pdf_sha256"],
+        "page_provenance_filename": page_path.name,
+        "page_provenance_media_type": MERGED_PAGE_PROVENANCE_MEDIA_TYPE,
+        "page_provenance_sha256": _sha256(page_provenance_bytes),
+        "page_provenance_size_bytes": len(page_provenance_bytes),
+        "source_page_map_sha256": dict(page_payload["source_map_sha256"]),
         "source_artifact_digests": {
             source: artifacts[source].digest for source in sorted(artifacts)
         },
@@ -1248,6 +1274,8 @@ def load_merge_bundle(
     expected_native_structure_receipt_digests: Mapping[SourceName, str],
     expected_skeleton_candidate_ids: Mapping[SourceName, str],
     expected_skeleton_candidate_projection_ids: Mapping[SourceName, str],
+    expected_pdf_sha256: str,
+    expected_source_page_map_sha256: Mapping[SourceName, str],
 ) -> tuple[str, dict, list]:
     manifest = json.loads(Path(bundle_manifest_path(merged_path)).read_text("utf-8"))
     if manifest.get("schema") != MANIFEST_SCHEMA or manifest.get("contract_id") != expected_contract_id:
@@ -1269,11 +1297,16 @@ def load_merge_bundle(
         != ABC_PARSER_IMPLEMENTATION_SHA256
         or manifest.get("semantic_payload_contract_version")
         != SEMANTIC_PAYLOAD_CONTRACT_VERSION
+        or manifest.get("pdf_sha256") != expected_pdf_sha256
+        or manifest.get("source_page_map_sha256")
+        != dict(expected_source_page_map_sha256)
     ):
         raise ValueError("merge manifest native skeleton identity mismatch")
     merged_bytes = Path(merged_path).read_bytes()
     metrics_bytes = Path(metrics_path).read_bytes()
     audit_bytes = Path(audit_path).read_bytes()
+    page_path = merged_page_provenance_path(merged_path)
+    page_bytes = page_path.read_bytes()
     if (
         manifest.get("output_filename") != Path(merged_path).name
         or manifest.get("metrics_filename") != Path(metrics_path).name
@@ -1281,6 +1314,11 @@ def load_merge_bundle(
         or manifest.get("output_sha256") != _sha256(merged_bytes)
         or manifest.get("metrics_sha256") != _sha256(metrics_bytes)
         or manifest.get("audit_sha256") != _sha256(audit_bytes)
+        or manifest.get("page_provenance_filename") != page_path.name
+        or manifest.get("page_provenance_media_type")
+        != MERGED_PAGE_PROVENANCE_MEDIA_TYPE
+        or manifest.get("page_provenance_sha256") != _sha256(page_bytes)
+        or manifest.get("page_provenance_size_bytes") != len(page_bytes)
     ):
         raise ValueError("merge manifest digest mismatch")
     text = merged_bytes.decode("utf-8")
@@ -1304,6 +1342,15 @@ def load_merge_bundle(
         audit,
         artifacts=artifacts,
         expected_contract_id=expected_contract_id,
+    )
+    validate_merged_page_provenance_bytes(
+        page_bytes,
+        pdf_sha256=expected_pdf_sha256,
+        merged_sha256=_sha256(merged_bytes),
+        merged_size_bytes=len(merged_bytes),
+        audit_sha256=_sha256(audit_bytes),
+        merge_contract_id=expected_contract_id,
+        source_map_sha256=expected_source_page_map_sha256,
     )
     return text, metrics, audit
 
