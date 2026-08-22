@@ -1,7 +1,7 @@
 # PDFX Incident and Page-Provenance Redesign Plan
 
 **Date:** 2026-08-22  
-**Status:** PR A open as #43; bounded Claude review requested
+**Status:** PR A #43 review complete; no supported blockers remain
 **Clean implementation base:** `origin/main` at `673ab52`  
 **Reference implementation only:** PR #42 / `fix/style-selection-receipt-consistency`
 
@@ -207,6 +207,13 @@ Current implementation evidence:
   High-value simplification. The reviewer independently reran the 99-test
   focused slice; unavailable `8394599` release evidence was the sole
   non-code follow-up.
+- [x] Claude reviewed PR #43 against the bounded contract and reported no
+  blockers, confirmed the change is not overengineered, and identified four
+  explicitly non-blocking notes. The producer comment and extra unit test are
+  optional coverage/documentation ideas; checklist splitting is optional
+  presentation; and the existing replay spy remains a defensible explicit
+  assertion. None supplies evidence for expanding the patch or requesting a
+  second review round.
 
 ### PR B: Repository-wide deterministic transformation contract
 
@@ -611,22 +618,22 @@ Use this framing in the initial Claude request:
 
 ### 13.3 Claude iteration stop rules
 
-- [ ] Classify each Claude finding using the same evidence standard as
+- [x] Classify each Claude finding using the same evidence standard as
   `$max-review-skill`; do not implement a suggestion merely because it was
   suggested.
-- [ ] Implement supported Blockers and Material corrections. Implement a
+- [x] Implement supported Blockers and Material corrections. Implement a
   High-value simplification only when it removes concrete present complexity
   or risk introduced by this PR.
-- [ ] Do not implement Optional simplifications or outside-scope observations
+- [x] Do not implement Optional simplifications or outside-scope observations
   in the incident PR; record them separately if they remain useful.
-- [ ] Request another Claude review only after a material code change that
+- [x] Request another Claude review only after a material code change that
   could affect its earlier conclusion. Do not request ceremonial additional
   rounds after documentation-only replies or disposition of unsupported
   comments.
-- [ ] Before every additional round, compare the diff with the accepted scope
+- [x] Before every additional round, compare the diff with the accepted scope
   and the Avoidance of Over-Engineering gate. Remove or narrow unsupported
   growth before asking again.
-- [ ] Stop iterating when no supported Blocker or Material correction remains.
+- [x] Stop iterating when no supported Blocker or Material correction remains.
   Zero comments, theoretical completeness, and reviewer exhaustion are not
   completion criteria.
 
