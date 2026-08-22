@@ -1,7 +1,7 @@
 # PDFX Incident and Page-Provenance Redesign Plan
 
 **Date:** 2026-08-22  
-**Status:** PR A local review passed; ready for PR publication
+**Status:** PR A open as #43; bounded Claude review requested
 **Clean implementation base:** `origin/main` at `673ab52`  
 **Reference implementation only:** PR #42 / `fix/style-selection-receipt-consistency`
 
@@ -586,13 +586,13 @@ PR is presented as ready for human review.
 
 ### 13.2 Opening the PR and requesting Claude review
 
-- [ ] Open the PR only after the local final-review gate passes.
-- [ ] Include the applicable acceptance checklist, production evidence, test
+- [x] Open the PR only after the local final-review gate passes.
+- [x] Include the applicable acceptance checklist, production evidence, test
   results, scan/call-count evidence, changed-file justification, and explicit
   exclusions in the PR description.
-- [ ] Ask Claude to review correctness, behavior preservation, integration,
+- [x] Ask Claude to review correctness, behavior preservation, integration,
   and proportionality against this bounded contract.
-- [ ] Tell Claude explicitly that review comments are not a request to broaden
+- [x] Tell Claude explicitly that review comments are not a request to broaden
   the work into page provenance, parser changes, merge-policy redesign, a
   general text-edit framework, exhaustive edge-case matrices, fallbacks, or
   compatibility machinery unless a concrete reachable defect requires it.
