@@ -1,7 +1,7 @@
 # PDFX Incident and Page-Provenance Redesign Plan
 
 **Date:** 2026-08-22  
-**Status:** Planning; no implementation approved  
+**Status:** PR A implementation in progress
 **Clean implementation base:** `origin/main` at `673ab52`  
 **Reference implementation only:** PR #42 / `fix/style-selection-receipt-consistency`
 
@@ -167,19 +167,41 @@ Constraints:
 
 Acceptance criteria:
 
-- [ ] Exactly the three named replay-derived diagnostics are excluded from
+- [x] Exactly the three named replay-derived diagnostics are excluded from
   call grouping; no other `style_selection_*` field is excluded.
-- [ ] Persisted style events are not rewritten or normalized.
+- [x] Persisted style events are not rewritten or normalized.
 - [ ] Synthetic regressions matching `8394599` and `8395484` succeed; exact
   cached artifacts succeed as local release evidence.
-- [ ] Changing a real request digest, candidate or selected identity, response
+- [x] Changing a real request digest, candidate or selected identity, response
   choice, model metadata, or matching trace still fails closed.
-- [ ] Changing a persisted replay diagnostic without its corresponding
+- [x] Changing a persisted replay diagnostic without its corresponding
   replay-derived value still fails exact event reconciliation.
-- [ ] Receipt validation invokes no model provider or model-selection
+- [x] Receipt validation invokes no model provider or model-selection
   resolver.
-- [ ] No parser, fuzzy-alignment, structural-scan, audit-schema, or
+- [x] No parser, fuzzy-alignment, structural-scan, audit-schema, or
   cache-contract behavior changes.
+
+Current implementation evidence:
+
+- [x] A synthetic duplicate-call regression failed on `origin/main` with the
+  production error and passes after excluding only the three replay-derived
+  diagnostics.
+- [x] The exact preserved `8395484` cache (`927dd77e…`) completes merge and
+  full `validate_merge_artifacts()` replay: 65 style groups, 50 duplicate
+  groups, 11 raw diagnostic-only inconsistencies, and zero canonical receipt
+  inconsistencies.
+- [x] Exact-cache mutation evidence rejects a changed response choice during
+  call grouping and rejects a changed donor ordinal during complete replay.
+- [x] `test_merge_artifact.py` plus `test_document_skeleton.py`: 99 passed.
+- [x] Broader backend suite in the available sibling virtual environment: 446
+  passed and 6 skipped. The Torch-dependent Marker test module and the
+  Docling-package-metadata test module were excluded because those optional
+  dependencies are not installed in that environment; neither module
+  exercises this receipt-grouping change.
+- [ ] Re-run the exact `8394599` artifacts. Its former backend cache hash is
+  known (`c8081bce…`), but that cache was on the terminated production worker
+  and is not in the preserved local capture; recover the cache or obtain the
+  source PDF before checking this item.
 
 ### PR B: Repository-wide deterministic transformation contract
 
