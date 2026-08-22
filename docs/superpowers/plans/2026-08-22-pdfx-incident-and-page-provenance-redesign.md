@@ -1,7 +1,7 @@
 # PDFX Incident and Page-Provenance Redesign Plan
 
 **Date:** 2026-08-22  
-**Status:** PR A #43 merged/deployed; PR B passed final local Max review
+**Status:** PR A #43 and PR B #44 merged, deployed, and production-canary verified; PR C/D gated
 **Clean implementation base:** `origin/main` at `9c07feb`
 **Reference implementation only:** PR #42 / `fix/style-selection-receipt-consistency`
 
@@ -397,6 +397,28 @@ Validation currently recorded:
   builder's `ValueError` with `ConsensusContractError` was not implemented:
   every current reachable caller already catches `Exception`, so no present
   failure or acceptance-criterion violation supports widening the code diff.
+
+PR B deployment evidence:
+
+- [x] PR #44 merged as `9324afdc947ee05e0a9304aedb4deb436da6ca7f`.
+- [x] Main Build and Deploy run `32552863851` initially failed before
+  publication because AWS had no `g6.2xlarge` capacity in `us-east-1c`. One
+  failed-job retry succeeded without a code or configuration change; the
+  capacity failure was operational and no partial AMI publication occurred.
+- [x] SSM now publishes the matched pair `ami-0c68817944e447e45` and immutable
+  backend image tag `9324afdc947ee05e0a9304aedb4deb436da6ca7f`.
+- [x] Production canary `d04d473c-c8a5-4f65-b8ac-7333a6b40707` used the
+  repository-owned `deploy/aws/ami/test-sample.pdf`, cleared cache, completed
+  Docling, GROBID, Marker, and the merge, and returned a 200 merged download
+  (148 bytes, SHA-256 `516a5581302e80aaa325f5ed0493fc1d391a83e2d10ba48610129048dc3590fe`).
+- [x] The canary instance booted from the exact published AMI. Bootstrap
+  reported `marker_models=ok` and `GPU worker CUDA: HEALTHY (NVIDIA L4)`;
+  deep health reported an empty queue and no active work after completion.
+- [x] The GPU ASG returned to desired/count zero. The unchanged
+  `pdfx-proxy:56` task was recycled after manual scale-down so final idle
+  health reports `ec2=stopped`, queue depth zero, and no active jobs.
+- [x] Final scope audit: PR C and PR D were not started. Both remain gated on
+  the page-transport contract decisions and prerequisites documented below.
 
 ### PR C: Alliance parser transport contract
 
