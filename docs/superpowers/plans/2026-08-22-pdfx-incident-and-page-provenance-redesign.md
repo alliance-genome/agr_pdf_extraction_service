@@ -317,7 +317,10 @@ Acceptance criteria:
   digests, operation kinds, and event reconciliation.
 - [x] Existing valid role-order, heading, table, reference, emphasis, newline,
   and fallback fixtures preserve their visible output and prior success or
-  failure behavior.
+  failure behavior, except where an already-emitted deterministic operation
+  was rejected solely because final validation omitted its declared shape.
+  The reachable `alliance_title_composite_join` path is the one additional
+  success correction and now has final-audit regression coverage.
 - [x] Existing valid fixtures preserve their Alliance reader model; PR B does
   not change publication-role decisions or output ordering.
 - [x] No current scan, parser, fuzzy-alignment, or model-call count increases.
@@ -386,6 +389,14 @@ Validation currently recorded:
   independently reran both test slices, checked old same-contract composite
   receipts, and found the central operation-shape module proportional to the
   five existing emitters rather than a general edit framework.
+- [x] Claude's bounded PR #44 review found the core change correct and no
+  blocker. Its concrete observation that `alliance_title_composite_join` now
+  changes a latent hard failure into success was accepted: the existing title
+  composition test now runs final audit validation and the intentional success
+  correction is recorded above. Its non-blocking suggestion to replace the
+  builder's `ValueError` with `ConsensusContractError` was not implemented:
+  every current reachable caller already catches `Exception`, so no present
+  failure or acceptance-criterion violation supports widening the code diff.
 
 ### PR C: Alliance parser transport contract
 

@@ -1889,6 +1889,7 @@ def test_role_slot_renderer_promotes_one_peer_proved_title_orders_back_matter_an
     assert sum(
         entry["output_byte_end"] - entry["output_byte_start"] for entry in audit
     ) == len(rendered.encode())
+    _validate_audit(rendered.encode(), audit, {"docling": docling})
     assert events or role_events
 
 
