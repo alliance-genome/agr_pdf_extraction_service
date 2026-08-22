@@ -35,6 +35,24 @@ authority for that goal.
   only those four were implemented: GROBID coverage separation, real Marker
   dual-render proof, complete deterministic-ownership coverage, and
   caller-authoritative final sidecar digest validation.
+- The repeated bounded Claude collaboration found one further Material
+  Docling defect against pinned `docling-core==2.87.1`: a primary provenance
+  order such as `1,2,1,3` can satisfy the transition-count check while placing
+  revisited page-1 bytes in a range labelled page 2. Before merge, PDFX must
+  validate the primary native page order with the exact explicit content-layer
+  and picture-traversal settings used by the Markdown export, and fail closed
+  to the existing residual path on any decrease. This is the only supported
+  Material correction from that review; blank-page recovery and generalized
+  provenance changes remain out of scope.
+- That correction now passes 27 focused Docling/page-provenance tests,
+  including a real `docling-core==2.87.1` subprocess fixture; the broader
+  backend suite passes 490 tests with 6 existing host-only Marker skips, and
+  the proxy suite passes all 189 tests. Scoped Ruff, `py_compile`, and
+  `git diff --check` pass.
+- The required repeated GPT-5.6 Sol/xhigh `$max-review-skill` gate returned
+  `Accept with follow-ups`, with no supported Blocker, Material correction, or
+  High-value simplification remaining. Its only gates are commit/push, parser
+  publication, and the preserved deployment canaries.
 - Parser publication remains operationally blocked: PyPI currently resolves
   only 1.6.0 and no publisher credential is materialized on this host. A clean
   PDFX build/deploy cannot proceed until 1.7.0 is published.
@@ -203,6 +221,15 @@ Add a dedicated `page_provenance` service. Do not extend
 4. Preserve global serialization; never concatenate per-page exports.
 5. If known nested-group or skipped-page behavior makes a boundary unsafe,
    leave the affected source range residual rather than guessing.
+6. Pin identical explicit content-layer and picture-traversal settings on the
+   Markdown export and its native-order validation walk; do not rely on
+   third-party defaults remaining equal.
+7. Validate the ordered primary `prov[0].page_no` sequence used by the
+   serializer. If it ever decreases, preserve the exact Markdown and leave the
+   complete Docling source map residual rather than emitting plausible but
+   wrong `direct` page evidence.
+8. Do not use secondary coordinates from a multi-page item's `prov` list for
+   this order check, and do not raise or drop Docling on an order failure.
 
 ### 5.2 Marker
 
@@ -330,6 +357,12 @@ changes are explicitly deferred to a separate goal after PDFX is proven.
 
 - [ ] Docling's 51-, 27-, and 24-page captures reproduce every expected safe
   transition and the current Markdown SHA exactly.
+- [x] A pinned real Docling fixture with primary provenance order `1,2,1,3`
+  preserves exact Markdown but produces residual rather than wrong `direct`
+  page evidence; a monotonic fixture retains direct ranges.
+- [x] Docling Markdown export and order validation use the same explicit
+  content layers and picture traversal, with byte identity against the current
+  pinned default proven by test.
 - [x] Marker fixtures cover tables, lists, blank pages, images/links, and the
   terminal page while preserving current cleaned Markdown exactly.
 - [ ] GROBID directly maps at least 95% of source Markdown bytes on both Debbie
@@ -415,6 +448,9 @@ Every checkbox blocks release if violated:
     required gate passes.
 12. Deploy PDFX, run the three canaries, and monitor extraction failures,
     sidecar validation, fallback counts, latency, and LLM cost.
+    For each canary, explicitly record Docling source direct/residual byte
+    counts and final `byte_counts_by_method`; inspect the final pages rather
+    than treating healthy-looking method counts as proof of correctness.
 13. Close PR #42 as superseded after the replacement is deployed and verified.
 14. Create a separate AI Curation goal only after the PDFX artifact contract is
     production-proven.
@@ -437,19 +473,19 @@ supported Blocker or Material correction remains.
 
 ## 12. Mandatory Final Goal Review
 
-- [ ] At the end of each implementation PR, spawn a **GPT-5.6 Sol sub-agent
+- [x] At the end of each implementation PR, spawn a **GPT-5.6 Sol sub-agent
   with xhigh reasoning**.
-- [ ] Its prompt **MUST explicitly invoke `$max-review-skill`** and identify
+- [x] Its prompt **MUST explicitly invoke `$max-review-skill`** and identify
   this goal document, the final diff, preserved production captures,
   acceptance criteria, and Avoidance of Over-Engineering checklist.
-- [ ] Require evidence-backed finding labels and the smallest complete
+- [x] Require evidence-backed finding labels and the smallest complete
   correction. The reviewer must not invent theoretical edge cases,
   generalized frameworks, or unreachable test combinations.
-- [ ] Resolve every supported Blocker, Material correction, and High-value
+- [x] Resolve every supported Blocker, Material correction, and High-value
   simplification.
-- [ ] If material code changes follow, rerun affected tests and repeat the same
+- [x] If material code changes follow, rerun affected tests and repeat the same
   GPT-5.6 Sol/xhigh `$max-review-skill` review.
-- [ ] Do not proceed to Claude or declare the PR ready until the local verdict
+- [x] Do not proceed to Claude or declare the PR ready until the local verdict
   is `Accept` or `Accept with follow-ups` with no supported Blocker, Material
   correction, or High-value simplification outstanding.
 - [ ] After the local gate, iterate with Claude only under the bounded rules in

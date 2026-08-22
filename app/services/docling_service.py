@@ -25,6 +25,7 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
+from docling_core.types.doc import ContentLayer
 
 try:
     from rapidocr.utils.typings import EngineType, LangDet, LangRec, ModelType, OCRVersion
@@ -42,6 +43,32 @@ logger = logging.getLogger(__name__)
 
 # Process-level converter cache — survives across Celery tasks within the same fork
 _cached_converters = {}  # keyed by Docling accelerator and OCR configuration
+
+# Keep the native order check and Markdown serializer on one explicit traversal
+# contract. A subset check could miss a page decrease in serialized content.
+DOCLING_MARKDOWN_CONTENT_LAYERS = frozenset({ContentLayer.BODY})
+DOCLING_MARKDOWN_TRAVERSE_PICTURES = False
+
+
+def _docling_primary_page_order_is_monotonic(document) -> bool:
+    """Return whether serialized Docling items stay in forward PDF page order."""
+
+    previous_page = None
+    for item, _level in document.iterate_items(
+        with_groups=True,
+        included_content_layers=set(DOCLING_MARKDOWN_CONTENT_LAYERS),
+        traverse_pictures=DOCLING_MARKDOWN_TRAVERSE_PICTURES,
+    ):
+        provenance = getattr(item, "prov", None)
+        if not provenance:
+            continue
+        page_number = getattr(provenance[0], "page_no", None)
+        if type(page_number) is not int or page_number < 1:
+            return False
+        if previous_page is not None and page_number < previous_page:
+            return False
+        previous_page = page_number
+    return True
 
 
 def _get_rapidocr_model_type():
@@ -228,15 +255,24 @@ class Docling(PDFExtractor):
         if total_pages <= 0:
             raise RuntimeError("Docling reported zero pages for document; cannot export markdown.")
 
+        primary_page_order_is_monotonic = _docling_primary_page_order_is_monotonic(doc)
+        if not primary_page_order_is_monotonic:
+            logger.warning(
+                "Docling primary provenance page order decreased; "
+                "page evidence will remain residual"
+            )
         paginated_markdown = doc.export_to_markdown(
             image_placeholder="",
             page_break_placeholder=page_sentinel,
             text_width=-1,
+            included_content_layers=set(DOCLING_MARKDOWN_CONTENT_LAYERS),
+            traverse_pictures=DOCLING_MARKDOWN_TRAVERSE_PICTURES,
         )
         markdown, page_ranges = docling_markdown_with_page_ranges(
             paginated_markdown,
             sentinel=page_sentinel,
             expected_page_count=total_pages,
+            primary_page_order_is_monotonic=primary_page_order_is_monotonic,
         )
         if not markdown:
             raise RuntimeError("Docling returned empty Markdown.")

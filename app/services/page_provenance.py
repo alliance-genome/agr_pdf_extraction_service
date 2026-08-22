@@ -141,20 +141,23 @@ def docling_markdown_with_page_ranges(
     *,
     sentinel: str,
     expected_page_count: int,
+    primary_page_order_is_monotonic: bool,
 ) -> tuple[str, list[dict]]:
     """Remove Docling's transient page token without another render pass."""
 
     if type(expected_page_count) is not int or expected_page_count < 1:
         raise ValueError("expected page count must be a positive integer")
+    if type(primary_page_order_is_monotonic) is not bool:
+        raise ValueError("Docling primary page order status must be boolean")
     occurrences = paginated_markdown.count(sentinel)
     expected_transitions = expected_page_count - 1
-    if occurrences > expected_transitions:
+    if primary_page_order_is_monotonic and occurrences > expected_transitions:
         raise ValueError("Docling page sentinel collides with rendered content")
     parts = paginated_markdown.split(sentinel)
     markdown = "".join(parts).strip()
     if not markdown:
         return markdown, []
-    if occurrences != expected_transitions:
+    if not primary_page_order_is_monotonic or occurrences != expected_transitions:
         return markdown, []
     return _trimmed_partition(
         [(part, page_number) for page_number, part in enumerate(parts, start=1)]

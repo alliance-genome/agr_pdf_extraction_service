@@ -61,6 +61,7 @@ def test_docling_transition_removal_preserves_markdown_and_utf8_offsets():
         paginated,
         sentinel=sentinel,
         expected_page_count=2,
+        primary_page_order_is_monotonic=True,
     )
 
     assert markdown == "α page one\n\n\n\n漢 page two"
@@ -79,9 +80,25 @@ def test_docling_unsafe_transition_inventory_leaves_all_bytes_residual():
         "first and third",
         sentinel="MISSING",
         expected_page_count=3,
+        primary_page_order_is_monotonic=True,
     )
 
     assert markdown == "first and third"
+    assert ranges == []
+
+
+def test_docling_non_monotonic_primary_page_order_leaves_all_bytes_residual():
+    sentinel = "PDFX_DOCLING_PAGE_BOUNDARY_TEST"
+    paginated = f"page one{sentinel}page two and revisited one{sentinel}page three"
+
+    markdown, ranges = docling_markdown_with_page_ranges(
+        paginated,
+        sentinel=sentinel,
+        expected_page_count=3,
+        primary_page_order_is_monotonic=False,
+    )
+
+    assert markdown == "page onepage two and revisited onepage three"
     assert ranges == []
 
 
