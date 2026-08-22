@@ -145,7 +145,7 @@ budget is exceeded.
 
 Do not combine these into one large PR.
 
-### PR A: Minimal PDFX incident fixes
+### PR A: Minimal style-receipt incident fix
 
 Scope:
 
@@ -154,33 +154,92 @@ Scope:
 2. Preserve strict validation of the actual request and choice fields.
 3. Keep receipt grouping and failure handling entirely programmatic; do not
    introduce an LLM retry, judge, or tie-breaker for receipt consistency.
-4. Make generated bibliography/figure heading text and any required leading
-   whitespace separate deterministic operations so later interval permutation
-   cannot split one content-bearing digest.
-5. Define narrow validators for each generated operation.
-6. Add exact regressions for both Debbie failure classes.
+4. Add exact regressions for the two style-receipt failures.
 
 Constraints:
 
-- No page-provenance behavior.
+- No deterministic-transformation or page-provenance behavior.
 - No new parser calls.
 - No new fuzzy-alignment calls.
 - No new LLM calls or prompts.
 - No cache-contract bump unless the persisted receipt shape actually changes.
-- No generic deterministic-span rebinding.
+- No audit-operation redesign.
 
 Acceptance criteria:
 
-- Exact `8395208` artifacts complete a no-model merge and final audit
-  validation.
-- Exact `8395484` artifacts replay duplicate style decisions successfully.
+- Exact `8394599` and `8395484` artifacts replay duplicate style decisions
+  successfully.
 - Mutating the real style response choice fails closed.
 - Tests prove receipt validation invokes no model provider or model-selection
   resolver.
-- Clipping `12. ` to `2. ` remains invalid.
 - Scan-count tests show no increase from `origin/main`.
 
-### PR B: Alliance parser transport contract
+### PR B: Repository-wide deterministic transformation contract
+
+The `8395208` failure is the first acceptance case, not the boundary of this
+work. Inventory every existing PDFX path that creates, deletes, replaces, or
+moves bytes after extraction, and make those paths obey one audit contract at
+the composition boundary. Keep this scoped to existing transformations; do not
+build a general-purpose text-edit framework for hypothetical future behavior.
+
+Core invariant:
+
+> A content-bearing deterministic audit atom may never straddle a structural
+> permutation boundary.
+
+If a proposed boundary lands inside such an atom, the transformation must move
+the complete atom according to its declared boundary ownership or reject the
+transformation before output. It must never silently clip the bytes and assign
+the old digest, range, or semantic identity to the fragments.
+
+Scope:
+
+1. Inventory all existing deterministic transformation producers and
+   consumers, including generated headings, boundary whitespace, deletions,
+   replacements, source-byte permutations, and final audit validation.
+2. Introduce one typed operation description at the existing audit boundary
+   containing only the facts validation needs: operation kind, source/output
+   interval, exact replacement bytes or digest, boundary ownership, atomicity,
+   and the operation-specific validator identity.
+3. Represent meaningful generated content and incidental boundary whitespace
+   as separate operations at creation time.
+4. Make structural permutations consume complete audit atoms. Reject a cut
+   through an atomic operation before constructing output.
+5. Centralize the registered operation kinds and their validators so creation,
+   composition, and final validation cannot develop separate allowlists.
+6. Reconcile the composed audit against the final byte partition, exact
+   digests, and operation events without rescanning Markdown semantics.
+7. Convert each current deterministic edit path to the contract and remove its
+   duplicate clipping/rebinding rules.
+8. Add composition tests that exercise deterministic operations before and
+   after every currently supported structural permutation.
+
+Constraints:
+
+- No LLM calls or semantic judgment.
+- No regex-based reconstruction of document roles.
+- No new `read_markdown()`, fuzzy-alignment, or whole-document scan passes.
+- No generic "rehash the clipped fragment" escape hatch.
+- No new operation abstraction beyond behavior already present in the
+  repository.
+
+Acceptance criteria:
+
+- Exact `8395208` artifacts complete the no-model merge and final
+  `_validate_audit`.
+- Every existing content-bearing deterministic operation is atomic by default;
+  any exception is named, shape-validated, and justified in the operation
+  registry.
+- Clipping `12. ` to `2. ` remains invalid.
+- A boundary placed inside a generated References or Figure Legends heading is
+  either moved outside the complete atom or rejected before output.
+- Tests validate full audit integrity, not only visible bytes or interval
+  coverage.
+- Property/composition tests demonstrate no dropped, duplicated, or
+  incorrectly rebound bytes across the current deterministic-operation set.
+- Scan-count tests show no increase from `origin/main`.
+
+### PR C: Alliance parser transport contract
 
 Repository: the repository that publishes `agr-abc-document-parsers`.
 
@@ -203,7 +262,7 @@ Scope:
 6. Publish a new pinned parser version and implementation digest.
 
 If the parser maintainers do not want inline page tokens, stop here and use
-sidecar-only page provenance in PR C.
+sidecar-only page provenance in PR D.
 
 Acceptance criteria:
 
@@ -214,9 +273,9 @@ Acceptance criteria:
 - No new heuristic role inference is introduced.
 - Parser performance is measured against representative large PDFX Markdown.
 
-### PR C: Page provenance with a declared transport contract
+### PR D: Page provenance with a declared transport contract
 
-Prerequisite: PR B is released, or a sidecar-only decision is recorded.
+Prerequisite: PR C is released, or a sidecar-only decision is recorded.
 
 Scope:
 
@@ -256,7 +315,12 @@ extractor Markdown + native sidecars + exact PDF digest
                          v
 existing merge structural analysis (computed once, then reused)
                          |
-                         +--> publication merge + deterministic audit
+                         +--> publication merge
+                         |        |
+                         |        +--> typed deterministic operations
+                         |                 |
+                         |                 +--> atom-preserving composition
+                         |                 +--> final byte/audit reconciliation
                          |
                          +--> page evidence join
                                   |
@@ -278,7 +342,8 @@ token is safe. Safety comes from the parser contract and typed placement data.
 
 ## 6. Measurement Plan
 
-Before coding PR A or PR C, add a temporary benchmark harness or test spy that
+Before coding PR A, PR B, or PR D, add a temporary benchmark harness or test
+spy that
 records:
 
 - `scan_structural_units()` calls and total input bytes scanned;
@@ -311,8 +376,11 @@ shape. Run the exact cached artifacts locally as release evidence.
 - Change only a replay ordinal diagnostic: canonical call grouping remains
   consistent, while exact event replay still detects unauthorized mutation.
 - Clip a numbered reference marker: reject.
-- Split or permute an atomic generated heading: retain valid audit ownership or
-  reject before delivery.
+- Attempt to split or permute every registered atomic operation: move the
+  complete atom according to its ownership rule or reject before delivery.
+- Compose every current deterministic operation with every current structural
+  permutation that can legally follow it: preserve exact bytes and audit
+  identity.
 - Change the PDF digest under a native sidecar: reject/re-extract.
 - Reverse or overlap page intervals: reject.
 - Introduce a contradictory page vote: record unresolved, do not guess.
@@ -325,7 +393,8 @@ rule. Do this once in the parser repository, not repeatedly at PDFX runtime.
 
 ## 8. Cache and Migration Policy
 
-- PR A should avoid invalidating extractor caches.
+- PR A and PR B should avoid invalidating extractor caches unless PR B changes
+  a persisted merge-receipt schema.
 - A changed persisted merge-receipt schema requires a new merge contract ID.
 - A parser version/digest change requires regeneration only for artifacts whose
   replay semantics depend on that parser.
@@ -336,11 +405,13 @@ rule. Do this once in the parser repository, not repeatedly at PDFX runtime.
 
 ## 9. Rollout Plan
 
-1. Merge and deploy PR A independently.
-2. Re-run the three Debbie PDFs and confirm the incident errors are gone.
-3. Observe merge timing and audit failures before introducing page changes.
-4. Complete and release PR B, or explicitly choose sidecar-only provenance.
-5. Implement PR C against the declared contract and scan budget.
+1. Merge and deploy PR A independently, then re-run `8394599` and `8395484`.
+2. Implement PR B from the repository-wide operation inventory and run exact
+   `8395208` as release evidence.
+3. Deploy PR B and observe merge timing and audit failures before introducing
+   page changes.
+4. Complete and release PR C, or explicitly choose sidecar-only provenance.
+5. Implement PR D against the declared contract and scan budget.
 6. Canary page provenance on cached/non-sensitive PDFs.
 7. Deploy without interrupting active or queued production jobs.
 8. Monitor merge duration, cache replay failures, audit rejection reasons, and
@@ -371,5 +442,6 @@ against this plan and the scan budget.
 6. Should PR #42 be closed immediately as superseded, or retained as a draft
    reference until PR A lands?
 
-No implementation begins until these decisions and the scan budget are
-reviewed.
+The atom-preserving deterministic-operation contract is decided by this plan;
+it is not limited to References and Figure Legends. No implementation begins
+until the remaining transport, replay, and scan-budget decisions are reviewed.
