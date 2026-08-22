@@ -1,7 +1,7 @@
 # PDFX Incident and Page-Provenance Redesign Plan
 
 **Date:** 2026-08-22  
-**Status:** PR A #43 review complete; no supported blockers remain
+**Status:** PR A #43 approved for merge and deployment
 **Clean implementation base:** `origin/main` at `673ab52`  
 **Reference implementation only:** PR #42 / `fix/style-selection-receipt-consistency`
 
@@ -636,6 +636,16 @@ Use this framing in the initial Claude request:
 - [x] Stop iterating when no supported Blocker or Material correction remains.
   Zero comments, theoretical completeness, and reviewer exhaustion are not
   completion criteria.
+
+### 13.4 Merge authorization
+
+After the mandatory GPT-5.6 Sol/xhigh Max-review gate and bounded Claude review
+both finish with no supported blocker or material correction, no additional
+external human approval is required. The operator explicitly authorized the
+agent on 2026-08-22 to use the repository-ruleset bypass to merge and deploy
+these implementation PRs once their required tests, evidence, checks, and
+review gates pass. This authorization does not waive any acceptance criterion,
+validation, deployment health check, or review stop rule above.
 
 If Claude begins expanding scope or producing variants of already-dispositioned
 theoretical concerns, reply with this boundary rather than implementing them:
