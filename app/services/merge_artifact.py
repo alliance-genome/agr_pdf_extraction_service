@@ -20,17 +20,29 @@ from app.services.model_policy import (
 from app.services.abc_markdown_policy import (
     ABC_PARSER_IMPLEMENTATION_SHA256,
     ABC_PARSER_VERSION,
+    RAPIDFUZZ_VERSION,
+    runtime_abc_parser_implementation_sha256,
+    runtime_abc_parser_version,
+    runtime_rapidfuzz_version,
 )
 from app.services.semantic_payload import SEMANTIC_PAYLOAD_CONTRACT_VERSION
 from app.services.document_skeleton import (
     DocumentSkeleton,
     project_native_emphasis,
+    project_native_page_markers,
     reconcile_native_emphasis_fallback,
 )
 
 
 MANIFEST_SCHEMA = "pdfx-source-merge-manifest"
 ALIAS_SCHEMA = "pdfx-source-merge-alias"
+_STYLE_SELECTION_REPLAY_DIAGNOSTICS = frozenset(
+    {
+        "style_selection_donor_ordinal",
+        "style_selection_target_ordinal",
+        "style_selection_order_crossing",
+    }
+)
 
 
 def _sha256(value: bytes) -> str:
@@ -42,6 +54,36 @@ def _json_bytes(value: object) -> bytes:
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("utf-8")
+
+
+def _style_selection_record(
+    event: Mapping,
+    *,
+    include_unit_pair_ambiguous: bool = False,
+) -> dict:
+    """Return model-selection inputs, excluding diagnostics rebuilt by replay."""
+
+    return {
+        key: value
+        for key, value in event.items()
+        if key not in _STYLE_SELECTION_REPLAY_DIAGNOSTICS
+        and (
+            key.startswith("style_selection_")
+            or key == "style_selected_candidate_id"
+            or key == "model_selected_target"
+            or (include_unit_pair_ambiguous and key == "unit_pair_ambiguous")
+        )
+    }
+
+
+def _differing_mapping_keys(left: Mapping, right: Mapping) -> list[str]:
+    """Return content-free field names whose canonical values differ."""
+
+    return sorted(
+        key
+        for key in set(left) | set(right)
+        if (key in left) != (key in right) or left.get(key) != right.get(key)
+    )
 
 
 def bundle_manifest_path(merged_path: str | os.PathLike[str]) -> str:
@@ -120,17 +162,21 @@ def _validate_audit(
             elif transformation == "alliance_bibliography_heading_insert":
                 expected_span = (
                     span
-                    if re.fullmatch(rb"\n{0,2}## References\n\n", span) is not None
+                    if span == b"## References\n\n"
                     else None
                 )
             elif transformation == "alliance_figure_legend_heading_insert":
                 expected_span = (
                     span
-                    if re.fullmatch(
-                        rb"\n{0,2}## Figure Legends\n\n", span
-                    )
-                    is not None
+                    if span == b"## Figure Legends\n\n"
                     else None
+                )
+            elif transformation in {
+                "alliance_bibliography_heading_boundary",
+                "alliance_figure_legend_heading_boundary",
+            }:
+                expected_span = (
+                    span if re.fullmatch(rb"\n{1,2}", span) is not None else None
                 )
             elif transformation in {
                 "alliance_heading_depth",
@@ -169,6 +215,13 @@ def _validate_audit(
                 expected_span = span if span == b"**Categories:** " else None
             elif transformation == "native_emphasis_projection":
                 expected_span = span if span == b"*" else None
+            elif transformation == "native_page_marker":
+                expected_span = (
+                    span
+                    if re.fullmatch(rb"<!-- page: [1-9]\d* -->\n", span)
+                    is not None
+                    else None
+                )
             else:
                 expected_span = None
             if (
@@ -534,6 +587,87 @@ def _validate_title_selection_receipts(metrics: Mapping) -> None:
             raise ValueError("title numeric choice does not match projection")
 
 
+def _validate_native_page_projection_receipts(
+    output: bytes,
+    audit: Sequence[Mapping],
+    metrics: Mapping,
+    artifacts: Mapping[SourceName, SourceArtifact],
+    skeletons: Mapping[SourceName, DocumentSkeleton] | None,
+) -> None:
+    """Replay native page markers from the source provenance partition."""
+
+    transformations = metrics.get("document_skeleton_transformations", ())
+    page_events = [
+        dict(event)
+        for event in transformations
+        if isinstance(event, Mapping)
+        and event.get("operation") == "native_page_marker"
+    ]
+    report = metrics.get("native_page_projection")
+    if not isinstance(report, Mapping):
+        if page_events or any(
+            entry.get("transformation") == "native_page_marker"
+            for entry in audit
+        ):
+            raise ValueError("native page projection receipt is missing")
+        return
+    if skeletons is None:
+        if page_events:
+            raise ValueError("native page projection cannot be replayed")
+        return
+
+    try:
+        runtime_parser_version = runtime_abc_parser_version()
+        runtime_parser_digest = runtime_abc_parser_implementation_sha256()
+        runtime_fuzzy_version = runtime_rapidfuzz_version()
+    except Exception as exc:
+        raise ValueError(
+            "native page projection replay dependency is unavailable"
+        ) from exc
+    if (
+        runtime_parser_version != ABC_PARSER_VERSION
+        or runtime_parser_digest != ABC_PARSER_IMPLEMENTATION_SHA256
+        or runtime_fuzzy_version != RAPIDFUZZ_VERSION
+        or report.get("abc_parser_version") != runtime_parser_version
+        or report.get("abc_parser_implementation_sha256")
+        != runtime_parser_digest
+        or report.get("rapidfuzz_version") != runtime_fuzzy_version
+    ):
+        raise ValueError("native page projection replay dependency mismatch")
+
+    pre_projection = b"".join(
+        output[entry["output_byte_start"] : entry["output_byte_end"]]
+        for entry in audit
+        if entry.get("transformation") != "native_page_marker"
+    )
+    pre_projection_audit = []
+    cursor = 0
+    for entry in audit:
+        if entry.get("transformation") == "native_page_marker":
+            continue
+        length = entry["output_byte_end"] - entry["output_byte_start"]
+        rewritten = dict(entry)
+        rewritten["output_byte_start"] = cursor
+        cursor += length
+        rewritten["output_byte_end"] = cursor
+        pre_projection_audit.append(rewritten)
+    replayed_text, replayed_audit, replayed_events, replayed_report = (
+        project_native_page_markers(
+            pre_projection.decode("utf-8", errors="strict"),
+            pre_projection_audit,
+            skeletons,
+            artifacts,
+        )
+    )
+    if (
+        replayed_text.encode("utf-8") != output
+        or replayed_audit != list(audit)
+        or replayed_events != page_events
+        or replayed_report != dict(report)
+    ):
+        raise ValueError("native page projection replay failed")
+
+
 def _validate_positive_style_overlay_receipts(
     output: bytes,
     audit: Sequence[Mapping],
@@ -542,6 +676,28 @@ def _validate_positive_style_overlay_receipts(
     skeletons: Mapping[SourceName, DocumentSkeleton] | None,
 ) -> None:
     """Replay the one final-target overlay and bind every emitted delimiter."""
+
+    # Page markers are projected after the positive-style overlay.  Remove
+    # that later deterministic layer before replaying the style stage so its
+    # output digests and byte coordinates remain bound to the original stage.
+    style_output = b"".join(
+        output[entry["output_byte_start"] : entry["output_byte_end"]]
+        for entry in audit
+        if entry.get("transformation") != "native_page_marker"
+    )
+    style_audit = []
+    style_cursor = 0
+    for entry in audit:
+        if entry.get("transformation") == "native_page_marker":
+            continue
+        length = entry["output_byte_end"] - entry["output_byte_start"]
+        rewritten = dict(entry)
+        rewritten["output_byte_start"] = style_cursor
+        style_cursor += length
+        rewritten["output_byte_end"] = style_cursor
+        style_audit.append(rewritten)
+    output = style_output
+    audit = style_audit
 
     transformations = metrics.get("document_skeleton_transformations", ())
     native_events = [
@@ -582,16 +738,14 @@ def _validate_positive_style_overlay_receipts(
             or event.get("reason") == "model_selection_unavailable"
         ):
             continue
-        record = {
-            key: value
-            for key, value in event.items()
-            if key.startswith("style_selection_")
-            or key == "style_selected_candidate_id"
-            or key == "model_selected_target"
-        }
+        record = _style_selection_record(event)
         previous = selection_records.setdefault(selection_id, record)
         if previous != record:
-            raise ValueError("positive style model-selection receipt is inconsistent")
+            differing = ",".join(_differing_mapping_keys(previous, record))
+            raise ValueError(
+                "positive style model-selection receipt is inconsistent "
+                f"(call grouping; differing keys: {differing})"
+            )
     model_call_traces = metrics.get("model_selection_calls", [])
     if not isinstance(model_call_traces, list):
         raise ValueError("model-selection trace ledger is missing")
@@ -700,14 +854,10 @@ def _validate_positive_style_overlay_receipts(
             selection_id = event.get("style_selection_id")
             if not isinstance(selection_id, str):
                 continue
-            record = {
-                key: value
-                for key, value in event.items()
-                if key == "unit_pair_ambiguous"
-                or key.startswith("style_selection_")
-                or key == "style_selected_candidate_id"
-                or key == "model_selected_target"
-            }
+            record = _style_selection_record(
+                event,
+                include_unit_pair_ambiguous=True,
+            )
             if (
                 event.get("style_selected_candidate_id")
                 == event.get("style_selection_none_id")
@@ -715,7 +865,13 @@ def _validate_positive_style_overlay_receipts(
                 record["reason"] = event.get("reason")
             previous = recorded_style_selections.setdefault(selection_id, record)
             if previous != record:
-                raise ValueError("positive style model-selection receipt is inconsistent")
+                differing = ",".join(
+                    _differing_mapping_keys(previous, record)
+                )
+                raise ValueError(
+                    "positive style model-selection receipt is inconsistent "
+                    f"(replay grouping; differing keys: {differing})"
+                )
         replayed_text, replayed_audit, replayed_events = project_native_emphasis(
             pre_projection.decode("utf-8", errors="strict"),
             pre_projection_audit,
@@ -1165,9 +1321,11 @@ def validate_merge_artifacts(
         "alliance_heading_role_marker",
         "alliance_reference_marker",
         "alliance_bibliography_heading_remove",
+        "alliance_bibliography_heading_boundary",
         "alliance_bibliography_heading_insert",
         "alliance_bibliography_role_order",
         "alliance_figure_legend_role_order",
+        "alliance_figure_legend_heading_boundary",
         "alliance_figure_legend_heading_insert",
         "alliance_figure_label_heading",
         "alliance_figure_label_caption_boundary",
@@ -1185,6 +1343,7 @@ def validate_merge_artifacts(
         "alliance_article_category_marker",
         "alliance_front_list_block_separator",
         "native_emphasis_projection",
+        "native_page_marker",
     }
     if not isinstance(transformation_events, list) or any(
         not isinstance(event, Mapping)
@@ -1217,6 +1376,13 @@ def validate_merge_artifacts(
     ):
         raise ValueError("Alliance transformation receipt mismatch")
     _validate_title_selection_receipts(metrics)
+    _validate_native_page_projection_receipts(
+        text.encode("utf-8"),
+        audit,
+        metrics,
+        artifacts,
+        skeletons,
+    )
     _validate_positive_style_overlay_receipts(
         text.encode("utf-8"),
         audit,
@@ -1305,6 +1471,7 @@ def load_merge_bundle(
     metrics_path: str,
     audit_path: str,
     artifacts: Mapping[SourceName, SourceArtifact],
+    skeletons: Mapping[SourceName, DocumentSkeleton],
     expected_contract_id: str,
     expected_native_structure_receipt_digests: Mapping[SourceName, str],
     expected_skeleton_candidate_ids: Mapping[SourceName, str],
@@ -1318,8 +1485,18 @@ def load_merge_bundle(
     }
     if manifest.get("source_artifact_digests") != expected_source_digests:
         raise ValueError("merge manifest source digest mismatch")
+    runtime_skeleton_ids = {
+        source: skeletons[source].skeleton_id for source in sorted(skeletons)
+    }
+    runtime_skeleton_projection_ids = {
+        source: skeletons[source].projection_id for source in sorted(skeletons)
+    }
     if (
-        manifest.get("native_structure_receipt_digests")
+        set(skeletons) != set(artifacts)
+        or runtime_skeleton_ids != dict(expected_skeleton_candidate_ids)
+        or runtime_skeleton_projection_ids
+        != dict(expected_skeleton_candidate_projection_ids)
+        or manifest.get("native_structure_receipt_digests")
         != dict(expected_native_structure_receipt_digests)
         or manifest.get("document_skeleton_candidate_ids")
         != dict(expected_skeleton_candidate_ids)
@@ -1365,6 +1542,7 @@ def load_merge_bundle(
         audit,
         artifacts=artifacts,
         expected_contract_id=expected_contract_id,
+        skeletons=skeletons,
     )
     return text, metrics, audit
 

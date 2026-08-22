@@ -1,11 +1,15 @@
+import hashlib
 import json
 from dataclasses import replace
 
 import pytest
 
+import app.services.document_skeleton as document_skeleton_module
+from app.services.abc_markdown_policy import abc_markdown_report
 from app.services.document_skeleton import (
     NativeEmphasisSpan,
     NativeStructureArtifact,
+    _copy_audit_interval,
     _final_projection_targets,
     _projection_claim_inventory,
     build_document_skeleton,
@@ -14,6 +18,7 @@ from app.services.document_skeleton import (
     native_heading_hints,
     native_occurrence_hints,
     project_native_emphasis,
+    project_native_page_markers,
     reconcile_document_transformations,
     render_document_skeleton,
     render_document_role_slots,
@@ -26,6 +31,7 @@ from app.services.native_extractor_artifact import (
     sha256_file,
 )
 from app.services.native_style import unavailable_native_style_bytes
+from app.services.merge_artifact import _validate_audit
 
 
 def _native(source, markdown, value, native_style=None):
@@ -49,6 +55,710 @@ def _audit(artifact):
         "candidate_id": None,
         "region_id": None,
         "decision_method": "baseline_fallback",
+    }]
+
+
+def test_clipped_deterministic_marker_rebinds_exact_retained_bytes():
+    artifact = SourceArtifact.from_text("marker", "## Title\n")
+    original = artifact.raw_utf8
+    marker = original[:2]
+    audit = [
+        {
+            "output_byte_start": 0,
+            "output_byte_end": 2,
+            "source": "deterministic_markup",
+            "artifact_digest": hashlib.sha256(marker).hexdigest(),
+            "source_byte_start": 0,
+            "source_byte_end": 2,
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "deterministic",
+            "transformation": "selected_document_skeleton",
+            "transformation_id": "heading-marker",
+        },
+        {
+            "output_byte_start": 2,
+            "output_byte_end": len(original),
+            "source": "marker",
+            "artifact_digest": artifact.digest,
+            "source_byte_start": 2,
+            "source_byte_end": len(original),
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "baseline_fallback",
+        },
+    ]
+    output = bytearray()
+    rewritten = []
+
+    _copy_audit_interval(output, rewritten, original, audit, 1, len(original))
+
+    assert bytes(output) == b"# Title\n"
+    assert rewritten[0]["artifact_digest"] == hashlib.sha256(b"#").hexdigest()
+    assert rewritten[0]["source_byte_start"] == 0
+    assert rewritten[0]["source_byte_end"] == 1
+    assert rewritten[0]["transformation_id"] == "heading-marker"
+    _validate_audit(bytes(output), rewritten, {"marker": artifact})
+
+
+@pytest.mark.parametrize(
+    "transformation",
+    [
+        "alliance_bibliography_heading_boundary",
+        "alliance_figure_legend_heading_boundary",
+    ],
+)
+def test_clipped_generated_heading_boundary_rebinds_retained_newline(
+    transformation,
+):
+    artifact = SourceArtifact.from_text("marker", "\n\nBody\n")
+    original = artifact.raw_utf8
+    boundary = original[:2]
+    audit = [
+        {
+            "output_byte_start": 0,
+            "output_byte_end": 2,
+            "source": "deterministic_markup",
+            "artifact_digest": hashlib.sha256(boundary).hexdigest(),
+            "source_byte_start": 0,
+            "source_byte_end": 2,
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "deterministic",
+            "transformation": transformation,
+            "transformation_id": "heading-boundary",
+        },
+        {
+            "output_byte_start": 2,
+            "output_byte_end": len(original),
+            "source": "marker",
+            "artifact_digest": artifact.digest,
+            "source_byte_start": 2,
+            "source_byte_end": len(original),
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "baseline_fallback",
+        },
+    ]
+    output = bytearray()
+    rewritten = []
+
+    _copy_audit_interval(output, rewritten, original, audit, 1, len(original))
+
+    assert bytes(output) == b"\nBody\n"
+    assert rewritten[0]["artifact_digest"] == hashlib.sha256(b"\n").hexdigest()
+    assert rewritten[0]["source_byte_start"] == 0
+    assert rewritten[0]["source_byte_end"] == 1
+    assert rewritten[0]["transformation_id"] == "heading-boundary"
+    _validate_audit(bytes(output), rewritten, {"marker": artifact})
+
+
+def test_clipped_numbered_marker_remains_fail_closed():
+    artifact = SourceArtifact.from_text("marker", "12. Reference\n")
+    original = artifact.raw_utf8
+    marker = original[:4]
+    audit = [
+        {
+            "output_byte_start": 0,
+            "output_byte_end": 4,
+            "source": "deterministic_markup",
+            "artifact_digest": hashlib.sha256(marker).hexdigest(),
+            "source_byte_start": 0,
+            "source_byte_end": 4,
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "deterministic",
+            "transformation": "alliance_reference_marker",
+            "transformation_id": "reference-marker",
+        },
+        {
+            "output_byte_start": 4,
+            "output_byte_end": len(original),
+            "source": "marker",
+            "artifact_digest": artifact.digest,
+            "source_byte_start": 4,
+            "source_byte_end": len(original),
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "baseline_fallback",
+        },
+    ]
+    output = bytearray()
+    rewritten = []
+
+    _copy_audit_interval(output, rewritten, original, audit, 1, len(original))
+
+    assert bytes(output) == b"2. Reference\n"
+    with pytest.raises(ValueError, match="deterministic markup provenance"):
+        _validate_audit(bytes(output), rewritten, {"marker": artifact})
+
+
+def test_projects_native_page_transitions_without_changing_publication_text():
+    artifact = SourceArtifact.from_text(
+        "docling", "# Title\n\nFirst page text.\n\nSecond page text.\n"
+    )
+    native = _native(
+        "docling",
+        artifact,
+        {
+            "schema_name": "DoclingDocument",
+            "body": {"children": [
+                {"$ref": "#/texts/0"},
+                {"$ref": "#/texts/1"},
+                {"$ref": "#/texts/2"},
+            ]},
+            "texts": [
+                {
+                    "self_ref": "#/texts/0",
+                    "label": "title",
+                    "text": "Title",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "self_ref": "#/texts/1",
+                    "label": "text",
+                    "text": "First page text.",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "self_ref": "#/texts/2",
+                    "label": "text",
+                    "text": "Second page text.",
+                    "prov": [{"page_no": 2}],
+                },
+            ],
+        },
+    )
+    skeleton = build_document_skeleton(artifact, native)
+
+    rendered, audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"docling": skeleton},
+        {"docling": artifact},
+    )
+
+    assert rendered == (
+        "# Title\n\nFirst page text.\n\n<!-- page: 2 -->\nSecond page text.\n"
+    )
+    assert rendered.replace("<!-- page: 2 -->\n", "") == artifact.text
+    assert [event["page_no"] for event in events] == [2]
+    assert report["projected_pages"] == [2]
+    assert report["ambiguous_structural_unit_count"] == 0
+    assert sum(
+        entry["output_byte_end"] - entry["output_byte_start"]
+        for entry in audit
+    ) == len(rendered.encode("utf-8"))
+    assert [unit.comparison_key for unit in scan_structural_units(
+        SourceArtifact.from_text("docling", rendered)
+    )] == [unit.comparison_key for unit in scan_structural_units(artifact)]
+
+
+def test_native_page_projection_abstains_on_equal_page_evidence():
+    artifact = SourceArtifact.from_text("docling", "Ambiguous text.\n")
+    skeleton = build_document_skeleton(artifact, None)
+    occurrence = skeleton.occurrences[0]
+    skeleton = replace(
+        skeleton,
+        occurrences=(
+            replace(occurrence, page_no=1),
+            replace(
+                occurrence,
+                occurrence_id=f"{occurrence.occurrence_id}-page-2",
+                page_no=2,
+            ),
+        ),
+    )
+
+    rendered, audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"docling": skeleton},
+    )
+
+    assert rendered == artifact.text
+    assert audit == _audit(artifact)
+    assert events == []
+    assert report["ambiguous_structural_unit_count"] == 1
+    assert report["marker_count"] == 0
+
+
+def test_native_page_projection_abstains_on_unequal_cross_source_evidence():
+    grobid = SourceArtifact.from_text("grobid", "AAAAAA")
+    marker = SourceArtifact.from_text("marker", "BBBBB")
+    grobid_skeleton = build_document_skeleton(grobid, None)
+    marker_skeleton = build_document_skeleton(marker, None)
+    grobid_skeleton = replace(
+        grobid_skeleton,
+        occurrences=(replace(grobid_skeleton.occurrences[0], page_no=2),),
+    )
+    marker_skeleton = replace(
+        marker_skeleton,
+        occurrences=(replace(marker_skeleton.occurrences[0], page_no=3),),
+    )
+    text = grobid.text + marker.text
+    audit = [
+        {
+            "output_byte_start": 0,
+            "output_byte_end": len(grobid.raw_utf8),
+            "source": "grobid",
+            "artifact_digest": grobid.digest,
+            "source_byte_start": 0,
+            "source_byte_end": len(grobid.raw_utf8),
+        },
+        {
+            "output_byte_start": len(grobid.raw_utf8),
+            "output_byte_end": len(text.encode("utf-8")),
+            "source": "marker",
+            "artifact_digest": marker.digest,
+            "source_byte_start": 0,
+            "source_byte_end": len(marker.raw_utf8),
+        },
+    ]
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        text,
+        audit,
+        {"grobid": grobid_skeleton, "marker": marker_skeleton},
+    )
+
+    assert rendered == text
+    assert rewritten_audit == audit
+    assert events == []
+    assert report["ambiguous_structural_unit_count"] == 1
+    assert report["marker_count"] == 0
+
+
+def test_native_page_projection_skips_marker_inside_abc_table():
+    artifact = SourceArtifact.from_text(
+        "marker",
+        "# Title\n\n| A | B |\n|---|---|\n| 1 | 2 |\n",
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    separator_start = artifact.raw_utf8.index(b"|---|---|")
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=2 if occurrence.source_byte_start == separator_start else 1,
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+    original_audit = _audit(artifact)
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        original_audit,
+        {"marker": skeleton},
+    )
+
+    assert rendered == artifact.text
+    assert rewritten_audit == original_audit
+    assert events == []
+    assert report["marker_count"] == 0
+    assert report["validation_abstained_marker_count"] == 0
+    assert report["structural_block_abstained_marker_count"] == 1
+    assert report["marker_abstention_reason"] is None
+    assert abc_markdown_report(rendered)["error_rule_ids"] == []
+
+
+def test_native_page_projection_abstains_before_byte_zero_h1():
+    artifact = SourceArtifact.from_text(
+        "marker", "# Title\n\nBody on second page.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(occurrence, page_no=2)
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    from agr_abc_document_parsers import read_markdown
+
+    document = read_markdown(rendered)
+    assert rendered == artifact.text
+    assert rewritten_audit == _audit(artifact)
+    assert events == []
+    assert document.title == "Title"
+    assert document.authors == []
+    assert document.sections[0].paragraphs[0].text == "Body on second page."
+    assert report["structural_block_abstained_marker_count"] == 1
+
+
+def test_native_page_projection_abstains_before_h1_after_leading_whitespace():
+    artifact = SourceArtifact.from_text(
+        "marker", "\n# Title\n\nBody on second page.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(occurrence, page_no=2)
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    from agr_abc_document_parsers import read_markdown
+
+    document = read_markdown(rendered)
+    assert rendered == artifact.text
+    assert rewritten_audit == _audit(artifact)
+    assert events == []
+    assert document.title == "Title"
+    assert document.authors == []
+    assert report["abstained_boundaries"] == [{
+        "output_byte_offset": 1,
+        "page_no": 2,
+        "reason": "first_heading_slot",
+        "projection_method": "source_audit",
+    }]
+
+
+@pytest.mark.parametrize("failure_mode", ["introduced_warning", "parser_failure"])
+def test_native_page_projection_abstains_on_abc_regression(
+    monkeypatch,
+    failure_mode,
+):
+    artifact = SourceArtifact.from_text(
+        "marker", "# Title\n\nFirst page.\n\nSecond page.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    second_start = artifact.raw_utf8.index(b"Second page.")
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=2 if occurrence.source_byte_start == second_start else 1,
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    def report(text):
+        introduced = "<!-- page:" in text
+        parser_failed = failure_mode == "parser_failure"
+        return {
+            "valid": not parser_failed,
+            "error_rule_ids": [],
+            "warning_rule_ids": (
+                ["W99"]
+                if introduced and failure_mode == "introduced_warning"
+                else []
+            ),
+            "failure_code": (
+                "parser_distribution_missing" if parser_failed else None
+            ),
+        }
+
+    monkeypatch.setattr(document_skeleton_module, "abc_markdown_report", report)
+
+    rendered, rewritten_audit, events, projection_report = (
+        project_native_page_markers(
+            artifact.text,
+            _audit(artifact),
+            {"marker": skeleton},
+        )
+    )
+
+    assert rendered == artifact.text
+    assert rewritten_audit == _audit(artifact)
+    assert events == []
+    assert projection_report["validation_abstained_marker_count"] == 1
+    assert projection_report["marker_abstention_reason"] == (
+        "abc_validation_regression"
+    )
+
+
+@pytest.mark.parametrize(
+    ("block", "protected_type"),
+    [
+        ("| A | B |\n|---|---|\n| 1 | 2 |\n", "table"),
+        ("- first\n- second\n", "list"),
+        (
+            "## References\n\n1. First reference.\n\n2. Second reference.\n",
+            "reference",
+        ),
+    ],
+)
+def test_native_page_projection_delays_marker_until_after_structural_block(
+    block,
+    protected_type,
+):
+    artifact = SourceArtifact.from_text(
+        "marker", f"# Title\n\n{block}\n## Next\n\nAfter block.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    protected = [
+        occurrence
+        for occurrence in skeleton.occurrences
+        if occurrence.unit_type == protected_type
+    ]
+    assert protected
+    first_protected_start = protected[0].source_byte_start
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    2
+                    if occurrence.source_byte_start >= first_protected_start
+                    else 1
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, _audit_result, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    assert f"{block}\n<!-- page: 2 -->\n## Next" in rendered
+    assert rendered.startswith(f"# Title\n\n{block}\n")
+    assert [event["page_no"] for event in events] == [2]
+    assert report["structural_block_abstained_marker_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "continuation on page two",
+        "  continuation on page two",
+        "    continuation on page two",
+    ],
+)
+def test_native_page_projection_delays_marker_past_list_continuation(
+    continuation,
+):
+    list_block = f"- item first line\n{continuation}"
+    artifact = SourceArtifact.from_text(
+        "marker", f"# Title\n\n{list_block}\n\n## Next\n\nTail.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    continuation_start = artifact.raw_utf8.index(continuation.encode())
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    2
+                    if occurrence.source_byte_start >= continuation_start
+                    else 1
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, _rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    assert rendered.startswith(f"# Title\n\n{list_block}\n\n")
+    assert f"{list_block}\n\n<!-- page: 2 -->\n## Next" in rendered
+    assert f"- item first line\n<!-- page: 2 -->\n{continuation}" not in rendered
+    assert [event["page_no"] for event in events] == [2]
+    assert report["structural_block_abstained_marker_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "nested_block",
+    [
+        "  ## nested heading",
+        "  ```text\n  nested code\n  ```",
+        "  **Figure 1.** nested caption",
+        "  nested paragraph after a blank line",
+    ],
+)
+def test_native_page_projection_delays_marker_past_nested_list_block(
+    nested_block,
+):
+    separator = "\n\n" if nested_block.startswith("  nested") else "\n"
+    list_block = f"- item first line{separator}{nested_block}"
+    artifact = SourceArtifact.from_text(
+        "marker", f"# Title\n\n{list_block}\n\n## Next\n\nTail.\n"
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    nested_start = artifact.raw_utf8.index(nested_block.encode())
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    2 if occurrence.source_byte_start >= nested_start else 1
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, _rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    assert rendered.startswith(f"# Title\n\n{list_block}\n\n")
+    assert f"{list_block}\n\n<!-- page: 2 -->\n## Next" in rendered
+    assert "- item first line\n<!-- page: 2 -->" not in rendered
+    assert [event["page_no"] for event in events] == [2]
+    assert report["structural_block_abstained_marker_count"] == 1
+
+
+def test_native_page_projection_records_unproven_page_inside_table():
+    artifact = SourceArtifact.from_text(
+        "marker",
+        "Intro.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nAfter.\n",
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    row_start = artifact.raw_utf8.index(b"| 1 | 2 |")
+    after_start = artifact.raw_utf8.index(b"After.")
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    3
+                    if occurrence.source_byte_start >= after_start
+                    else 2
+                    if occurrence.source_byte_start >= row_start
+                    else 1
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, _rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    assert "| 1 | 2 |\n\n<!-- page: 3 -->\nAfter." in rendered
+    assert [event["page_no"] for event in events] == [3]
+    assert report["projected_pages"] == [3]
+    assert report["abstained_boundaries"] == [{
+        "output_byte_offset": row_start,
+        "page_no": 2,
+        "reason": "protected_structural_block",
+        "projection_method": "source_audit",
+    }]
+
+
+def test_native_page_projection_sorts_structural_and_reader_abstentions():
+    artifact = SourceArtifact.from_text(
+        "marker",
+        "Intro.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n",
+    )
+    skeleton = build_document_skeleton(artifact, None)
+    table_start = artifact.raw_utf8.index(b"| A | B |")
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    3
+                    if occurrence.source_byte_start >= table_start
+                    else 2
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+
+    rendered, rewritten_audit, events, report = project_native_page_markers(
+        artifact.text,
+        _audit(artifact),
+        {"marker": skeleton},
+    )
+
+    assert rendered == artifact.text
+    assert rewritten_audit == _audit(artifact)
+    assert events == []
+    assert [
+        boundary["output_byte_offset"]
+        for boundary in report["abstained_boundaries"]
+    ] == [0, table_start]
+    assert [
+        boundary["reason"]
+        for boundary in report["abstained_boundaries"]
+    ] == ["reader_payload_regression", "protected_structural_block"]
+
+
+def test_native_page_projection_uses_bounded_cross_extractor_alignment():
+    final_artifact = SourceArtifact.from_text(
+        "grobid", "Long reference title and journal 2024.\n"
+    )
+    marker_artifact = SourceArtifact.from_text(
+        "marker", "Long reference title & journal, 2024.\n"
+    )
+    marker_native = _native(
+        "marker",
+        marker_artifact,
+        {
+            "block_type": "Document",
+            "children": [
+                {"block_type": "Page", "children": []},
+                {
+                    "block_type": "Page",
+                    "children": [{
+                    "id": "/page/1/Text/0",
+                    "block_type": "Text",
+                    "html": "<p>Long reference title &amp; journal, 2024.</p>",
+                    }],
+                },
+            ],
+        },
+    )
+    skeletons = {
+        "grobid": build_document_skeleton(final_artifact, None),
+        "marker": build_document_skeleton(marker_artifact, marker_native),
+    }
+
+    rendered, _audit_result, events, report = project_native_page_markers(
+        final_artifact.text,
+        _audit(final_artifact),
+        skeletons,
+        {"grobid": final_artifact, "marker": marker_artifact},
+    )
+
+    assert rendered == final_artifact.text
+    assert events == []
+    assert report["bounded_structural_alignment_assignment_count"] == 1
+    assert report["reader_payload_abstained_marker_count"] == 1
+    assert report["marker_abstention_reason"] == "reader_payload_regression"
+    assert report["abstained_boundaries"] == [{
+        "output_byte_offset": 0,
+        "page_no": 2,
+        "reason": "reader_payload_regression",
+        "projection_method": "bounded_structural_alignment",
     }]
 
 
@@ -2098,6 +2808,7 @@ def test_role_slot_renderer_moves_native_nonreferences_before_final_bibliography
     assert sum(
         entry["output_byte_end"] - entry["output_byte_start"] for entry in audit
     ) == len(rendered.encode())
+    _validate_audit(rendered.encode(), audit, {"marker": artifact})
 
 
 @pytest.mark.parametrize(

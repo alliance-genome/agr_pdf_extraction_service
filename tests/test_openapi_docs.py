@@ -148,7 +148,9 @@ def test_config_endpoint_reports_only_release_approved_5_6_models(client):
     assert response.status_code == 200
 
     payload = response.get_json()
-    assert payload["merge_contract_id"] == "pdfx-native-skeleton-selection"
+    assert payload["merge_contract_id"] == (
+        "pdfx-native-skeleton-selection-page-provenance-v3"
+    )
     assert payload["resolved_runtime_models"] == {
         "source_selection": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
         "hard_selection": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},

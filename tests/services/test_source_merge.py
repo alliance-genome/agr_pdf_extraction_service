@@ -48,6 +48,20 @@ def test_structural_scan_ranges_reproduce_exact_source_bytes():
         assert raw.decode("utf-8")
 
 
+def test_structural_scan_keeps_indented_page_like_literal_content():
+    artifact = SourceArtifact.from_text(
+        "marker",
+        "    <!-- page: 2 -->\n    literal code\n",
+    )
+
+    units = scan_structural_units(artifact)
+
+    assert len(units) == 1
+    assert artifact.raw_utf8[units[0].byte_start : units[0].byte_end] == (
+        artifact.raw_utf8.rstrip(b"\n")
+    )
+
+
 def test_baseline_requires_digest_bound_completion_evidence():
     artifacts = _artifacts()
     with pytest.raises(ConsensusContractError, match="no clean baseline"):

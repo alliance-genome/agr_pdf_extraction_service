@@ -23,7 +23,11 @@ from app.services.source_contracts import (
 )
 from app.services.llm_service import CandidateSelectionFailure
 from app.services.document_skeleton import NativeStructureArtifact, build_document_skeleton
-from app.services.merge_artifact import persist_merge_bundle, validate_merge_artifacts
+from app.services.merge_artifact import (
+    load_merge_bundle,
+    persist_merge_bundle,
+    validate_merge_artifacts,
+)
 from config import Config
 from app.services.page_coverage import (
     PAGE_COVERAGE_METHOD,
@@ -338,7 +342,9 @@ def test_candidate_adapter_uses_selection_only_terra_and_emits_span_audit():
         "# Title\n\nGene Gγa is active.\n",
         "# Title\n\nGene G g a is active.\n",
     }
-    assert metrics["merge_contract_id"] == "pdfx-native-skeleton-selection"
+    assert metrics["merge_contract_id"] == (
+        "pdfx-native-skeleton-selection-page-provenance-v3"
+    )
     assert metrics["merge_quality"] == "terra_selected"
     assert metrics["runtime_models"]["source_selection"]["model"] == "gpt-5.6-terra"
     assert metrics["qualification_outcome"] == "failsafe"
@@ -449,6 +455,240 @@ def test_baseline_retained_native_italics_reconcile_without_replacement():
     assert receipt["canonical_output_emphasis_interval_count"] == 1
     assert receipt["auxiliary_positive_emphasis_count"] == 0
     assert receipt["all_native_body_italics_retained"] is True
+
+
+def test_merge_projects_replayable_native_page_transitions(tmp_path):
+    marker = "# Title\n\nFirst page text.\n\nSecond page text.\n"
+    artifact = SourceArtifact.from_text("marker", marker)
+    marker_native = NativeStructureArtifact.for_test(
+        "marker",
+        artifact,
+        json.dumps({
+            "block_type": "Document",
+            "children": [
+                {
+                    "block_type": "Page",
+                    "children": [
+                        {
+                            "id": "/page/0/Title/0",
+                            "block_type": "Title",
+                            "html": "<h1>Title</h1>",
+                        },
+                        {
+                            "id": "/page/0/Text/1",
+                            "block_type": "Text",
+                            "html": "<p>First page text.</p>",
+                        },
+                    ],
+                },
+                {
+                    "block_type": "Page",
+                    "children": [{
+                        "id": "/page/1/Text/0",
+                        "block_type": "Text",
+                        "html": "<p>Second page text.</p>",
+                    }],
+                },
+            ],
+        }).encode("utf-8"),
+    )
+
+    merged, metrics, audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": artifact}
+        ),
+        native_structures={"marker": marker_native},
+        baseline_requirements=FRAGMENT_REQUIREMENTS,
+        benchmark_mode=True,
+    )
+
+    assert merged == (
+        "# Title\n\nFirst page text.\n\n"
+        "<!-- page: 2 -->\nSecond page text.\n"
+    )
+    assert metrics["native_page_projection"]["projected_pages"] == [2]
+    assert any(
+        entry.get("transformation") == "native_page_marker"
+        for entry in audit
+    )
+
+    skeletons = {"marker": build_document_skeleton(artifact, marker_native)}
+    merged_path = tmp_path / "merged.md"
+    metrics_path = tmp_path / "metrics.json"
+    audit_path = tmp_path / "audit.json"
+    persist_merge_bundle(
+        merged_path=str(merged_path),
+        metrics_path=str(metrics_path),
+        audit_path=str(audit_path),
+        text=merged,
+        metrics=metrics,
+        audit=audit,
+        artifacts={"marker": artifact},
+        skeletons=skeletons,
+        expected_contract_id=Config.MERGE_CONTRACT_ID,
+    )
+    assert load_merge_bundle(
+        merged_path=str(merged_path),
+        metrics_path=str(metrics_path),
+        audit_path=str(audit_path),
+        artifacts={"marker": artifact},
+        skeletons=skeletons,
+        expected_contract_id=Config.MERGE_CONTRACT_ID,
+        expected_native_structure_receipt_digests=metrics[
+            "native_structure_receipt_digests"
+        ],
+        expected_skeleton_candidate_ids=metrics[
+            "document_skeleton_candidate_ids"
+        ],
+        expected_skeleton_candidate_projection_ids=metrics[
+            "document_skeleton_candidate_projection_ids"
+        ],
+    ) == (merged, metrics, audit)
+
+
+def test_merge_abstains_from_page_marker_in_first_post_title_slot():
+    marker = "# Title\n\nBody on page two.\n"
+    artifact = SourceArtifact.from_text("marker", marker)
+    marker_native = NativeStructureArtifact.for_test(
+        "marker",
+        artifact,
+        json.dumps({
+            "block_type": "Document",
+            "children": [
+                {
+                    "block_type": "Page",
+                    "children": [{
+                        "id": "/page/0/Title/0",
+                        "block_type": "Title",
+                        "html": "<h1>Title</h1>",
+                    }],
+                },
+                {
+                    "block_type": "Page",
+                    "children": [{
+                        "id": "/page/1/Text/0",
+                        "block_type": "Text",
+                        "html": "<p>Body on page two.</p>",
+                    }],
+                },
+            ],
+        }).encode("utf-8"),
+    )
+
+    merged, metrics, audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": artifact}
+        ),
+        native_structures={"marker": marker_native},
+        baseline_requirements=FRAGMENT_REQUIREMENTS,
+        benchmark_mode=True,
+    )
+
+    from agr_abc_document_parsers import read_markdown
+
+    document = read_markdown(merged)
+    assert merged == marker
+    assert document.title == "Title"
+    assert document.authors == []
+    assert document.sections[0].paragraphs[0].text == "Body on page two."
+    assert metrics["semantic_payload_reader"]["reader_payload_retained"] is True
+    assert metrics["native_page_projection"]["marker_count"] == 0
+    assert (
+        metrics["native_page_projection"][
+            "structural_block_abstained_marker_count"
+        ]
+        == 1
+    )
+    assert not any(
+        entry.get("transformation") == "native_page_marker"
+        for entry in audit
+    )
+
+
+def test_merge_validates_separate_generated_role_heading_boundaries():
+    marker = (
+        "# Title\n\n## Results\n\nBody.\n\n## References\n\n"
+        "1. Alpha et al. (2024). One.\n\n"
+        "**Figure 1.** Reader-visible caption.\n\n"
+        "| Gene | Value |\n|---|---|\n| dpp | 1 |\n"
+    )
+    artifact = SourceArtifact.from_text("marker", marker)
+    marker_native = NativeStructureArtifact.for_test(
+        "marker",
+        artifact,
+        json.dumps({
+            "block_type": "Document",
+            "children": [{
+                "block_type": "Page",
+                "children": [
+                    {
+                        "id": "/page/0/Title/0",
+                        "block_type": "Title",
+                        "html": "<h1>Title</h1>",
+                    },
+                    {
+                        "id": "/page/0/SectionHeader/1",
+                        "block_type": "SectionHeader",
+                        "html": "<h2>Results</h2>",
+                    },
+                    {
+                        "id": "/page/0/Text/2",
+                        "block_type": "Text",
+                        "html": "<p>Body.</p>",
+                    },
+                    {
+                        "id": "/page/0/SectionHeader/3",
+                        "block_type": "SectionHeader",
+                        "html": "<h2>References</h2>",
+                    },
+                    {
+                        "id": "/page/0/Reference/4",
+                        "block_type": "Reference",
+                        "html": "<p>1. Alpha et al. (2024). One.</p>",
+                    },
+                    {
+                        "id": "/page/0/Caption/5",
+                        "block_type": "Caption",
+                        "html": "<p>Figure 1. Reader-visible caption.</p>",
+                    },
+                ],
+            }],
+        }).encode("utf-8"),
+    )
+
+    merged, metrics, audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": artifact}
+        ),
+        native_structures={"marker": marker_native},
+        baseline_requirements=FRAGMENT_REQUIREMENTS,
+        benchmark_mode=True,
+    )
+
+    operations = {
+        event["operation"]
+        for event in metrics["document_skeleton_transformations"]
+    }
+    assert "alliance_bibliography_heading_boundary" in operations
+    assert any(
+        entry.get("transformation")
+        == "alliance_bibliography_heading_boundary"
+        for entry in audit
+    )
+    assert merged.count("## References") == 1
+    assert merged.count("## Figure Legends") == 1
 
 
 def _plain_marker_with_native_dpp():

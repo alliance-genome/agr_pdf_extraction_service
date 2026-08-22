@@ -87,15 +87,33 @@ selection or coverage evidence as `failsafe`; it is never mislabeled
 ### Alliance Markdown
 
 PDFX validates the exact merged bytes with
-`agr-abc-document-parsers==1.6.0`. It does not ask a model to repair headings or
-rewrite prose, and it does not run a normalizing emitter over arbitrary
-extractor content. Validator and downstream-reader receipts are bound to the
-output SHA-256 in merge metrics and the commit manifest.
+`agr-abc-document-parsers==1.6.0`. Structural alignment also pins
+`rapidfuzz==3.14.5` because merge-bundle validation replays its bounded scores.
+PDFX does not ask a model to repair headings or rewrite prose, and it does not
+run a normalizing emitter over arbitrary extractor content. Validator and
+downstream-reader receipts are bound to the output SHA-256 in merge metrics and
+the commit manifest.
 
 Italics are publication data. When aligned sources show an unambiguous
 formatting-only omission, PDFX copies the complete italic-bearing span from the
 source artifact and records the exact byte provenance. It never synthesizes
 emphasis markers around model-authored text.
+
+Merged Markdown preserves native PDF page boundaries as
+`<!-- page: N -->` transport comments. PDFX projects a boundary from exact
+source/audit overlap first, then from an unambiguous bounded structural
+alignment to another extractor's native occurrence. Conflicting or missing
+page evidence, transitions inside table/list/reference blocks, and placements
+that would alter Alliance Markdown validation or downstream-reader semantics
+abstain rather than placing an unsafe comment. Because the transport format
+cannot encode an unassigned span directly, every skipped boundary is recorded
+in `native_page_projection.abstained_boundaries` with its final-output byte
+offset, page, evidence method, and reason; consumers must treat the span from
+that boundary to the next recorded or projected boundary as unproven rather
+than inheriting the preceding page. The comments are excluded from
+publication-content comparison, and their deterministic audit entries,
+dependency identities, and projection receipt are replayed during merge-bundle
+validation.
 
 ### Duplicate-content protection
 

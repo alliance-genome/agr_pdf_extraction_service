@@ -40,6 +40,7 @@ from app.services.document_skeleton import (
     effective_occurrence_region,
     _projection_claim_inventory,
     project_native_emphasis,
+    project_native_page_markers,
     reconcile_native_emphasis_fallback,
     render_document_role_slots,
     reconcile_document_transformations,
@@ -1447,6 +1448,14 @@ def merge_source_artifacts(
     ):
         merged_warnings.append(structural_resolution_failure)
 
+    merged_text, audit, page_transformations, native_page_projection = (
+        project_native_page_markers(merged_text, audit, skeletons, artifacts)
+    )
+    skeleton_transformations = [
+        *skeleton_transformations,
+        *page_transformations,
+    ]
+
     llm_usage = _llm_usage_summary(llm)
     model_selection_calls = list(
         getattr(llm, "selection_call_traces", ()) if llm is not None else ()
@@ -1703,6 +1712,7 @@ def merge_source_artifacts(
         "semantic_payload_reader": semantic_report,
         "italic_preservation": italic_report,
         "native_emphasis_projection": native_emphasis_projection,
+        "native_page_projection": native_page_projection,
         "quality_receipt_status": {
             "native_italics_valid": True,
             "native_italics_error": None,

@@ -13,6 +13,8 @@ ABC_PARSER_VERSION = "1.6.0"
 ABC_PARSER_IMPLEMENTATION_SHA256 = (
     "34e5ddfb6b8549648b04c3aa8e7355769dde89c08abf1622d2e08ff102d932cf"
 )
+RAPIDFUZZ_DISTRIBUTION = "rapidfuzz"
+RAPIDFUZZ_VERSION = "3.14.5"
 
 
 def runtime_abc_parser_version() -> str:
@@ -47,6 +49,12 @@ def runtime_abc_parser_implementation_sha256() -> str:
         file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
         digest.update(f"{file_digest}  {relative}\n".encode("utf-8"))
     return digest.hexdigest()
+
+
+def runtime_rapidfuzz_version() -> str:
+    """Return the installed structural-alignment implementation version."""
+
+    return metadata.version(RAPIDFUZZ_DISTRIBUTION)
 
 
 def _round_trip_diagnostics(text: str) -> tuple[bool, bool]:

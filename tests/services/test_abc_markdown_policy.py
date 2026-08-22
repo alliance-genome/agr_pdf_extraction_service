@@ -109,7 +109,7 @@ def test_round_trip_is_diagnostic_not_part_of_validator_conformance(monkeypatch)
     assert reasons == ()
 
 
-def test_runtime_requirement_pins_exact_authoritative_parser_version():
+def test_runtime_requirements_pin_exact_replay_dependencies():
     requirements = (
         (Path(__file__).resolve().parents[2] / "requirements.txt")
         .read_text(encoding="utf-8")
@@ -121,4 +121,20 @@ def test_runtime_requirement_pins_exact_authoritative_parser_version():
         line.startswith("agr-abc-document-parsers")
         and line != "agr-abc-document-parsers==1.6.0"
         for line in requirements
+    )
+    assert "rapidfuzz==3.14.5" in requirements
+
+
+def test_installed_runtime_matches_exact_replay_dependencies():
+    assert (
+        abc_markdown_policy.runtime_abc_parser_version()
+        == abc_markdown_policy.ABC_PARSER_VERSION
+    )
+    assert (
+        abc_markdown_policy.runtime_abc_parser_implementation_sha256()
+        == abc_markdown_policy.ABC_PARSER_IMPLEMENTATION_SHA256
+    )
+    assert (
+        abc_markdown_policy.runtime_rapidfuzz_version()
+        == abc_markdown_policy.RAPIDFUZZ_VERSION
     )

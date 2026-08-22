@@ -14,7 +14,7 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from pathlib import Path
@@ -22,7 +22,12 @@ from typing import Callable, Literal, Mapping
 
 from rapidfuzz.fuzz import ratio
 
-from app.services.abc_markdown_policy import abc_markdown_report
+from app.services.abc_markdown_policy import (
+    abc_markdown_report,
+    runtime_abc_parser_implementation_sha256,
+    runtime_abc_parser_version,
+    runtime_rapidfuzz_version,
+)
 from app.services.model_policy import MAX_BOUNDED_TARGET_CHOICES
 from app.services.native_extractor_artifact import (
     load_native_extractor_artifact,
@@ -50,6 +55,7 @@ _MARKDOWN_HEADING = re.compile(rb"^ {0,3}(#{1,6})[ \t]+", re.MULTILINE)
 _MARKDOWN_TABLE_ROW = re.compile(rb"^\|.*\|[ \t]*$")
 _MARKDOWN_TABLE_SEPARATOR = re.compile(rb"^\|(?:[ \t]*:?-{3,}:?[ \t]*\|)+[ \t]*$")
 _MARKDOWN_CODE_FENCE = re.compile(rb"^`{3,}[^`]*$")
+_PAGE_TRANSPORT_COMMENT = re.compile(r"^<!-- page: [1-9]\d* -->$")
 _MARKDOWN_INLINE = re.compile(r"[`*_~\[\]()]|<[^>]+>")
 _REFERENCE_MARKER = re.compile(
     rb"^\s*(?:[-+*]|\d+[.)]|\[\d+\]|\[\^\d+\]:)\s+"
@@ -1587,7 +1593,30 @@ def _copy_audit_interval(
         clipped["source_byte_start"] = source_start + overlap_start - entry_start
         clipped["source_byte_end"] = source_end - (entry_end - overlap_end)
         output_start = len(output)
-        output.extend(original[overlap_start:overlap_end])
+        copied_span = original[overlap_start:overlap_end]
+        output.extend(copied_span)
+        if (
+            entry.get("source") == "deterministic_markup"
+            and entry.get("transformation")
+            in {
+                "selected_document_skeleton",
+                "alliance_heading_role_marker",
+                "alliance_heading_depth",
+                "alliance_bibliography_heading_boundary",
+                "alliance_figure_legend_heading_boundary",
+            }
+            and (
+                overlap_start != entry_start or overlap_end != entry_end
+            )
+        ):
+            # A later rewrite can retain only part of an earlier hash run or
+            # one newline from a two-newline generated heading boundary.
+            # Rebinding is safe only for these shape-validated heading markers
+            # and whitespace boundaries. Other generated spans stay bound to
+            # their original bytes and therefore fail closed if clipped.
+            clipped["artifact_digest"] = hashlib.sha256(copied_span).hexdigest()
+            clipped["source_byte_start"] = 0
+            clipped["source_byte_end"] = len(copied_span)
         clipped["output_byte_start"] = output_start
         clipped["output_byte_end"] = len(output)
         rewritten_audit.append(clipped)
@@ -2207,18 +2236,24 @@ def _bibliography_marker_ranges(raw: bytes) -> list[tuple[int, int, bytes, str]]
     return ranges
 
 
-def _canonical_inserted_heading(prefix: bytes, heading: bytes) -> bytes:
+def _canonical_inserted_heading_parts(
+    prefix: bytes,
+    heading: bytes,
+) -> tuple[bytes, bytes]:
+    boundary = b""
     if not prefix:
-        return heading + b"\n\n"
-    if prefix.endswith(b"\n\n"):
-        return heading + b"\n\n"
-    if prefix.endswith(b"\n"):
-        return b"\n" + heading + b"\n\n"
-    return b"\n\n" + heading + b"\n\n"
+        pass
+    elif prefix.endswith(b"\n\n"):
+        pass
+    elif prefix.endswith(b"\n"):
+        boundary = b"\n"
+    else:
+        boundary = b"\n\n"
+    return boundary, heading + b"\n\n"
 
 
-def _canonical_bibliography_heading(prefix: bytes) -> bytes:
-    return _canonical_inserted_heading(prefix, b"## References")
+def _canonical_bibliography_heading_parts(prefix: bytes) -> tuple[bytes, bytes]:
+    return _canonical_inserted_heading_parts(prefix, b"## References")
 
 
 def _figure_caption_marker_ranges(
@@ -2415,13 +2450,29 @@ def _render_figure_legend_slot(
             return text, audit, events
         legend_start = moved_figure_units[0].byte_start
         raw = moved_artifact.raw_utf8
+        boundary, heading = _canonical_inserted_heading_parts(
+            raw[:legend_start], b"## Figure Legends"
+        )
+        if boundary:
+            text, audit, boundary_events = _replace_deterministic_markup(
+                text,
+                audit,
+                [(
+                    legend_start,
+                    legend_start,
+                    boundary,
+                    "alliance_figure_legend_heading_boundary",
+                )],
+            )
+            events.extend(boundary_events)
+            legend_start += len(boundary)
         text, audit, insert_events = _replace_deterministic_markup(
             text,
             audit,
             [(
                 legend_start,
                 legend_start,
-                _canonical_inserted_heading(raw[:legend_start], b"## Figure Legends"),
+                heading,
                 "alliance_figure_legend_heading_insert",
             )],
         )
@@ -4914,6 +4965,442 @@ def project_native_emphasis(
     )
 
 
+def _page_marker_reader_payload(text: str) -> object | None:
+    """Return reader semantics with transport-only paragraphs removed."""
+
+    try:
+        from agr_abc_document_parsers import read_markdown
+
+        payload = asdict(read_markdown(text))
+    except Exception:
+        return None
+
+    removed = object()
+
+    def normalize(value: object) -> object:
+        if isinstance(value, dict):
+            paragraph_text = value.get("text")
+            if (
+                isinstance(paragraph_text, str)
+                and _PAGE_TRANSPORT_COMMENT.fullmatch(paragraph_text)
+                and {"refs", "named_content"}.issubset(value)
+            ):
+                return removed
+            return {
+                key: normalized
+                for key, child in value.items()
+                if (normalized := normalize(child)) is not removed
+            }
+        if isinstance(value, list):
+            return [
+                normalized
+                for child in value
+                if (normalized := normalize(child)) is not removed
+            ]
+        return value
+
+    return normalize(payload)
+
+
+def project_native_page_markers(
+    text: str,
+    audit: list[dict],
+    skeletons: Mapping[SourceName, DocumentSkeleton],
+    artifacts: Mapping[SourceName, SourceArtifact] | None = None,
+) -> tuple[str, list[dict], list[dict], dict]:
+    """Project native page boundaries onto final source-backed Markdown.
+
+    Audit source spans and skeleton occurrence spans share the same immutable
+    extractor Markdown byte coordinates.  Their overlap therefore provides a
+    deterministic page vote for each final structural unit without rewriting
+    publication text. Cross-source conflicts, equal direct votes, and units
+    with no native evidence deliberately abstain.
+    """
+
+    evidence: list[tuple[int, int, SourceName, int]] = []
+    occurrences_by_source = {
+        source: tuple(
+            occurrence
+            for occurrence in skeleton.occurrences
+            if type(occurrence.page_no) is int and occurrence.page_no > 0
+        )
+        for source, skeleton in skeletons.items()
+    }
+    for entry in audit:
+        source = entry.get("source")
+        output_start = entry.get("output_byte_start")
+        output_end = entry.get("output_byte_end")
+        source_start = entry.get("source_byte_start")
+        source_end = entry.get("source_byte_end")
+        if (
+            source not in occurrences_by_source
+            or type(output_start) is not int
+            or type(output_end) is not int
+            or type(source_start) is not int
+            or type(source_end) is not int
+            or output_end - output_start != source_end - source_start
+        ):
+            continue
+        for occurrence in occurrences_by_source[source]:
+            overlap_start = max(source_start, occurrence.source_byte_start)
+            overlap_end = min(source_end, occurrence.source_byte_end)
+            if overlap_start >= overlap_end:
+                continue
+            evidence.append((
+                output_start + overlap_start - source_start,
+                output_start + overlap_end - source_start,
+                source,
+                occurrence.page_no,
+            ))
+    evidence.sort()
+
+    comparison_pages: dict[str, Counter[int]] = {}
+    if artifacts is not None:
+        for source, occurrences in occurrences_by_source.items():
+            source_artifact = artifacts.get(source)
+            if source_artifact is None:
+                continue
+            for occurrence in occurrences:
+                raw = source_artifact.raw_utf8[
+                    occurrence.source_byte_start : occurrence.source_byte_end
+                ]
+                key = _comparison_key(raw.decode("utf-8", errors="strict"))
+                if key:
+                    comparison_pages.setdefault(key, Counter())[occurrence.page_no] += 1
+
+    artifact = SourceArtifact.from_text("marker", text)
+    units = scan_structural_units(artifact)
+    aligned_pages: dict[int, Counter[int]] = {}
+    if artifacts is not None:
+        for source, source_artifact in artifacts.items():
+            skeleton = skeletons.get(source)
+            if skeleton is None:
+                continue
+            occurrence_pages: dict[str, set[int]] = {}
+            for occurrence in skeleton.occurrences:
+                if type(occurrence.page_no) is int and occurrence.page_no > 0:
+                    occurrence_pages.setdefault(occurrence.unit_id, set()).add(
+                        occurrence.page_no
+                    )
+            page_by_unit = {
+                unit_id: next(iter(pages))
+                for unit_id, pages in occurrence_pages.items()
+                if len(pages) == 1
+            }
+            source_units = scan_structural_units(source_artifact)
+            for final_index, match in _align_to_baseline(
+                units,
+                source_units,
+                require_matching_unit_types=False,
+            ).items():
+                if match.ambiguous:
+                    continue
+                page_no = page_by_unit.get(
+                    source_units[match.alternative_index].unit_id
+                )
+                if page_no is not None:
+                    aligned_pages.setdefault(final_index, Counter())[page_no] += (
+                        round(match.similarity * 1_000)
+                    )
+    assignments: list[tuple[int, StructuralUnitSpan, int, str]] = []
+    direct_assignment_count = 0
+    exact_match_assignment_count = 0
+    aligned_assignment_count = 0
+    ambiguous_count = 0
+    evidence_cursor = 0
+    for unit_index, unit in enumerate(units):
+        while (
+            evidence_cursor < len(evidence)
+            and evidence[evidence_cursor][1] <= unit.byte_start
+        ):
+            evidence_cursor += 1
+        scores: Counter[int] = Counter()
+        direct_pages_by_source: dict[SourceName, set[int]] = {}
+        cursor = evidence_cursor
+        while cursor < len(evidence) and evidence[cursor][0] < unit.byte_end:
+            start, end, source, page_no = evidence[cursor]
+            overlap = min(unit.byte_end, end) - max(unit.byte_start, start)
+            if overlap > 0:
+                scores[page_no] += overlap
+                direct_pages_by_source.setdefault(source, set()).add(page_no)
+            cursor += 1
+        assignment_method = "source_audit"
+        if not scores:
+            scores = comparison_pages.get(unit.comparison_key, Counter())
+            assignment_method = "exact_structural_match"
+        if not scores:
+            scores = aligned_pages.get(unit_index, Counter())
+            assignment_method = "bounded_structural_alignment"
+        if not scores:
+            continue
+        ranked = scores.most_common()
+        cross_source_conflict = (
+            assignment_method == "source_audit"
+            and len(
+                {
+                    frozenset(pages)
+                    for pages in direct_pages_by_source.values()
+                }
+            )
+            > 1
+        )
+        if cross_source_conflict or (
+            len(ranked) > 1
+            and (
+                assignment_method != "source_audit"
+                or ranked[0][1] == ranked[1][1]
+            )
+        ):
+            ambiguous_count += 1
+            continue
+        assignments.append((unit_index, unit, ranked[0][0], assignment_method))
+        if assignment_method == "source_audit":
+            direct_assignment_count += 1
+        elif assignment_method == "exact_structural_match":
+            exact_match_assignment_count += 1
+        else:
+            aligned_assignment_count += 1
+
+    replacements: list[tuple[int, int, bytes, str]] = []
+    transition_pages: list[int] = []
+    transition_methods: list[str] = []
+    structural_block_abstained_marker_count = 0
+    protected_block_types = {"table", "list", "reference"}
+    protected_unit_indexes: set[int] = set()
+    for unit_index, unit in enumerate(units):
+        if unit.unit_type in protected_block_types:
+            protected_unit_indexes.add(unit_index)
+            continue
+        if unit_index == 0:
+            continue
+        previous_unit = units[unit_index - 1]
+        separator = artifact.raw_utf8[previous_unit.byte_end : unit.byte_start]
+        unit_raw = artifact.raw_utf8[unit.byte_start : unit.byte_end]
+        indented = unit_raw.startswith((b" ", b"\t"))
+        if unit_index - 1 in protected_unit_indexes and (
+            indented
+            or (
+                unit.unit_type == "paragraph"
+                and separator.count(b"\n") < 2
+            )
+        ):
+            # Markdown permits list item continuation text without another
+            # bullet, and indented headings, fences, captions, and paragraphs
+            # can remain nested even across blank lines.  A comment inserted
+            # there changes the list's meaning, even though both documents
+            # remain syntactically valid.
+            protected_unit_indexes.add(unit_index)
+    first_unit_is_h1 = False
+    if units:
+        first_heading_match = _MARKDOWN_HEADING.match(
+            artifact.raw_utf8[units[0].byte_start : units[0].byte_end]
+        )
+        first_unit_is_h1 = (
+            units[0].unit_type == "heading"
+            and first_heading_match is not None
+            and len(first_heading_match.group(1)) == 1
+        )
+    # The downstream Markdown contract defaults to page 1, so only emit an
+    # initial marker when the first proven unit belongs to another page.
+    previous_page: int | None = 1
+    observed_page: int | None = 1
+    abstained_boundaries: list[dict] = []
+    for unit_index, unit, page_no, assignment_method in assignments:
+        observed_transition = page_no != observed_page
+        observed_page = page_no
+        if page_no == previous_page:
+            continue
+        if first_unit_is_h1 and unit_index == 0:
+            # A marker before the document title makes the Alliance reader
+            # lose the title and body.  Delaying it until just after the title
+            # is also unsafe because the reader interprets it as an author.
+            if observed_transition:
+                structural_block_abstained_marker_count += 1
+                abstained_boundaries.append({
+                    "pre_projection_output_byte_offset": unit.byte_start,
+                    "page_no": page_no,
+                    "reason": "first_heading_slot",
+                    "projection_method": assignment_method,
+                })
+            previous_page = page_no
+            continue
+        if unit_index in protected_unit_indexes:
+            if observed_transition:
+                structural_block_abstained_marker_count += 1
+                abstained_boundaries.append({
+                    "pre_projection_output_byte_offset": unit.byte_start,
+                    "page_no": page_no,
+                    "reason": "protected_structural_block",
+                    "projection_method": assignment_method,
+                })
+            continue
+        if first_unit_is_h1 and unit_index == 1:
+            # Inserting the page comment into the first post-title slot makes
+            # the Alliance reader parse it as a document author.  Once actual
+            # body/front-matter content is established, ordinary page markers
+            # remain safe to project.
+            if observed_transition:
+                structural_block_abstained_marker_count += 1
+                abstained_boundaries.append({
+                    "pre_projection_output_byte_offset": unit.byte_start,
+                    "page_no": page_no,
+                    "reason": "first_post_title_slot",
+                    "projection_method": assignment_method,
+                })
+            previous_page = page_no
+            continue
+        replacements.append((
+            unit.byte_start,
+            unit.byte_start,
+            f"<!-- page: {page_no} -->\n".encode("ascii"),
+            "native_page_marker",
+        ))
+        transition_pages.append(page_no)
+        transition_methods.append(assignment_method)
+        previous_page = page_no
+
+    rendered, rewritten_audit, events = _replace_deterministic_markup(
+        text, audit, replacements
+    )
+    decorated_events = [
+        {
+            **event,
+            "page_no": page_no,
+            "projection_method": assignment_method,
+        }
+        for event, page_no, assignment_method in zip(
+            events,
+            transition_pages,
+            transition_methods,
+            strict=True,
+        )
+    ]
+    marker_abstention_reason = None
+    validation_abstained_marker_count = 0
+    reader_payload_abstained_marker_count = 0
+    if events:
+        rendered_abc = abc_markdown_report(rendered)
+        validation_regressed = rendered_abc["failure_code"] is not None
+        if not validation_regressed and not (
+            rendered_abc["valid"] is True
+            and not rendered_abc["error_rule_ids"]
+            and not rendered_abc["warning_rule_ids"]
+        ):
+            original_abc = abc_markdown_report(text)
+            validation_regressed = (
+                original_abc["failure_code"] is not None
+                or bool(
+                    set(rendered_abc["error_rule_ids"])
+                    - set(original_abc["error_rule_ids"])
+                )
+                or bool(
+                    set(rendered_abc["warning_rule_ids"])
+                    - set(original_abc["warning_rule_ids"])
+                )
+                or (
+                    original_abc["valid"] is True
+                    and rendered_abc["valid"] is not True
+                )
+            )
+        reader_payload_regressed = False
+        if not validation_regressed:
+            original_reader_payload = _page_marker_reader_payload(text)
+            rendered_reader_payload = _page_marker_reader_payload(rendered)
+            reader_payload_regressed = (
+                original_reader_payload is None
+                or rendered_reader_payload is None
+                or rendered_reader_payload != original_reader_payload
+            )
+        if validation_regressed or reader_payload_regressed:
+            abstention_reason = (
+                "abc_validation_regression"
+                if validation_regressed
+                else "reader_payload_regression"
+            )
+            abstained_boundaries.extend(
+                {
+                    "pre_projection_output_byte_offset": replacement[0],
+                    "page_no": page_no,
+                    "reason": abstention_reason,
+                    "projection_method": assignment_method,
+                }
+                for replacement, page_no, assignment_method in zip(
+                    replacements,
+                    transition_pages,
+                    transition_methods,
+                    strict=True,
+                )
+            )
+        if validation_regressed:
+            validation_abstained_marker_count = len(events)
+            marker_abstention_reason = "abc_validation_regression"
+        elif reader_payload_regressed:
+            reader_payload_abstained_marker_count = len(events)
+            marker_abstention_reason = "reader_payload_regression"
+        if validation_regressed or reader_payload_regressed:
+            rendered = text
+            rewritten_audit = audit
+            decorated_events = []
+            transition_pages = []
+    accepted_replacements = replacements if decorated_events else []
+    rendered_abstained_boundaries = []
+    for boundary in abstained_boundaries:
+        pre_projection_offset = boundary["pre_projection_output_byte_offset"]
+        rendered_abstained_boundaries.append({
+            "output_byte_offset": pre_projection_offset + sum(
+                len(replacement[2])
+                for replacement in accepted_replacements
+                if replacement[0] <= pre_projection_offset
+            ),
+            "page_no": boundary["page_no"],
+            "reason": boundary["reason"],
+            "projection_method": boundary["projection_method"],
+        })
+    rendered_abstained_boundaries.sort(
+        key=lambda boundary: (
+            boundary["output_byte_offset"],
+            boundary["page_no"],
+            boundary["reason"],
+            boundary["projection_method"],
+        )
+    )
+    abc_parser_version = runtime_abc_parser_version()
+    abc_parser_implementation_sha256 = (
+        runtime_abc_parser_implementation_sha256()
+    )
+    rapidfuzz_version = runtime_rapidfuzz_version()
+    report = {
+        "policy_version": "source-audit-native-page-projection-v3",
+        "abc_parser_version": abc_parser_version,
+        "abc_parser_implementation_sha256": (
+            abc_parser_implementation_sha256
+        ),
+        "rapidfuzz_version": rapidfuzz_version,
+        "structural_unit_count": len(units),
+        "mapped_structural_unit_count": len(assignments),
+        "direct_audit_assignment_count": direct_assignment_count,
+        "exact_structural_match_assignment_count": exact_match_assignment_count,
+        "bounded_structural_alignment_assignment_count": aligned_assignment_count,
+        "ambiguous_structural_unit_count": ambiguous_count,
+        "unmapped_structural_unit_count": (
+            len(units) - len(assignments) - ambiguous_count
+        ),
+        "marker_count": len(decorated_events),
+        "projected_pages": transition_pages,
+        "validation_abstained_marker_count": validation_abstained_marker_count,
+        "reader_payload_abstained_marker_count": (
+            reader_payload_abstained_marker_count
+        ),
+        "structural_block_abstained_marker_count": (
+            structural_block_abstained_marker_count
+        ),
+        "abstained_boundary_count": len(rendered_abstained_boundaries),
+        "abstained_boundaries": rendered_abstained_boundaries,
+        "marker_abstention_reason": marker_abstention_reason,
+    }
+    return rendered, rewritten_audit, decorated_events, report
+
+
 def reconcile_native_emphasis_fallback(
     text: str,
     skeletons: Mapping[SourceName, DocumentSkeleton],
@@ -5668,7 +6155,22 @@ def render_document_role_slots(
                 ]
             )
             raw = text.encode("utf-8")
-            heading = _canonical_bibliography_heading(raw[:reference_start])
+            boundary, heading = _canonical_bibliography_heading_parts(
+                raw[:reference_start]
+            )
+            if boundary:
+                text, audit, boundary_events = _replace_deterministic_markup(
+                    text,
+                    audit,
+                    [(
+                        reference_start,
+                        reference_start,
+                        boundary,
+                        "alliance_bibliography_heading_boundary",
+                    )],
+                )
+                events.extend(boundary_events)
+                reference_start += len(boundary)
             text, audit, insert_events = _replace_deterministic_markup(
                 text,
                 audit,

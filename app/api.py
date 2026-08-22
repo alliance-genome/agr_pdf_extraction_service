@@ -1248,6 +1248,7 @@ def download_result(process_id, method):
 
         if method in {"merged", "audit"} and data.get("merged_cache_path"):
             contract_id = data.get("merge_contract_id")
+            source_pdf_sha256 = data.get("source_pdf_sha256")
             merged_path = data.get("merged_cache_path")
             metrics_path = data.get("merge_metrics_path")
             audit_path = data.get("merge_audit_path")
@@ -1256,10 +1257,24 @@ def download_result(process_id, method):
             skeleton_projection_ids = data.get(
                 "document_skeleton_candidate_projection_ids"
             )
-            if not all((contract_id, merged_path, metrics_path, audit_path)) or not all(
+            metadata_complete = all(
+                (merged_path, metrics_path, audit_path)
+            ) and (
+                isinstance(source_pdf_sha256, str)
+                and len(source_pdf_sha256) == 64
+            ) and all(
                 isinstance(value, dict)
                 for value in (native_receipts, skeleton_ids, skeleton_projection_ids)
-            ):
+            )
+            if contract_id != Config.MERGE_CONTRACT_ID:
+                local_merge_verification_failed = True
+                logger.warning(
+                    "Merge download contract is stale for %s; expected=%s; "
+                    "trying durable artifact",
+                    process_id,
+                    Config.MERGE_CONTRACT_ID,
+                )
+            elif not metadata_complete:
                 local_merge_verification_failed = True
                 logger.warning(
                     "Merge download bundle metadata is incomplete for %s; "
@@ -1287,12 +1302,54 @@ def download_result(process_id, method):
                             artifacts[source] = SourceArtifact.from_text(
                                 source, handle.read()
                             )
+                    from app.services.document_skeleton import (
+                        build_document_skeleton,
+                        load_runtime_native_structures,
+                    )
+
+                    native_structures, _native_failures = (
+                        load_runtime_native_structures(
+                            artifacts,
+                            {
+                                source: download_paths[source]
+                                for source in artifacts
+                            },
+                            expected_pdf_sha256=source_pdf_sha256,
+                        )
+                    )
+                    if {
+                        source: native.receipt_digest
+                        for source, native in sorted(native_structures.items())
+                    } != native_receipts:
+                        raise ValueError(
+                            "merge native structure receipts do not match local sidecars"
+                        )
+                    skeletons = {}
+                    for source, artifact in sorted(artifacts.items()):
+                        try:
+                            skeletons[source] = build_document_skeleton(
+                                artifact,
+                                native_structures.get(source),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Merge download skeleton rebuild failed for %s "
+                                "source=%s: %s",
+                                process_id,
+                                source,
+                                type(exc).__name__,
+                            )
+                            skeletons[source] = build_document_skeleton(
+                                artifact,
+                                None,
+                            )
                     merged_text, _metrics, merge_audit = load_merge_bundle(
                         merged_path=merged_path,
                         metrics_path=metrics_path,
                         audit_path=audit_path,
                         artifacts=artifacts,
-                        expected_contract_id=contract_id,
+                        skeletons=skeletons,
+                        expected_contract_id=Config.MERGE_CONTRACT_ID,
                         expected_native_structure_receipt_digests=native_receipts,
                         expected_skeleton_candidate_ids=skeleton_ids,
                         expected_skeleton_candidate_projection_ids=(

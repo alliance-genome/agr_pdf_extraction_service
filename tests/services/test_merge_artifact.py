@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 
+import app.services.merge_artifact as merge_artifact_module
 from app.services.source_contracts import SourceArtifact
 from app.services.merge_artifact import (
+    _validate_native_page_projection_receipts,
     _validate_positive_style_overlay_receipts,
     _validate_title_selection_receipts,
     bundle_manifest_path,
@@ -18,14 +20,18 @@ from app.services.merge_artifact import (
 )
 from app.services.model_policy import resolved_runtime_model_map
 from app.services.abc_markdown_policy import abc_markdown_report
-from app.services.document_skeleton import build_document_skeleton
+from app.services.document_skeleton import (
+    build_document_skeleton,
+    project_native_page_markers,
+)
 from app.services.semantic_payload import (
     build_semantic_payload_receipt,
     semantic_payload_reader_report,
 )
 
 
-CONTRACT_ID = "pdfx-native-skeleton-selection"
+CONTRACT_ID = "pdfx-native-skeleton-selection-page-provenance-v3"
+LEGACY_CONTRACT_ID = "pdfx-native-skeleton-selection"
 
 
 def _empty_native_italic_receipt() -> dict:
@@ -84,8 +90,9 @@ def _case(text: str = "# Title\nBody\n"):
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     artifacts = {"grobid": artifact}
     abc_report = abc_markdown_report(text)
-    skeleton_id = hashlib.sha256(f"skeleton:{digest}".encode()).hexdigest()
-    projection_id = hashlib.sha256(f"projection:{digest}".encode()).hexdigest()
+    skeleton = build_document_skeleton(artifact, None)
+    skeleton_id = skeleton.skeleton_id
+    projection_id = skeleton.projection_id
     metrics = {
         "merge_contract_id": CONTRACT_ID,
         "failed": False,
@@ -138,7 +145,7 @@ def _case(text: str = "# Title\nBody\n"):
         text,
         audit,
         baseline_source="grobid",
-        skeletons={"grobid": build_document_skeleton(artifact, None)},
+        skeletons={"grobid": skeleton},
     )
     metrics["semantic_payload_receipt"] = semantic_receipt.as_metric()
     metrics["semantic_payload_reader"] = semantic_payload_reader_report(
@@ -189,6 +196,13 @@ def _load_expectations(metrics: dict) -> dict:
     }
 
 
+def _skeletons(artifacts: dict) -> dict:
+    return {
+        source: build_document_skeleton(artifact, None)
+        for source, artifact in artifacts.items()
+    }
+
+
 def test_validation_accepts_exact_source_bytes_and_receipts():
     text = "# Title\nBody\n"
     artifacts, metrics, audit = _case(text)
@@ -199,6 +213,59 @@ def test_validation_accepts_exact_source_bytes_and_receipts():
         artifacts=artifacts,
         expected_contract_id=CONTRACT_ID,
     ) == metrics["output_digest"]
+
+
+def test_page_projection_replay_rejects_runtime_dependency_drift(monkeypatch):
+    from dataclasses import replace
+
+    text = "# Title\n\nFirst page.\n\nSecond page.\n"
+    artifact = SourceArtifact.from_text("grobid", text)
+    skeleton = build_document_skeleton(artifact, None)
+    second_start = artifact.raw_utf8.index(b"Second page.")
+    skeleton = replace(
+        skeleton,
+        occurrences=tuple(
+            replace(
+                occurrence,
+                page_no=(
+                    2 if occurrence.source_byte_start == second_start else 1
+                ),
+            )
+            for occurrence in skeleton.occurrences
+        ),
+    )
+    source_audit = [{
+        "output_byte_start": 0,
+        "output_byte_end": len(artifact.raw_utf8),
+        "source": "grobid",
+        "artifact_digest": artifact.digest,
+        "source_byte_start": 0,
+        "source_byte_end": len(artifact.raw_utf8),
+    }]
+    rendered, audit, events, report = project_native_page_markers(
+        text,
+        source_audit,
+        {"grobid": skeleton},
+        {"grobid": artifact},
+    )
+    metrics = {
+        "document_skeleton_transformations": events,
+        "native_page_projection": report,
+    }
+    monkeypatch.setattr(
+        merge_artifact_module,
+        "runtime_rapidfuzz_version",
+        lambda: "0.0.0",
+    )
+
+    with pytest.raises(ValueError, match="replay dependency mismatch"):
+        _validate_native_page_projection_receipts(
+            rendered.encode(),
+            audit,
+            metrics,
+            {"grobid": artifact},
+            {"grobid": skeleton},
+        )
 
 
 def test_unreconciled_native_italic_receipt_delivers_only_as_bound_failsafe():
@@ -402,6 +469,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
         metrics_path=str(metric_file),
         audit_path=str(audit_file),
         artifacts=artifacts,
+        skeletons=_skeletons(artifacts),
         expected_contract_id=CONTRACT_ID,
         **_load_expectations(metrics),
     ) == (text, metrics, audit)
@@ -412,6 +480,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id=CONTRACT_ID,
             expected_native_structure_receipt_digests={"grobid": "0" * 64},
             expected_skeleton_candidate_ids=metrics[
@@ -427,6 +496,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id=CONTRACT_ID,
             expected_native_structure_receipt_digests={},
             expected_skeleton_candidate_ids={"grobid": "0" * 64},
@@ -440,6 +510,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id=CONTRACT_ID,
             expected_native_structure_receipt_digests={},
             expected_skeleton_candidate_ids=metrics[
@@ -453,6 +524,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id="pdfx-source-selection",
             **_load_expectations(metrics),
         )
@@ -463,6 +535,7 @@ def test_manifest_last_bundle_round_trip_and_tamper_detection(tmp_path):
             metrics_path=str(metric_file),
             audit_path=str(audit_file),
             artifacts=artifacts,
+            skeletons=_skeletons(artifacts),
             expected_contract_id=CONTRACT_ID,
             **_load_expectations(metrics),
         )
@@ -489,6 +562,39 @@ def test_manifest_binds_the_exact_source_generation(tmp_path):
         load_merge_bundle(
             merged_path=str(merged), metrics_path=str(metric_file),
             audit_path=str(audit_file), artifacts=newer,
+            skeletons=_skeletons(newer),
+            expected_contract_id=CONTRACT_ID,
+            **_load_expectations(metrics),
+        )
+
+
+def test_new_contract_rejects_a_legacy_merge_bundle(tmp_path):
+    text = "# Title\nBody\n"
+    artifacts, metrics, audit = _case(text)
+    metrics["merge_contract_id"] = LEGACY_CONTRACT_ID
+    merged = tmp_path / "merged.md"
+    metric_file = tmp_path / "metrics.json"
+    audit_file = tmp_path / "audit.json"
+    skeletons = _skeletons(artifacts)
+    persist_merge_bundle(
+        merged_path=str(merged),
+        metrics_path=str(metric_file),
+        audit_path=str(audit_file),
+        text=text,
+        metrics=metrics,
+        audit=audit,
+        artifacts=artifacts,
+        skeletons=skeletons,
+        expected_contract_id=LEGACY_CONTRACT_ID,
+    )
+
+    with pytest.raises(ValueError, match="manifest identity"):
+        load_merge_bundle(
+            merged_path=str(merged),
+            metrics_path=str(metric_file),
+            audit_path=str(audit_file),
+            artifacts=artifacts,
+            skeletons=skeletons,
             expected_contract_id=CONTRACT_ID,
             **_load_expectations(metrics),
         )
@@ -616,6 +722,96 @@ def test_positive_style_selection_must_match_its_numeric_sol_trace():
 
     trace["response"]["decisions"][0]["choice"] = 0
     with pytest.raises(ValueError, match="numeric-choice trace is malformed"):
+        _validate_positive_style_overlay_receipts(
+            artifact.raw_utf8,
+            audit,
+            metrics,
+            {"grobid": artifact},
+            None,
+        )
+
+
+def test_positive_style_selection_ignores_late_event_diagnostics():
+    artifact = SourceArtifact.from_text("grobid", "Body\n")
+    audit = [{
+        "output_byte_start": 0,
+        "output_byte_end": len(artifact.raw_utf8),
+        "source": "grobid",
+        "artifact_digest": artifact.digest,
+        "source_byte_start": 0,
+        "source_byte_end": len(artifact.raw_utf8),
+    }]
+    selection_id = "style-selection"
+    request_sha256 = "a" * 64
+    event = {
+        "operation": "native_emphasis_projection",
+        "outcome": "supported",
+        "positive_style_claim_id": "b" * 64,
+        "style_selection_id": selection_id,
+        "style_selection_method": "sol_numbered_choice",
+        "style_selection_candidate_ids": ["target"],
+        "style_selection_candidate_count": 1,
+        "style_selection_none_id": "none",
+        "style_selected_candidate_id": "target",
+        "style_selection_request_sha256": request_sha256,
+        "style_selection_response_choice": 1,
+        "style_selection_model": "gpt-5.6-sol",
+        "style_selection_reasoning_effort": "high",
+        "model_selected_target": True,
+    }
+    enriched_event = {
+        **event,
+        "positive_style_claim_id": "c" * 64,
+        "style_selection_donor_ordinal": 4,
+        "style_selection_target_ordinal": 7,
+        "style_selection_order_crossing": False,
+    }
+    trace = {
+        "tier": "sol",
+        "call_type": "bounded_id_selection_sol",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "outcome": "valid",
+        "request": {
+            "request_sha256": request_sha256,
+            "regions": [{
+                "region_id": selection_id,
+                "keep_baseline_choice": 0,
+                "baseline_candidate_id": "none",
+                "candidates": [
+                    {"candidate_id": "none"},
+                    {"candidate_id": "target"},
+                ],
+                "path_choices": [{"choice": 1, "candidate_ids": ["target"]}],
+            }],
+        },
+        "response": {
+            "request_sha256": request_sha256,
+            "decisions": [{"region_id": selection_id, "choice": 1}],
+        },
+    }
+    metrics = {
+        "document_skeleton_transformations": [event, enriched_event],
+        "model_selection_calls": [trace],
+    }
+
+    _validate_positive_style_overlay_receipts(
+        artifact.raw_utf8,
+        audit,
+        metrics,
+        {"grobid": artifact},
+        None,
+    )
+
+    enriched_event["style_selection_response_choice"] = 0
+    with pytest.raises(
+        ValueError,
+        match=(
+            "positive style model-selection receipt is inconsistent "
+            r"\(call grouping; differing keys: "
+            "style_selection_response_choice"
+        ),
+    ):
         _validate_positive_style_overlay_receipts(
             artifact.raw_utf8,
             audit,
