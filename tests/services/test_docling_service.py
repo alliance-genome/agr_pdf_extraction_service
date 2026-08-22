@@ -140,7 +140,10 @@ class _FakeDocument:
             "text_width": text_width,
         }
         self.calls.append(kwargs)
-        return "# Title\n\nBody with *italics*."
+        return (
+            f"# Title{page_break_placeholder}\n\n"
+            f"Body with *italics*.{page_break_placeholder}"
+        )
 
     def export_to_dict(self, **kwargs):
         self.export_dict_kwargs = kwargs
@@ -175,6 +178,10 @@ def test_docling_extract_writes_clean_markdown_and_native_document(monkeypatch, 
         "app.services.docling_service._get_converter",
         lambda *_args, **_kwargs: _FakeConverter(fake_doc),
     )
+    monkeypatch.setattr(
+        "app.services.docling_service.version",
+        lambda package: {"docling": "2.113.0", "docling-core": "2.87.1"}[package],
+    )
 
     docling = Docling()
     pdf_path = tmp_path / "test.pdf"
@@ -186,11 +193,12 @@ def test_docling_extract_writes_clean_markdown_and_native_document(monkeypatch, 
     content = output_path.read_text(encoding="utf-8")
     assert content == "# Title\n\nBody with *italics*."
     assert "<!-- page:" not in content
-    assert fake_doc.calls == [{
-        "image_placeholder": "",
-        "page_break_placeholder": "",
-        "text_width": -1,
-    }]
+    assert len(fake_doc.calls) == 1
+    assert fake_doc.calls[0]["image_placeholder"] == ""
+    assert fake_doc.calls[0]["page_break_placeholder"].startswith(
+        "PDFX_DOCLING_PAGE_BOUNDARY_"
+    )
+    assert fake_doc.calls[0]["text_width"] == -1
     assert fake_doc.export_dict_kwargs == {
         "mode": "json",
         "by_alias": True,
@@ -206,6 +214,7 @@ def test_docling_extract_writes_clean_markdown_and_native_document(monkeypatch, 
     assert manifest["expected_page_count"] == 3
     assert manifest["covered_pages"] == [1, 2, 3]
     assert manifest["options"]["native_style_cell_collection"] == "word_cells"
+    assert manifest["page_provenance_filename"].endswith("page-provenance.json")
 
 
 def test_docling_converter_pins_rapidocr_onnxruntime_cpu(monkeypatch):

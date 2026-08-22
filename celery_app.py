@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import threading
+from collections import Counter
 from contextlib import contextmanager, suppress
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -45,8 +46,19 @@ from app.services.native_extractor_artifact import (
     load_native_extractor_artifact,
     native_artifact_path,
     native_manifest_path,
+    sha256_file,
 )
 from app.services.page_coverage import page_coverage_sidecar_path
+from app.services.page_provenance import (
+    bound_page_resolution_ranges,
+    build_page_resolution_batches,
+    canonical_json_line_sha256,
+    finalize_merged_page_provenance_bytes,
+    load_source_page_provenance,
+    merged_page_provenance_path,
+    project_merged_page_ranges,
+    source_page_provenance_path,
+)
 
 logger = logging.getLogger(__name__)
 _torch_worker_configured = False
@@ -359,6 +371,7 @@ def _clear_cached_outputs(file_hash, clear_cache_scope):
             patterns.extend([
                 f"{prefix}merged.md",                  # vX_<hash>_merged.md
                 f"{prefix}*_merged.md",               # vX_<hash>_<methods>_merged.md
+                f"{prefix}*_merged.md.*",             # manifest + page provenance
                 f"{prefix}*_consensus_metrics.json",
                 f"{prefix}*_audit.json",
             ])
@@ -370,6 +383,9 @@ def _clear_cached_outputs(file_hash, clear_cache_scope):
                 f"{prefix}grobid.md.page-coverage.json",
                 f"{prefix}docling.md.page-coverage.json",
                 f"{prefix}marker.md.page-coverage.json",
+                f"{prefix}grobid.md.page-provenance.json",
+                f"{prefix}docling.md.page-provenance.json",
+                f"{prefix}marker.md.page-provenance.json",
                 f"{prefix}grobid.md.native.*",
                 f"{prefix}docling.md.native.*",
                 f"{prefix}marker.md.native.*",
@@ -658,6 +674,8 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
     for method, path in download_paths.items():
         if not path or not os.path.exists(path):
             continue
+        if method == "page_provenance":
+            continue
 
         try:
             with open(path, "rb") as f:
@@ -684,10 +702,19 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
                 native_manifest_path(path).read_bytes(),
                 subdir=f"native/{method}",
             )
-            if native_key and manifest_key:
+            page_provenance_key = audit_logger.upload_artifact(
+                manifest["page_provenance_filename"],
+                source_page_provenance_path(path).read_bytes(),
+                subdir=f"native/{method}",
+            )
+            if native_key and manifest_key and page_provenance_key:
                 artifacts.setdefault("native", {})[method] = {
                     "artifact": native_key,
                     "manifest": manifest_key,
+                    "page_provenance": page_provenance_key,
+                    "page_provenance_sha256": manifest[
+                        "page_provenance_sha256"
+                    ],
                     "sha256": manifest["native_sha256"],
                     "media_type": manifest["native_media_type"],
                 }
@@ -710,6 +737,19 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
         if not key:
             raise RuntimeError("Failed to upload durable merged output")
         artifacts["merged"] = key
+        page_path = merged_page_provenance_path(merged_path)
+        try:
+            page_key = audit_logger.upload_artifact(
+                "page_provenance.json",
+                page_path.read_bytes(),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to upload durable merged page provenance"
+            ) from exc
+        if not page_key:
+            raise RuntimeError("Failed to upload durable merged page provenance")
+        artifacts["page_provenance"] = page_key
 
     images = []
     if file_hash:
@@ -1451,6 +1491,7 @@ def _discard_failed_extractor_cache(file_hash, method):
         native_manifest_path(output_path),
         native_artifact_path(output_path, method),
         page_coverage_sidecar_path(output_path),
+        source_page_provenance_path(output_path),
     )
     for path in paths:
         try:
@@ -1733,8 +1774,7 @@ def _run_extraction(
             build_document_skeleton,
             load_runtime_native_structures,
         )
-        from app.services.native_extractor_artifact import sha256_file
-
+        pdf_sha256 = sha256_file(pdf_path)
         runtime_output_paths = {
             source: _cached_path(file_hash, source)
             for source in source_artifacts
@@ -1743,9 +1783,24 @@ def _run_extraction(
             load_runtime_native_structures(
                 source_artifacts,
                 runtime_output_paths,
-                expected_pdf_sha256=sha256_file(pdf_path),
+                expected_pdf_sha256=pdf_sha256,
             )
         )
+        runtime_source_page_maps = {}
+        runtime_source_page_map_sha256 = {}
+        for source, output_path in sorted(runtime_output_paths.items()):
+            manifest, _native_bytes = load_native_extractor_artifact(
+                source=source,
+                output_filename=output_path,
+                expected_pdf_sha256=pdf_sha256,
+            )
+            runtime_source_page_maps[source] = load_source_page_provenance(
+                output_path,
+                manifest=manifest,
+            )
+            runtime_source_page_map_sha256[source] = manifest[
+                "page_provenance_sha256"
+            ]
         # Persistence replay must use skeletons built from the same native inputs
         # that merge_source_artifacts receives below.
         runtime_skeletons = {}
@@ -1787,6 +1842,10 @@ def _run_extraction(
                     expected_skeleton_candidate_ids=runtime_skeleton_ids,
                     expected_skeleton_candidate_projection_ids=(
                         runtime_skeleton_projection_ids
+                    ),
+                    expected_pdf_sha256=pdf_sha256,
+                    expected_source_page_map_sha256=(
+                        runtime_source_page_map_sha256
                     ),
                 )
                 audit_cache_path = possible_audit
@@ -1894,6 +1953,86 @@ def _run_extraction(
                     reason = (consensus_metrics or {}).get("failure_reason", "unknown")
                     raise ValueError(f"Consensus pipeline failed: {reason}")
 
+                merged_bytes = consensus_md.encode("utf-8")
+                projected_page_ranges = project_merged_page_ranges(
+                    merged_bytes=merged_bytes,
+                    audit=consensus_audit or [],
+                    source_maps=runtime_source_page_maps,
+                    page_candidate_regions=consensus_metrics.get(
+                        "page_candidate_regions", []
+                    ),
+                    transformation_events=consensus_metrics.get(
+                        "document_skeleton_transformations", []
+                    ),
+                )
+                projected_page_ranges = bound_page_resolution_ranges(
+                    merged_bytes=merged_bytes,
+                    projected_ranges=projected_page_ranges,
+                    max_text_bytes=(
+                        Config.PAGE_PROVENANCE_LLM_EVIDENCE_BYTES_PER_RANGE
+                    ),
+                )
+                page_batches = build_page_resolution_batches(
+                    merged_bytes=merged_bytes,
+                    projected_ranges=projected_page_ranges,
+                    source_bytes={
+                        source: artifact.raw_utf8
+                        for source, artifact in source_artifacts.items()
+                    },
+                    max_ranges_per_batch=(
+                        Config.PAGE_PROVENANCE_LLM_MAX_RANGES_PER_BATCH
+                    ),
+                    context_bytes=Config.PAGE_PROVENANCE_LLM_CONTEXT_BYTES,
+                    evidence_bytes_per_range=(
+                        Config.PAGE_PROVENANCE_LLM_EVIDENCE_BYTES_PER_RANGE
+                    ),
+                )
+                page_choices = {}
+                page_llm_receipts = []
+                for batch in page_batches:
+                    if llm is None or not _recovery_time_available(
+                        job_started_monotonic
+                    ):
+                        break
+                    decisions, receipt = llm.resolve_page_choices(batch)
+                    page_choices.update(decisions)
+                    page_llm_receipts.append(receipt)
+                source_page_counts = {
+                    source_map["expected_page_count"]
+                    for source_map in runtime_source_page_maps.values()
+                }
+                if len(source_page_counts) != 1:
+                    raise ValueError("source page maps disagree on PDF page count")
+                page_provenance_bytes, page_summary = (
+                    finalize_merged_page_provenance_bytes(
+                        pdf_sha256=pdf_sha256,
+                        expected_page_count=next(iter(source_page_counts)),
+                        merged_bytes=merged_bytes,
+                        audit_sha256=canonical_json_line_sha256(
+                            list(consensus_audit or [])
+                        ),
+                        merge_contract_id=Config.MERGE_CONTRACT_ID,
+                        source_map_sha256=runtime_source_page_map_sha256,
+                        projected_ranges=projected_page_ranges,
+                        llm_choices=page_choices,
+                        llm_receipts=page_llm_receipts,
+                    )
+                )
+                consensus_metrics["page_provenance"] = {
+                    **page_summary,
+                    "llm_batch_count": len(page_llm_receipts),
+                    "llm_outcomes": dict(
+                        sorted(
+                            Counter(
+                                receipt.get("outcome", "unknown")
+                                for receipt in page_llm_receipts
+                            ).items()
+                        )
+                    ),
+                }
+                if llm is not None:
+                    consensus_metrics["llm_usage"] = llm.usage.summary()
+
                 persist_merge_bundle(
                     merged_path=merged_cache_path,
                     metrics_path=metrics_cache_path,
@@ -1904,6 +2043,9 @@ def _run_extraction(
                     artifacts=source_artifacts,
                     skeletons=runtime_skeletons,
                     expected_contract_id=Config.MERGE_CONTRACT_ID,
+                    page_provenance_bytes=page_provenance_bytes,
+                    pdf_sha256=pdf_sha256,
+                    source_page_map_sha256=runtime_source_page_map_sha256,
                     alias_path=merged_alias_path,
                 )
 
@@ -2017,11 +2159,16 @@ def _run_extraction(
         result["merge_contract_id"] = Config.MERGE_CONTRACT_ID
         result["merge_metrics_path"] = metrics_cache_path
         result["merge_audit_path"] = audit_cache_path
+        result["page_provenance_cache_path"] = str(
+            merged_page_provenance_path(merged_cache_path)
+        )
         result["native_structure_receipt_digests"] = runtime_native_receipts
         result["document_skeleton_candidate_ids"] = runtime_skeleton_ids
         result["document_skeleton_candidate_projection_ids"] = (
             runtime_skeleton_projection_ids
         )
+        result["pdf_sha256"] = pdf_sha256
+        result["source_page_map_sha256"] = runtime_source_page_map_sha256
 
     if llm_usage_json is not None:
         result["llm_usage_json"] = llm_usage_json
@@ -2030,5 +2177,9 @@ def _run_extraction(
 
     if audit_cache_path:
         result["download_paths"]["audit"] = audit_cache_path
+    if merged_cache_path:
+        result["download_paths"]["page_provenance"] = str(
+            merged_page_provenance_path(merged_cache_path)
+        )
 
     return result

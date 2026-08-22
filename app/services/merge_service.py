@@ -1658,6 +1658,24 @@ def merge_source_artifacts(
         ),
         "selection_events": selection_events,
         "region_decisions": list(result.decision_trace) if benchmark_mode else [],
+        "page_candidate_regions": [
+            {
+                "region_id": event.get("region_id"),
+                "candidates": [
+                    {
+                        "candidate_id": candidate.get("candidate_id"),
+                        "source": candidate.get("source"),
+                        "artifact_digest": candidate.get("artifact_digest"),
+                        "source_byte_start": candidate.get("source_byte_start"),
+                        "source_byte_end": candidate.get("source_byte_end"),
+                    }
+                    for candidate in event.get("candidates", ())
+                    if isinstance(candidate, Mapping)
+                ],
+            }
+            for event in result.decision_trace
+            if isinstance(event, Mapping)
+        ],
         "candidate_alignment_trace": (
             list(result.candidate_construction_trace) if benchmark_mode else []
         ),

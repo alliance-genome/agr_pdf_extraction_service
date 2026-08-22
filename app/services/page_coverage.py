@@ -56,6 +56,12 @@ def _pdf_page_count(path: str | os.PathLike[str]) -> int:
     return count
 
 
+def pdf_page_count(path: str | os.PathLike[str]) -> int:
+    """Public page-count boundary shared by provenance and coverage receipts."""
+
+    return _pdf_page_count(path)
+
+
 def page_coverage_sidecar_path(output_filename: str | os.PathLike[str]) -> str:
     return f"{output_filename}.page-coverage.json"
 

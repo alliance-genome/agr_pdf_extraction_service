@@ -1,10 +1,47 @@
 # PDFX Primary Page-Provenance Goal
 
-**Date:** 2026-08-22  
-**Status:** Approved for implementation  
-**PDFX implementation base:** `origin/main` at `9747452`  
-**Parser implementation base:** `agr_abc_document_parsers` `origin/main` at `a37100e` / `v1.6.0`  
+**Date:** 2026-08-22
+
+**Status:** Implementation in progress; local correction/review cycle
+
+**PDFX implementation base:** `origin/main` at `9747452`
+
+**Parser implementation base:** `agr_abc_document_parsers` `origin/main` at `a37100e` / `v1.6.0`
+
 **Reference evidence only:** PDFX PR #42 and commit `05687ea`
+
+**Official goal:** Active for the complete parser/PDFX/review/release/deploy
+sequence in this document. This document remains the scope and acceptance
+authority for that goal.
+
+### Implementation evidence ledger
+
+- Parser PR #2 merged as `7efc257bb858449fab9e4d96f17cfa031a9402cb`;
+  tag `v1.7.0` is pushed and PDFX pins `agr-abc-document-parsers==1.7.0`.
+- Parser source digest is pinned by PDFX as
+  `192f912fff47fe79e6a3118a60530cfd00a07944a06c2394ced59fa47e82095c`.
+- Parser validation: 537 passed, 4 skipped, 3 deselected; required Sol/max and
+  bounded Claude reviews accepted the parser change.
+- PDFX validation after the first bounded Claude correction round: 188 focused
+  tests passed with 6 skips; 487 backend tests passed with 6 skips when the
+  host-only Marker module was excluded; 189 proxy tests passed; scoped Ruff
+  and `git diff --check` passed.
+- The excluded Marker renderer invariant was executed separately against the
+  pinned Marker 1.10.2 production GPU/Torch image: the real four-page
+  `Document` fixture passed exactly (table; list with link/image; blank page;
+  terminal page).
+- The first local Sol/max PDFX review accepted after corrections. The first
+  Claude round then identified four concrete separation/binding/test gaps;
+  only those four were implemented: GROBID coverage separation, real Marker
+  dual-render proof, complete deterministic-ownership coverage, and
+  caller-authoritative final sidecar digest validation.
+- Parser publication remains operationally blocked: PyPI currently resolves
+  only 1.6.0 and no publisher credential is materialized on this host. A clean
+  PDFX build/deploy cannot proceed until 1.7.0 is published.
+- Exact Debbie PDFs are no longer recoverable from the terminated worker
+  volumes or known durable stores. Their three exact MD5 identities are
+  retained for the required post-deployment canary gate; no local replay claim
+  may substitute for that gate.
 
 ## 1. Goal and Non-Negotiable Contract
 
@@ -94,7 +131,8 @@ invent a page, or override direct native evidence.
 
 ## 4. PR 1: Additive TEI Provenance API
 
-Repository: `agr_abc_document_parsers`  
+Repository: `agr_abc_document_parsers`
+
 Branch: `fix/tei-markdown-page-provenance`
 
 Add this explicitly TEI-specific Python interface:
@@ -133,23 +171,24 @@ Implementation requirements:
 
 Parser acceptance criteria:
 
-- [ ] Existing conversion APIs return byte-identical Markdown for all current
+- [x] Existing conversion APIs return byte-identical Markdown for all current
   fixtures.
-- [ ] The new TEI API's Markdown equals `convert_xml_to_markdown(...,
+- [x] The new TEI API's Markdown equals `convert_xml_to_markdown(...,
   source_format="tei")` exactly.
-- [ ] New output passes the official ABC `validate_markdown()` contract.
-- [ ] Reading old and new output with `read_markdown()` produces equal document
+- [x] New output passes the official ABC `validate_markdown()` contract.
+- [x] Reading old and new output with `read_markdown()` produces equal document
   models.
-- [ ] Provenance spans are in bounds, ordered, and non-overlapping.
-- [ ] Multi-page coordinate order is preserved.
-- [ ] Focused fixtures cover title, body paragraphs, headings, tables, figures,
+- [x] Provenance spans are in bounds, ordered, and non-overlapping.
+- [x] Multi-page coordinate order is preserved.
+- [x] Focused fixtures cover title, body paragraphs, headings, tables, figures,
   formulas, lists, acknowledgments, and references.
-- [ ] Every coordinate-bearing `biblStruct` maps to its emitted reference line.
-- [ ] Existing pytest, Ruff, formatting, and mypy checks pass.
+- [x] Every coordinate-bearing `biblStruct` maps to its emitted reference line.
+- [x] Existing pytest, Ruff, formatting, and mypy checks pass.
 
 ## 5. PR 2: PDFX Source Page Maps
 
-Repository: `agr_pdf_extraction_service`  
+Repository: `agr_pdf_extraction_service`
+
 Branch: `fix/primary-page-provenance-sidecar`
 
 Add a dedicated `page_provenance` service. Do not extend
@@ -291,7 +330,7 @@ changes are explicitly deferred to a separate goal after PDFX is proven.
 
 - [ ] Docling's 51-, 27-, and 24-page captures reproduce every expected safe
   transition and the current Markdown SHA exactly.
-- [ ] Marker fixtures cover tables, lists, blank pages, images/links, and the
+- [x] Marker fixtures cover tables, lists, blank pages, images/links, and the
   terminal page while preserving current cleaned Markdown exactly.
 - [ ] GROBID directly maps at least 95% of source Markdown bytes on both Debbie
   captures and maps every coordinate-bearing reference.

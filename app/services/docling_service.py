@@ -4,10 +4,17 @@ import json
 import os
 import logging
 from importlib.metadata import version
+from pathlib import Path
 
 from app.services.pdf_extractor import PDFExtractor
 from app.services.native_extractor_artifact import (
     persist_native_extractor_artifact,
+    sha256_file,
+)
+from app.services.page_provenance import (
+    build_source_page_provenance_bytes,
+    docling_markdown_with_page_ranges,
+    docling_page_sentinel,
 )
 from app.services.native_style import (
     docling_native_style_bytes,
@@ -202,6 +209,8 @@ class Docling(PDFExtractor):
         self.num_threads = int(os.environ.get("DOCLING_NUM_THREADS", 0)) or None
 
     def extract(self, pdf_path, output_filename):
+        pdf_digest = sha256_file(pdf_path)
+        page_sentinel = docling_page_sentinel(pdf_digest)
         converter = _get_converter(
             self.device,
             self.num_threads,
@@ -219,11 +228,16 @@ class Docling(PDFExtractor):
         if total_pages <= 0:
             raise RuntimeError("Docling reported zero pages for document; cannot export markdown.")
 
-        markdown = doc.export_to_markdown(
+        paginated_markdown = doc.export_to_markdown(
             image_placeholder="",
-            page_break_placeholder="",
+            page_break_placeholder=page_sentinel,
             text_width=-1,
-        ).strip()
+        )
+        markdown, page_ranges = docling_markdown_with_page_ranges(
+            paginated_markdown,
+            sentinel=page_sentinel,
+            expected_page_count=total_pages,
+        )
         if not markdown:
             raise RuntimeError("Docling returned empty Markdown.")
 
@@ -254,8 +268,38 @@ class Docling(PDFExtractor):
 
         covered_pages = native_payload_covered_pages("docling", native_bytes)
 
-        with open(output_filename, "w", encoding="utf-8") as f:
-            f.write(markdown)
+        extractor_versions = {
+            "docling": version("docling"),
+            "docling-core": version("docling-core"),
+        }
+        options = {
+            "device": self.device,
+            "do_ocr": True,
+            "force_full_page_ocr": self.force_full_page_ocr,
+            "ocr_backend": os.environ.get(
+                "DOCLING_RAPIDOCR_BACKEND",
+                "onnxruntime",
+            ),
+            "ocr_model_type": _get_rapidocr_model_type(),
+            "generate_parsed_pages": True,
+            "native_style_cell_collection": "word_cells",
+            "native_style_sidecar": True,
+            "page_provenance": "digest_sentinel_v1",
+        }
+        markdown_bytes = markdown.encode("utf-8")
+        page_provenance_bytes = build_source_page_provenance_bytes(
+            source="docling",
+            pdf_sha256=pdf_digest,
+            native_bytes=native_bytes,
+            markdown_bytes=markdown_bytes,
+            expected_page_count=total_pages,
+            extractor_versions=extractor_versions,
+            options=options,
+            evidence_ranges=page_ranges,
+            residual_reason="unsafe_docling_page_transition",
+        )
+
+        Path(output_filename).write_bytes(markdown_bytes)
 
         persist_native_extractor_artifact(
             source="docling",
@@ -263,23 +307,10 @@ class Docling(PDFExtractor):
             native_bytes=native_bytes,
             native_media_type="application/json",
             pdf_path=pdf_path,
-            extractor_versions={
-                "docling": version("docling"),
-                "docling-core": version("docling-core"),
-            },
-            options={
-                "device": self.device,
-                "do_ocr": True,
-                "force_full_page_ocr": self.force_full_page_ocr,
-                "ocr_backend": os.environ.get(
-                    "DOCLING_RAPIDOCR_BACKEND",
-                    "onnxruntime",
-                ),
-                "ocr_model_type": _get_rapidocr_model_type(),
-                "generate_parsed_pages": True,
-                "native_style_cell_collection": "word_cells",
-                "native_style_sidecar": True,
-            },
+            extractor_versions=extractor_versions,
+            options=options,
+            page_provenance_bytes=page_provenance_bytes,
+            pdf_sha256=pdf_digest,
             expected_page_count=total_pages,
             covered_pages=covered_pages,
             native_style_bytes=native_style_bytes,

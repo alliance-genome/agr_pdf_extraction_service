@@ -1,4 +1,4 @@
-"""Exact GPT-5.6 policy for the three reachable PDFX model routes."""
+"""Exact GPT-5.6 policy for the reachable PDFX model routes."""
 
 from __future__ import annotations
 
@@ -9,7 +9,12 @@ from typing import Literal
 from config import Config
 
 
-ModelRole = Literal["source_selection", "hard_selection", "image_text_review"]
+ModelRole = Literal[
+    "source_selection",
+    "hard_selection",
+    "image_text_review",
+    "page_resolution",
+]
 GPT_5_6_SOL = "gpt-5.6-sol"
 GPT_5_6_TERRA = "gpt-5.6-terra"
 GPT_5_6_LUNA = "gpt-5.6-luna"
@@ -34,6 +39,12 @@ _ROLE_CONFIG = {
     "image_text_review": (
         "IMAGE_TEXT_REVIEW_MODEL",
         "IMAGE_TEXT_REVIEW_REASONING",
+        GPT_5_6_LUNA,
+        "medium",
+    ),
+    "page_resolution": (
+        "PAGE_RESOLUTION_MODEL",
+        "PAGE_RESOLUTION_REASONING",
         GPT_5_6_LUNA,
         "medium",
     ),
@@ -102,6 +113,18 @@ def validate_runtime_model_policy() -> None:
         )
     if not 0 <= Config.LLM_OPENAI_MAX_RETRIES <= 2:
         raise RuntimeModelPolicyError("LLM_OPENAI_MAX_RETRIES must be between 0 and 2")
+    if not 1 <= Config.PAGE_PROVENANCE_LLM_MAX_RANGES_PER_BATCH <= 64:
+        raise RuntimeModelPolicyError(
+            "PAGE_PROVENANCE_LLM_MAX_RANGES_PER_BATCH must be between 1 and 64"
+        )
+    if not 0 <= Config.PAGE_PROVENANCE_LLM_CONTEXT_BYTES <= 16384:
+        raise RuntimeModelPolicyError(
+            "PAGE_PROVENANCE_LLM_CONTEXT_BYTES must be between 0 and 16384"
+        )
+    if not 1 <= Config.PAGE_PROVENANCE_LLM_EVIDENCE_BYTES_PER_RANGE <= 65536:
+        raise RuntimeModelPolicyError(
+            "PAGE_PROVENANCE_LLM_EVIDENCE_BYTES_PER_RANGE must be between 1 and 65536"
+        )
     cost_alert = Config.LLM_COST_ALERT_USD_PER_JOB
     if not math.isfinite(cost_alert) or cost_alert <= 0:
         raise RuntimeModelPolicyError(
