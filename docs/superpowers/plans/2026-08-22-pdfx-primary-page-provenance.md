@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-22
 
-**Status:** Implementation in progress; local correction/review cycle
+**Status:** Implementation and code review complete; release gates remain
 
 **PDFX implementation base:** `origin/main` at `9747452`
 
@@ -53,6 +53,13 @@ authority for that goal.
   `Accept with follow-ups`, with no supported Blocker, Material correction, or
   High-value simplification remaining. Its only gates are commit/push, parser
   publication, and the preserved deployment canaries.
+- GitHub's Claude workflow hit its hard ten-minute cancellation twice without
+  posting a verdict. A final bounded manual Claude Opus/xhigh review of pushed
+  commit `0df7932` independently reran the 27 focused, 490 backend, and 189
+  proxy tests and returned `Accept with follow-ups`, with no supported Blocker,
+  Material correction, or High-value simplification. Its non-blocking notes
+  remain recorded on PR #46 and do not justify another code round under the
+  Section 11 stop rules.
 - Parser publication remains operationally blocked: PyPI currently resolves
   only 1.6.0 and no publisher credential is materialized on this host. A clean
   PDFX build/deploy cannot proceed until 1.7.0 is published.
@@ -488,6 +495,6 @@ supported Blocker or Material correction remains.
 - [x] Do not proceed to Claude or declare the PR ready until the local verdict
   is `Accept` or `Accept with follow-ups` with no supported Blocker, Material
   correction, or High-value simplification outstanding.
-- [ ] After the local gate, iterate with Claude only under the bounded rules in
+- [x] After the local gate, iterate with Claude only under the bounded rules in
   Section 11. No additional external human approval is required for merge and
   deployment once tests, checks, reviews, and canaries pass.
