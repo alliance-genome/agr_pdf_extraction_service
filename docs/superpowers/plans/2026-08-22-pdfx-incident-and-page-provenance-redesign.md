@@ -45,6 +45,15 @@ Those fields are not part of the model request or choice. The real receipt
 fields—request digest, candidates, response choice, selected candidate, model,
 reasoning effort, and trace—must remain strictly validated.
 
+**Decision:** this is a purely programmatic fix. Receipt consistency asks
+whether recorded hashes, candidates, choices, models, and traces agree; an LLM
+must not arbitrate conflicts in its own audit trail. Differences limited to the
+three replay-derived diagnostics above are normalized for call grouping. Any
+disagreement in the real request or choice fields fails closed. If safe
+fallback delivery is considered later, its selection must also be
+deterministic—for example, a separately verified baseline extractor output—not
+another model call.
+
 ### 2.2 Deterministic-provenance failure
 
 - `8395208_J390188.pdf`
@@ -143,17 +152,20 @@ Scope:
 1. Canonicalize style-selection receipts by excluding exactly the three known
    replay-derived diagnostics from call grouping.
 2. Preserve strict validation of the actual request and choice fields.
-3. Make generated bibliography/figure heading text and any required leading
+3. Keep receipt grouping and failure handling entirely programmatic; do not
+   introduce an LLM retry, judge, or tie-breaker for receipt consistency.
+4. Make generated bibliography/figure heading text and any required leading
    whitespace separate deterministic operations so later interval permutation
    cannot split one content-bearing digest.
-4. Define narrow validators for each generated operation.
-5. Add exact regressions for both Debbie failure classes.
+5. Define narrow validators for each generated operation.
+6. Add exact regressions for both Debbie failure classes.
 
 Constraints:
 
 - No page-provenance behavior.
 - No new parser calls.
 - No new fuzzy-alignment calls.
+- No new LLM calls or prompts.
 - No cache-contract bump unless the persisted receipt shape actually changes.
 - No generic deterministic-span rebinding.
 
@@ -163,6 +175,8 @@ Acceptance criteria:
   validation.
 - Exact `8395484` artifacts replay duplicate style decisions successfully.
 - Mutating the real style response choice fails closed.
+- Tests prove receipt validation invokes no model provider or model-selection
+  resolver.
 - Clipping `12. ` to `2. ` remains invalid.
 - Scan-count tests show no increase from `origin/main`.
 
