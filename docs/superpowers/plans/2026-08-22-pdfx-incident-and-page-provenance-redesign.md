@@ -1,8 +1,8 @@
 # PDFX Incident and Page-Provenance Redesign Plan
 
 **Date:** 2026-08-22  
-**Status:** PR A #43 approved for merge and deployment
-**Clean implementation base:** `origin/main` at `673ab52`  
+**Status:** PR A #43 merged/deployed; PR B implementation validated locally
+**Clean implementation base:** `origin/main` at `9c07feb`
 **Reference implementation only:** PR #42 / `fix/style-selection-receipt-consistency`
 
 ## 1. Why We Are Restarting
@@ -215,6 +215,27 @@ Current implementation evidence:
   assertion. None supplies evidence for expanding the patch or requesting a
   second review round.
 
+Deployment evidence:
+
+- [x] PR #43 merged as `9c07febfa92b1b3cdeda3f190f5d7d6f5bcac1e6`.
+- [x] The main deployment workflow completed successfully and published that
+  exact immutable backend image tag and its baked AMI.
+- [x] Production canary `e4f0617a-0422-4b79-97a4-00a1cbe4d0f3` used the
+  repository-owned `deploy/aws/ami/test-sample.pdf`, woke the new backend,
+  completed all three extractors, and returned a 200 merged download.
+- [x] Bootstrap reported `marker_models=ok` and `GPU worker CUDA: HEALTHY
+  (NVIDIA L4)`; deep health was healthy with an empty durable queue after the
+  job.
+- [x] The GPU ASG returned to desired capacity zero with no instances, queued
+  work, or active work. The unchanged proxy task was recycled after the
+  documented manual ASG scale-down so its in-memory lifecycle state again
+  reported `ec2=stopped`.
+- [ ] Operational follow-up outside PR A/B: the documented direct ASG
+  scale-down leaves a ready proxy's lifecycle label stale until that process
+  resynchronizes, and extractor-specific download requests can wake a stopped
+  backend. Address that lifecycle/runbook behavior separately; it is not part
+  of either provenance failure.
+
 ### PR B: Repository-wide deterministic transformation contract
 
 The `8395208` failure is the first acceptance case, not the boundary of this
@@ -274,33 +295,91 @@ Constraints:
 
 Acceptance criteria:
 
-- [ ] The PR description contains the bounded current-operation inventory and
+- [x] The PR description contains the bounded current-operation inventory and
   maps each item to its producer, reachable composition path, validator, event
   behavior, and focused test.
-- [ ] Every later composition path rejects partial retention of a
+- [x] Every later composition path rejects partial retention of a
   content-bearing deterministic atom before output construction.
-- [ ] Exact source-backed subrange slicing remains supported and
+- [x] Exact source-backed subrange slicing remains supported and
   byte-validated.
-- [ ] In the `8395208` path, optional separator bytes preceding
+- [x] In the `8395208` path, optional separator bytes preceding
   `## References` are emitted separately and remain left-owned;
   `## References\n\n` moves intact with the reference container.
-- [ ] Figure Legends uses the equivalent declared ownership rule.
-- [ ] Exact `8395208` artifacts complete a no-model merge and final
+- [x] Figure Legends uses the equivalent declared ownership rule.
+- [x] Exact `8395208` artifacts complete a no-model merge and final
   `_validate_audit()`.
-- [ ] A synthetic Figure Legends analogue completes with intact heading
+- [x] A synthetic Figure Legends analogue completes with intact heading
   ownership.
-- [ ] Clipping `12. ` to `2. ` remains invalid.
-- [ ] Deletions remain event-reconciled and create no zero-length final audit
+- [x] Clipping `12. ` to `2. ` remains invalid.
+- [x] Deletions remain event-reconciled and create no zero-length final audit
   entries.
-- [ ] Final audit entries exactly partition output and retain valid ranges,
+- [x] Final audit entries exactly partition output and retain valid ranges,
   digests, operation kinds, and event reconciliation.
-- [ ] Existing valid role-order, heading, table, reference, emphasis, newline,
+- [x] Existing valid role-order, heading, table, reference, emphasis, newline,
   and fallback fixtures preserve their visible output and prior success or
   failure behavior.
-- [ ] Existing valid fixtures preserve their Alliance reader model; PR B does
+- [x] Existing valid fixtures preserve their Alliance reader model; PR B does
   not change publication-role decisions or output ordering.
-- [ ] No current scan, parser, fuzzy-alignment, or model-call count increases.
-- [ ] No persisted contract bump occurs unless separately justified.
+- [x] No current scan, parser, fuzzy-alignment, or model-call count increases.
+- [x] No persisted contract bump occurs unless separately justified.
+
+Current PR B inventory and evidence:
+
+| Emitter | Producer and reachable composition | Static validator/event | Focused evidence |
+|---|---|---|---|
+| Final newline atom | `normalize_trailing_newline()` after merge finalization | exact LF; finalization warning, no transformation ID | `test_deterministic_markdown_repair.py` |
+| Missing table separator atom | `_render_missing_table_separators()` through skeleton rendering and later role composition | generated GFM separator plus transformation event | merge-service table repair regression |
+| Selected-skeleton heading atom | `render_document_skeleton()` through later replacements/permutations | one-to-six `#` bytes plus transformation event | document-skeleton heading regressions |
+| Structural edit atom | `_replace_deterministic_markup()` for current copy/replacement/role-order paths | operation-specific static shape plus transformation event | role, reference, Figure Legends, front matter, and table regressions |
+| Native emphasis delimiter atom | `project_native_emphasis()` through final audit validation | exact `*` plus projection event | native emphasis projection regressions |
+
+All five emitters now call one `deterministic_audit_entry()` builder. The same
+static operation-shape table drives final validation. `_copy_audit_interval()`
+permits exact slicing only for source-backed spans and rejects any partial
+generated atom before appending bytes; replacement, permutation, role-slot,
+and emphasis paths all compose through that copy primitive. Final newline
+normalization performs the equivalent atomicity check on its direct rewrite.
+No general edit engine, semantic rescanning, role reconstruction, LLM route,
+fallback, migration, or page-provenance behavior was added.
+
+The inserted References and Figure Legends helpers now create at most two
+ordinary edits at the same insertion point: optional `\n`/`\n\n` with the
+operation's declared left ownership, followed by one complete heading atom.
+The exact `8395208` output therefore retains one valid left-boundary receipt
+and one intact `## References\n\n` receipt instead of splitting one receipt
+after composition.
+
+Fresh-`origin/main` measurement and proposed counts (calls/bytes or calls/
+compared characters) are:
+
+| Case | Structural scan | `read_markdown` | `validate_markdown` | RapidFuzz ratio | Alignment calls (baseline/alternative units) | Result |
+|---|---:|---:|---:|---:|---:|---|
+| Small synthetic, before = after | 37 / 4,791 | 45 / 5,832 | 18 / 2,340 | 155 / 4,722 | 8 (44 / 38) | success; identical output SHA-256 |
+| Large generated non-sensitive fixture, before = after | 37 / 1,334,048 | 45 / 1,622,511 | 18 / 649,002 | 471,950 / 33,206,502 | 8 (6,626 / 6,620) | success; identical output SHA-256 |
+| Exact `8395484`, before = after | 28 / 1,934,387 | 26 / 1,707,760 | 11 / 768,976 | 252,691 / 138,997,858 | 1,346 (160,048 / 4,902) | success; identical output SHA-256 |
+| Exact `8395208`, before | 27 / 4,227,063 | 24 / 3,510,580 | 10 / 1,590,325 | 425,234 / 166,583,164 | 747 (251,534 / 3,396) | failed during audit validation |
+| Exact `8395208`, after | 29 / 4,581,307 | 26 / 3,823,604 | 11 / 1,767,485 | 802,402 / 329,777,696 | 1,490 (501,182 / 5,613) | success, 177,160 bytes and 928 valid audit entries |
+
+The three already-successful paths have exactly unchanged call and byte/unit
+counts, and all runs use `llm=None` (zero provider/model calls). The repaired
+`8395208` path reaches two existing post-audit validation phases that
+`origin/main` never reached because it terminated at the invalid receipt; the
+patch adds no scan, parser, validator, alignment, or provider call site.
+Wall-clock observations were 0.034s, 2.818s, 15.314s (failed), and 12.211s for
+the four baseline cases, versus 0.034s, 2.810s, 25.913s (completed), and
+13.660s after the patch. These are diagnostic observations, not CI limits.
+
+Validation currently recorded:
+
+- [x] Focused deterministic/document/merge/artifact tests: 156 passed, 6
+  skipped.
+- [x] Broad available backend suite: 452 passed, 6 skipped. Only the
+  unavailable Torch Marker and Docling package-metadata modules were excluded;
+  neither exercises deterministic composition.
+- [x] Existing successful small, large, and exact `8395484` output SHA-256
+  values are identical to fresh `origin/main`.
+- [x] Exact `8395208` completes with no model and passes final
+  `_validate_audit()`.
 
 ### PR C: Alliance parser transport contract
 

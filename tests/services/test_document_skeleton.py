@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 
@@ -6,6 +7,7 @@ import pytest
 from app.services.document_skeleton import (
     NativeEmphasisSpan,
     NativeStructureArtifact,
+    _copy_audit_interval,
     _final_projection_targets,
     _projection_claim_inventory,
     build_document_skeleton,
@@ -18,7 +20,8 @@ from app.services.document_skeleton import (
     render_document_skeleton,
     render_document_role_slots,
 )
-from app.services.source_contracts import SourceArtifact
+from app.services.merge_artifact import _validate_audit
+from app.services.source_contracts import ConsensusContractError, SourceArtifact
 from app.services.source_merge import scan_structural_units
 from app.services.native_extractor_artifact import (
     native_artifact_path,
@@ -50,6 +53,63 @@ def _audit(artifact):
         "region_id": None,
         "decision_method": "baseline_fallback",
     }]
+
+
+def test_source_audit_interval_remains_exactly_sliceable():
+    artifact = SourceArtifact.from_text("marker", "abcdef")
+    output = bytearray()
+    rewritten = []
+
+    _copy_audit_interval(
+        output, rewritten, artifact.raw_utf8, _audit(artifact), 1, 5
+    )
+
+    assert bytes(output) == b"bcde"
+    assert rewritten[0]["source_byte_start"] == 1
+    assert rewritten[0]["source_byte_end"] == 5
+    _validate_audit(bytes(output), rewritten, {"marker": artifact})
+
+
+@pytest.mark.parametrize("boundary", range(1, 4))
+def test_copy_rejects_every_partial_numbered_marker_before_writing(boundary):
+    artifact = SourceArtifact.from_text("marker", "12. Reference\n")
+    marker = artifact.raw_utf8[:4]
+    audit = [
+        {
+            "output_byte_start": 0,
+            "output_byte_end": 4,
+            "source": "deterministic_markup",
+            "artifact_digest": hashlib.sha256(marker).hexdigest(),
+            "source_byte_start": 0,
+            "source_byte_end": 4,
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "deterministic",
+            "transformation": "alliance_reference_marker",
+        },
+        {
+            "output_byte_start": 4,
+            "output_byte_end": len(artifact.raw_utf8),
+            "source": "marker",
+            "artifact_digest": artifact.digest,
+            "source_byte_start": 4,
+            "source_byte_end": len(artifact.raw_utf8),
+            "candidate_id": None,
+            "region_id": None,
+            "decision_method": "baseline_fallback",
+        },
+    ]
+    output = bytearray()
+
+    with pytest.raises(
+        ConsensusContractError,
+        match="cannot split deterministic markup atom",
+    ):
+        _copy_audit_interval(
+            output, [], artifact.raw_utf8, audit, boundary, len(artifact.raw_utf8)
+        )
+
+    assert output == b""
 
 
 def _style(source, text, start, end):
@@ -2067,6 +2127,66 @@ def _marker_bibliography_skeleton(text):
         },
     )
     return artifact, build_document_skeleton(artifact, native)
+
+
+@pytest.mark.parametrize(
+    ("text", "boundary_operation", "heading_operation", "heading_bytes"),
+    [
+        (
+            "# Title\n\n## Results\n\nBody.\n"
+            "1. Alpha et al. (2024). One.\n\n"
+            "## Discussion\n\nLater.\n",
+            "alliance_bibliography_heading_boundary",
+            "alliance_bibliography_heading_insert",
+            b"## References\n\n",
+        ),
+        (
+            "# Title\n\n## Results\n\nBody.\n"
+            "**Figure 1.** Reader-visible caption.\n\n"
+            "## References\n\n1. Alpha et al. (2024). One.\n",
+            "alliance_figure_legend_heading_boundary",
+            "alliance_figure_legend_heading_insert",
+            b"## Figure Legends\n\n",
+        ),
+    ],
+)
+def test_inserted_role_heading_keeps_left_boundary_and_content_atoms_complete(
+    text,
+    boundary_operation,
+    heading_operation,
+    heading_bytes,
+):
+    artifact, skeleton = _marker_bibliography_skeleton(text)
+
+    rendered, audit, events = render_document_role_slots(
+        text,
+        _audit(artifact),
+        skeleton,
+        {"marker": skeleton},
+    )
+
+    raw = rendered.encode()
+    boundary = next(
+        entry for entry in audit
+        if entry.get("transformation") == boundary_operation
+    )
+    heading = next(
+        entry for entry in audit
+        if entry.get("transformation") == heading_operation
+    )
+    assert raw[boundary["output_byte_start"]:boundary["output_byte_end"]] == b"\n"
+    assert raw[heading["output_byte_start"]:heading["output_byte_end"]] == heading_bytes
+    assert boundary["output_byte_end"] == heading["output_byte_start"]
+    emitted_ids = {
+        event["transformation_id"]
+        for event in events
+        if event.get("operation") in {boundary_operation, heading_operation}
+    }
+    assert emitted_ids == {
+        boundary["transformation_id"],
+        heading["transformation_id"],
+    }
+    _validate_audit(raw, audit, {"marker": artifact})
 
 
 def test_role_slot_renderer_moves_native_nonreferences_before_final_bibliography():
