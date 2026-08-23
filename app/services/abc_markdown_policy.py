@@ -9,9 +9,9 @@ from pathlib import Path
 
 ABC_MARKDOWN_POLICY_VERSION = "alliance-abc-1.6-schema-v4"
 ABC_PARSER_DISTRIBUTION = "agr-abc-document-parsers"
-ABC_PARSER_VERSION = "1.7.1"
+ABC_PARSER_VERSION = "1.7.2"
 ABC_PARSER_IMPLEMENTATION_SHA256 = (
-    "41ce835298863d25a30c733cd245580f3d782eb943470fda096e5389e5914ad2"
+    "fea04b17244c8a262867852daa2b3a5c922e529f858403caececaf3f671e3bab"
 )
 
 

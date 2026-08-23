@@ -54,7 +54,7 @@ _REQUIRED_OPTIONS = {
 _REQUIRED_EXTRACTOR_VERSIONS = {
     "grobid": {
         "grobid": "0.8.2",
-        "agr-abc-document-parsers": "1.7.1",
+        "agr-abc-document-parsers": "1.7.2",
     },
     "docling": {
         "docling": "2.113.0",

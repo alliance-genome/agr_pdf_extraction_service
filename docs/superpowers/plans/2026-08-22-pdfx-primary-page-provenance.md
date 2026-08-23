@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-22
 
-**Status:** Parser 1.7.1 released; bounded PDFX integration and replacement
+**Status:** Parser 1.7.2 released; bounded PDFX integration and replacement
 canaries remain
 
 **PDFX implementation base:** `origin/main` at `9747452`
@@ -24,11 +24,23 @@ authority for that goal.
   adjacency ownership rule. Parser PR #3 merged as
   `37a63876db1bd5345a5664df8e980fd57031cc95`, and tag `v1.7.1` binds generated
   figure/reference headings to their first emitted entry without changing
-  Markdown bytes. PDFX now pins `agr-abc-document-parsers==1.7.1`.
+  Markdown bytes. Replacement canaries then exposed missing native provenance
+  for generated Acknowledgments, Funding, and Availability headings. Parser PR
+  #4 merged as `1875dcabf0ff690ac501c9279f4e3ce210647cfb`; tag `v1.7.2`
+  corrects those headings without changing Markdown bytes. PDFX now pins
+  `agr-abc-document-parsers==1.7.2`.
 - Parser source digest is pinned by PDFX as
-  `41ce835298863d25a30c733cd245580f3d782eb943470fda096e5389e5914ad2`.
-- Parser validation: 537 passed, 4 skipped, 3 deselected; required Sol/max and
-  bounded Claude reviews accepted the parser change.
+  `fea04b17244c8a262867852daa2b3a5c922e529f858403caececaf3f671e3bab`.
+- Parser validation: 543 passed, 4 skipped, 3 deselected; repeated required
+  Sol/xhigh `$max-review-skill` and bounded Claude reviews accepted the final
+  parser change with no blocker, material correction, or production-code
+  change remaining.
+- The bounded PDFX 1.7.2 integration passes 22 focused parser-policy,
+  GROBID, and native-manifest tests against the public wheel; 489 backend tests
+  pass with 7 skips when the host-only Marker module is excluded; all 189 proxy
+  tests pass. A synthetic parser-1.7.1 GROBID manifest is rejected by the 1.7.2
+  runtime pin, so no extraction-config version bump is required. Scoped Ruff,
+  `py_compile`, and `git diff --check` pass.
 - PDFX validation after the first bounded Claude correction round: 188 focused
   tests passed with 6 skips; 487 backend tests passed with 6 skips when the
   host-only Marker module was excluded; 189 proxy tests passed; scoped Ruff
@@ -81,14 +93,22 @@ authority for that goal.
   `cf0e5e9c06dc0aefaeecf80e9402ac8d4ae7cab0df72d670e03a47a97afb890a`,
   its sdist SHA-256 is
   `e14b4f54fa950036cf4c967dbd670e3405ce3f84990f7ae2b2a99c677cecb2f6`,
-  and a fresh install produced the pinned implementation digest above.
+  and a fresh install produced implementation digest
+  `41ce835298863d25a30c733cd245580f3d782eb943470fda096e5389e5914ad2`.
+- Parser 1.7.2 is published and verified from its public PyPI wheel. Its wheel
+  SHA-256 is
+  `eff7ab73b2a181a9b0775c1080e747a38f3984da14696a312dc9ddf30e3765ce`,
+  its sdist SHA-256 is
+  `7e3363d34a0a389e330beb3c26293c03c4799bf9a41b966b4060ca279257a83f`,
+  and the public wheel produced the pinned implementation digest above.
 - All three exact Debbie PDFs were recovered from AI Curation production
   storage and durably preserved under
   `s3://agr-pdf-extraction-benchmark/pdfx/canaries/2026-08-23/source/`.
   Their exact page counts are 51, 27, and 25; the earlier 24-page note was
-  incorrect. The first 1.7.0 deployment run completed all three jobs and
-  exposed the generated-heading page defect described above, so all three must
-  be rerun after the bounded 1.7.1 PDFX integration.
+  incorrect. The 1.7.0 deployment exposed the Figure Legends defect; the 1.7.1
+  replacement canaries exposed the remaining generated Acknowledgments,
+  Funding, and Availability defects. All three must be rerun after the bounded
+  1.7.2 PDFX integration.
 
 ## 1. Goal and Non-Negotiable Contract
 
@@ -213,9 +233,10 @@ Implementation requirements:
 6. Do not enable GROBID sentence segmentation in this change. Primary-page
    semantics do not require character-level splitting inside a cross-page
    paragraph.
-7. Release and tag `agr-abc-document-parsers==1.7.1`; PDFX pins that exact
-   version. Version 1.7.1 includes the production-canary correction that binds
-   generated figure/reference headings to their first emitted entry.
+7. Release and tag `agr-abc-document-parsers==1.7.2`; PDFX pins that exact
+   version. Version 1.7.1 binds generated figure/reference headings to their
+   first emitted entry; version 1.7.2 adds native provenance for generated
+   Acknowledgments, Funding, and Availability headings.
 
 Parser acceptance criteria:
 
@@ -434,7 +455,7 @@ changes are explicitly deferred to a separate goal after PDFX is proven.
 - [ ] Independently inspect every real residual selection from the three
   captures against native/PDF evidence.
 - [ ] Canary `8395208_J390188.pdf`, `8395484_J390190.pdf`, and
-  `8394599_J390144.pdf` end to end on parser 1.7.1.
+  `8394599_J390144.pdf` end to end on parser 1.7.2.
 - [ ] Confirm successful durable `merged` and `page_provenance` downloads.
 - [ ] Confirm metrics expose direct, LLM, and fallback byte/range counts plus
   LLM usage and cost.
@@ -470,7 +491,7 @@ Every checkbox blocks release if violated:
 2. Implement and validate the parser branch.
 3. Run the mandatory local review gate for the parser diff.
 4. Push and open the parser PR only after the local reviewer is satisfied.
-5. Run bounded Claude review, merge, tag, and publish parser 1.7.1.
+5. Run bounded Claude review, merge, tag, and publish parser 1.7.2.
 6. Implement PDFX against the exact published parser pin.
 7. Run focused/full PDFX tests and the exact production-artifact evidence.
 8. Run the mandatory local review gate for the PDFX diff.
@@ -544,6 +565,15 @@ Verified state as of 2026-08-23:
   Both reviews accepted with no supported Blocker, Material correction, or
   High-value simplification. The exact three TEI replays remain byte-identical
   and produce generated figure/reference heading pages 3/14, 4/10, and 5/13.
+- Parser PR #4 merged as
+  `1875dcabf0ff690ac501c9279f4e3ce210647cfb`; tag `v1.7.2` is pushed and the
+  release is published and verified from its public PyPI wheel:
+  <https://github.com/alliance-genome/agr_abc_document_parsers/pull/4>
+- Parser PR #4 passed 543 tests with 4 skips and 3 deselections. Repeated
+  GPT-5.6 Sol/xhigh `$max-review-skill` and bounded Claude Opus reviews accepted
+  with no remaining blocker, material correction, or production-code change.
+  Exact replay remained byte-identical and independently PDF-ground-truthed
+  Acknowledgments page 9 plus Funding/Availability page 13.
 - PDFX PR #46 merged as
   `b2d73a45388027a64dbc069b0ec4009d20bc3463` and deployed successfully after
   retrying an AWS `g6.2xlarge` capacity failure in a different availability
@@ -562,16 +592,32 @@ Verified state as of 2026-08-23:
   correction, and PDFX integration branch
   `fix/generated-heading-page-provenance-integration` updates its exact pin,
   implementation digest, and native-manifest parser version.
+- PDFX PR #47 merged as
+  `343e30d58e354071c888a55efc840ca5e0590a02` and deployed successfully on
+  backend AMI `ami-0cc9379de43451279` with parser 1.7.1 and implementation
+  digest `41ce835298863d25a30c733cd245580f3d782eb943470fda096e5389e5914ad2`:
+  <https://github.com/alliance-genome/agr_pdf_extraction_service/pull/47>
+- The exact parser-1.7.1 replacement canaries completed as process IDs
+  `9f175123-a540-4086-b002-6810323fb00c`,
+  `4ebce48a-ec77-415a-82d4-402822ba9ff9`, and
+  `09d8c3f0-a5dc-48ce-9869-47c9b7faeb95`. They proved the Figure Legends fix,
+  but exposed three remaining generated-back-matter mistakes: the 27-page
+  Acknowledgments heading selected page 26 instead of native page 9; the
+  25-page Funding heading selected page 12 instead of native page 13; and its
+  Availability heading selected page 25 instead of native page 13. Parser
+  1.7.2 is the bounded programmatic correction.
 - Do not repeat completed parser work or PR #46 review work unless a concrete
   new finding appears.
 
 Immediate next steps:
 
-1. Validate and review the bounded PDFX parser-1.7.1 integration branch, then
+1. Validate and review the bounded PDFX parser-1.7.2 integration branch, then
    open, merge, and deploy its PR under the existing authorization.
 2. Rerun all three exact durable Debbie canaries. Confirm the 25-page
-   `Figure Legends` range is page 5 via direct/native evidence rather than
-   Luna, and re-record sidecar, download, runtime, fallback, and cost evidence.
+   `Figure Legends` range is page 5, the 27-page Acknowledgments range is page
+   9, and the 25-page Funding/Availability ranges are page 13 via direct/native
+   evidence rather than Luna. Re-record sidecar, download, runtime, fallback,
+   and cost evidence.
 3. Correct this ledger with final replacement process IDs and deployment
    evidence, close superseded PDFX PR #42, and then prepare the separate AI
    Curation consumer goal.
