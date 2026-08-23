@@ -208,7 +208,7 @@ def test_grobid_native_manifest_labels_page_qualification_unavailable(tmp_path):
     native = b"<TEI><text/></TEI>"
     versions = {
         "grobid": "0.8.2",
-        "agr-abc-document-parsers": "1.7.0",
+        "agr-abc-document-parsers": "1.7.1",
     }
     options = {
         "include_coordinates": True,
