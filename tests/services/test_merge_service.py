@@ -2377,7 +2377,7 @@ def test_saved_cases_report_no_model_italics_and_schema_diagnostics(case_id):
     )
 
     assert merged is not None and merged.endswith("\n") and not merged.endswith("\n\n")
-    assert metrics["abc_markdown"]["parser_version"] == "1.7.0"
+    assert metrics["abc_markdown"]["parser_version"] == "1.7.1"
     assert metrics["abc_markdown"]["error_rule_ids"] == []
     assert isinstance(metrics["abc_markdown"]["warning_rule_ids"], list)
     assert metrics["abc_markdown"]["validator_clean"] is (

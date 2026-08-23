@@ -42,7 +42,7 @@ def test_grobid_extract_uses_alliance_converter_and_retains_exact_tei(
     monkeypatch.setattr("app.services.grobid_service.pdf_page_count", lambda _path: 2)
     monkeypatch.setattr(
         "app.services.grobid_service.version",
-        lambda package: "1.7.0" if package == "agr-abc-document-parsers" else "0",
+        lambda package: "1.7.1" if package == "agr-abc-document-parsers" else "0",
     )
     pdf = tmp_path / "paper.pdf"
     output = tmp_path / "grobid.md"
@@ -129,7 +129,7 @@ def test_pdfalto_timeout_keeps_grobid_markdown_and_records_unavailable_style(
     monkeypatch.setattr("app.services.grobid_service.pdf_page_count", lambda _path: 1)
     monkeypatch.setattr(
         "app.services.grobid_service.version",
-        lambda package: "1.7.0" if package == "agr-abc-document-parsers" else "0",
+        lambda package: "1.7.1" if package == "agr-abc-document-parsers" else "0",
     )
 
     def timeout(*_args, **_kwargs):
