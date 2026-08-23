@@ -29,6 +29,10 @@ from app.services.page_coverage import (
     PAGE_COVERAGE_METHOD,
     page_coverage_proof_digest,
 )
+from app.services.page_provenance import (
+    canonical_json_line_sha256,
+    finalize_merged_page_provenance_bytes,
+)
 from app.services.source_merge import BaselineCompletionEvidence, BaselineRequirements
 
 
@@ -40,6 +44,45 @@ FRAGMENT_REQUIREMENTS = BaselineRequirements(
     required_heading_groups=(),
     require_abc_validation=False,
 )
+TEST_PDF_SHA256 = hashlib.sha256(b"fixture pdf").hexdigest()
+
+
+def _bundle_source_page_map_sha256(metrics):
+    return {
+        source: hashlib.sha256(f"page-map:{digest}".encode()).hexdigest()
+        for source, digest in metrics["source_artifact_digests"].items()
+    }
+
+
+def _bundle_page_provenance(text, metrics, audit):
+    raw = text.encode()
+    page_map_digests = _bundle_source_page_map_sha256(metrics)
+    projected = [
+        {
+            "byte_start": 0,
+            "byte_end": len(raw),
+            "page_number": 1,
+            "candidate_pages": [1],
+            "method": "direct",
+            "source": metrics["baseline_source"],
+            "operation": None,
+            "region_id": None,
+            "evidence_digest": hashlib.sha256(b"fixture").hexdigest(),
+            "_publication_text": True,
+            "_candidate_votes": {},
+            "_candidate_evidence": [],
+        }
+    ]
+    payload, _summary = finalize_merged_page_provenance_bytes(
+        pdf_sha256=TEST_PDF_SHA256,
+        expected_page_count=1,
+        merged_bytes=raw,
+        audit_sha256=canonical_json_line_sha256(audit),
+        merge_contract_id=metrics["merge_contract_id"],
+        source_map_sha256=page_map_digests,
+        projected_ranges=projected,
+    )
+    return payload
 
 
 class _Usage:
@@ -338,7 +381,10 @@ def test_candidate_adapter_uses_selection_only_terra_and_emits_span_audit():
         "# Title\n\nGene Gγa is active.\n",
         "# Title\n\nGene G g a is active.\n",
     }
-    assert metrics["merge_contract_id"] == "pdfx-native-skeleton-selection"
+    assert (
+        metrics["merge_contract_id"]
+        == "pdfx-native-skeleton-primary-page-v1"
+    )
     assert metrics["merge_quality"] == "terra_selected"
     assert metrics["runtime_models"]["source_selection"]["model"] == "gpt-5.6-terra"
     assert metrics["qualification_outcome"] == "failsafe"
@@ -549,6 +595,9 @@ def test_repetition_fallback_closes_style_ledger_and_delivers_baseline(
         artifacts={"marker": artifact},
         skeletons=skeletons,
         expected_contract_id=Config.MERGE_CONTRACT_ID,
+        page_provenance_bytes=_bundle_page_provenance(merged, metrics, audit),
+        pdf_sha256=TEST_PDF_SHA256,
+        source_page_map_sha256=_bundle_source_page_map_sha256(metrics),
     )
     assert Path(manifest_path).is_file()
 
@@ -682,6 +731,9 @@ def test_alliance_error_delivery_replaces_prior_repetition_style_ledger(
         artifacts={"marker": artifact},
         skeletons=skeletons,
         expected_contract_id=Config.MERGE_CONTRACT_ID,
+        page_provenance_bytes=_bundle_page_provenance(merged, metrics, audit),
+        pdf_sha256=TEST_PDF_SHA256,
+        source_page_map_sha256=_bundle_source_page_map_sha256(metrics),
     )
     assert Path(manifest_path).is_file()
 
@@ -2325,7 +2377,7 @@ def test_saved_cases_report_no_model_italics_and_schema_diagnostics(case_id):
     )
 
     assert merged is not None and merged.endswith("\n") and not merged.endswith("\n\n")
-    assert metrics["abc_markdown"]["parser_version"] == "1.6.0"
+    assert metrics["abc_markdown"]["parser_version"] == "1.7.0"
     assert metrics["abc_markdown"]["error_rule_ids"] == []
     assert isinstance(metrics["abc_markdown"]["warning_rule_ids"], list)
     assert metrics["abc_markdown"]["validator_clean"] is (

@@ -29,6 +29,7 @@ from app.services.native_extractor_artifact import (
     sha256_file,
 )
 from app.services.native_style import unavailable_native_style_bytes
+from app.services.page_provenance import build_source_page_provenance_bytes
 
 
 def _native(source, markdown, value, native_style=None):
@@ -2852,27 +2853,45 @@ def test_runtime_native_file_disappearing_degrades_only_that_receipt(tmp_path):
     pdf.write_bytes(b"exact pdf bytes")
     markdown.write_text("# Title\n\nBody.\n", encoding="utf-8")
     artifact = SourceArtifact.from_text("docling", markdown.read_text())
+    native = json.dumps(
+        {
+            "schema_name": "DoclingDocument",
+            "body": {"children": [{"$ref": "#/texts/0"}]},
+            "texts": [
+                {"self_ref": "#/texts/0", "label": "title", "text": "Title"}
+            ],
+        }
+    ).encode()
+    versions = {"docling": "2.113.0", "docling-core": "2.87.1"}
+    options = {
+        "do_ocr": True,
+        "generate_parsed_pages": True,
+        "native_style_cell_collection": "word_cells",
+        "native_style_sidecar": True,
+        "page_provenance": "digest_sentinel_v1",
+    }
+    page_provenance = build_source_page_provenance_bytes(
+        source="docling",
+        pdf_sha256=sha256_file(pdf),
+        native_bytes=native,
+        markdown_bytes=markdown.read_bytes(),
+        expected_page_count=1,
+        extractor_versions=versions,
+        options=options,
+        evidence_ranges=[],
+        residual_reason="fixture",
+    )
     persist_native_extractor_artifact(
         source="docling",
         output_filename=markdown,
-        native_bytes=json.dumps(
-            {
-                "schema_name": "DoclingDocument",
-                "body": {"children": [{"$ref": "#/texts/0"}]},
-                "texts": [
-                    {"self_ref": "#/texts/0", "label": "title", "text": "Title"}
-                ],
-            }
-        ).encode(),
+        native_bytes=native,
         native_media_type="application/json",
         pdf_path=pdf,
-        extractor_versions={"docling": "2.113.0", "docling-core": "2.87.1"},
-        options={
-            "do_ocr": True,
-            "generate_parsed_pages": True,
-            "native_style_cell_collection": "word_cells",
-            "native_style_sidecar": True,
-        },
+        extractor_versions=versions,
+        options=options,
+        page_provenance_bytes=page_provenance,
+        expected_page_count=1,
+        covered_pages=[],
         native_style_bytes=unavailable_native_style_bytes("docling", "fixture"),
     )
     native_artifact_path(markdown, "docling").unlink()

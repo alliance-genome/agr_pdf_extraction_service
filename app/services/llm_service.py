@@ -169,6 +169,27 @@ class _NumberedSelectionResponse(BaseModel):
         return self
 
 
+class _PageRangeDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    range_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    page_number: int = Field(ge=1)
+
+
+class _PageResolutionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    decisions: tuple[_PageRangeDecision, ...]
+
+    @model_validator(mode="after")
+    def unique_ranges(self):
+        range_ids = [decision.range_id for decision in self.decisions]
+        if len(range_ids) != len(set(range_ids)):
+            raise ValueError("page response repeats a range")
+        return self
+
+
 class ImageTextReviewResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -229,6 +250,51 @@ class LLM:
         self.openai_max_retries = retries
         self.usage = TokenAccumulator()
         self.selection_call_traces: list[dict] = []
+
+    @staticmethod
+    def _page_request_trace(payload: dict) -> dict:
+        """Persist replayable page choices without duplicating publication text."""
+
+        traced_ranges = []
+        for item in payload.get("ranges", []):
+            alternatives = []
+            for evidence in item.get("alternative_evidence", []):
+                excerpt = str(evidence.get("excerpt", ""))
+                alternatives.append(
+                    {
+                        "source": evidence.get("source"),
+                        "page_number": evidence.get("page_number"),
+                        "source_byte_start": evidence.get("source_byte_start"),
+                        "source_byte_end": evidence.get("source_byte_end"),
+                        "excerpt_sha256": hashlib.sha256(excerpt.encode()).hexdigest(),
+                        "excerpt_utf8_bytes": len(excerpt.encode()),
+                    }
+                )
+            traced = {
+                key: item.get(key)
+                for key in (
+                    "range_id",
+                    "byte_start",
+                    "byte_end",
+                    "page_choices",
+                    "preceding_anchor",
+                    "following_anchor",
+                    "preceding_context_byte_start",
+                    "preceding_context_byte_end",
+                    "following_context_byte_start",
+                    "following_context_byte_end",
+                )
+            }
+            for key in ("text", "preceding_context", "following_context"):
+                value = str(item.get(key, ""))
+                traced[f"{key}_sha256"] = hashlib.sha256(value.encode()).hexdigest()
+                traced[f"{key}_utf8_bytes"] = len(value.encode())
+            traced["alternative_evidence"] = alternatives
+            traced_ranges.append(traced)
+        return {
+            "request_sha256": payload.get("request_sha256"),
+            "ranges": traced_ranges,
+        }
 
     @staticmethod
     def _selection_request_trace(payload: dict) -> dict:
@@ -439,6 +505,118 @@ class LLM:
             if raise_on_failure:
                 raise failure from exc
             return SelectionDecisionResponse(decisions=())
+
+    def resolve_page_choices(self, payload: dict) -> tuple[dict[str, int], dict]:
+        """Use Luna/medium to select only supplied primary-page choices."""
+
+        ranges = payload.get("ranges")
+        if (
+            not isinstance(ranges, list)
+            or not 1 <= len(ranges) <= Config.PAGE_PROVENANCE_LLM_MAX_RANGES_PER_BATCH
+        ):
+            raise ValueError("page-resolution request batch is invalid")
+        core = {"ranges": ranges}
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                core,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if payload.get("request_sha256") != expected_digest:
+            raise ValueError("page-resolution request digest mismatch")
+        choice_sets = {}
+        for item in ranges:
+            range_id = item.get("range_id") if isinstance(item, dict) else None
+            choices = item.get("page_choices") if isinstance(item, dict) else None
+            if (
+                not isinstance(range_id, str)
+                or len(range_id) != 64
+                or not isinstance(choices, list)
+                or not choices
+                or choices != list(dict.fromkeys(choices))
+                or any(type(page) is not int or page < 1 for page in choices)
+                or range_id in choice_sets
+            ):
+                raise ValueError("page-resolution range choices are invalid")
+            choice_sets[range_id] = set(choices)
+
+        runtime = resolve_runtime_model("page_resolution")
+        started = time.monotonic()
+        trace = {
+            "tier": "luna",
+            "call_type": "page_resolution_luna",
+            "model": runtime.model,
+            "reasoning_effort": runtime.reasoning_effort,
+            "request": self._page_request_trace(payload),
+            "timeout_seconds": self.openai_timeout_seconds,
+            "max_retries": self.openai_max_retries,
+        }
+        completion = None
+        try:
+            completion = self.client.chat.completions.parse(
+                model=runtime.model,
+                reasoning_effort=runtime.reasoning_effort,
+                messages=[
+                    {"role": "system", "content": render_prompt("page_resolution")},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ],
+                response_format=_PageResolutionResponse,
+            )
+            self.usage.record(completion.usage, "page_resolution_luna", runtime.model)
+            message = completion.choices[0].message
+            if getattr(message, "refusal", None):
+                raise _ModelRefusal("model refused page resolution")
+            if not message.parsed:
+                raise ValueError("model returned no parsed page resolution")
+            parsed = _PageResolutionResponse.model_validate(
+                message.parsed.model_dump(mode="python")
+            )
+            if parsed.request_sha256 != expected_digest:
+                raise ValueError("page-resolution response digest mismatch")
+            decisions = {item.range_id: item.page_number for item in parsed.decisions}
+            if set(decisions) != set(choice_sets):
+                raise ValueError("page-resolution response range set mismatch")
+            if any(page not in choice_sets[range_id] for range_id, page in decisions.items()):
+                raise ValueError("page-resolution response invented a page choice")
+            trace.update(
+                {
+                    "outcome": "valid",
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                    "usage": self._single_call_usage(completion.usage),
+                    "response": parsed.model_dump(mode="json"),
+                }
+            )
+            self.selection_call_traces.append(trace)
+            return decisions, trace
+        except Exception as exc:
+            trace.update(
+                {
+                    "outcome": (
+                        "refusal"
+                        if isinstance(exc, _ModelRefusal)
+                        else "timeout"
+                        if isinstance(exc, TimeoutError)
+                        or "timeout" in type(exc).__name__.casefold()
+                        else "invalid"
+                    ),
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                }
+            )
+            if completion is not None:
+                trace["usage"] = self._single_call_usage(completion.usage)
+            self.selection_call_traces.append(trace)
+            return {}, trace
 
     def resolve_bounded_id_choice(
         self,

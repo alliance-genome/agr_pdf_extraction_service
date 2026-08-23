@@ -13,10 +13,15 @@ from app.services.native_style import (
     NATIVE_STYLE_MEDIA_TYPE,
     validate_native_style_bytes,
 )
+from app.services.page_provenance import (
+    SOURCE_PAGE_PROVENANCE_MEDIA_TYPE,
+    source_page_provenance_path,
+    validate_source_page_provenance_bytes,
+)
 
 
 NATIVE_ARTIFACT_SCHEMA = "pdfx-native-extractor-artifact"
-NATIVE_ARTIFACT_CONTRACT_VERSION = "native-structure-v2"
+NATIVE_ARTIFACT_CONTRACT_VERSION = "native-structure-v3"
 _NATIVE_SUFFIX = {
     "grobid": "tei.xml",
     "docling": "document.json",
@@ -28,19 +33,28 @@ _NATIVE_MEDIA_TYPE = {
     "marker": "application/json",
 }
 _REQUIRED_OPTIONS = {
-    "grobid": {"generate_ids": True, "native_style_sidecar": True},
+    "grobid": {
+        "generate_ids": True,
+        "include_coordinates": True,
+        "native_style_sidecar": True,
+        "page_provenance": "tei_coords_v1",
+    },
     "docling": {
         "do_ocr": True,
         "generate_parsed_pages": True,
         "native_style_cell_collection": "word_cells",
         "native_style_sidecar": True,
+        "page_provenance": "digest_sentinel_v1",
     },
-    "marker": {"disable_links": True},
+    "marker": {
+        "disable_links": True,
+        "page_provenance": "marker_paginated_v1",
+    },
 }
 _REQUIRED_EXTRACTOR_VERSIONS = {
     "grobid": {
         "grobid": "0.8.2",
-        "agr-abc-document-parsers": "1.6.0",
+        "agr-abc-document-parsers": "1.7.0",
     },
     "docling": {
         "docling": "2.113.0",
@@ -132,6 +146,8 @@ def persist_native_extractor_artifact(
     pdf_path: str | os.PathLike[str],
     extractor_versions: Mapping[str, str],
     options: Mapping[str, object],
+    page_provenance_bytes: bytes,
+    pdf_sha256: str | None = None,
     expected_page_count: int | None = None,
     covered_pages: list[int] | tuple[int, ...] | None = None,
     native_style_bytes: bytes | None = None,
@@ -184,6 +200,32 @@ def persist_native_extractor_artifact(
         ):
             raise ValueError("native covered pages must be a sorted PDF-page subset")
 
+    pdf_digest = pdf_sha256 or sha256_file(pdf_path)
+    if pdf_sha256 is not None and (
+        not isinstance(pdf_sha256, str) or len(pdf_sha256) != 64
+    ):
+        raise ValueError("PDF digest is invalid")
+    page_provenance = validate_source_page_provenance_bytes(
+        page_provenance_bytes,
+        source=source,
+        pdf_sha256=pdf_digest,
+        native_sha256=sha256_bytes(native_bytes),
+        markdown_sha256=sha256_bytes(markdown_bytes),
+    )
+    if (
+        expected_page_count is not None
+        and page_provenance.get("expected_page_count") != expected_page_count
+    ):
+        raise ValueError("source page provenance page count does not match native artifact")
+    if page_provenance.get("markdown_size_bytes") != len(markdown_bytes):
+        raise ValueError("source page provenance Markdown size does not match")
+    if page_provenance.get("extractor_versions") != dict(
+        sorted(extractor_versions.items())
+    ):
+        raise ValueError("source page provenance extractor versions do not match")
+    if page_provenance.get("options") != dict(sorted(options.items())):
+        raise ValueError("source page provenance options do not match")
+
     native_path = native_artifact_path(output_path, source)
     _atomic_write(native_path, native_bytes)
     style_fields = {}
@@ -196,17 +238,23 @@ def persist_native_extractor_artifact(
             "native_style_sha256": sha256_bytes(native_style_bytes),
             "native_style_size_bytes": len(native_style_bytes),
         }
+    page_path = source_page_provenance_path(output_path)
+    _atomic_write(page_path, page_provenance_bytes)
     manifest = {
         "schema": NATIVE_ARTIFACT_SCHEMA,
         "contract_version": NATIVE_ARTIFACT_CONTRACT_VERSION,
         "source": source,
-        "pdf_sha256": sha256_file(pdf_path),
+        "pdf_sha256": pdf_digest,
         "markdown_filename": output_path.name,
         "markdown_sha256": sha256_bytes(markdown_bytes),
         "native_filename": native_path.name,
         "native_media_type": native_media_type,
         "native_sha256": sha256_bytes(native_bytes),
         "native_size_bytes": len(native_bytes),
+        "page_provenance_filename": page_path.name,
+        "page_provenance_media_type": SOURCE_PAGE_PROVENANCE_MEDIA_TYPE,
+        "page_provenance_sha256": sha256_bytes(page_provenance_bytes),
+        "page_provenance_size_bytes": len(page_provenance_bytes),
         "extractor_versions": dict(sorted(extractor_versions.items())),
         "options": dict(sorted(options.items())),
         "expected_page_count": expected_page_count,
@@ -307,6 +355,29 @@ def load_native_extractor_artifact(
         raise ValueError("native artifact size mismatch")
     if manifest.get("native_sha256") != sha256_bytes(native_bytes):
         raise ValueError("native artifact digest mismatch")
+    page_path = source_page_provenance_path(output_path)
+    if manifest.get("page_provenance_filename") != page_path.name:
+        raise ValueError("source page provenance manifest filename is invalid")
+    if manifest.get("page_provenance_media_type") != SOURCE_PAGE_PROVENANCE_MEDIA_TYPE:
+        raise ValueError("source page provenance media type is invalid")
+    page_provenance_bytes = page_path.read_bytes()
+    if manifest.get("page_provenance_size_bytes") != len(page_provenance_bytes):
+        raise ValueError("source page provenance size mismatch")
+    if manifest.get("page_provenance_sha256") != sha256_bytes(page_provenance_bytes):
+        raise ValueError("source page provenance digest mismatch")
+    page_provenance = validate_source_page_provenance_bytes(
+        page_provenance_bytes,
+        source=source,
+        pdf_sha256=manifest.get("pdf_sha256"),
+        native_sha256=manifest.get("native_sha256"),
+        markdown_sha256=manifest.get("markdown_sha256"),
+    )
+    if page_provenance.get("extractor_versions") != extractor_versions:
+        raise ValueError("source page provenance extractor versions do not match")
+    if page_provenance.get("options") != options:
+        raise ValueError("source page provenance options do not match")
+    if page_provenance.get("markdown_size_bytes") != output_path.stat().st_size:
+        raise ValueError("source page provenance Markdown size does not match")
     expected_page_count = manifest.get("expected_page_count")
     covered_pages = manifest.get("covered_pages")
     expected_status = (
@@ -332,6 +403,11 @@ def load_native_extractor_artifact(
         )
     ):
         raise ValueError("native page coverage receipt is invalid")
+    if (
+        expected_page_count is not None
+        and page_provenance.get("expected_page_count") != expected_page_count
+    ):
+        raise ValueError("source page provenance page count does not match native artifact")
     load_native_style_artifact(
         source=source,
         output_filename=output_path,

@@ -14,7 +14,7 @@ openai
 pydantic>=2.0
 
 # Consensus pipeline
-agr-abc-document-parsers==1.6.0
+agr-abc-document-parsers==1.7.0
 mistune
 rapidfuzz
 regex  # UAX #29 extended-grapheme boundaries for lossless candidate clipping

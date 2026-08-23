@@ -4,10 +4,17 @@ import json
 import os
 import logging
 from importlib.metadata import version
+from pathlib import Path
 
 from app.services.pdf_extractor import PDFExtractor
 from app.services.native_extractor_artifact import (
     persist_native_extractor_artifact,
+    sha256_file,
+)
+from app.services.page_provenance import (
+    build_source_page_provenance_bytes,
+    docling_markdown_with_page_ranges,
+    docling_page_sentinel,
 )
 from app.services.native_style import (
     docling_native_style_bytes,
@@ -18,6 +25,7 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
+from docling_core.types.doc import ContentLayer
 
 try:
     from rapidocr.utils.typings import EngineType, LangDet, LangRec, ModelType, OCRVersion
@@ -35,6 +43,32 @@ logger = logging.getLogger(__name__)
 
 # Process-level converter cache — survives across Celery tasks within the same fork
 _cached_converters = {}  # keyed by Docling accelerator and OCR configuration
+
+# Keep the native order check and Markdown serializer on one explicit traversal
+# contract. A subset check could miss a page decrease in serialized content.
+DOCLING_MARKDOWN_CONTENT_LAYERS = frozenset({ContentLayer.BODY})
+DOCLING_MARKDOWN_TRAVERSE_PICTURES = False
+
+
+def _docling_primary_page_order_is_monotonic(document) -> bool:
+    """Return whether serialized Docling items stay in forward PDF page order."""
+
+    previous_page = None
+    for item, _level in document.iterate_items(
+        with_groups=True,
+        included_content_layers=set(DOCLING_MARKDOWN_CONTENT_LAYERS),
+        traverse_pictures=DOCLING_MARKDOWN_TRAVERSE_PICTURES,
+    ):
+        provenance = getattr(item, "prov", None)
+        if not provenance:
+            continue
+        page_number = getattr(provenance[0], "page_no", None)
+        if type(page_number) is not int or page_number < 1:
+            return False
+        if previous_page is not None and page_number < previous_page:
+            return False
+        previous_page = page_number
+    return True
 
 
 def _get_rapidocr_model_type():
@@ -202,6 +236,8 @@ class Docling(PDFExtractor):
         self.num_threads = int(os.environ.get("DOCLING_NUM_THREADS", 0)) or None
 
     def extract(self, pdf_path, output_filename):
+        pdf_digest = sha256_file(pdf_path)
+        page_sentinel = docling_page_sentinel(pdf_digest)
         converter = _get_converter(
             self.device,
             self.num_threads,
@@ -219,11 +255,25 @@ class Docling(PDFExtractor):
         if total_pages <= 0:
             raise RuntimeError("Docling reported zero pages for document; cannot export markdown.")
 
-        markdown = doc.export_to_markdown(
+        primary_page_order_is_monotonic = _docling_primary_page_order_is_monotonic(doc)
+        if not primary_page_order_is_monotonic:
+            logger.warning(
+                "Docling primary provenance page order decreased; "
+                "page evidence will remain residual"
+            )
+        paginated_markdown = doc.export_to_markdown(
             image_placeholder="",
-            page_break_placeholder="",
+            page_break_placeholder=page_sentinel,
             text_width=-1,
-        ).strip()
+            included_content_layers=set(DOCLING_MARKDOWN_CONTENT_LAYERS),
+            traverse_pictures=DOCLING_MARKDOWN_TRAVERSE_PICTURES,
+        )
+        markdown, page_ranges = docling_markdown_with_page_ranges(
+            paginated_markdown,
+            sentinel=page_sentinel,
+            expected_page_count=total_pages,
+            primary_page_order_is_monotonic=primary_page_order_is_monotonic,
+        )
         if not markdown:
             raise RuntimeError("Docling returned empty Markdown.")
 
@@ -254,8 +304,38 @@ class Docling(PDFExtractor):
 
         covered_pages = native_payload_covered_pages("docling", native_bytes)
 
-        with open(output_filename, "w", encoding="utf-8") as f:
-            f.write(markdown)
+        extractor_versions = {
+            "docling": version("docling"),
+            "docling-core": version("docling-core"),
+        }
+        options = {
+            "device": self.device,
+            "do_ocr": True,
+            "force_full_page_ocr": self.force_full_page_ocr,
+            "ocr_backend": os.environ.get(
+                "DOCLING_RAPIDOCR_BACKEND",
+                "onnxruntime",
+            ),
+            "ocr_model_type": _get_rapidocr_model_type(),
+            "generate_parsed_pages": True,
+            "native_style_cell_collection": "word_cells",
+            "native_style_sidecar": True,
+            "page_provenance": "digest_sentinel_v1",
+        }
+        markdown_bytes = markdown.encode("utf-8")
+        page_provenance_bytes = build_source_page_provenance_bytes(
+            source="docling",
+            pdf_sha256=pdf_digest,
+            native_bytes=native_bytes,
+            markdown_bytes=markdown_bytes,
+            expected_page_count=total_pages,
+            extractor_versions=extractor_versions,
+            options=options,
+            evidence_ranges=page_ranges,
+            residual_reason="unsafe_docling_page_transition",
+        )
+
+        Path(output_filename).write_bytes(markdown_bytes)
 
         persist_native_extractor_artifact(
             source="docling",
@@ -263,23 +343,10 @@ class Docling(PDFExtractor):
             native_bytes=native_bytes,
             native_media_type="application/json",
             pdf_path=pdf_path,
-            extractor_versions={
-                "docling": version("docling"),
-                "docling-core": version("docling-core"),
-            },
-            options={
-                "device": self.device,
-                "do_ocr": True,
-                "force_full_page_ocr": self.force_full_page_ocr,
-                "ocr_backend": os.environ.get(
-                    "DOCLING_RAPIDOCR_BACKEND",
-                    "onnxruntime",
-                ),
-                "ocr_model_type": _get_rapidocr_model_type(),
-                "generate_parsed_pages": True,
-                "native_style_cell_collection": "word_cells",
-                "native_style_sidecar": True,
-            },
+            extractor_versions=extractor_versions,
+            options=options,
+            page_provenance_bytes=page_provenance_bytes,
+            pdf_sha256=pdf_digest,
             expected_page_count=total_pages,
             covered_pages=covered_pages,
             native_style_bytes=native_style_bytes,

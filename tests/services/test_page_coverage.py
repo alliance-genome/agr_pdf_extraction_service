@@ -7,6 +7,10 @@ from app.services.merge_service import (
 from app.services.source_contracts import SourceArtifact
 from app.services.native_extractor_artifact import persist_native_extractor_artifact
 from app.services.native_style import unavailable_native_style_bytes
+from app.services.page_provenance import (
+    build_source_page_provenance_bytes,
+    source_page_provenance_path,
+)
 from app.services.page_coverage import (
     PAGE_COVERAGE_METHOD,
     load_extractor_page_coverage,
@@ -43,27 +47,46 @@ def _write_artifact(tmp_path, source, pdf, text="# Title\n\nBody.\n", pages=2):
                 for page in range(1, pages + 1)
             ],
         }
+    native_bytes = json.dumps(native).encode()
+    versions = (
+        {"docling": "2.113.0", "docling-core": "2.87.1"}
+        if source == "docling"
+        else {"marker-pdf": "1.10.2"}
+    )
+    options = (
+        {
+            "do_ocr": True,
+            "generate_parsed_pages": True,
+            "native_style_cell_collection": "word_cells",
+            "native_style_sidecar": True,
+            "page_provenance": "digest_sentinel_v1",
+        }
+        if source == "docling"
+        else {
+            "disable_links": True,
+            "page_provenance": "marker_paginated_v1",
+        }
+    )
+    page_provenance = build_source_page_provenance_bytes(
+        source=source,
+        pdf_sha256=hashlib.sha256(pdf.read_bytes()).hexdigest(),
+        native_bytes=native_bytes,
+        markdown_bytes=path.read_bytes(),
+        expected_page_count=pages,
+        extractor_versions=versions,
+        options=options,
+        evidence_ranges=[],
+        residual_reason="fixture",
+    )
     persist_native_extractor_artifact(
         source=source,
         output_filename=path,
-        native_bytes=json.dumps(native).encode(),
+        native_bytes=native_bytes,
         native_media_type="application/json",
         pdf_path=pdf,
-        extractor_versions=(
-            {"docling": "2.113.0", "docling-core": "2.87.1"}
-            if source == "docling"
-            else {"marker-pdf": "1.10.2"}
-        ),
-        options=(
-            {
-                "do_ocr": True,
-                "generate_parsed_pages": True,
-                "native_style_cell_collection": "word_cells",
-                "native_style_sidecar": True,
-            }
-            if source == "docling"
-            else {"disable_links": True}
-        ),
+        extractor_versions=versions,
+        options=options,
+        page_provenance_bytes=page_provenance,
         expected_page_count=pages,
         covered_pages=list(range(1, pages + 1)),
         native_style_bytes=(
@@ -166,6 +189,28 @@ def test_runtime_page_coverage_rejects_missing_native_payload_page(
     manifest["native_size_bytes"] = len(native_bytes)
     manifest["covered_pages"] = [1, 2]
     manifest["page_coverage_status"] = "partial"
+    page_map_bytes = build_source_page_provenance_bytes(
+        source="docling",
+        pdf_sha256=hashlib.sha256(pdf.read_bytes()).hexdigest(),
+        native_bytes=native_bytes,
+        markdown_bytes=output.read_bytes(),
+        expected_page_count=3,
+        extractor_versions={"docling": "2.113.0", "docling-core": "2.87.1"},
+        options={
+            "do_ocr": True,
+            "generate_parsed_pages": True,
+            "native_style_cell_collection": "word_cells",
+            "native_style_sidecar": True,
+            "page_provenance": "digest_sentinel_v1",
+        },
+        evidence_ranges=[],
+        residual_reason="fixture",
+    )
+    source_page_provenance_path(output).write_bytes(page_map_bytes)
+    manifest["page_provenance_sha256"] = hashlib.sha256(
+        page_map_bytes
+    ).hexdigest()
+    manifest["page_provenance_size_bytes"] = len(page_map_bytes)
     open(manifest_path, "w", encoding="utf-8").write(json.dumps(manifest))
     write_extractor_page_coverage(
         source="docling",

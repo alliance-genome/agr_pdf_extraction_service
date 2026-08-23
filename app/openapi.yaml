@@ -472,8 +472,8 @@ components:
       required: true
       schema:
         type: string
-        enum: [grobid, docling, marker, merged, audit]
-      description: Output method to download.
+        enum: [grobid, docling, marker, merged, audit, page_provenance]
+      description: Output method to download; page provenance is JSON.
 
   schemas:
     ErrorResponse:

@@ -22,7 +22,7 @@ def test_abc_report_accepts_exact_stable_canonical_bytes():
 
     report = abc_markdown_policy.abc_markdown_report(text)
 
-    assert report["parser_version"] == "1.6.0"
+    assert report["parser_version"] == "1.7.0"
     assert report["parser_version_exact"] is True
     assert (
         report["parser_implementation_sha256"]
@@ -116,9 +116,9 @@ def test_runtime_requirement_pins_exact_authoritative_parser_version():
         .splitlines()
     )
 
-    assert "agr-abc-document-parsers==1.6.0" in requirements
+    assert "agr-abc-document-parsers==1.7.0" in requirements
     assert not any(
         line.startswith("agr-abc-document-parsers")
-        and line != "agr-abc-document-parsers==1.6.0"
+        and line != "agr-abc-document-parsers==1.7.0"
         for line in requirements
     )

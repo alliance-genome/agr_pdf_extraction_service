@@ -25,6 +25,12 @@ from app.image_metadata import (
 from app.services.pdf_extractor import PDFExtractor
 from app.services.native_extractor_artifact import (
     persist_native_extractor_artifact,
+    sha256_file,
+)
+from app.services.page_provenance import (
+    MARKER_PAGE_SEPARATOR,
+    build_source_page_provenance_bytes,
+    marker_markdown_with_page_ranges,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,6 +185,8 @@ def _get_converter(device, dtype, extract_images=False, disable_links=True):
         converter_config = {
             "extract_images": bool(extract_images),
             "disable_links": bool(disable_links),
+            "paginate_output": True,
+            "page_separator": MARKER_PAGE_SEPARATOR,
         }
         _cached_converters[converter_key] = PdfConverter(
             artifact_dict=_cached_models[model_key],
@@ -253,19 +261,44 @@ class Marker(PDFExtractor):
             structured_metadata = _collect_structured_image_metadata(document, images.keys())
             for image_name, metadata in structured_metadata.items():
                 image_references.setdefault(image_name, {})["structured_metadata"] = metadata
-        text = _clean_publication_markdown(text)
+        cleaned_paginated = _clean_publication_markdown(text)
+        text, page_ranges = marker_markdown_with_page_ranges(
+            cleaned_paginated,
+            expected_page_count=len(document.pages),
+        )
         native_bytes = _serialize_marker_document(document)
 
         from app.services.page_coverage import native_payload_covered_pages
 
         covered_pages = native_payload_covered_pages("marker", native_bytes)
 
+        pdf_digest = sha256_file(pdf_path)
+        extractor_versions = {"marker-pdf": version("marker-pdf")}
+        options = {
+            "device": dev.type,
+            "disable_links": True,
+            "dtype": str(dtype),
+            "extract_images": bool(self.extract_images),
+            "page_provenance": "marker_paginated_v1",
+        }
+        markdown_bytes = text.encode("utf-8")
+        page_provenance_bytes = build_source_page_provenance_bytes(
+            source="marker",
+            pdf_sha256=pdf_digest,
+            native_bytes=native_bytes,
+            markdown_bytes=markdown_bytes,
+            expected_page_count=len(document.pages),
+            extractor_versions=extractor_versions,
+            options=options,
+            evidence_ranges=page_ranges,
+            residual_reason="marker_page_boundary_unavailable",
+        )
+
         metadata = rendered.metadata
         num_pages = len(metadata.get("page_stats", []))
         logger.info("Marker converted %d pages, extracted %d images", num_pages, len(images))
 
-        with open(output_filename, "w", encoding="utf-8") as f:
-            f.write(text)
+        Path(output_filename).write_bytes(markdown_bytes)
 
         persist_native_extractor_artifact(
             source="marker",
@@ -273,13 +306,10 @@ class Marker(PDFExtractor):
             native_bytes=native_bytes,
             native_media_type="application/json",
             pdf_path=pdf_path,
-            extractor_versions={"marker-pdf": version("marker-pdf")},
-            options={
-                "device": dev.type,
-                "disable_links": True,
-                "dtype": str(dtype),
-                "extract_images": bool(self.extract_images),
-            },
+            extractor_versions=extractor_versions,
+            options=options,
+            page_provenance_bytes=page_provenance_bytes,
+            pdf_sha256=pdf_digest,
             expected_page_count=len(document.pages),
             covered_pages=covered_pages,
         )
