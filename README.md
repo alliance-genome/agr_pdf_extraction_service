@@ -87,7 +87,7 @@ selection or coverage evidence as `failsafe`; it is never mislabeled
 ### Alliance Markdown
 
 PDFX validates the exact merged bytes with
-`agr-abc-document-parsers==1.7.1`. It does not ask a model to repair headings or
+`agr-abc-document-parsers==1.7.2`. It does not ask a model to repair headings or
 rewrite prose, and it does not run a normalizing emitter over arbitrary
 extractor content. Validator and downstream-reader receipts are bound to the
 output SHA-256 in merge metrics and the commit manifest.
