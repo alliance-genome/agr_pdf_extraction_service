@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-22
 
-**Status:** Implementation and code review complete; release gates remain
+**Status:** Parser released; PDFX merge, deployment, and canary gates remain
 
 **PDFX implementation base:** `origin/main` at `9747452`
 
@@ -60,15 +60,15 @@ authority for that goal.
   Material correction, or High-value simplification. Its non-blocking notes
   remain recorded on PR #46 and do not justify another code round under the
   Section 11 stop rules.
-- Parser publication remains operationally blocked: PyPI currently resolves
-  only 1.6.0. Valerio (`@valearna`) approved the change and added PyPI account
-  `ctabone` as an owner. The protected local token is project-scoped to
-  `agr-curation-api-client`; PyPI therefore rejected the 1.7.0 upload before
-  accepting any file with `403 Invalid API Token: project-scoped token is not
-  valid for project: 'agr-abc-document-parsers'`. Publishing now requires a
-  new token scoped to `agr-abc-document-parsers` (kept separately from the
-  existing token). A clean PDFX build/deploy cannot proceed until 1.7.0 is
-  published.
+- Parser 1.7.0 is published on PyPI after Valerio (`@valearna`) approved the
+  change and added PyPI account `ctabone` as an owner. PyPI records the exact
+  verified wheel SHA-256
+  `287d32db68410c36c5d7d947867adad3d67fae817e949bac1a1270cbed07345b`
+  and sdist SHA-256
+  `0ffa35f760d1adc7777eb8092f49c7352a05505494f78cd2473bf463fbd20870`.
+  A fresh no-cache wheel install from the public Simple Index returned version
+  1.7.0 and the PDFX-pinned implementation digest
+  `192f912fff47fe79e6a3118a60530cfd00a07944a06c2394ced59fa47e82095c`.
 - Exact Debbie PDFs are no longer recoverable from the terminated worker
   volumes or known durable stores. Their three exact MD5 identities are
   retained for the required post-deployment canary gate; no local replay claim
@@ -510,29 +510,29 @@ supported Blocker or Material correction remains.
 Point a new Codex session at this document and say: **Resume the PDFX primary
 page-provenance goal from Section 13.**
 
-Verified state as of 2026-08-22:
+Verified state as of 2026-08-23:
 
 - Parser PR #2 is merged and tag `v1.7.0` is pushed:
   <https://github.com/alliance-genome/agr_abc_document_parsers/pull/2>
 - Valerio approved the change and added PyPI user `ctabone` as an owner:
   <https://github.com/alliance-genome/agr_abc_document_parsers/pull/2#issuecomment-5382525044>
-- The existing `/home/ctabone/.pypi/token` must not be overwritten: it is
-  project-scoped to `agr-curation-api-client`. Store a new parser-scoped token
-  separately at `/home/ctabone/.pypi/agr-abc-document-parsers.token` with mode
-  `0600`; never paste the token into chat or commit it.
-- PDFX PR #46 is open, mergeable, and locally review-complete at
-  `a3cf3e38febf9029f0b3725d3bee6a0656b9ff36`:
+- Parser 1.7.0 is published and verified from the public PyPI Simple Index;
+  its wheel and source-distribution hashes match the release artifacts, and a
+  fresh install matches the pinned implementation digest.
+- PDFX PR #46 is open and mergeable. Its implementation was locally
+  review-complete at `a3cf3e38febf9029f0b3725d3bee6a0656b9ff36`; later commits
+  update only this evidence ledger:
   <https://github.com/alliance-genome/agr_pdf_extraction_service/pull/46>
-- Do not merge PDFX PR #46 while PyPI still resolves only parser 1.6.0; its
-  production build pins 1.7.0.
+- The parser publication gate is complete; PDFX PR #46 may now be merged once
+  its current documentation-only head and required check are green.
 - Do not repeat implementation or review work unless the branch changes or a
   concrete new finding appears.
 
 Immediate next steps:
 
-1. Confirm PyPI exposes `agr-abc-document-parsers==1.7.0`; install it into a
-   fresh environment and verify the pinned parser implementation digest.
-2. Merge PDFX PR #46 using the already-authorized ruleset bypass, monitor its
+1. Merge PDFX PR #46 using the already-authorized ruleset bypass, monitor its
    build/deployment, and verify public service health.
-3. Run the Debbie PDF canaries when their source PDFs are resubmitted or
+2. Run the Debbie PDF canaries when their source PDFs are resubmitted or
    otherwise made available; record sidecar correctness and runtime evidence.
+3. Close superseded PDFX PR #42 only after the replacement is deployed and
+   verified; then prepare the separate AI Curation consumer goal.
