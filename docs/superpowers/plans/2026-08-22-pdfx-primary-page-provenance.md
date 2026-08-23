@@ -2,8 +2,8 @@
 
 **Date:** 2026-08-22
 
-**Status:** Parser 1.7.2 released; bounded PDFX integration and replacement
-canaries remain
+**Status:** Complete in PDFX production; parser 1.7.2 released, PDFX PR #48
+deployed, and all three replacement canaries verified
 
 **PDFX implementation base:** `origin/main` at `9747452`
 
@@ -107,8 +107,82 @@ authority for that goal.
   Their exact page counts are 51, 27, and 25; the earlier 24-page note was
   incorrect. The 1.7.0 deployment exposed the Figure Legends defect; the 1.7.1
   replacement canaries exposed the remaining generated Acknowledgments,
-  Funding, and Availability defects. All three must be rerun after the bounded
-  1.7.2 PDFX integration.
+  Funding, and Availability defects. All three were rerun successfully after
+  the bounded 1.7.2 PDFX integration, as recorded below.
+- PDFX PR #48 merged as
+  `94dd55556235079a8b5ddac5ce49c5374678d766` and its complete deployment
+  workflow succeeded:
+  <https://github.com/alliance-genome/agr_pdf_extraction_service/pull/48> and
+  <https://github.com/alliance-genome/agr_pdf_extraction_service/actions/runs/32625401103>.
+  The immutable backend image tag is the merge SHA above, with ECR index digest
+  `sha256:11348566173518811dfc556b2237859ee277fa7313ef155a7c7cf46320285f14`.
+  The matched AMI is `ami-06ade111a5fc13fa4`; the two SSM publication pointers
+  were updated atomically to that AMI and image tag. Live inspection verified
+  parser distribution/policy version 1.7.2, implementation digest
+  `fea04b17244c8a262867852daa2b3a5c922e529f858403caececaf3f671e3bab`,
+  NVIDIA L4/CUDA readiness, and the exact immutable container tag.
+- The exact parser-1.7.2 production canaries completed successfully:
+
+  | PDF | Process ID | Docling source bytes (`direct` / residual) | Final page methods (bytes / ranges) | Page Luna / fallback | Existing merge Sol usage / cost |
+  | --- | --- | ---: | --- | --- | ---: |
+  | `8395208_J390188.pdf` (51 pages) | `a057665d-7785-4fcc-9b2c-6b08252c8bac` | 149,651 / 0 | `direct` 176,534 / 218; `deterministic_owner` 616 / 244 | 0 batches / 0 bytes | 187,231 tokens / $1.206545 |
+  | `8395484_J390190.pdf` (27 pages) | `7e1e09c2-8c1a-4f56-a70e-ab9f7e8e79f1` | 79,474 / 0 | `direct` 49,153 / 270; `native_start_page` 13,173 / 73; `aligned_agreement` 1,081 / 4; `deterministic_owner` 303 / 250 | 0 batches / 0 bytes | 114,151 tokens / $0.782150 |
+  | `8394599_J390144.pdf` (25 pages) | `ff06f11b-7319-45b8-b708-e47356b66b6f` | 0 / 78,400 (`unsafe_docling_page_transition`) | `direct` 45,542 / 413; `native_start_page` 12,810 / 73; `aligned_agreement` 2,969 / 7; `deterministic_owner` 451 / 393 | 0 batches / 0 bytes | 137,802 tokens / $0.842905 |
+
+  Sparse method counters plus `llm_batch_count=0`, empty `llm_outcomes`, and
+  `fallback_used=false` prove zero page-selection LLM and fallback ranges/bytes;
+  the nonzero costs above are the pre-existing document-merge Sol calls, not
+  page-number review.
+- Exact heading inspection proves the reported regressions are corrected
+  programmatically: the 27-page final Acknowledgments heading is direct page 9;
+  the 25-page final Figure Legends, Funding, and Availability headings are
+  direct pages 5, 13, and 13. References begin on pages 14, 10, and 13. The
+  corresponding GROBID source headings retain their direct/native candidates;
+  no heading needed Luna.
+- Every current GROBID Markdown artifact is byte-identical to the 1.7.2 parser
+  replay. Native mapping covers 99,330/100,756 bytes (98.585%),
+  62,384/63,465 bytes (98.297%), and 60,119/61,304 bytes (98.067%). All
+  coordinate-bearing `biblStruct` records map to distinct emitted reference
+  ranges: 142/142, 47/47, and 61/61.
+- Independent validators bound each source map to the exact PDF, native
+  artifact, Markdown, range partition, and record digest, and bound each final
+  map to the exact merged bytes, audit, merge contract, and source-map digests.
+  Official ABC validation/readback succeeds for all three GROBID parser outputs
+  and all three final merged outputs. The 51-page final retains only the same
+  pre-existing nonfatal S01/S02/S08 warnings as its 1.7.1 output; the other two
+  final outputs are validator-clean. Docling and Marker page capture preserves
+  their raw pre-feature Markdown bytes exactly, including pre-existing raw
+  Marker schema diagnostics; those source audit artifacts are not reclassified
+  as final ABC output.
+- Authenticated public downloads of `merged` and `page_provenance` returned HTTP
+  200 and matched their durable S3 objects byte-for-byte. Merged/sidecar
+  SHA-256 pairs are respectively
+  `08255ac55ce9dbe731bee742ce944ef83112b24fb670bd80e36a813d282ff915` /
+  `78b2110eee386290c87435f232fe98d7255e1a59b21e7727d4c17eea28167b23`,
+  `fae1b7dd742a902d353c44339a7c22cbfd65fc1d120d423f125a1a0f908205ec` /
+  `89a7d8d9969f14d779dd43222894d1849c7cc4bcd0e24132e962d0aa49f486da`,
+  and
+  `b94bbdc9e7da1fa0b57460c55bba60a4479ff06d305da3868b941363e50e10fb` /
+  `5197d54e6a9bca051300f28988c406c8fa41d15be1f1052f99e5ecddea808858`.
+- The deterministic masked holdout covered all three captures, all three
+  extractors, and every observed TEI kind in 36 one-range bounded requests.
+  Luna/medium made 35 valid choices and all 35 were correct; one abstract case
+  returned an invalid structured response and therefore produced no accepted
+  model choice. PDFX's tested fail-closed path records and deterministically
+  resolves such a missing choice. No wrong LLM page was accepted. The
+  content-free evidence digest is
+  `2b0206fbdaa67e7b05b6ba0de01fe8dccad4fd578be506bb2f0a0f95cee7bf38`
+  and request-set digest is
+  `0c7773a2e2be1783b13dd6b55f1cf69439540d5f5887bf9b757acac4816a9dc0`.
+  The exact production canaries had zero real residual model selections, so
+  the complete real-selection inspection set was empty.
+- Three preliminary submissions used a JSON-like `methods` form value instead
+  of the API's required comma-separated value and failed at HTTP 400 before
+  extraction. They are not canaries and do not indicate a 1.7.2 runtime
+  failure. Correctly encoded fresh process IDs are the three recorded above.
+  After evidence collection the durable queue and active-job counts were zero,
+  the ASG desired capacity was returned to zero, and the GPU instance
+  terminated.
 
 ## 1. Goal and Non-Negotiable Contract
 
@@ -408,7 +482,7 @@ changes are explicitly deferred to a separate goal after PDFX is proven.
 
 ### Parser and extractor tests
 
-- [ ] Docling's 51-, 27-, and 25-page captures reproduce every expected safe
+- [x] Docling's 51-, 27-, and 25-page captures reproduce every expected safe
   transition and the current Markdown SHA exactly.
 - [x] A pinned real Docling fixture with primary provenance order `1,2,1,3`
   preserves exact Markdown but produces residual rather than wrong `direct`
@@ -418,71 +492,78 @@ changes are explicitly deferred to a separate goal after PDFX is proven.
   pinned default proven by test.
 - [x] Marker fixtures cover tables, lists, blank pages, images/links, and the
   terminal page while preserving current cleaned Markdown exactly.
-- [ ] GROBID directly maps at least 95% of source Markdown bytes on both Debbie
+- [x] GROBID directly maps at least 95% of source Markdown bytes on both Debbie
   captures and maps every coordinate-bearing reference.
-- [ ] Parser and extractor outputs remain official ABC Markdown.
+- [x] Parser and extractor outputs remain official ABC Markdown.
+
+  Here “remain” is a regression criterion at each existing contract boundary:
+  GROBID parser and final merged outputs pass the official validator/reader,
+  while the Docling/Marker source audit artifacts remain byte-identical and do
+  not acquire new diagnostics. Rewriting pre-existing noncanonical raw Marker
+  source would violate the stronger byte-identity requirement and is not part
+  of the public final-output contract.
 
 ### Contract and mutation tests
 
-- [ ] Every range satisfies `0 <= start < end <= markdown_size`.
-- [ ] Final ranges exactly partition every merged byte without gaps or overlap.
-- [ ] Every final page is an integer within the PDF page count.
-- [ ] Cross-page blocks select their starting page and retain all candidates.
-- [ ] Wrong PDF, Markdown, native, audit, contract, or sidecar digests reject
+- [x] Every range satisfies `0 <= start < end <= markdown_size`.
+- [x] Final ranges exactly partition every merged byte without gaps or overlap.
+- [x] Every final page is an integer within the PDF page count.
+- [x] Cross-page blocks select their starting page and retain all candidates.
+- [x] Wrong PDF, Markdown, native, audit, contract, or sidecar digests reject
   reuse.
-- [ ] Reversed, overlapping, missing, and out-of-bounds ranges are rejected.
-- [ ] Missing source maps invalidate extractor caches under v7.
-- [ ] Invalid model digests, missing decisions, duplicate decisions, and
+- [x] Reversed, overlapping, missing, and out-of-bounds ranges are rejected.
+- [x] Missing source maps invalidate extractor caches under v7.
+- [x] Invalid model digests, missing decisions, duplicate decisions, and
   invented page choices are rejected.
-- [ ] Missing/failed model calls produce recorded deterministic fallbacks, not
+- [x] Missing/failed model calls produce recorded deterministic fallbacks, not
   unnumbered output.
 
 ### Performance and architecture tests
 
-- [ ] Page provenance adds zero `read_markdown()` calls.
-- [ ] Page provenance adds zero `validate_markdown()` calls beyond the existing
+- [x] Page provenance adds zero `read_markdown()` calls.
+- [x] Page provenance adds zero `validate_markdown()` calls beyond the existing
   authoritative conversion/final-output gates.
-- [ ] Page provenance adds zero RapidFuzz calls and zero new structural scans.
-- [ ] Extractor page capture occurs in the existing Markdown emission pass.
-- [ ] Cache validation uses hashes, schemas, ranges, and receipts rather than
+- [x] Page provenance adds zero RapidFuzz calls and zero new structural scans.
+- [x] Extractor page capture occurs in the existing Markdown emission pass.
+- [x] Cache validation uses hashes, schemas, ranges, and receipts rather than
   publication-text reparsing.
 
 ### Real evidence
 
-- [ ] Build a deterministic masked holdout across all three captures covering
+- [x] Build a deterministic masked holdout across all three captures covering
   each extractor and observed structural kind. No wrong LLM page choice is
   allowed before deployment.
-- [ ] Independently inspect every real residual selection from the three
+- [x] Independently inspect every real residual selection from the three
   captures against native/PDF evidence.
-- [ ] Canary `8395208_J390188.pdf`, `8395484_J390190.pdf`, and
+- [x] Canary `8395208_J390188.pdf`, `8395484_J390190.pdf`, and
   `8394599_J390144.pdf` end to end on parser 1.7.2.
-- [ ] Confirm successful durable `merged` and `page_provenance` downloads.
-- [ ] Confirm metrics expose direct, LLM, and fallback byte/range counts plus
+- [x] Confirm successful durable `merged` and `page_provenance` downloads.
+- [x] Confirm metrics expose direct, LLM, and fallback byte/range counts plus
   LLM usage and cost.
 
 ## 10. Avoidance of Over-Engineering
 
 Every checkbox blocks release if violated:
 
-- [ ] No inline page comments or Markdown rewrites.
-- [ ] No new heuristic publication-role regex.
-- [ ] No per-page Docling export concatenation.
-- [ ] No final-document structural scan, repeated reader comparison, or
+- [x] No inline page comments or Markdown rewrites.
+- [x] No new heuristic publication-role regex.
+- [x] No per-page Docling export concatenation.
+- [x] No final-document structural scan, repeated reader comparison, or
   cross-source fuzzy page vote.
-- [ ] No general text-edit engine, provenance plugin framework, or second
+- [x] No general text-edit engine, provenance plugin framework, or second
   Markdown parser.
-- [ ] No vision/page-image pipeline in this goal.
-- [ ] No JATS provenance expansion or sentence-segmentation rollout.
-- [ ] No compatibility layer, migration framework, feature flag, or rollback
+- [x] No vision/page-image pipeline in this goal.
+- [x] No JATS provenance expansion or sentence-segmentation rollout.
+- [x] No compatibility layer, migration framework, feature flag, or rollback
   machinery beyond required cache/contract versioning.
-- [ ] The LLM sees only residual ranges and bounded application-owned choices.
-- [ ] Existing `page_coverage` qualification behavior remains separate.
-- [ ] PR #42 and `05687ea` remain evidence only; their rescanning/projection
+- [x] The LLM sees only residual ranges and bounded application-owned choices.
+- [x] Existing `page_coverage` qualification behavior remains separate.
+- [x] PR #42 and `05687ea` remain evidence only; their rescanning/projection
   implementation is not cherry-picked.
-- [ ] Every changed production file maps to the parser hook, one extractor
+- [x] Every changed production file maps to the parser hook, one extractor
   adapter, the page-sidecar contract, residual page selection, persistence, or
   the public download.
-- [ ] Tests cover observed and reachable behavior without an exhaustive
+- [x] Tests cover observed and reachable behavior without an exhaustive
   theoretical Cartesian matrix.
 
 ## 11. Implementation, PR, and Deployment Order
@@ -608,16 +689,26 @@ Verified state as of 2026-08-23:
   1.7.2 is the bounded programmatic correction.
 - Do not repeat completed parser work or PR #46 review work unless a concrete
   new finding appears.
+- PDFX PR #48 merged as
+  `94dd55556235079a8b5ddac5ce49c5374678d766`; deployment run `32625401103`
+  published immutable image/AMI pair
+  `94dd55556235079a8b5ddac5ce49c5374678d766` /
+  `ami-06ade111a5fc13fa4`. Parser 1.7.2 and the exact implementation digest were
+  verified in the live GPU runtime:
+  <https://github.com/alliance-genome/agr_pdf_extraction_service/pull/48>
+- The exact parser-1.7.2 replacement canaries completed as process IDs
+  `a057665d-7785-4fcc-9b2c-6b08252c8bac`,
+  `7e1e09c2-8c1a-4f56-a70e-ab9f7e8e79f1`, and
+  `ff06f11b-7319-45b8-b708-e47356b66b6f`. All final/download/digest/range/ABC
+  checks passed, no page-resolution LLM or fallback range was needed, and the
+  corrected heading pages are 9 plus 5/13/13 as required. The detailed hashes,
+  method counts, cost, holdout, and shutdown evidence are in the implementation
+  evidence ledger above.
+- The production queue is empty and the GPU ASG has desired capacity zero with
+  no remaining instance.
 
-Immediate next steps:
+Completion state:
 
-1. Validate and review the bounded PDFX parser-1.7.2 integration branch, then
-   open, merge, and deploy its PR under the existing authorization.
-2. Rerun all three exact durable Debbie canaries. Confirm the 25-page
-   `Figure Legends` range is page 5, the 27-page Acknowledgments range is page
-   9, and the 25-page Funding/Availability ranges are page 13 via direct/native
-   evidence rather than Luna. Re-record sidecar, download, runtime, fallback,
-   and cost evidence.
-3. Correct this ledger with final replacement process IDs and deployment
-   evidence, close superseded PDFX PR #42, and then prepare the separate AI
-   Curation consumer goal.
+1. Close superseded PDFX PR #42 after this evidence-only checkpoint is merged.
+2. Do not add the AI Curation/Weaviate consumer here. Start that work only as a
+   separate goal using this production-proven sidecar contract.
