@@ -55,6 +55,17 @@ def test_pdfx_stack_uses_canonical_resources():
     assert "Rollback: true" in template
 
 
+def test_pdfx_backend_propagates_controlled_cost_tags():
+    template = STACK_PATH.read_text()
+
+    assert template.count("- Key: Team\n                Value: specialists") >= 2
+    assert (
+        "- Key: Team\n"
+        "          Value: specialists\n"
+        "          PropagateAtLaunch: true"
+    ) in template
+
+
 def test_upload_limit_is_500_mib_across_backend_configs():
     backend_config = CONFIG_PATH.read_text()
     nginx_config = NGINX_CONFIG_PATH.read_text()
