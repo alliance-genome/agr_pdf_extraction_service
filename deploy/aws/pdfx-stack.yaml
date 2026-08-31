@@ -450,12 +450,16 @@ Resources:
                 Value: !Ref BackendResourceName
               - Key: Project
                 Value: pdfx
+              - Key: Team
+                Value: specialists
               - Key: Environment
                 Value: !Ref EnvironmentName
           - ResourceType: volume
             Tags:
               - Key: Project
                 Value: pdfx
+              - Key: Team
+                Value: specialists
               - Key: Environment
                 Value: !Ref EnvironmentName
         UserData:
@@ -628,6 +632,9 @@ Resources:
           PropagateAtLaunch: true
         - Key: Project
           Value: pdfx
+          PropagateAtLaunch: true
+        - Key: Team
+          Value: specialists
           PropagateAtLaunch: true
         - Key: Environment
           Value: !Ref EnvironmentName
