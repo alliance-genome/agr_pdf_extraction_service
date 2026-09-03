@@ -1703,6 +1703,22 @@ async def _reconciler_loop():
                 )
                 continue
 
+            if durable_phase in {"queued", "claimed"}:
+                # A durable queue record is authoritative evidence that the
+                # backend has not accepted this job yet. A quiet local tracker
+                # cannot turn that recoverable wait into a terminal failure.
+                job_trackers.pop(process_id, None)
+                await _ensure_queued_jobs_replaying(
+                    "stale durable queue record",
+                    known_queued=True,
+                )
+                logger.warning(
+                    "job=%s event=durable_queue_stale_retained phase=%s",
+                    process_id,
+                    durable_phase,
+                )
+                continue
+
             if settings.RECONCILER_REQUEUE_ONCE and not tracker.requeue_attempted and process_id in job_payload_cache:
                 tracker.requeue_attempted = True
                 job = job_payload_cache[process_id]

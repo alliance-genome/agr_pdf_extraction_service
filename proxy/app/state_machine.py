@@ -226,6 +226,35 @@ class LifecycleManager:
             self._start_idle_monitor()
             return True
 
+    async def _backend_snapshot_is_current(
+        self,
+        private_ip: str,
+        instance_id: str | None,
+    ) -> bool:
+        """Revalidate backend identity after an awaited application health check."""
+        try:
+            state, current_ip, current_instance_id = await asyncio.to_thread(
+                self._ec2.get_instance_snapshot
+            )
+        except Exception as exc:
+            logger.debug("Failed to revalidate healthy backend identity: %s", exc)
+            return False
+
+        is_current = (
+            state == "running"
+            and current_ip == private_ip
+            and current_instance_id == instance_id
+        )
+        if not is_current:
+            logger.info(
+                "event=stale_backend_health_snapshot "
+                "expected_instance=%s current_instance=%s current_state=%s",
+                instance_id,
+                current_instance_id,
+                state,
+            )
+        return is_current
+
     async def _poll_until_healthy(self, generation: int | None = None) -> None:
         """Poll EC2 health endpoint until ready or timeout."""
         current_task = asyncio.current_task()
@@ -244,6 +273,17 @@ class LifecycleManager:
         target_instance_id = self._startup_instance_id
 
         try:
+            # A wake can overlap an earlier idle scale-in while the old instance
+            # still looks healthy. Reassert desired capacity before trusting any
+            # ASG snapshot so Auto Scaling launches a replacement if that old
+            # instance is already committed to termination.
+            if self._ec2.uses_auto_scaling:
+                try:
+                    await asyncio.to_thread(self._ec2.start_instance)
+                    start_requested = True
+                except Exception as exc:
+                    logger.warning("Failed to reassert backend ASG capacity during startup: %s", exc)
+
             while True:
                 while time.time() < deadline:
                     async with self._transition_lock:
@@ -268,7 +308,12 @@ class LifecycleManager:
                             logger.info("EC2 reached stopped during startup poll; issuing start request.")
                             await asyncio.to_thread(self._ec2.start_instance)
                             start_requested = True
-                        if ec2_state == "running" and ip and await self._check_health(ip):
+                        if (
+                            ec2_state == "running"
+                            and ip
+                            and await self._check_health(ip)
+                            and await self._backend_snapshot_is_current(ip, instance_id)
+                        ):
                             logger.info("EC2 instance healthy at %s", ip)
                             if await self._set_ready_if_owner(generation, ip, instance_id):
                                 return
@@ -310,7 +355,12 @@ class LifecycleManager:
                         if self._owns_startup(generation):
                             self._startup_instance_id = current_instance_id
 
-                if ec2_state == "running" and ip and await self._check_health(ip):
+                if (
+                    ec2_state == "running"
+                    and ip
+                    and await self._check_health(ip)
+                    and await self._backend_snapshot_is_current(ip, current_instance_id)
+                ):
                     if await self._set_ready_if_owner(generation, ip, current_instance_id):
                         return
                     await self._record_stale_monitor_exit(generation, "timeout_health_superseded")
@@ -558,51 +608,58 @@ class LifecycleManager:
                     )
                     self._stop_blocked_total += 1
                     continue
-                # Health and AWS reads are await boundaries. Recheck process-local
-                # work and current identity immediately before the exact-target stop.
-                if self._state != InstanceState.READY:
-                    continue
-                if self._stop_guard:
-                    try:
-                        if not self._stop_guard():
+                # Serialize the exact-target stop and local state change with
+                # ensure_running(). A concurrent wake must observe STOPPED and
+                # create a new startup generation instead of returning early
+                # against a backend already committed to scale-in.
+                async with self._transition_lock:
+                    if self._state != InstanceState.READY:
+                        continue
+                    if self.idle_seconds < timeout:
+                        continue
+                    if self._stop_guard:
+                        try:
+                            if not self._stop_guard():
+                                self._stop_blocked_total += 1
+                                continue
+                        except Exception as exc:
+                            logger.error("Stop guard callback failed during final recheck: %s", exc)
                             self._stop_blocked_total += 1
                             continue
+                    try:
+                        _state, _ip, verified_instance_id = await asyncio.to_thread(
+                            self._ec2.get_instance_snapshot
+                        )
                     except Exception as exc:
-                        logger.error("Stop guard callback failed during final recheck: %s", exc)
-                        self._stop_blocked_total += 1
+                        logger.error("Failed final idle backend identity check: %s", exc)
                         continue
-                try:
-                    _state, _ip, verified_instance_id = await asyncio.to_thread(
-                        self._ec2.get_instance_snapshot
-                    )
-                except Exception as exc:
-                    logger.error("Failed final idle backend identity check: %s", exc)
-                    continue
-                if verified_instance_id != instance_id:
+                    if verified_instance_id != instance_id:
+                        logger.info(
+                            "event=stale_idle_stop_exit expected_instance=%s current_instance=%s",
+                            instance_id,
+                            verified_instance_id,
+                        )
+                        continue
                     logger.info(
-                        "event=stale_idle_stop_exit expected_instance=%s current_instance=%s",
-                        instance_id,
-                        verified_instance_id,
+                        "Idle timeout reached (%.0f seconds). Stopping EC2.",
+                        self.idle_seconds,
                     )
-                    continue
-                logger.info(
-                    "Idle timeout reached (%.0f seconds). Stopping EC2.",
-                    self.idle_seconds,
-                )
-                try:
-                    stopped = await asyncio.to_thread(self._ec2.stop_instance, instance_id)
-                    if stopped:
-                        self._stop_events_total += 1
-                except Exception as exc:
-                    logger.error("Failed to stop EC2: %s", exc)
-                    stopped = False
-                if not stopped:
-                    continue
-                self._state = InstanceState.STOPPED
-                self._private_ip = None
-                self._ready_since = None
-                self._clear_health_snapshot()
-                return
+                    try:
+                        stopped = await asyncio.to_thread(self._ec2.stop_instance, instance_id)
+                        if stopped:
+                            self._stop_events_total += 1
+                    except Exception as exc:
+                        logger.error("Failed to stop EC2: %s", exc)
+                        stopped = False
+                    if not stopped:
+                        continue
+                    self._startup_generation += 1
+                    self._startup_instance_id = None
+                    self._state = InstanceState.STOPPED
+                    self._private_ip = None
+                    self._ready_since = None
+                    self._clear_health_snapshot()
+                    return
 
     async def sync_state_from_ec2(self) -> None:
         """Sync internal state with actual EC2 state. Call on proxy startup."""
@@ -610,6 +667,12 @@ class LifecycleManager:
             ec2_state, ip, instance_id = await asyncio.to_thread(self._ec2.get_instance_snapshot)
             if ec2_state == "running" and ip:
                 if await self._check_health(ip):
+                    if not await self._backend_snapshot_is_current(ip, instance_id):
+                        async with self._transition_lock:
+                            if not (self._startup_task and not self._startup_task.done()):
+                                self._begin_startup_locked()
+                        logger.info("Synced: healthy EC2 snapshot changed during verification")
+                        return
                     async with self._transition_lock:
                         old_task = self._startup_task
                         self._startup_generation += 1

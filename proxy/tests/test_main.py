@@ -1948,6 +1948,54 @@ class TestExtractCancelEndpoint:
         assert process_id not in main_mod.job_trackers
         assert main_mod.job_queue.get_durable_phase(process_id) == "accepted"
 
+    @pytest.mark.parametrize("claimed", [False, True], ids=["queued", "claimed"])
+    def test_reconciler_retains_unaccepted_durable_queue_work(self, monkeypatch, claimed):
+        import app.main as main_mod
+
+        process_id = f"stale-{'claimed' if claimed else 'queued'}-job"
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        main_mod.job_queue.enqueue(process_id, b"%PDF durable", {})
+        if claimed:
+            claimed_job = main_mod.job_queue.claim_next("stale-owner", lease_seconds=60)
+            assert claimed_job is not None
+        main_mod.job_trackers[process_id] = main_mod.JobTracker(
+            process_id=process_id,
+            status="queued",
+            first_seen_at=0,
+            last_seen_at=0,
+            last_progress_at=0,
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_lookup_authoritative_status",
+            AsyncMock(return_value=(False, None)),
+        )
+        ensure_replay = AsyncMock()
+        monkeypatch.setattr(main_mod, "_ensure_queued_jobs_replaying", ensure_replay)
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+        monkeypatch.setattr(main_mod.settings, "RECONCILER_REQUEUE_ONCE", False)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        assert process_id not in main_mod.replay_submission_errors
+        assert process_id not in main_mod.job_trackers
+        assert main_mod.job_queue.has_job(process_id) is True
+        assert main_mod.job_queue.get_durable_phase(process_id) == ("claimed" if claimed else "queued")
+        ensure_replay.assert_awaited_once_with(
+            "stale durable queue record",
+            known_queued=True,
+        )
+
     def test_reconciler_does_not_renew_unchanged_authoritative_running_row(self, monkeypatch):
         import app.main as main_mod
 
