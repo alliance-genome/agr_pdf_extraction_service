@@ -439,6 +439,53 @@ class TestLifecycleManager:
         assert mgr.replacement_requests_total == 0
         ec2.stop_instance.assert_not_called()
 
+    def test_timeout_identity_read_error_defers_destructive_recovery(self, monkeypatch):
+        mgr, ec2 = self._make_manager(InstanceState.STARTING)
+        ec2.get_instance_snapshot.side_effect = [
+            ("running", "10.0.0.5", "i-current"),
+            RuntimeError("AWS read unavailable"),
+            ("running", "10.0.0.5", "i-current"),
+            ("running", "10.0.0.5", "i-current"),
+        ]
+        mgr._check_health = AsyncMock(return_value=True)
+        mgr._start_idle_monitor = MagicMock()
+
+        clock = {"now": 0.0}
+
+        def _advancing_time():
+            clock["now"] += 0.1
+            return clock["now"]
+
+        async def _no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("app.state_machine.time.time", _advancing_time)
+        monkeypatch.setattr("app.state_machine.asyncio.sleep", _no_sleep)
+        monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 0)
+        monkeypatch.setattr("app.state_machine.settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS", 1)
+
+        asyncio.run(mgr._poll_until_healthy())
+
+        ec2.mark_unhealthy.assert_not_called()
+        ec2.stop_instance.assert_not_called()
+        assert mgr.state == InstanceState.READY
+        assert mgr.private_ip == "10.0.0.5"
+
+    def test_sync_identity_read_error_preserves_existing_state(self):
+        mgr, ec2 = self._make_manager(InstanceState.READY)
+        mgr._private_ip = "10.0.0.4"
+        ec2.get_instance_snapshot.side_effect = [
+            ("running", "10.0.0.5", "i-current"),
+            RuntimeError("AWS read unavailable"),
+        ]
+        mgr._check_health = AsyncMock(return_value=True)
+
+        asyncio.run(mgr.sync_state_from_ec2())
+
+        assert mgr.state == InstanceState.READY
+        assert mgr.private_ip == "10.0.0.4"
+        assert mgr._startup_task is None
+
     def test_poll_until_healthy_stops_backend_after_exhausted_replacement(self, monkeypatch):
         mgr, ec2 = self._make_manager(InstanceState.STARTING)
         ec2.get_instance_snapshot.return_value = ("running", "10.0.0.5", "i-current")

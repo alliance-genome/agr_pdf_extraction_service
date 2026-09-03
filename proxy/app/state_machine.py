@@ -230,15 +230,15 @@ class LifecycleManager:
         self,
         private_ip: str,
         instance_id: str | None,
-    ) -> bool:
-        """Revalidate backend identity after an awaited application health check."""
+    ) -> bool | None:
+        """Revalidate backend identity, or return None when AWS is unreadable."""
         try:
             state, current_ip, current_instance_id = await asyncio.to_thread(
                 self._ec2.get_instance_snapshot
             )
         except Exception as exc:
-            logger.debug("Failed to revalidate healthy backend identity: %s", exc)
-            return False
+            logger.warning("Failed to revalidate healthy backend identity; deferring: %s", exc)
+            return None
 
         is_current = (
             state == "running"
@@ -373,16 +373,18 @@ class LifecycleManager:
                         if self._owns_startup(generation):
                             self._startup_instance_id = current_instance_id
 
-                if (
-                    ec2_state == "running"
-                    and ip
-                    and await self._check_health(ip)
-                    and await self._backend_snapshot_is_current(ip, current_instance_id)
-                ):
-                    if await self._set_ready_if_owner(generation, ip, current_instance_id):
+                if ec2_state == "running" and ip and await self._check_health(ip):
+                    snapshot_is_current = await self._backend_snapshot_is_current(ip, current_instance_id)
+                    if snapshot_is_current is True:
+                        if await self._set_ready_if_owner(generation, ip, current_instance_id):
+                            return
+                        await self._record_stale_monitor_exit(generation, "timeout_health_superseded")
                         return
-                    await self._record_stale_monitor_exit(generation, "timeout_health_superseded")
-                    return
+                    if snapshot_is_current is None:
+                        # AWS read failures are not evidence that a healthy
+                        # backend is stale. Keep polling instead of replacing it.
+                        deadline = time.time() + max(1, poll_interval)
+                        continue
 
                 # Re-read identity after the awaited health call. EC2Manager also
                 # validates the exact target immediately before the AWS mutation.
@@ -685,7 +687,11 @@ class LifecycleManager:
             ec2_state, ip, instance_id = await asyncio.to_thread(self._ec2.get_instance_snapshot)
             if ec2_state == "running" and ip:
                 if await self._check_health(ip):
-                    if not await self._backend_snapshot_is_current(ip, instance_id):
+                    snapshot_is_current = await self._backend_snapshot_is_current(ip, instance_id)
+                    if snapshot_is_current is None:
+                        logger.warning("Deferring EC2 state sync until backend identity can be verified")
+                        return
+                    if not snapshot_is_current:
                         async with self._transition_lock:
                             if not (self._startup_task and not self._startup_task.done()):
                                 self._begin_startup_locked()

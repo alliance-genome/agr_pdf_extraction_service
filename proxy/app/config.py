@@ -50,6 +50,7 @@ class Settings:
     )
     ACCEPTED_CLEANUP_BATCH_SIZE: int = int(os.environ.get("ACCEPTED_CLEANUP_BATCH_SIZE", "25"))
     REPLAY_RETRY_DELAY_SECONDS: int = int(os.environ.get("REPLAY_RETRY_DELAY_SECONDS", "30"))
+    REPLAY_MAX_QUEUE_AGE_SECONDS: int = int(os.environ.get("REPLAY_MAX_QUEUE_AGE_SECONDS", "86400"))
 
     STATUS_DATABASE_URL: str = os.environ.get("STATUS_DATABASE_URL", os.environ.get("DATABASE_URL", "")).strip()
     STATUS_DB_TIMEOUT_SECONDS: int = int(os.environ.get("STATUS_DB_TIMEOUT_SECONDS", "5"))

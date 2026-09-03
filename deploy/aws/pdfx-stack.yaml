@@ -924,6 +924,8 @@ Resources:
               Value: "900"
             - Name: REPLAY_RETRY_DELAY_SECONDS
               Value: "30"
+            - Name: REPLAY_MAX_QUEUE_AGE_SECONDS
+              Value: "86400"
             - Name: ACCEPTED_STATUS_RETENTION_SECONDS
               Value: "604800"
             - Name: ACCEPTED_CLEANUP_BATCH_SIZE

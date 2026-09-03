@@ -34,7 +34,7 @@ def _patch_singletons(monkeypatch):
     mock_lifecycle.record_backend_work = MagicMock()
     mock_lifecycle.active_jobs = 0
     mock_lifecycle.stale_monitor_exits_total = 0
-    mock_lifecycle.private_ip = None
+    mock_lifecycle.private_ip = "172.31.1.100"
     mock_lifecycle.ensure_running = AsyncMock()
     mock_lifecycle.sync_state_from_ec2 = AsyncMock()
     mock_lifecycle.refresh_health_snapshot = AsyncMock(return_value=True)
@@ -310,7 +310,6 @@ class TestExtractEndpoint:
         data = resp.json()
         assert data["status"] == "queued"
         assert data["progress"]["stage"] in {"queued", "ec2_starting"}
-        main_mod.lifecycle.sync_state_from_ec2.assert_not_called()
         assert main_mod.job_queue.has_job(data["process_id"]) is True
         assert data["process_id"] in main_mod.job_payload_cache
 
@@ -386,6 +385,7 @@ class TestExtractEndpoint:
             return JSONResponse(status_code=202, content={"process_id": "backend-1", "status": "queued"})
 
         monkeypatch.setattr(main_mod, "_forward_extraction", _forward_capture)
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", lambda: None)
 
         resp = client.post(
             "/api/v1/extract",
@@ -399,6 +399,7 @@ class TestExtractEndpoint:
         )
 
         assert resp.status_code == 202
+        asyncio.run(main_mod._replay_when_ready())
         assert captured["form_fields"]["extract_images"] == "true"
         assert "process_id" in captured["form_fields"]
         assert "review_images" not in captured["form_fields"]
@@ -416,6 +417,7 @@ class TestExtractEndpoint:
             return JSONResponse(status_code=202, content={"process_id": "backend-1", "status": "queued"})
 
         monkeypatch.setattr(main_mod, "_forward_extraction", _forward_capture)
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", lambda: None)
 
         resp = client.post(
             "/api/v1/extract",
@@ -430,6 +432,7 @@ class TestExtractEndpoint:
         )
 
         assert resp.status_code == 202
+        asyncio.run(main_mod._replay_when_ready())
         assert captured["form_fields"]["extract_images"] == "true"
         assert captured["form_fields"]["review_images"] == "false"
         assert "process_id" in captured["form_fields"]
@@ -1078,7 +1081,7 @@ class TestExtractStatusEndpoint:
 
         assert resp.status_code == 200
         assert resp.json()["status"] == "queued"
-        main_mod.lifecycle.ensure_running.assert_called_once()
+        main_mod.lifecycle.ensure_running.assert_not_awaited()
         replay_mock.assert_called_once()
 
 
@@ -1673,6 +1676,212 @@ class TestExtractCancelEndpoint:
         assert queue.has_job("foreign-claim-job") is False
         assert queue.get_durable_phase("foreign-claim-job") == "accepted"
 
+    def test_replay_wakes_and_recovers_after_backend_disappears_without_new_traffic(self, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        main_mod.job_queue.enqueue("backend-disappeared-job", b"%PDF retry", {})
+        forward = AsyncMock(
+            side_effect=[
+                HTTPException(status_code=502, detail="backend disappeared"),
+                None,
+            ]
+        )
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+
+        async def _sync_stopped_backend():
+            main_mod.lifecycle.state = InstanceState.STOPPED
+            main_mod.lifecycle.private_ip = None
+
+        async def _start_backend():
+            main_mod.lifecycle.state = InstanceState.STARTING
+
+        sleep_calls = []
+
+        async def _advance_backend(seconds):
+            sleep_calls.append(seconds)
+            if len(sleep_calls) == 2:
+                main_mod.lifecycle.state = InstanceState.READY
+                main_mod.lifecycle.private_ip = "172.31.1.101"
+
+        main_mod.lifecycle.sync_state_from_ec2 = AsyncMock(side_effect=_sync_stopped_backend)
+        main_mod.lifecycle.ensure_running = AsyncMock(side_effect=_start_backend)
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _advance_backend)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert forward.await_count == 2
+        main_mod.lifecycle.sync_state_from_ec2.assert_awaited_once()
+        main_mod.lifecycle.ensure_running.assert_awaited_once()
+        assert sleep_calls == [30, 5]
+        assert main_mod.job_queue.has_job("backend-disappeared-job") is False
+        assert main_mod.job_queue.get_durable_phase("backend-disappeared-job") == "accepted"
+
+    def test_replay_expires_job_past_configured_maximum_age(self, monkeypatch):
+        from app.job_queue import JobQueue
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        queue = JobQueue(max_size=2)
+        queue.enqueue("expired-replay-job", b"%PDF expired", {})
+        queue._queue[0].queued_at = 100.0
+        monkeypatch.setattr(main_mod, "job_queue", queue)
+        monkeypatch.setattr(main_mod.time, "time", lambda: 201.0)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_MAX_QUEUE_AGE_SECONDS", 100)
+        monkeypatch.setattr(main_mod.status_reader, "lookup", MagicMock(return_value=(True, None)))
+        forward = AsyncMock(return_value=None)
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        forward.assert_not_awaited()
+        assert queue.has_job("expired-replay-job") is False
+        assert queue.get_durable_phase("expired-replay-job") == "failed"
+        assert "maximum replay age" in main_mod.replay_submission_errors["expired-replay-job"]
+
+    def test_replay_never_applies_foreign_claimed_oldest_age_to_fresh_job(self, monkeypatch):
+        from app.job_queue import JobQueue
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        queue = JobQueue(max_size=3)
+        queue.enqueue("old-foreign-job", b"%PDF old", {})
+        queue.enqueue("fresh-job", b"%PDF fresh", {})
+        queue._queue[0].queued_at = 100.0
+        queue._queue[1].queued_at = 200.0
+        clock = {"now": 201.0}
+        monkeypatch.setattr(main_mod.time, "time", lambda: clock["now"])
+        foreign_claim = queue.claim_next("old-proxy", lease_seconds=60)
+        assert foreign_claim is not None
+        monkeypatch.setattr(main_mod, "job_queue", queue)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_MAX_QUEUE_AGE_SECONDS", 100)
+        monkeypatch.setattr(main_mod.status_reader, "lookup", MagicMock(return_value=(True, None)))
+        forward = AsyncMock(return_value=None)
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+
+        async def _advance_clock(seconds):
+            clock["now"] += seconds
+
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _advance_clock)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        forward.assert_awaited_once()
+        assert queue.get_durable_phase("fresh-job") == "accepted"
+        assert "fresh-job" not in main_mod.replay_submission_errors
+        assert queue.get_durable_phase("old-foreign-job") == "failed"
+
+    def test_replay_age_limit_acknowledges_existing_accepted_marker(self, monkeypatch):
+        from app.job_queue import JobQueue
+        import app.main as main_mod
+
+        queue = JobQueue(max_size=2)
+        queue.enqueue("old-accepted-job", b"%PDF accepted", {})
+        queue._queue[0].queued_at = 100.0
+        queue.record_accepted("old-accepted-job")
+        monkeypatch.setattr(main_mod, "job_queue", queue)
+        monkeypatch.setattr(main_mod.time, "time", lambda: 201.0)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_MAX_QUEUE_AGE_SECONDS", 100)
+        lookup = MagicMock()
+        monkeypatch.setattr(main_mod.status_reader, "lookup", lookup)
+        forward = AsyncMock(return_value=None)
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        forward.assert_not_awaited()
+        lookup.assert_not_called()
+        assert queue.has_job("old-accepted-job") is False
+        assert queue.get_durable_phase("old-accepted-job") == "accepted"
+        assert "old-accepted-job" not in main_mod.replay_submission_errors
+
+    def test_replay_age_limit_preserves_cancellation_request(self, monkeypatch):
+        from app.job_queue import JobQueue
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        queue = JobQueue(max_size=2)
+        queue.enqueue("old-cancel-job", b"%PDF cancel", {}, authorization="Bearer test")
+        queue._queue[0].queued_at = 100.0
+        queue.record_cancel_requested("old-cancel-job", "Cancel requested")
+        monkeypatch.setattr(main_mod, "job_queue", queue)
+        monkeypatch.setattr(main_mod.time, "time", lambda: 201.0)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_MAX_QUEUE_AGE_SECONDS", 100)
+        lookup = MagicMock()
+        monkeypatch.setattr(main_mod.status_reader, "lookup", lookup)
+        forward = AsyncMock(return_value=None)
+        cancel = AsyncMock(return_value=MagicMock())
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+        monkeypatch.setattr(main_mod, "_forward_cancel_to_backend", cancel)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        forward.assert_awaited_once()
+        cancel.assert_awaited_once_with(
+            "old-cancel-job",
+            authorization="Bearer test",
+            reason="Cancel requested",
+        )
+        lookup.assert_not_called()
+        assert queue.get_durable_phase("old-cancel-job") == "cancel_requested"
+        assert "old-cancel-job" not in main_mod.replay_submission_errors
+
+    def test_replay_age_limit_reconciles_authoritative_backend_row(self, monkeypatch):
+        from app.job_queue import JobQueue
+        import app.main as main_mod
+
+        queue = JobQueue(max_size=2)
+        queue.enqueue("old-authoritative-job", b"%PDF accepted", {})
+        queue._queue[0].queued_at = 100.0
+        monkeypatch.setattr(main_mod, "job_queue", queue)
+        monkeypatch.setattr(main_mod.time, "time", lambda: 201.0)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_MAX_QUEUE_AGE_SECONDS", 100)
+        monkeypatch.setattr(
+            main_mod.status_reader,
+            "lookup",
+            MagicMock(
+                return_value=(
+                    True,
+                    {"process_id": "old-authoritative-job", "status": "running"},
+                )
+            ),
+        )
+        forward = AsyncMock(return_value=None)
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        forward.assert_not_awaited()
+        assert queue.has_job("old-authoritative-job") is False
+        assert queue.get_durable_phase("old-authoritative-job") == "accepted"
+        assert "old-authoritative-job" not in main_mod.replay_submission_errors
+
+    def test_retained_expired_only_queue_is_reconciled_without_gpu_wake(self, monkeypatch):
+        from app.job_queue import JobQueue
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        queue = JobQueue(max_size=2)
+        queue.enqueue("expired-without-wake", b"%PDF expired", {})
+        queue._queue[0].queued_at = 100.0
+        monkeypatch.setattr(main_mod, "job_queue", queue)
+        monkeypatch.setattr(main_mod.time, "time", lambda: 201.0)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_MAX_QUEUE_AGE_SECONDS", 100)
+        monkeypatch.setattr(main_mod.status_reader, "lookup", MagicMock(return_value=(True, None)))
+        schedule_replay = MagicMock()
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", schedule_replay)
+
+        asyncio.run(main_mod._ensure_queued_jobs_replaying("expired retained queue"))
+
+        schedule_replay.assert_called_once()
+        main_mod.lifecycle.ensure_running.assert_not_awaited()
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        main_mod.lifecycle.ensure_running.assert_not_awaited()
+        assert queue.size == 0
+        assert queue.get_durable_phase("expired-without-wake") == "failed"
+
     def test_replay_keeps_queue_while_asg_replacement_is_starting(self, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.STARTING
@@ -1710,6 +1919,13 @@ class TestExtractCancelEndpoint:
         removed_jobs = []
 
         class _DrainedQueue:
+            @property
+            def size(self):
+                return 1
+
+            def oldest_age_seconds(self):
+                return 0.0
+
             def drain(self):
                 return [job]
 

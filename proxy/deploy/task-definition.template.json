@@ -26,6 +26,7 @@
         {"name": "QUEUE_S3_REGION", "value": "${QUEUE_S3_REGION}"},
         {"name": "QUEUE_CLAIM_TTL_SECONDS", "value": "900"},
         {"name": "REPLAY_RETRY_DELAY_SECONDS", "value": "30"},
+        {"name": "REPLAY_MAX_QUEUE_AGE_SECONDS", "value": "86400"},
         {"name": "ACCEPTED_STATUS_RETENTION_SECONDS", "value": "604800"},
         {"name": "ACCEPTED_CLEANUP_BATCH_SIZE", "value": "25"},
         {"name": "STATUS_DB_TIMEOUT_SECONDS", "value": "5"},
