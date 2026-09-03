@@ -154,8 +154,10 @@ def test_review_operational_limits_are_in_proxy_task_templates():
     ).read_text()
 
     assert environment["REPLAY_RETRY_DELAY_SECONDS"] == "30"
+    assert environment["REPLAY_MAX_QUEUE_AGE_SECONDS"] == "86400"
     assert environment["SHARED_RUNNING_MAX_AGE_MINUTES"] == "60"
     assert "Name: REPLAY_RETRY_DELAY_SECONDS" in stack_text
+    assert "Name: REPLAY_MAX_QUEUE_AGE_SECONDS" in stack_text
     assert "Name: SHARED_RUNNING_MAX_AGE_MINUTES" in stack_text
 
 
@@ -402,6 +404,7 @@ def test_task_definition_is_environment_parameterized():
     assert {"name": "QUEUE_S3_PREFIX", "value": "${QUEUE_S3_PREFIX}"} in container["environment"]
     assert {"name": "QUEUE_S3_REGION", "value": "${QUEUE_S3_REGION}"} in container["environment"]
     assert {"name": "QUEUE_CLAIM_TTL_SECONDS", "value": "900"} in container["environment"]
+    assert {"name": "REPLAY_MAX_QUEUE_AGE_SECONDS", "value": "86400"} in container["environment"]
     assert {"name": "ACCEPTED_STATUS_RETENTION_SECONDS", "value": "604800"} in container["environment"]
     assert {"name": "ACCEPTED_CLEANUP_BATCH_SIZE", "value": "25"} in container["environment"]
     assert {"name": "STATUS_DB_TIMEOUT_SECONDS", "value": "5"} in container["environment"]

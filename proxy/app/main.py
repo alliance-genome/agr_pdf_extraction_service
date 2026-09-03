@@ -355,7 +355,7 @@ async def _ensure_backend_ready_for_proxy(error_context: str) -> None:
 async def _ensure_queued_jobs_replaying(reason: str, *, known_queued: bool = False) -> None:
     """Start durable queued-job replay after restarts or queued-job polls."""
     try:
-        queued_count = job_queue.size
+        queued_count = await asyncio.to_thread(lambda: job_queue.size)
     except Exception:
         logger.exception("Failed to inspect queued jobs for replay (%s)", reason)
         return
@@ -367,8 +367,6 @@ async def _ensure_queued_jobs_replaying(reason: str, *, known_queued: bool = Fal
         return
 
     logger.info("Ensuring queued-job replay is active (%s); queue_depth=%d", reason, queued_count)
-    if lifecycle.state not in (InstanceState.READY, InstanceState.BUSY):
-        await lifecycle.ensure_running()
     _ensure_replay_task()
 
 
@@ -1571,6 +1569,108 @@ def _ensure_replay_task() -> None:
     replay_task = asyncio.create_task(_replay_when_ready())
 
 
+async def _prepare_expired_queue_head() -> str:
+    """Safely reconcile an expired queue head before waking the backend."""
+    max_queue_age = max(1, settings.REPLAY_MAX_QUEUE_AGE_SECONDS)
+    try:
+        queued_count = await asyncio.to_thread(lambda: job_queue.size)
+        if queued_count <= 0:
+            return "empty"
+        oldest_age = await asyncio.to_thread(job_queue.oldest_age_seconds)
+    except Exception:
+        logger.exception("Failed to inspect oldest queued job age")
+        return "defer"
+    if oldest_age < max_queue_age:
+        return "replay"
+
+    try:
+        job = await asyncio.to_thread(
+            job_queue.claim_next,
+            proxy_owner_id,
+            settings.QUEUE_CLAIM_TTL_SECONDS,
+        )
+    except Exception:
+        logger.exception("Failed to claim expired queued job for reconciliation")
+        return "defer"
+    if job is None:
+        # Another proxy owns the oldest entry. Its lease must remain authoritative.
+        return "replay"
+
+    claim_resolved = False
+    try:
+        job_age = max(0.0, time.time() - job.queued_at)
+        if job_age < max_queue_age:
+            # The oldest record can be foreign-claimed, causing claim_next()
+            # to return a newer job. Never apply the older record's age here.
+            return "replay"
+        durable_phase = await asyncio.to_thread(job_queue.get_durable_phase, job.job_id)
+        if durable_phase == "accepted":
+            claim_resolved = await asyncio.to_thread(job_queue.acknowledge_claim, job)
+            return "handled" if claim_resolved else "defer"
+        if durable_phase in {"cancelled", "failed"}:
+            await asyncio.to_thread(job_queue.remove_job, job.job_id)
+            await asyncio.to_thread(job_queue.release_claim, job)
+            claim_resolved = True
+            return "handled"
+        if durable_phase == "cancel_requested":
+            authoritative_reachable, authoritative_payload = await _lookup_authoritative_status(job.job_id)
+            if not authoritative_reachable:
+                logger.warning(
+                    "Deferring cancellation cleanup for queued job %s while authoritative status is unavailable",
+                    job.job_id,
+                )
+                return "defer"
+            if authoritative_payload is not None:
+                # The backend has the job, so normal replay must preserve and
+                # enforce the cancellation rather than terminalizing locally.
+                return "replay"
+            durable_record = await asyncio.to_thread(job_queue.get_durable_record, job.job_id)
+            reason = str((durable_record or {}).get("message") or "Cancelled by user request")
+            await asyncio.to_thread(job_queue.record_cancelled, job.job_id, reason)
+            await asyncio.to_thread(job_queue.remove_job, job.job_id)
+            await asyncio.to_thread(job_queue.release_claim, job)
+            claim_resolved = True
+            _record_job_cancelled(job.job_id, reason)
+            return "handled"
+
+        authoritative_reachable, authoritative_payload = await _lookup_authoritative_status(job.job_id)
+        if not authoritative_reachable:
+            logger.warning(
+                "Deferring expiration for queued job %s while authoritative status is unavailable",
+                job.job_id,
+            )
+            return "defer"
+        if authoritative_payload is not None:
+            accepted = await asyncio.to_thread(job_queue.record_accepted, job.job_id)
+            if not accepted:
+                return "defer"
+            _update_tracker_from_payload(job.job_id, authoritative_payload)
+            claim_resolved = await asyncio.to_thread(job_queue.acknowledge_claim, job)
+            return "handled" if claim_resolved else "defer"
+
+        detail = (
+            f"Queued job exceeded the maximum replay age of {max_queue_age} seconds "
+            "without backend acceptance."
+        )
+        logger.error("Expiring proven-unaccepted queued job %s after %.0f seconds", job.job_id, job_age)
+        await asyncio.to_thread(job_queue.record_failed, job.job_id, detail)
+        await asyncio.to_thread(job_queue.remove_job, job.job_id)
+        await asyncio.to_thread(job_queue.release_claim, job)
+        claim_resolved = True
+        _mark_job_failed(job.job_id, detail)
+        return "handled"
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Failed to reconcile expired queued job %s", job.job_id)
+        return "defer"
+    finally:
+        if not claim_resolved:
+            with suppress(Exception):
+                await asyncio.to_thread(job_queue.release_claim, job)
+        job.cleanup()
+
+
 async def _replay_when_ready():
     """Wait for EC2, then claim and hand off queued jobs one at a time."""
     startup_attempts = 1 + max(0, settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS)
@@ -1579,26 +1679,55 @@ async def _replay_when_ready():
         + settings.HEALTH_POLL_INTERVAL_SECONDS
         + 5
     )
-    deadline = asyncio.get_event_loop().time() + replay_wait_seconds
-    while asyncio.get_event_loop().time() < deadline:
-        if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
-            break
-        if lifecycle.state == InstanceState.STOPPED:
-            logger.warning("Backend startup stopped before replay; retaining durable queued work")
-            return
-        await asyncio.sleep(5)
-    else:
-        logger.warning("Timed out waiting for backend; retaining durable queued work")
-        return
-
     while accepting_queue_claims:
+        expiry_action = await _prepare_expired_queue_head()
+        if expiry_action == "empty":
+            return
+        if expiry_action == "handled":
+            continue
+        if expiry_action == "defer":
+            await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
+            continue
+
+        deadline = asyncio.get_event_loop().time() + replay_wait_seconds
+        while asyncio.get_event_loop().time() < deadline:
+            if _backend_ready_for_proxy():
+                break
+            if lifecycle.state == InstanceState.STOPPED:
+                logger.info("Waking stopped backend for retained durable queued work")
+                await lifecycle.ensure_running()
+                if lifecycle.state == InstanceState.STOPPED:
+                    logger.warning("Backend wake did not start; retaining durable queued work")
+                    return
+                continue
+            if lifecycle.state in (InstanceState.READY, InstanceState.BUSY):
+                try:
+                    await lifecycle.sync_state_from_ec2()
+                except Exception:
+                    logger.debug("Failed to refresh backend readiness during replay", exc_info=True)
+            await asyncio.sleep(5)
+        else:
+            logger.warning("Timed out waiting for backend; retaining durable queued work")
+            return
+
         job = await asyncio.to_thread(
             job_queue.claim_next,
             proxy_owner_id,
             settings.QUEUE_CLAIM_TTL_SECONDS,
         )
         if job is None:
-            return
+            try:
+                queued_count = await asyncio.to_thread(lambda: job_queue.size)
+            except Exception:
+                logger.exception("Failed to inspect queue after replay claim miss")
+                return
+            if queued_count <= 0:
+                return
+            logger.info(
+                "Queued work is temporarily claimed by another proxy; retrying replay after lease delay"
+            )
+            await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
+            continue
         replay_inflight_jobs.add(job.job_id)
         _record_job_event(job.job_id, "replayed")
         job_payload_cache[job.job_id] = job
@@ -1643,6 +1772,7 @@ async def _replay_when_ready():
             else:
                 logger.warning("Transient replay failure for %s; retaining queue record: %s", job.job_id, exc)
                 await asyncio.to_thread(job_queue.release_claim, job)
+                await _refresh_replay_backend_readiness()
                 await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
                 continue
         except asyncio.CancelledError:
@@ -1651,11 +1781,26 @@ async def _replay_when_ready():
         except Exception as exc:
             logger.warning("Replay handoff interrupted for %s; retaining queue record: %s", job.job_id, exc)
             await asyncio.to_thread(job_queue.release_claim, job)
+            await _refresh_replay_backend_readiness()
             await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
             continue
         finally:
             job.cleanup()
             replay_inflight_jobs.discard(job.job_id)
+
+
+async def _refresh_replay_backend_readiness() -> None:
+    """Use application health before allowing a lifecycle-mutating AWS sync."""
+    if _backend_ready_for_proxy():
+        try:
+            if await lifecycle.refresh_health_snapshot():
+                return
+        except Exception:
+            logger.debug("Failed to refresh backend health after replay failure", exc_info=True)
+    try:
+        await lifecycle.sync_state_from_ec2()
+    except Exception:
+        logger.debug("Failed to refresh backend lifecycle after replay failure", exc_info=True)
 
 
 async def _reconciler_loop():
@@ -1673,6 +1818,13 @@ async def _reconciler_loop():
             raise
         except Exception:
             logger.exception("Expired durable-status cleanup pass failed")
+
+        try:
+            await _ensure_queued_jobs_replaying("periodic durable queue sweep")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Periodic durable queue replay sweep failed")
 
         for process_id, tracker in list(job_trackers.items()):
             if process_id in replay_submission_errors:
@@ -1698,6 +1850,22 @@ async def _reconciler_loop():
                 job_trackers.pop(process_id, None)
                 logger.warning(
                     "job=%s event=accepted_status_stale_local_guard_released phase=%s",
+                    process_id,
+                    durable_phase,
+                )
+                continue
+
+            if durable_phase in {"queued", "claimed"}:
+                # A durable queue record is authoritative evidence that the
+                # backend has not accepted this job yet. A quiet local tracker
+                # cannot turn that recoverable wait into a terminal failure.
+                job_trackers.pop(process_id, None)
+                await _ensure_queued_jobs_replaying(
+                    "stale durable queue record",
+                    known_queued=True,
+                )
+                logger.warning(
+                    "job=%s event=durable_queue_stale_retained phase=%s",
                     process_id,
                     durable_phase,
                 )

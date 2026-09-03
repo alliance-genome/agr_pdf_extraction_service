@@ -260,6 +260,7 @@ All settings come from environment variables. In production, values are injected
 | `QUEUE_S3_REGION` | No | — | Optional S3 region override |
 | `QUEUE_CLAIM_TTL_SECONDS` | No | `900` | Lease duration for one ECS replay owner; expired claims are conditionally reclaimable after task loss |
 | `REPLAY_RETRY_DELAY_SECONDS` | No | `30` | Backoff before durable queued work retries a transient backend handoff without waiting for new traffic |
+| `REPLAY_MAX_QUEUE_AGE_SECONDS` | No | `86400` | Maximum age of a proven-unaccepted queued job before durable failure cleanup; defaults to 24 hours |
 | `ACCEPTED_STATUS_RETENTION_SECONDS` | No | `604800` | Minimum age before a caller-proven terminal accepted/status marker may be removed; active markers are preserved |
 | `ACCEPTED_CLEANUP_BATCH_SIZE` | No | `25` | Maximum expired accepted/status markers revalidated against RDS per reconciler pass |
 | `STATUS_DATABASE_URL` | Production | — | Existing backend RDS URL used only by read-only status sessions; injected from SSM in ECS |
