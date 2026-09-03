@@ -336,6 +336,21 @@ class LifecycleManager:
                     self._startup_timeout_total += 1
                 logger.error("EC2 startup timed out after %d minutes", settings.STARTUP_TIMEOUT_MINUTES)
 
+                if not asg_capacity_reasserted:
+                    logger.error(
+                        "Backend ASG capacity was not restored before startup timeout; "
+                        "refusing stale health and destructive actions"
+                    )
+                    async with self._transition_lock:
+                        if self._owns_startup(generation):
+                            self._startup_generation += 1
+                            self._startup_instance_id = None
+                            self._state = InstanceState.STOPPED
+                            self._private_ip = None
+                            self._ready_since = None
+                            self._clear_health_snapshot()
+                    return
+
                 try:
                     ec2_state, ip, current_instance_id = await asyncio.to_thread(
                         self._ec2.get_instance_snapshot

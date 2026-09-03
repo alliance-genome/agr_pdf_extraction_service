@@ -198,6 +198,36 @@ class TestLifecycleManager:
         assert mgr.state == InstanceState.READY
         assert mgr.private_ip == "10.0.0.9"
 
+    def test_asg_startup_timeout_never_trusts_health_without_capacity(self, monkeypatch):
+        mgr, ec2 = self._make_manager(InstanceState.STARTING)
+        ec2.uses_auto_scaling = True
+        ec2.start_instance.side_effect = RuntimeError("throttled")
+        ec2.get_instance_snapshot.return_value = (
+            "running",
+            "10.0.0.5",
+            "i-scaling-in",
+        )
+        mgr._check_health = AsyncMock(return_value=True)
+        mgr._start_idle_monitor = MagicMock()
+        times = iter([0.0, 0.0, 2.0])
+
+        async def _no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("app.state_machine.time.time", lambda: next(times, 2.0))
+        monkeypatch.setattr("app.state_machine.asyncio.sleep", _no_sleep)
+        monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 1 / 60)
+
+        asyncio.run(mgr._poll_until_healthy())
+
+        ec2.start_instance.assert_called_once()
+        ec2.get_instance_snapshot.assert_not_called()
+        mgr._check_health.assert_not_awaited()
+        ec2.mark_unhealthy.assert_not_called()
+        ec2.stop_instance.assert_not_called()
+        assert mgr.state == InstanceState.STOPPED
+        assert mgr.private_ip is None
+
     def test_sync_does_not_accept_health_from_instance_leaving_asg(self, monkeypatch):
         mgr, ec2 = self._make_manager()
         ec2.uses_auto_scaling = True
