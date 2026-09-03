@@ -383,7 +383,7 @@ class LifecycleManager:
                     if snapshot_is_current is None:
                         # AWS read failures are not evidence that a healthy
                         # backend is stale. Keep polling instead of replacing it.
-                        deadline = time.time() + max(1, poll_interval)
+                        deadline = time.time() + max(1, settings.STARTUP_TIMEOUT_MINUTES * 60)
                         continue
 
                 # Re-read identity after the awaited health call. EC2Manager also

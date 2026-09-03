@@ -441,19 +441,21 @@ class TestLifecycleManager:
 
     def test_timeout_identity_read_error_defers_destructive_recovery(self, monkeypatch):
         mgr, ec2 = self._make_manager(InstanceState.STARTING)
+        ec2.uses_auto_scaling = True
         ec2.get_instance_snapshot.side_effect = [
+            ("running", "10.0.0.5", "i-current"),
             ("running", "10.0.0.5", "i-current"),
             RuntimeError("AWS read unavailable"),
             ("running", "10.0.0.5", "i-current"),
             ("running", "10.0.0.5", "i-current"),
         ]
-        mgr._check_health = AsyncMock(return_value=True)
+        mgr._check_health = AsyncMock(side_effect=[False, True, True])
         mgr._start_idle_monitor = MagicMock()
 
         clock = {"now": 0.0}
 
         def _advancing_time():
-            clock["now"] += 0.1
+            clock["now"] += 40
             return clock["now"]
 
         async def _no_sleep(_seconds):
@@ -461,15 +463,17 @@ class TestLifecycleManager:
 
         monkeypatch.setattr("app.state_machine.time.time", _advancing_time)
         monkeypatch.setattr("app.state_machine.asyncio.sleep", _no_sleep)
-        monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 0)
+        monkeypatch.setattr("app.state_machine.settings.STARTUP_TIMEOUT_MINUTES", 1)
         monkeypatch.setattr("app.state_machine.settings.ASG_STARTUP_REPLACEMENT_ATTEMPTS", 1)
 
         asyncio.run(mgr._poll_until_healthy())
 
         ec2.mark_unhealthy.assert_not_called()
         ec2.stop_instance.assert_not_called()
+        ec2.start_instance.assert_called_once()
         assert mgr.state == InstanceState.READY
         assert mgr.private_ip == "10.0.0.5"
+        assert mgr.startup_timeout_total == 1
 
     def test_sync_identity_read_error_preserves_existing_state(self):
         mgr, ec2 = self._make_manager(InstanceState.READY)

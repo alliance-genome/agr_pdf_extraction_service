@@ -1613,9 +1613,25 @@ async def _prepare_expired_queue_head() -> str:
             claim_resolved = True
             return "handled"
         if durable_phase == "cancel_requested":
-            # Preserve cancellation intent and let normal replay hand off the
-            # request so the cancellation can be enforced on the backend.
-            return "replay"
+            authoritative_reachable, authoritative_payload = await _lookup_authoritative_status(job.job_id)
+            if not authoritative_reachable:
+                logger.warning(
+                    "Deferring cancellation cleanup for queued job %s while authoritative status is unavailable",
+                    job.job_id,
+                )
+                return "defer"
+            if authoritative_payload is not None:
+                # The backend has the job, so normal replay must preserve and
+                # enforce the cancellation rather than terminalizing locally.
+                return "replay"
+            durable_record = await asyncio.to_thread(job_queue.get_durable_record, job.job_id)
+            reason = str((durable_record or {}).get("message") or "Cancelled by user request")
+            await asyncio.to_thread(job_queue.record_cancelled, job.job_id, reason)
+            await asyncio.to_thread(job_queue.remove_job, job.job_id)
+            await asyncio.to_thread(job_queue.release_claim, job)
+            claim_resolved = True
+            _record_job_cancelled(job.job_id, reason)
+            return "handled"
 
         authoritative_reachable, authoritative_payload = await _lookup_authoritative_status(job.job_id)
         if not authoritative_reachable:
@@ -1756,10 +1772,7 @@ async def _replay_when_ready():
             else:
                 logger.warning("Transient replay failure for %s; retaining queue record: %s", job.job_id, exc)
                 await asyncio.to_thread(job_queue.release_claim, job)
-                try:
-                    await lifecycle.sync_state_from_ec2()
-                except Exception:
-                    logger.debug("Failed to refresh backend readiness after replay failure", exc_info=True)
+                await _refresh_replay_backend_readiness()
                 await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
                 continue
         except asyncio.CancelledError:
@@ -1768,15 +1781,26 @@ async def _replay_when_ready():
         except Exception as exc:
             logger.warning("Replay handoff interrupted for %s; retaining queue record: %s", job.job_id, exc)
             await asyncio.to_thread(job_queue.release_claim, job)
-            try:
-                await lifecycle.sync_state_from_ec2()
-            except Exception:
-                logger.debug("Failed to refresh backend readiness after replay interruption", exc_info=True)
+            await _refresh_replay_backend_readiness()
             await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
             continue
         finally:
             job.cleanup()
             replay_inflight_jobs.discard(job.job_id)
+
+
+async def _refresh_replay_backend_readiness() -> None:
+    """Use application health before allowing a lifecycle-mutating AWS sync."""
+    if _backend_ready_for_proxy():
+        try:
+            if await lifecycle.refresh_health_snapshot():
+                return
+        except Exception:
+            logger.debug("Failed to refresh backend health after replay failure", exc_info=True)
+    try:
+        await lifecycle.sync_state_from_ec2()
+    except Exception:
+        logger.debug("Failed to refresh backend lifecycle after replay failure", exc_info=True)
 
 
 async def _reconciler_loop():
@@ -1794,6 +1818,13 @@ async def _reconciler_loop():
             raise
         except Exception:
             logger.exception("Expired durable-status cleanup pass failed")
+
+        try:
+            await _ensure_queued_jobs_replaying("periodic durable queue sweep")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Periodic durable queue replay sweep failed")
 
         for process_id, tracker in list(job_trackers.items()):
             if process_id in replay_submission_errors:

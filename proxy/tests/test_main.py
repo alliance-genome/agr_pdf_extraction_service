@@ -1635,6 +1635,8 @@ class TestExtractCancelEndpoint:
 
         assert forward.await_count == 2
         retry_sleep.assert_awaited_once_with(7)
+        main_mod.lifecycle.refresh_health_snapshot.assert_awaited_once()
+        main_mod.lifecycle.sync_state_from_ec2.assert_not_awaited()
         assert main_mod.job_queue.has_job("replay-fail-1") is False
         assert main_mod.job_queue.get_durable_phase("replay-fail-1") == "accepted"
         assert "replay-fail-1" not in main_mod.replay_submission_errors
@@ -1705,6 +1707,7 @@ class TestExtractCancelEndpoint:
                 main_mod.lifecycle.private_ip = "172.31.1.101"
 
         main_mod.lifecycle.sync_state_from_ec2 = AsyncMock(side_effect=_sync_stopped_backend)
+        main_mod.lifecycle.refresh_health_snapshot = AsyncMock(return_value=False)
         main_mod.lifecycle.ensure_running = AsyncMock(side_effect=_start_backend)
         monkeypatch.setattr(main_mod.asyncio, "sleep", _advance_backend)
 
@@ -1807,7 +1810,9 @@ class TestExtractCancelEndpoint:
         monkeypatch.setattr(main_mod, "job_queue", queue)
         monkeypatch.setattr(main_mod.time, "time", lambda: 201.0)
         monkeypatch.setattr(main_mod.settings, "REPLAY_MAX_QUEUE_AGE_SECONDS", 100)
-        lookup = MagicMock()
+        lookup = MagicMock(
+            return_value=(True, {"process_id": "old-cancel-job", "status": "running"})
+        )
         monkeypatch.setattr(main_mod.status_reader, "lookup", lookup)
         forward = AsyncMock(return_value=None)
         cancel = AsyncMock(return_value=MagicMock())
@@ -1822,9 +1827,33 @@ class TestExtractCancelEndpoint:
             authorization="Bearer test",
             reason="Cancel requested",
         )
-        lookup.assert_not_called()
+        lookup.assert_called_once_with("old-cancel-job")
         assert queue.get_durable_phase("old-cancel-job") == "cancel_requested"
         assert "old-cancel-job" not in main_mod.replay_submission_errors
+
+    def test_replay_age_limit_cancels_proven_unaccepted_request_without_gpu_wake(self, monkeypatch):
+        from app.job_queue import JobQueue
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.STOPPED
+        queue = JobQueue(max_size=2)
+        queue.enqueue("old-unaccepted-cancel", b"%PDF cancel", {})
+        queue._queue[0].queued_at = 100.0
+        queue.record_cancel_requested("old-unaccepted-cancel", "No longer needed")
+        monkeypatch.setattr(main_mod, "job_queue", queue)
+        monkeypatch.setattr(main_mod.time, "time", lambda: 201.0)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_MAX_QUEUE_AGE_SECONDS", 100)
+        monkeypatch.setattr(main_mod.status_reader, "lookup", MagicMock(return_value=(True, None)))
+        forward = AsyncMock(side_effect=HTTPException(status_code=503, detail="backend unavailable"))
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        forward.assert_not_awaited()
+        main_mod.lifecycle.ensure_running.assert_not_awaited()
+        assert queue.size == 0
+        assert queue.get_durable_phase("old-unaccepted-cancel") == "cancelled"
+        assert main_mod.cancelled_jobs["old-unaccepted-cancel"] == "No longer needed"
 
     def test_replay_age_limit_reconciles_authoritative_backend_row(self, monkeypatch):
         from app.job_queue import JobQueue
@@ -2194,6 +2223,28 @@ class TestExtractCancelEndpoint:
         assert process_id not in main_mod.job_trackers
         assert main_mod.job_queue.get_durable_phase(process_id) == "accepted"
 
+    def test_reconciler_periodically_rearms_untracked_durable_queue(self, monkeypatch):
+        import app.main as main_mod
+
+        main_mod.job_queue.enqueue("untracked-durable-job", b"%PDF durable", {})
+        ensure_replay = AsyncMock()
+        monkeypatch.setattr(main_mod, "_ensure_queued_jobs_replaying", ensure_replay)
+
+        sleep_calls = 0
+
+        async def _sleep_one_iteration(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep_one_iteration)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main_mod._reconciler_loop())
+
+        ensure_replay.assert_awaited_once_with("periodic durable queue sweep")
+
     @pytest.mark.parametrize("claimed", [False, True], ids=["queued", "claimed"])
     def test_reconciler_retains_unaccepted_durable_queue_work(self, monkeypatch, claimed):
         import app.main as main_mod
@@ -2237,7 +2288,9 @@ class TestExtractCancelEndpoint:
         assert process_id not in main_mod.job_trackers
         assert main_mod.job_queue.has_job(process_id) is True
         assert main_mod.job_queue.get_durable_phase(process_id) == ("claimed" if claimed else "queued")
-        ensure_replay.assert_awaited_once_with(
+        assert ensure_replay.await_count == 2
+        ensure_replay.assert_any_await("periodic durable queue sweep")
+        ensure_replay.assert_any_await(
             "stale durable queue record",
             known_queued=True,
         )
