@@ -168,6 +168,36 @@ class TestLifecycleManager:
         assert mgr.private_ip == "10.0.0.9"
         assert mgr._startup_instance_id == "i-replacement"
 
+    def test_asg_startup_retries_capacity_before_trusting_health(self, monkeypatch):
+        mgr, ec2 = self._make_manager()
+        ec2.uses_auto_scaling = True
+        ec2.start_instance.side_effect = [RuntimeError("throttled"), None]
+        ec2.get_instance_snapshot.side_effect = [
+            ("pending", None, None),
+            ("running", "10.0.0.9", "i-replacement"),
+            ("running", "10.0.0.9", "i-replacement"),
+        ]
+        mgr._check_health = AsyncMock(return_value=True)
+        mgr._start_idle_monitor = MagicMock()
+        states_while_waiting = []
+
+        async def _no_sleep(_seconds):
+            states_while_waiting.append(mgr.state)
+
+        monkeypatch.setattr("app.state_machine.asyncio.sleep", _no_sleep)
+
+        async def _run():
+            await mgr.ensure_running()
+            await mgr._startup_task
+
+        asyncio.run(_run())
+
+        assert ec2.start_instance.call_count == 2
+        assert states_while_waiting == [InstanceState.STARTING, InstanceState.STARTING]
+        assert mgr._check_health.await_count == 1
+        assert mgr.state == InstanceState.READY
+        assert mgr.private_ip == "10.0.0.9"
+
     def test_sync_does_not_accept_health_from_instance_leaving_asg(self, monkeypatch):
         mgr, ec2 = self._make_manager()
         ec2.uses_auto_scaling = True

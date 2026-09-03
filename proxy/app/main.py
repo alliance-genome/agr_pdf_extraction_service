@@ -1598,7 +1598,18 @@ async def _replay_when_ready():
             settings.QUEUE_CLAIM_TTL_SECONDS,
         )
         if job is None:
-            return
+            try:
+                queued_count = await asyncio.to_thread(lambda: job_queue.size)
+            except Exception:
+                logger.exception("Failed to inspect queue after replay claim miss")
+                return
+            if queued_count <= 0:
+                return
+            logger.info(
+                "Queued work is temporarily claimed by another proxy; retrying replay after lease delay"
+            )
+            await asyncio.sleep(max(1, settings.REPLAY_RETRY_DELAY_SECONDS))
+            continue
         replay_inflight_jobs.add(job.job_id)
         _record_job_event(job.job_id, "replayed")
         job_payload_cache[job.job_id] = job

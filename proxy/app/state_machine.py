@@ -271,25 +271,28 @@ class LifecycleManager:
         start_requested = False
         replacement_attempts = 0
         target_instance_id = self._startup_instance_id
+        asg_capacity_reasserted = not self._ec2.uses_auto_scaling
 
         try:
-            # A wake can overlap an earlier idle scale-in while the old instance
-            # still looks healthy. Reassert desired capacity before trusting any
-            # ASG snapshot so Auto Scaling launches a replacement if that old
-            # instance is already committed to termination.
-            if self._ec2.uses_auto_scaling:
-                try:
-                    await asyncio.to_thread(self._ec2.start_instance)
-                    start_requested = True
-                except Exception as exc:
-                    logger.warning("Failed to reassert backend ASG capacity during startup: %s", exc)
-
             while True:
                 while time.time() < deadline:
                     async with self._transition_lock:
                         if not self._owns_startup(generation):
                             await self._record_stale_monitor_exit(generation, "generation_superseded")
                             return
+
+                    # A wake can overlap an earlier idle scale-in while the old
+                    # instance still looks healthy. Do not trust backend health
+                    # until desired capacity has been restored successfully.
+                    if not asg_capacity_reasserted:
+                        try:
+                            await asyncio.to_thread(self._ec2.start_instance)
+                            asg_capacity_reasserted = True
+                            start_requested = True
+                        except Exception as exc:
+                            logger.warning("Failed to reassert backend ASG capacity during startup: %s", exc)
+                            await asyncio.sleep(poll_interval)
+                            continue
                     try:
                         ec2_state, ip, instance_id = await asyncio.to_thread(
                             self._ec2.get_instance_snapshot

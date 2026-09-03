@@ -1643,6 +1643,36 @@ class TestExtractCancelEndpoint:
         assert resp.status_code == 200
         assert resp.json()["status"] == "pending"
 
+    def test_replay_waits_for_foreign_claim_to_expire_without_new_traffic(self, monkeypatch):
+        from app.job_queue import JobQueue
+        import app.main as main_mod
+
+        main_mod.lifecycle.state = InstanceState.READY
+        queue = JobQueue(max_size=2)
+        queue.enqueue("foreign-claim-job", b"%PDF claimed", {})
+        clock = {"now": 0.0}
+        monkeypatch.setattr("app.job_queue.time.time", lambda: clock["now"])
+        foreign_claim = queue.claim_next("old-proxy", lease_seconds=7)
+        assert foreign_claim is not None
+        monkeypatch.setattr(main_mod, "job_queue", queue)
+        forward = AsyncMock(return_value=None)
+        monkeypatch.setattr(main_mod, "_forward_extraction", forward)
+        sleep_calls = []
+
+        async def _advance_claim_clock(seconds):
+            sleep_calls.append(seconds)
+            clock["now"] += seconds
+
+        monkeypatch.setattr(main_mod.asyncio, "sleep", _advance_claim_clock)
+        monkeypatch.setattr(main_mod.settings, "REPLAY_RETRY_DELAY_SECONDS", 7)
+
+        asyncio.run(main_mod._replay_when_ready())
+
+        assert sleep_calls == [7]
+        forward.assert_awaited_once()
+        assert queue.has_job("foreign-claim-job") is False
+        assert queue.get_durable_phase("foreign-claim-job") == "accepted"
+
     def test_replay_keeps_queue_while_asg_replacement_is_starting(self, monkeypatch):
         import app.main as main_mod
         main_mod.lifecycle.state = InstanceState.STARTING
