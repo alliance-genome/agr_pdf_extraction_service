@@ -135,7 +135,7 @@ Parameters:
       slow first-touch lazy-load. 0 disables it. Charged per-init on snapshot size.
   BackendDbInstanceClass:
     Type: String
-    Default: db.t4g.micro
+    Default: db.t4g.small
     Description: RDS instance class for the backend Postgres metadata DB.
   BackendDbAllocatedStorage:
     Type: Number
