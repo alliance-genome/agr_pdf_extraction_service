@@ -257,6 +257,7 @@ echo "==> Updating ECS service to new task definition..."
     --service "$SERVICE_NAME" \
     --task-definition "$TASK_DEF_ARN" \
     --deployment-configuration "$DEPLOYMENT_CONFIGURATION" \
+    --propagate-tags SERVICE \
     --force-new-deployment \
     --query "service.{serviceName:serviceName,taskDefinition:taskDefinition}" \
     --output json
