@@ -49,6 +49,7 @@ from app.services.native_extractor_artifact import (
     sha256_file,
 )
 from app.services.page_coverage import page_coverage_sidecar_path
+from app.services.page_resolution import resolve_page_batches
 from app.services.page_provenance import (
     bound_page_resolution_ranges,
     build_page_resolution_batches,
@@ -1873,6 +1874,8 @@ def _run_extraction(
 
             started = time.monotonic()
             _safe_log_event(audit_logger, stage, "started")
+            active_merge_phase = None
+            phase_started = started
             try:
                 if not source_artifacts:
                     raise ValueError("Merge requires at least one extractor artifact")
@@ -1887,6 +1890,9 @@ def _run_extraction(
                     output_paths=runtime_output_paths,
                 )
                 log.info("Attempting source-backed merge...")
+                active_merge_phase = "text_merge"
+                phase_started = time.monotonic()
+                _safe_log_event(audit_logger, active_merge_phase, "started")
                 consensus_md, consensus_metrics, consensus_audit = (
                     merge_finished_extractor_outputs(
                         grobid_text,
@@ -1916,12 +1922,6 @@ def _run_extraction(
                         "cached_methods": list(cached_methods),
                         "merge_compute_duration_s": round(
                             time.monotonic() - started, 3
-                        ),
-                        "stage_events": (
-                            audit_logger.timing_events()
-                            if audit_logger is not None
-                            and hasattr(audit_logger, "timing_events")
-                            else []
                         ),
                     }
 
@@ -1953,6 +1953,14 @@ def _run_extraction(
                     reason = (consensus_metrics or {}).get("failure_reason", "unknown")
                     raise ValueError(f"Consensus pipeline failed: {reason}")
 
+                text_merge_duration = round(time.monotonic() - phase_started, 3)
+                _safe_log_event(
+                    audit_logger, "text_merge", "completed",
+                    duration_s=text_merge_duration,
+                )
+                active_merge_phase = "page_resolution"
+                phase_started = time.monotonic()
+                _safe_log_event(audit_logger, active_merge_phase, "started")
                 merged_bytes = consensus_md.encode("utf-8")
                 projected_page_ranges = project_merged_page_ranges(
                     merged_bytes=merged_bytes,
@@ -1989,14 +1997,13 @@ def _run_extraction(
                 )
                 page_choices = {}
                 page_llm_receipts = []
-                for batch in page_batches:
-                    if llm is None or not _recovery_time_available(
-                        job_started_monotonic
-                    ):
-                        break
-                    decisions, receipt = llm.resolve_page_choices(batch)
-                    page_choices.update(decisions)
-                    page_llm_receipts.append(receipt)
+                if llm is not None:
+                    page_choices, page_llm_receipts = resolve_page_batches(
+                        page_batches, llm.resolve_page_choices,
+                        concurrency=Config.PAGE_PROVENANCE_LLM_CONCURRENCY,
+                        may_submit=lambda: _recovery_time_available(job_started_monotonic),
+                    )
+                    llm.selection_call_traces.extend(page_llm_receipts)
                 source_page_counts = {
                     source_map["expected_page_count"]
                     for source_map in runtime_source_page_maps.values()
@@ -2030,6 +2037,40 @@ def _run_extraction(
                         )
                     ),
                 }
+                page_resolution_duration = round(time.monotonic() - phase_started, 3)
+                phase_metrics = {
+                    "text_merge_duration_s": text_merge_duration,
+                    "page_resolution_duration_s": page_resolution_duration,
+                    "page_resolution_batch_count": len(page_batches),
+                    "page_resolution_completed_batch_count": len(page_llm_receipts),
+                    "page_resolution_unsubmitted_batch_count": len(page_batches) - len(page_llm_receipts),
+                    "page_resolution_concurrency": Config.PAGE_PROVENANCE_LLM_CONCURRENCY,
+                    "page_resolution_outcomes": consensus_metrics["page_provenance"]["llm_outcomes"],
+                }
+                consensus_metrics["merge_phase_timings"] = phase_metrics
+                _safe_log_event(
+                    audit_logger, "page_resolution", "completed",
+                    duration_s=page_resolution_duration, **phase_metrics,
+                )
+                log.info(
+                    "Merge phase timings: text_merge=%.3fs page_resolution=%.3fs "
+                    "page_batches=%d/%d concurrency=%d outcomes=%s",
+                    text_merge_duration, page_resolution_duration,
+                    len(page_llm_receipts), len(page_batches),
+                    Config.PAGE_PROVENANCE_LLM_CONCURRENCY,
+                    phase_metrics["page_resolution_outcomes"],
+                    extra={"_event": "merge_phase_timings", **{
+                        f"_{key}": value for key, value in phase_metrics.items()
+                    }},
+                )
+                active_merge_phase = None
+                if Config.PDFX_BENCHMARK_MODE:
+                    consensus_metrics["runtime_execution"]["stage_events"] = (
+                        audit_logger.timing_events()
+                        if audit_logger is not None
+                        and hasattr(audit_logger, "timing_events")
+                        else []
+                    )
                 if llm is not None:
                     consensus_metrics["llm_usage"] = llm.usage.summary()
 
@@ -2058,6 +2099,12 @@ def _run_extraction(
                 )
                 completed_stages.append("llm_merge")
             except Exception as exc:
+                if active_merge_phase is not None:
+                    _safe_log_event(
+                        audit_logger, active_merge_phase, "failed",
+                        error_code=type(exc).__name__,
+                        duration_s=round(time.monotonic() - phase_started, 3),
+                    )
                 _safe_log_event(
                     audit_logger,
                     stage,

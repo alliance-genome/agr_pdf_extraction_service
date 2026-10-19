@@ -60,8 +60,9 @@ def test_extraction_continues_when_one_of_three_methods_fails(tmp_path, monkeypa
     assert result["methods_used"] == ["marker", "grobid"]
 
 
+@pytest.mark.parametrize("benchmark_mode", [False, True])
 def test_candidate_merge_uses_two_valid_sources_when_third_is_whitespace(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, benchmark_mode
 ):
     monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
     monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
@@ -133,11 +134,16 @@ def test_candidate_merge_uses_two_valid_sources_when_third_is_whitespace(
     input_pdf = tmp_path / "input.pdf"
     input_pdf.write_bytes(b"%PDF-1.7\npartial merge fixture")
 
+    from app.services.audit_logger import AuditLogger
+    monkeypatch.setattr(celery_app.Config, "PDFX_BENCHMARK_MODE", benchmark_mode)
+    monkeypatch.setattr("app.services.audit_logger.build_s3_client", lambda *_: None)
+    audit = AuditLogger("phase-timing-fixture", {"AUDIT_S3_BUCKET_SSM_PARAM": ""})
     result = celery_app._run_extraction(
         _ProgressTask(),
         str(input_pdf),
         ["grobid", "docling", "marker"],
         True,
+        audit_logger=audit,
         file_hash="two-valid-one-empty",
     )
 
@@ -154,6 +160,25 @@ def test_candidate_merge_uses_two_valid_sources_when_third_is_whitespace(
         "marker",
     ]
     assert result["consensus_metrics"]["missing_extractors"] == ["docling"]
+    timings = result["consensus_metrics"]["merge_phase_timings"]
+    assert timings["text_merge_duration_s"] >= 0
+    assert timings["page_resolution_duration_s"] >= 0
+    assert timings["page_resolution_batch_count"] == 0
+    assert timings["page_resolution_completed_batch_count"] == 0
+    assert timings["page_resolution_unsubmitted_batch_count"] == 0
+    assert timings["page_resolution_outcomes"] == {}
+    phase_events = [event for event in audit.timing_events()
+                    if event["stage"] in {"text_merge", "page_resolution"}]
+    assert [(e["stage"], e["status"]) for e in phase_events] == [
+        ("text_merge", "started"), ("text_merge", "completed"),
+        ("page_resolution", "started"), ("page_resolution", "completed"),
+    ]
+    assert phase_events[-1]["duration_s"] == timings["page_resolution_duration_s"]
+    if benchmark_mode:
+        recorded = result["consensus_metrics"]["runtime_execution"]["stage_events"]
+        assert [event for event in recorded
+                if event["stage"] in {"text_merge", "page_resolution"}] == phase_events
+
 
 
 def test_extraction_fails_when_no_requested_method_succeeds(tmp_path, monkeypatch):

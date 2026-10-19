@@ -89,6 +89,11 @@ class Config:
     PAGE_PROVENANCE_LLM_MAX_RANGES_PER_BATCH = int(
         os.environ.get("PAGE_PROVENANCE_LLM_MAX_RANGES_PER_BATCH", 24)
     )
+    PAGE_PROVENANCE_LLM_CONCURRENCY = int(
+        os.environ.get("PAGE_PROVENANCE_LLM_CONCURRENCY", 4)
+    )
+    if PAGE_PROVENANCE_LLM_CONCURRENCY < 1:
+        raise ValueError("PAGE_PROVENANCE_LLM_CONCURRENCY must be a positive integer")
     PAGE_PROVENANCE_LLM_CONTEXT_BYTES = int(
         os.environ.get("PAGE_PROVENANCE_LLM_CONTEXT_BYTES", 512)
     )

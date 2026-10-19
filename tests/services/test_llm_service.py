@@ -318,7 +318,8 @@ def test_page_selector_failure_returns_recorded_fallback_signal():
 
     assert selected == {}
     assert trace["outcome"] == "refusal"
-    assert llm.selection_call_traces == [trace]
+    # The scheduler owns ordered collection after all calls have finished.
+    assert llm.selection_call_traces == []
 
 
 def test_bounded_id_choice_returns_existing_skeleton_id_with_sol_high():
@@ -534,3 +535,39 @@ def test_token_accounting_and_cost_reject_unknown_model():
 
     with pytest.raises(ValueError, match="No pricing entry"):
         compute_cost(summary, {})
+
+
+def test_concurrent_page_calls_account_usage_once_without_mutating_trace_order():
+    from threading import Barrier
+    from app.services.page_resolution import resolve_page_batches
+
+    payload = _page_request()
+    usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20,
+                            prompt_tokens_details=SimpleNamespace(cached_tokens=10))
+    llm = _llm_with_parsed(None, usage=usage)
+    barrier = Barrier(4)
+
+    def parse(**kwargs):
+        request = json.loads(kwargs["messages"][1]["content"])
+        barrier.wait(timeout=5)
+        return SimpleNamespace(usage=usage, choices=[SimpleNamespace(message=
+            SimpleNamespace(refusal=None, parsed=_parsed({
+                "request_sha256": request["request_sha256"],
+                "decisions": tuple({"range_id": r["range_id"], "page_number": 2}
+                                   for r in request["ranges"]),
+            })))])
+
+    llm.client.chat.completions.parse.side_effect = parse
+    choices, receipts = resolve_page_batches(
+        [payload] * 8, llm.resolve_page_choices,
+        concurrency=4, may_submit=lambda: True,
+    )
+    assert choices == {item["range_id"]: 2 for item in payload["ranges"]}
+    assert len(receipts) == 8
+    assert all(r["outcome"] == "valid" for r in receipts)
+    assert llm.selection_call_traces == []
+    summary = llm.usage.summary()
+    assert summary["total_prompt_tokens"] == 800
+    assert summary["total_completion_tokens"] == 160
+    assert summary["total_cached_tokens"] == 80
+    assert summary["breakdown"]["page_resolution_luna"]["calls"] == 8
