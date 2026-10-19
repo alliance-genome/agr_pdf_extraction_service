@@ -507,7 +507,11 @@ class LLM:
             return SelectionDecisionResponse(decisions=())
 
     def resolve_page_choices(self, payload: dict) -> tuple[dict[str, int], dict]:
-        """Use Luna/medium to select only supplied primary-page choices."""
+        """Select supplied pages; return a receipt for caller-ordered collection.
+
+        Concurrent batches share only the thread-safe usage accumulator and
+        HTTP client. They must not append to the ordered selection trace list.
+        """
 
         ranges = payload.get("ranges")
         if (
@@ -596,7 +600,6 @@ class LLM:
                     "response": parsed.model_dump(mode="json"),
                 }
             )
-            self.selection_call_traces.append(trace)
             return decisions, trace
         except Exception as exc:
             trace.update(
@@ -615,7 +618,6 @@ class LLM:
             )
             if completion is not None:
                 trace["usage"] = self._single_call_usage(completion.usage)
-            self.selection_call_traces.append(trace)
             return {}, trace
 
     def resolve_bounded_id_choice(

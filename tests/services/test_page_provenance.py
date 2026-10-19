@@ -616,3 +616,57 @@ def test_merged_record_rejects_semantically_invalid_rebound_ranges(mutation):
             merge_contract_id="contract-v2",
             source_map_sha256=source_digests,
         )
+
+
+def test_serial_and_parallel_page_scheduling_produce_identical_provenance_bytes():
+    from threading import Barrier
+    from app.services.page_resolution import resolve_page_batches
+
+    merged = b"abcdef"
+    projected = [{
+        "byte_start": i, "byte_end": i + 1, "page_number": None,
+        "candidate_pages": [2, 3], "method": None, "source": "grobid",
+        "operation": None, "region_id": f"r{i}", "evidence_digest": None,
+        "_publication_text": True, "_candidate_votes": {3: 2, 2: 1},
+    } for i in range(6)]
+    batches = build_page_resolution_batches(
+        merged_bytes=merged, projected_ranges=projected,
+        source_bytes={"grobid": merged}, max_ranges_per_batch=1,
+        context_bytes=2, evidence_bytes_per_range=4,
+    )
+    assert len(batches) == 6
+    barrier = Barrier(3)
+
+    def resolve(batch):
+        item = batch["ranges"][0]
+        valid = item["byte_start"] % 2 == 0
+        return ({item["range_id"]: 2} if valid else {}), {
+            "request_sha256": batch["request_sha256"],
+            "outcome": "valid" if valid else "invalid",
+        }
+
+    def parallel_resolve(batch):
+        barrier.wait(timeout=5)
+        return resolve(batch)
+
+    records = []
+    for cap, resolver in ((1, resolve), (3, parallel_resolve)):
+        choices, receipts = resolve_page_batches(
+            batches, resolver, concurrency=cap, may_submit=lambda: True,
+        )
+        record, summary = finalize_merged_page_provenance_bytes(
+            pdf_sha256=_sha256(b"pdf"), expected_page_count=3,
+            merged_bytes=merged, audit_sha256=_sha256(b"audit"),
+            merge_contract_id="contract-v2",
+            source_map_sha256={"grobid": _sha256(b"map")},
+            projected_ranges=projected, llm_choices=choices,
+            llm_receipts=receipts,
+        )
+        records.append((record, summary))
+    assert records[0] == records[1]
+    ranges = json.loads(records[0][0])["ranges"]
+    # Existing fallback follows the preceding selected page when available.
+    assert [r["page_number"] for r in ranges] == [2] * 6
+    assert [r["method"] for r in ranges] == [
+        "llm_selected", "deterministic_fallback",
+    ] * 3

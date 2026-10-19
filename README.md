@@ -120,6 +120,18 @@ Selection responses contain only the request digest, region IDs, and integer
 choices. OpenAI calls are bounded by `LLM_OPENAI_TIMEOUT_SECONDS` and
 `LLM_OPENAI_MAX_RETRIES`.
 
+After text merge, independent page-provenance requests run with bounded
+parallelism (`PAGE_PROVENANCE_LLM_CONCURRENCY`, default 4). Set it to 1 for
+serial execution or lower it to reduce provider rate-limit pressure. GPU
+extraction remains serial. Requests retain their existing input, model,
+validation, and deterministic fallback rules; receipts are collected in batch
+order. The scheduler stops admitting requests when the existing job recovery
+budget expires and drains admitted calls before finalizing usage and artifacts.
+Separate `text_merge` and `page_resolution` audit events, plus
+`merge_phase_timings` in consensus metrics, expose phase duration, page batch
+counts, concurrency, and outcomes. The outer `llm_merge` duration still includes
+both phases and artifact persistence.
+
 ## REST API
 
 Swagger UI is served at `/docs`; the OpenAPI document is at `/openapi.yaml`.
@@ -176,6 +188,7 @@ Key settings:
 | `IMAGE_TEXT_REVIEW_MODEL` | `gpt-5.6-luna` | Image metadata reviewer |
 | `IMAGE_TEXT_REVIEW_REASONING` | `medium` | Required Luna reasoning |
 | `LLM_OPENAI_TIMEOUT_SECONDS` | `180` | Per-call timeout |
+| `PAGE_PROVENANCE_LLM_CONCURRENCY` | `4` | Positive maximum simultaneous page-resolution requests per PDF; 1 restores serial scheduling |
 | `LLM_OPENAI_MAX_RETRIES` | `1` | OpenAI client retries, maximum 2 |
 | `LLM_COST_ALERT_USD_PER_JOB` | `2.0` | Non-blocking per-job cost warning threshold |
 | `TASK_SOFT_TIME_LIMIT_SECONDS` | `1800` | Overall Celery soft deadline |
