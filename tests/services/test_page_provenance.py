@@ -665,7 +665,7 @@ def test_serial_and_parallel_page_scheduling_produce_identical_provenance_bytes(
         records.append((record, summary))
     assert records[0] == records[1]
     ranges = json.loads(records[0][0])["ranges"]
-    # Existing fallback follows the preceding selected page when available.
+    # Existing fallback uses the first ranked candidate.
     assert [r["page_number"] for r in ranges] == [2] * 6
     assert [r["method"] for r in ranges] == [
         "llm_selected", "deterministic_fallback",

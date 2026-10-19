@@ -127,6 +127,8 @@ extraction remains serial. Requests retain their existing input, model,
 validation, and deterministic fallback rules; receipts are collected in batch
 order. The scheduler stops admitting requests when the existing job recovery
 budget expires and drains admitted calls before finalizing usage and artifacts.
+Draining does not cancel provider requests; keep provider timeout/retry settings
+compatible with the finalization reserve and task soft/hard deadlines.
 Separate `text_merge` and `page_resolution` audit events, plus
 `merge_phase_timings` in consensus metrics, expose phase duration, page batch
 counts, concurrency, and outcomes. The outer `llm_merge` duration still includes
