@@ -248,3 +248,16 @@ end-to-end extraction, queue drain, and return to cost-safe idle capacity.
 ## License
 
 See [LICENSE](LICENSE).
+
+### Backend database driver contract
+
+Backend requirements constrain SQLAlchemy to `>=2.0,<2.1` and install
+`psycopg2-binary`. SQLAlchemy 2.1 changes the driver selected by plain
+`postgresql://` URLs to Psycopg 3; upgrading requires a deliberate driver and
+connection-configuration migration. This release preserves the existing Psycopg
+2 application and Alembic contract, including externally supplied URLs.
+
+Both backend Dockerfiles run `deploy/check_database_driver.py` before image
+publication. It constructs application and migration engines for plain and
+explicit Psycopg 2 URLs without opening a database connection. A missing or
+unexpected driver fails the image build before starting a GPU AMI bake.

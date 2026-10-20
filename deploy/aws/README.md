@@ -41,6 +41,11 @@ write `/pdfx/*` placeholder parameters before it registers a new proxy task
 definition, because ASG-aware proxy revisions require both the legacy EC2
 instance parameter and the backend ASG parameter to exist.
 
+Packer also needs `ec2:DescribeVolumes` to inspect volumes during build cleanup.
+The checked-in policy includes this read-only action; synchronize the managed
+policy before retrying a bake that reported this permission missing. Merging
+this file alone does not update the live IAM policy.
+
 Backend AMI registration can outlast the default one-hour STS session. The
 workflow requests a three-hour session, so the production role must retain
 `MaxSessionDuration=10800`:

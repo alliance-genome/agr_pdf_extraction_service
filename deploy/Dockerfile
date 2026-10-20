@@ -43,6 +43,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=grobid-pdfalto /opt/grobid/grobid-home/pdfalto/lin-64/pdfalto /usr/local/bin/pdfalto
 COPY . .
 
+# Fail before image publication/AMI bake if database driver loading is broken.
+RUN python deploy/check_database_driver.py
+
 # Create data directories
 RUN mkdir -p data/cache data/uploads data/models logs
 

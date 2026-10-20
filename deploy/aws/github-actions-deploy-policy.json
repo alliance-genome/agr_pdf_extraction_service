@@ -103,6 +103,7 @@
         "ec2:DescribeVpcs",
         "ec2:DescribeSecurityGroups",
         "ec2:DescribeSnapshots",
+        "ec2:DescribeVolumes",
         "ec2:DescribeRegions",
         "ec2:DescribeImageAttribute",
         "ec2:DescribeKeyPairs",
