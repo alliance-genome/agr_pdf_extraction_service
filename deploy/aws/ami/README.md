@@ -41,8 +41,11 @@ outage. This design replaces that with two pieces:
 | File | Purpose |
 |------|---------|
 | `pdfx-backend.pkr.hcl` | Packer `amazon-ebs` template. Builds on `g6.2xlarge` (standing L4/Ada smoke test). |
-| `provision.sh` | Bake provisioner: reuses `deploy.sh`, runs one real sample extraction to warm all caches, asserts caches non-empty, bakes the RDS CA bundle to `/opt/pdfx/rds-ca.pem`, scrubs secrets/identity before snapshot. |
-| `test-sample.pdf` | Small multi-element PDF (heading + paragraph + table) used to warm Docling/GROBID/rapidocr caches during the bake. |
+| `provision.sh` | Bake provisioner: reuses `deploy.sh`, runs `warmup.py`, asserts caches non-empty, bakes the RDS CA bundle to `/opt/pdfx/rds-ca.pem`, scrubs secrets/identity before snapshot. |
+| `warmup.py` | Submits both fixtures through the local API and checks Celery results for fresh, complete success from every requested extractor. LLM merge and image review are disabled. |
+| `test-sample.pdf` | Synthetic text PDF (heading + paragraph + table) used to exercise GROBID, Docling and Marker. |
+| `test-scan.pdf` | Image-only rendering of the same sample; Docling must recover the expected text through OCR, warming RapidOCR's lazy model caches. |
+| `make_scan_fixture.py` | Regenerates `test-scan.pdf` with the image's installed pypdfium2/Pillow dependencies. |
 | `prune_amis.sh` | Deregisters old `Role=backend-baked` AMIs (keep last `KEEP_N`, default 3); never touches the AMI referenced by `/pdfx/backend-ami`. |
 | `tests/` | Shell unit tests for the prune selection logic. |
 
@@ -50,7 +53,24 @@ Run the unit tests any time:
 
 ```bash
 bash deploy/aws/ami/tests/test_prune_amis.sh
+python -m pytest -q tests/test_ami_warmup.py
 ```
+
+RapidOCR loads models lazily. The text fixture alone can pass every extractor
+without downloading any OCR models. Keep the image-only fixture and the cache
+gate: neither an aggregate `complete` API status nor a nonempty Markdown file
+proves that OCR worked. The bake checks Celery results directly because the HTTP
+status's extractor list relies on S3 artifact uploads, which the bake disables.
+
+`PDFX_BAKE_WARMUP_TIMEOUT_SECONDS` bounds each fixture's worker wait (default
+600 seconds); `PDFX_BAKE_HTTP_TIMEOUT_SECONDS` bounds submission (default 30
+seconds). Packer exposes these as `bake_warmup_timeout_seconds` and
+`bake_http_timeout_seconds`; use `-var` or `PKR_VAR_bake_warmup_timeout_seconds` /
+`PKR_VAR_bake_http_timeout_seconds` to override them. Packer passes the settings
+through sudo and the provisioner forwards them into the app container. Increase
+them only for demonstrated download or startup delays. The provisioner copies
+the helper and fixtures from the checked-out Git ref into a temporary container
+directory, so baking newer deploy code against an existing image remains supported.
 
 ## Manual bake
 

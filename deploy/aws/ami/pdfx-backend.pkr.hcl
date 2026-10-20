@@ -55,6 +55,24 @@ variable "root_volume_size" {
   default = 200
 }
 
+variable "bake_warmup_timeout_seconds" {
+  type    = number
+  default = 600
+  validation {
+    condition     = var.bake_warmup_timeout_seconds > 0
+    error_message = "Bake warm-up timeout must be positive."
+  }
+}
+
+variable "bake_http_timeout_seconds" {
+  type    = number
+  default = 30
+  validation {
+    condition     = var.bake_http_timeout_seconds > 0
+    error_message = "Bake HTTP timeout must be positive."
+  }
+}
+
 locals { ts = formatdate("YYYYMMDD-hhmmss", timestamp()) }
 
 source "amazon-ebs" "pdfx_backend" {
@@ -108,7 +126,7 @@ build {
   # instance's sudoers env policy) and via `bash` so no execute bit is needed.
   provisioner "shell" {
     inline = [
-      "sudo env BACKEND_IMAGE_REPO='${var.backend_image_repo}' BACKEND_IMAGE_TAG='${var.backend_image_tag}' BASE_AMI_ID='${var.base_ami_id}' AWS_REGION='${var.region}' BACKEND_GIT_REF='${var.backend_git_ref}' bash /tmp/provision.sh",
+      "sudo env PDFX_BAKE_WARMUP_TIMEOUT_SECONDS='${var.bake_warmup_timeout_seconds}' PDFX_BAKE_HTTP_TIMEOUT_SECONDS='${var.bake_http_timeout_seconds}' BACKEND_IMAGE_REPO='${var.backend_image_repo}' BACKEND_IMAGE_TAG='${var.backend_image_tag}' BASE_AMI_ID='${var.base_ami_id}' AWS_REGION='${var.region}' BACKEND_GIT_REF='${var.backend_git_ref}' bash /tmp/provision.sh",
     ]
   }
 
