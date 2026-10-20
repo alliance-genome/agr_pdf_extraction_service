@@ -265,6 +265,10 @@ def test_flask_unhandled_exception_is_redacted_and_correlated(monkeypatch):
     "secret",
     [
         "not-json",
+        '{"projects":{"pdfx-dev":{"dsn_private_vpc":"http://private@example.invalid/10"}}}',
+        '{"projects":{"pdfx-dev":{"dsn_private_vpc":"https://example.invalid/10"}}}',
+        '{"projects":{"pdfx-dev":{"dsn_private_vpc":"https://public@example.invalid/not-project"}}}',
+        '{"projects":{"pdfx-dev":{"dsn_private_vpc":"https://[invalid"}}}',
         "{}",
         '{"projects":null}',
         '{"projects":{"pdfx-dev":{"dsn_private_vpc":123}}}',
@@ -288,3 +292,11 @@ def test_malformed_reporting_secret_disables_reporting_without_content(
     assert initialize("extraction") is False
     assert "reporting disabled" in caplog.text
     assert secret not in caplog.text
+
+
+def test_explicit_malformed_dsn_still_fails_configuration(monkeypatch):
+    from sentry_sdk.utils import BadDsn
+
+    monkeypatch.setenv("SENTRY_DSN", "https://example.invalid/10")
+    with pytest.raises(BadDsn):
+        initialize("dispatcher")

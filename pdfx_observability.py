@@ -143,7 +143,8 @@ def initialize(component):
         return False
     dsn = os.getenv("SENTRY_DSN", "").strip()
     secret_id = os.getenv("SENTRY_RUNTIME_SECRET_ID", "").strip()
-    if not dsn and secret_id:
+    from_secret = bool(not dsn and secret_id)
+    if from_secret:
         import boto3
         from botocore.config import Config as AWSConfig
         from botocore.exceptions import BotoCoreError, ClientError
@@ -179,19 +180,28 @@ def initialize(component):
             return False
     if not dsn:
         return False
-    parsed = urlsplit(dsn)
-    if parsed.scheme != "https" and not (
-        parsed.scheme == "http"
-        and os.getenv("SENTRY_ALLOW_INSECURE_DSN", "false").lower() == "true"
-    ):
-        raise ValueError(
-            "Sentry requires HTTPS or explicit private-ingestion HTTP opt-in"
+    try:
+        parsed = urlsplit(dsn)
+        if parsed.scheme != "https" and not (
+            parsed.scheme == "http"
+            and os.getenv("SENTRY_ALLOW_INSECURE_DSN", "false").lower() == "true"
+        ):
+            raise ValueError(
+                "Sentry requires HTTPS or explicit private-ingestion HTTP opt-in"
+            )
+    except ValueError:
+        if not from_secret:
+            raise
+        logging.getLogger(__name__).warning(
+            "Sentry secret unavailable or malformed; reporting disabled for this process"
         )
+        return False
     rate = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1"))
     flush = float(os.getenv("SENTRY_SHUTDOWN_TIMEOUT_SECONDS", "2"))
     if not 0 <= rate <= 1 or not math.isfinite(flush) or flush <= 0:
         raise ValueError("Invalid Sentry sample rate or shutdown timeout")
     import sentry_sdk
+    from sentry_sdk.utils import BadDsn
     from sentry_sdk.integrations.dedupe import DedupeIntegration
     from sentry_sdk.integrations.excepthook import ExcepthookIntegration
     from sentry_sdk.integrations.threading import ThreadingIntegration
@@ -214,26 +224,34 @@ def initialize(component):
         from sentry_sdk.integrations.celery import CeleryIntegration
 
         integrations.append(CeleryIntegration(monitor_beat_tasks=False))
-    sentry_sdk.init(
-        dsn=dsn,
-        environment=os.getenv("SENTRY_ENVIRONMENT", "local"),
-        release=os.getenv("SENTRY_RELEASE", "pdfx@unknown"),
-        server_name="pdfx",
-        default_integrations=False,
-        auto_enabling_integrations=False,
-        integrations=integrations,
-        send_default_pii=False,
-        include_local_variables=False,
-        include_source_context=False,
-        max_request_body_size="never",
-        max_breadcrumbs=0,
-        enable_logs=False,
-        traces_sample_rate=rate,
-        shutdown_timeout=flush,
-        trace_propagation_targets=[],
-        before_send=sanitize_event,
-        before_send_transaction=sanitize_event,
-    )
+    try:
+        sentry_sdk.init(
+            dsn=dsn,
+            environment=os.getenv("SENTRY_ENVIRONMENT", "local"),
+            release=os.getenv("SENTRY_RELEASE", "pdfx@unknown"),
+            server_name="pdfx",
+            default_integrations=False,
+            auto_enabling_integrations=False,
+            integrations=integrations,
+            send_default_pii=False,
+            include_local_variables=False,
+            include_source_context=False,
+            max_request_body_size="never",
+            max_breadcrumbs=0,
+            enable_logs=False,
+            traces_sample_rate=rate,
+            shutdown_timeout=flush,
+            trace_propagation_targets=[],
+            before_send=sanitize_event,
+            before_send_transaction=sanitize_event,
+        )
+    except BadDsn:
+        if not from_secret:
+            raise
+        logging.getLogger(__name__).warning(
+            "Sentry secret unavailable or malformed; reporting disabled for this process"
+        )
+        return False
     sentry_sdk.set_tag("pdfx.component", component)
     return True
 

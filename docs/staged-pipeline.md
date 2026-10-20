@@ -62,7 +62,16 @@ checkpoint sizes, recovery attempts and container resources are documented in
 first extraction claim. At that claim, the execution deadline starts once and
 covers both stages, retries and handoff waits. Queue time does not consume the
 scientific finalization budget. The proxy's pre-backend durable queue retains
-its separate existing age limit.
+its separate existing age limit. In status payloads, `pipeline.deadline_at` is
+initially the queue-age expiry and becomes the execution deadline at first claim;
+`started_at` distinguishes these phases.
+
+For replacement of an unhealthy backend, never-claimed jobs block destruction
+only for `SHARED_RUNNING_MAX_AGE_MINUTES` (default 60), independently of the
+longer queue age. Their RDS records and S3 source inputs survive replacement.
+Claimed jobs, including queued finalization, remain protected until their
+execution deadline. An unavailable status database still refuses replacement.
+This does not change normal idle accounting, which counts all unfinished jobs.
 Health requires fresh dispatcher, GPU-worker and finalizer heartbeats, and idle
 accounting includes queued finalization even when the GPU queue is empty.
 
@@ -123,9 +132,8 @@ otherwise HTTPS is required. An empty DSN/reference or `SENTRY_ENABLED=false`
 disables reporting. Preserve the kill switch during emergency troubleshooting.
 Secret lookup uses bounded connect/read timeouts and attempts; AWS lookup
 failures disable reporting in that process and emit a content-free log warning.
-They do not fail extraction. Malformed secret contents also disable reporting. Invalid explicit
-project/transport settings still fail
-explicitly. After a lookup outage, restart the affected service to reinitialize
+They do not fail extraction. Malformed secret contents also disable reporting. Invalid explicit environment project/transport settings still fail explicitly;
+invalid DSN content loaded from a secret disables reporting. After a lookup outage, restart the affected service to reinitialize
 reporting; watchdog processes also attempt initialization for each new stage.
 
 The shared sanitizer rebuilds events from structural fields only. It excludes

@@ -77,10 +77,13 @@ class RDSStatusReader:
                                AND EXISTS (SELECT 1 FROM pipeline_job p
                                            WHERE p.process_id = extraction_run.process_id
                                              AND p.state <> 'terminal'
-                                             AND p.deadline_at > CURRENT_TIMESTAMP)
+                                             AND p.deadline_at > CURRENT_TIMESTAMP
+                                             AND (extraction_run.started_at IS NOT NULL
+                                                  OR p.created_at > CURRENT_TIMESTAMP
+                                                     - (%s * INTERVAL '1 minute')))
                         )
                         """,
-                        (),
+                        (max(1, settings.SHARED_RUNNING_MAX_AGE_MINUTES),),
                     )
                     row = cursor.fetchone()
             return True, bool(row and row[0])

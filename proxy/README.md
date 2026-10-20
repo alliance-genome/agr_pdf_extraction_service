@@ -266,7 +266,7 @@ All settings come from environment variables. In production, values are injected
 | `STATUS_DATABASE_URL` | Production | — | Existing backend RDS URL used only by read-only status sessions; injected from SSM in ECS |
 | `STATUS_DB_TIMEOUT_SECONDS` | No | `5` | Connection and statement timeout for the always-on authoritative status lookup |
 | `STATUS_ERROR_MESSAGE_MAX_CHARS` | No | `4000` | Maximum error text returned by direct RDS status, matching the backend response bound |
-| `SHARED_RUNNING_MAX_AGE_MINUTES` | No | `60` | Maximum age of an unchanged RDS `running` row that can block exact-target startup replacement; exceeds the 35-minute backend hard limit |
+| `SHARED_RUNNING_MAX_AGE_MINUTES` | No | `60` | Maximum age of never-claimed durable backend work that blocks exact-target startup replacement; claimed work remains protected until its execution deadline |
 | `PROXY_SHUTDOWN_GRACE_SECONDS` | No | `90` | Grace for an in-progress replay handoff before cancellation releases its claim |
 | `STUCK_PENDING_MINUTES` | No | `20` | Age threshold for stale pending/running jobs |
 | `RECONCILER_INTERVAL_SECONDS` | No | `60` | Background reconciler interval |

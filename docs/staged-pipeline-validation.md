@@ -98,7 +98,10 @@ The AWS dependency-image suite passed 558 tests before final review fixes.
 The final admission/error and queue-budget fixes were additionally validated
 in a local Python 3.11 CUDA dependency image built from the available pinned
 backend base: 576 passed, 24 skipped, with 17 real-PostgreSQL pipeline tests
-run separately. The final proxy run passed 213 tests including its opt-in PostgreSQL case. Proxy tests
+run separately. Subsequent malformed-secret DSN hardening passed all 17 Sentry
+tests in that same dependency image. The final proxy run passed 213 tests,
+including its opt-in PostgreSQL case covering bounded replacement protection
+for never-claimed jobs and retained protection after first claim. Proxy tests
 run separately because both packages are named `app`. PostgreSQL tests opt in
 through `PDFX_TEST_DATABASE_URL`, pointing only to a migrated disposable test
 DB. Scientific merge, native artifact and page-provenance regression suites

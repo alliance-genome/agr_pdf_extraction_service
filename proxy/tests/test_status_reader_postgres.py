@@ -55,6 +55,21 @@ def test_joined_durable_status_and_read_only_active_work(monkeypatch):
         assert result["pipeline"]["stage"] == "finalization"
         assert result["pipeline"]["generation"] == 2
         assert reader.has_active_work() == (True, True)
+        # A broken GPU host must not be protected for the full 24-hour queue age.
+        # Sources and queue records are durable across replacement. A claimed
+        # job, including a ready finalization handoff, retains deadline protection.
+        monkeypatch.setattr("app.status_reader.settings.SHARED_RUNNING_MAX_AGE_MINUTES", 60)
+        with admin.cursor() as cursor:
+            cursor.execute("UPDATE pipeline_job SET stage='extraction', created_at=now()-interval '2 hours', deadline_at=now()+interval '22 hours'")
+        assert reader.has_active_work() == (True, False)
+        assert reader.lookup(pid)[1]["status"] == "pending"
+        with admin.cursor() as cursor:
+            cursor.execute("UPDATE extraction_run SET started_at=now()-interval '5 minutes'")
+            cursor.execute("UPDATE pipeline_job SET stage='finalization', deadline_at=now()+interval '30 minutes'")
+        assert reader.has_active_work() == (True, True)
+        with admin.cursor() as cursor:
+            cursor.execute("UPDATE pipeline_job SET deadline_at=now()-interval '1 minute'")
+        assert reader.has_active_work() == (True, False)
         with reader._connect() as connection:
             with connection.cursor() as cursor:
                 with pytest.raises(psycopg2.errors.ReadOnlySqlTransaction):
