@@ -200,6 +200,8 @@ def _run_stage(process_id, generation, stage):
                             audit, result, options["merge"], pdf_path=str(pdf)
                         )
                         required = {"source_pdf", *sources["methods_used"]}
+                        if options["merge"]:
+                            required.update({"merged", "audit", "page_provenance"})
                         if (
                             not required <= artifacts.keys()
                             or not set(sources["methods_used"])

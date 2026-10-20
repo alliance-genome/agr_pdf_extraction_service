@@ -529,6 +529,8 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
         if not page_key:
             raise RuntimeError("Failed to upload durable merged page provenance")
         artifacts["page_provenance"] = page_key
+        if not artifacts.get("audit"):
+            raise RuntimeError("Failed to upload durable merged audit")
 
     images = []
     if file_hash:

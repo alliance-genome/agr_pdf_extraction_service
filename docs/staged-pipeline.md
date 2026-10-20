@@ -29,7 +29,9 @@ A generation number fences stale notifications. Each stage also holds a live
 PostgreSQL session advisory lock. The dispatcher recovers a stale heartbeat only
 when the live lock has been released. A separate watchdog process enforces the
 job deadline and cancellation even if a native extension holds the worker's
-Python GIL. Losing the ownership connection or watchdog stops that worker
+Python GIL. A separate stdlib-only sentinel supervises watchdog death; both
+monitors share the worker-owned stop pipe and use exact-process handles.
+Losing the ownership connection or either monitor stops that worker
 process. A GPU worker restart reloads its models; a finalizer restart affects
 only its prefork child.
 
@@ -104,6 +106,11 @@ infrastructure configuration before rollout; installing the SDK alone does not
 activate reporting. Private HTTP ingestion requires the explicit opt-in;
 otherwise HTTPS is required. An empty DSN/reference or `SENTRY_ENABLED=false`
 disables reporting. Preserve the kill switch during emergency troubleshooting.
+Secret lookup uses bounded connect/read timeouts and attempts; AWS lookup
+failures disable reporting in that process and emit a content-free log warning.
+They do not fail extraction. Invalid project/transport settings still fail
+explicitly. After a lookup outage, restart the affected service to reinitialize
+reporting; watchdog processes also attempt initialization for each new stage.
 
 The shared sanitizer rebuilds events from structural fields only. It excludes
 PDF text, prompts, responses, request bodies/headers, credentials, raw URLs,

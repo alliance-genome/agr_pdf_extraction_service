@@ -240,7 +240,7 @@ def test_interrupted_finalizer_before_provider_reuses_checkpoint(jobs):
     assert pipeline.claim(pid, 3, "finalization")
 
 
-def _native_hang_child(url, pid):
+def _native_hang_child(url, pid, ready=None):
     import os, ctypes
 
     os.environ["DATABASE_URL"] = url
@@ -252,7 +252,10 @@ def _native_hang_child(url, pid):
     with pipeline.live_lock(pid) as owner:
         assert owner is not None
         assert pipeline.claim(pid, 1, "extraction")
-        with Watchdog(pid, 1, "extraction"):
+        with Watchdog(pid, 1, "extraction") as watchdog:
+            if ready is not None:
+                ready.send(watchdog.process.pid)
+                ready.close()
             # PyDLL deliberately holds the GIL across this native call. A thread
             # watchdog cannot enforce this deadline; a separate process must.
             ctypes.PyDLL(None).sleep(60)
@@ -281,6 +284,73 @@ def test_external_watchdog_kills_native_hang_and_persists_deadline(jobs):
         assert run.error_code == "PipelineDeadlineExceeded"
     with pipeline.live_lock(pid) as owner:
         assert owner is not None
+
+
+@pytest.mark.parametrize("target", ["watchdog", "sentinel"])
+def test_monitor_death_stops_worker_holding_native_gil(jobs, target):
+    import multiprocessing
+    import signal
+    import time
+    from pathlib import Path
+
+    pid = jobs()
+    dispatch()
+    ctx = multiprocessing.get_context("spawn")
+    reader, writer = ctx.Pipe(duplex=False)
+    child = ctx.Process(
+        target=_native_hang_child,
+        args=(os.environ["PDFX_TEST_DATABASE_URL"], pid, writer),
+    )
+    child.start()
+    writer.close()
+    try:
+        assert reader.poll(15), "Watchdog startup failed"
+        watchdog_pid = reader.recv()
+        target_pid = watchdog_pid
+        if target == "sentinel":
+            children = (
+                Path(f"/proc/{watchdog_pid}/task/{watchdog_pid}/children")
+                .read_text()
+                .split()
+            )
+            assert len(children) == 1
+            target_pid = int(children[0])
+        time.sleep(0.3)  # allow the child to enter the native GIL-holding sleep
+        os.kill(target_pid, signal.SIGKILL)
+        child.join(15)
+        assert not child.is_alive(), "Worker survived loss of stage supervision"
+        assert child.exitcode == -9
+        with pipeline.live_lock(pid) as owner:
+            assert owner is not None
+    finally:
+        reader.close()
+        if child.is_alive():
+            child.kill()
+            child.join()
+
+
+def test_watchdog_ready_despite_sentry_secret_outage(jobs, monkeypatch):
+    from app.pipeline_tasks import Watchdog
+
+    # Exercise the real subprocess and boto client against a closed local port.
+    for key, value in {
+        "SENTRY_ENABLED": "true",
+        "SENTRY_DSN": "",
+        "SENTRY_RUNTIME_SECRET_ID": "unavailable-reporting",
+        "SENTRY_PROJECT": "pdfx-dev",
+        "AWS_ACCESS_KEY_ID": "synthetic",
+        "AWS_SECRET_ACCESS_KEY": "synthetic",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "AWS_ENDPOINT_URL_SECRETS_MANAGER": "http://127.0.0.1:1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    pid = jobs()
+    dispatch()
+    with pipeline.live_lock(pid):
+        assert pipeline.claim(pid, 1, "extraction")
+        with Watchdog(pid, 1, "extraction") as watchdog:
+            assert watchdog.process.poll() is None
+            assert pipeline.snapshot(pid)["state"] == "running"
 
 
 def test_claim_after_deadline_reports_failure_once(jobs, monkeypatch):

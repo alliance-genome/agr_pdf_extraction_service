@@ -172,6 +172,27 @@ def test_runtime_secret_selects_only_configured_project(monkeypatch):
     assert captured["max_request_body_size"] == "never"
 
 
+def test_reporting_secret_outage_is_bounded_and_does_not_raise(monkeypatch, caplog):
+    import boto3
+    from botocore.exceptions import EndpointConnectionError
+
+    monkeypatch.setenv("SENTRY_RUNTIME_SECRET_ID", "runtime-secret")
+    monkeypatch.setenv("SENTRY_PROJECT", "pdfx-dev")
+    configurations = []
+
+    def unavailable(*args, **kwargs):
+        configurations.append(kwargs["config"])
+        raise EndpointConnectionError(endpoint_url="PRIVATE-SENTINEL")
+
+    monkeypatch.setattr(boto3, "client", unavailable)
+    assert initialize("extraction") is False
+    assert configurations[0].connect_timeout == 2
+    assert configurations[0].read_timeout == 2
+    assert configurations[0].retries == {"total_max_attempts": 1}
+    assert "reporting disabled" in caplog.text
+    assert "PRIVATE-SENTINEL" not in caplog.text
+
+
 def test_log_context_correlates_sentry_hash_across_internal_threads():
     import logging
     from concurrent.futures import ThreadPoolExecutor

@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -144,13 +145,33 @@ def initialize(component):
     secret_id = os.getenv("SENTRY_RUNTIME_SECRET_ID", "").strip()
     if not dsn and secret_id:
         import boto3
+        from botocore.config import Config as AWSConfig
+        from botocore.exceptions import BotoCoreError, ClientError
 
         project = os.getenv("SENTRY_PROJECT", "").strip()
         if project not in {"pdfx-dev", "pdfx-prod"}:
             raise ValueError("Set SENTRY_PROJECT explicitly to pdfx-dev or pdfx-prod")
-        response = boto3.client(
-            "secretsmanager", region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-        ).get_secret_value(SecretId=secret_id)
+        timeout = float(os.getenv("SENTRY_SECRET_TIMEOUT_SECONDS", "2"))
+        attempts = int(os.getenv("SENTRY_SECRET_MAX_ATTEMPTS", "1"))
+        if not math.isfinite(timeout) or timeout <= 0 or attempts < 1:
+            raise ValueError("Invalid Sentry secret timeout or attempt limit")
+        try:
+            response = boto3.client(
+                "secretsmanager",
+                region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+                config=AWSConfig(
+                    connect_timeout=timeout,
+                    read_timeout=timeout,
+                    retries={"total_max_attempts": attempts},
+                ),
+            ).get_secret_value(SecretId=secret_id)
+        except (BotoCoreError, ClientError):
+            # Reporting availability must not change extraction outcomes.
+            # Do not log exception details, which can contain credential context.
+            logging.getLogger(__name__).warning(
+                "Sentry secret lookup unavailable; reporting disabled for this process"
+            )
+            return False
         dsn = json.loads(response["SecretString"])["projects"][project][
             "dsn_private_vpc"
         ]

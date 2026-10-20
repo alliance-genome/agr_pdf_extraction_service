@@ -28,6 +28,13 @@ kernels; it does not establish a GPU utilization percentage improvement. Peak
 sampled GPU allocation was 4,184 MiB. Production sizing and longer-document
 throughput require representative workload validation.
 
+A separate two-job probe used unique 24-page synthetic PDFs with Marker and
+Docling, no merge/provider calls, and 100 ms GPU sampling. Both jobs completed.
+It recorded 762 samples, 148 with nonzero GPU utilization, a 100% peak and
+7,882 MiB peak GPU allocation. The sample mean was 14.3% across the whole probe.
+This confirms GPU execution on a longer fixture; it is not a baseline
+comparison or evidence of saturated GPU use.
+
 ## Correctness and recovery evidence
 
 - Fresh schema migration, and upgrade of the baseline database with its ten
@@ -36,7 +43,10 @@ throughput require representative workload validation.
 - Real PostgreSQL tests cover concurrent dispatchers, duplicate claims, fencing,
   publish failure, backpressure, deadlines, terminal immutability, cross-process
   provider budgets and recovery. A native call deliberately holding the GIL was
-  killed by the external watchdog and its deadline persisted.
+  killed by the external watchdog and its deadline persisted. Killing either
+  watchdog or sentinel while a worker held the native GIL also terminated
+  that worker and released ownership. A reporting-secret endpoint outage
+  did not prevent watchdog readiness.
 - Redis stopped during acceptance, duplicate submission, then Redis restarted
   with an empty queue: the same durable job completed.
 - Six-job saturation with finalizers stopped: four downstream jobs admitted,
@@ -57,6 +67,8 @@ throughput require representative workload validation.
   both completed all three extractors with fresh caches. Native byte digests,
   style/page receipts and required S3 objects verified; one image retained only
   for the image-enabled job. No cross-job cache interference.
+- Selective scientific audit upload failures (exception, empty receipt and
+  missing file) prevent completion, independently of the NDJSON job audit.
 - Completed status, all six text/audit/page download methods and image download
   remained usable with Redis stopped.
 - The isolated AMI S3 emulator overlay passed the unchanged text/all-extractor
