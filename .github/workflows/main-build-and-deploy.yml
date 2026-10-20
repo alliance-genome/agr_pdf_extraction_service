@@ -81,13 +81,13 @@ jobs:
             --jq '.[].filename')"; then
             printf 'Changed files:\n%s\n' "$changed_files"
 
-            if grep -Eq '^(proxy/Dockerfile|proxy/requirements\.txt|proxy/app/|proxy/deploy/)' <<< "$changed_files"; then
+            if grep -Eq '^(pdfx_observability\.py$|proxy/Dockerfile|proxy/requirements\.txt|proxy/app/|proxy/deploy/)' <<< "$changed_files"; then
               proxy_changed=true
             fi
 
             # These paths affect the backend image, the checked-out deploy
             # code embedded in the AMI, or the bake itself.
-            if grep -Eq '^(\.dockerignore$|requirements\.txt$|alembic\.ini$|alembic/|app/|celery_app\.py$|config\.py$|deploy/Dockerfile\.gpu$|deploy/check_database_driver\.py$|deploy/gpu-constraints\.txt$|deploy/deploy\.sh$|deploy/manage\.sh$|deploy/nginx\.conf$|deploy/docker-compose[^/]*\.yml$|deploy/aws/ami/(pdfx-backend\.pkr\.hcl|provision\.sh|warmup\.py|test-(sample|scan)\.pdf)$)' <<< "$changed_files"; then
+            if grep -Eq '^(\.dockerignore$|requirements\.txt$|pdfx_observability\.py$|alembic\.ini$|alembic/|app/|celery_app\.py$|config\.py$|deploy/Dockerfile\.gpu$|deploy/check_(database_driver|pipeline_database)\.py$|deploy/gpu-constraints\.txt$|deploy/deploy\.sh$|deploy/manage\.sh$|deploy/nginx\.conf$|deploy/docker-compose[^/]*\.yml$|deploy/aws/ami/(pdfx-backend\.pkr\.hcl|provision\.sh|bake-s3\.yml|warmup\.py|test-(sample|scan)\.pdf)$)' <<< "$changed_files"; then
               backend_changed=true
             fi
 
@@ -172,7 +172,8 @@ jobs:
         env:
           DOCKER_BUILD_SUMMARY: false
         with:
-          context: ./proxy
+          context: .
+          file: ./proxy/Dockerfile
           tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           outputs: type=docker,dest=${{ env.IMAGE_ARCHIVE_PATH }}
           platforms: linux/amd64

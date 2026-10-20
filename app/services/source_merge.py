@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.pipeline_errors import StageControlError
+
 import hashlib
 import json
 import re
@@ -3985,6 +3987,8 @@ def merge_with_baseline_failsafe(
                         for decision in model_response.decisions
                     )
                 )
+            except StageControlError:
+                raise
             except Exception as exc:
                 warnings.append(f"selection_failed:{type(exc).__name__}")
                 model_response = None

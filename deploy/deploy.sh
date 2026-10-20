@@ -337,6 +337,7 @@ mkdir -p "$REPO_ROOT/data/model_cache"
 mkdir -p "$REPO_ROOT/data/rapidocr_models"
 mkdir -p "$REPO_ROOT/logs"
 rm -f "$REPO_ROOT/data/cache/marker_worker_ready.json"
+rm -f "$REPO_ROOT/data/cache/pipeline-health/"*.ready
 
 # External DB (RDS) mode: layer the override so the bundled Postgres is excluded
 # and app/worker talk to DATABASE_URL. Must be set before any compose command.
@@ -361,6 +362,11 @@ if [ "${PDFX_EXTERNAL_DB:-false}" = "true" ]; then
     COMPOSE_ARGS+=(-f "docker-compose.external-db.yml")
 fi
 
+# Explicit deployment overlay (used by isolated AMI warm-up for S3 emulation).
+if [ -n "${PDFX_DEPLOY_COMPOSE_OVERRIDE:-}" ]; then
+    COMPOSE_ARGS+=(-f "$PDFX_DEPLOY_COMPOSE_OVERRIDE")
+fi
+
 # Step 3: Stop existing services
 echo "Stopping existing services..."
 docker compose "${COMPOSE_ARGS[@]}" down 2>/dev/null || true
@@ -370,12 +376,12 @@ if [ "$COMPOSE_FILE" = "docker-compose.gpu.yml" ] && \
    [ -n "${PDFX_GPU_IMAGE:-}" ] && \
    [ "${SHOULD_PULL_PREBUILT_GPU_IMAGE}" = "true" ]; then
     echo "Pulling prebuilt GPU application image: ${PDFX_GPU_IMAGE}"
-    docker compose "${COMPOSE_ARGS[@]}" pull app worker
+    docker compose "${COMPOSE_ARGS[@]}" pull app worker finalizer dispatcher
 fi
 
 if [ "${PDFX_DEPLOY_BUILD_MODE}" = "rebuild" ]; then
     echo "Rebuilding application images before migrations..."
-    docker compose "${COMPOSE_ARGS[@]}" build app worker
+    docker compose "${COMPOSE_ARGS[@]}" build app worker finalizer dispatcher
 fi
 
 wait_for_nvidia_container_runtime
@@ -405,6 +411,8 @@ else
     docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps app alembic upgrade head
 fi
 echo "  Database migrations applied."
+echo "Checking runtime database permissions..."
+docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps app python -m deploy.check_pipeline_database
 
 # Step 7: Start full stack
 echo "Starting application services (build mode: ${PDFX_DEPLOY_BUILD_MODE})..."

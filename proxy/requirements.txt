@@ -7,3 +7,6 @@ PyJWT[crypto]
 cryptography
 requests
 python-multipart
+
+# Explicit integrations and final content-free envelope sanitizer
+sentry-sdk[fastapi]>=2.63,<3

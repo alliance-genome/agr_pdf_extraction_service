@@ -4,6 +4,26 @@ Description: >
   SSM parameters, ALB routing, and DNS.
 
 Parameters:
+  PipelinePrefix:
+    Type: String
+    Default: pdfx/pipeline
+  PipelineRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Source/checkpoint retention; must exceed maximum queue and processing time
+  SentryRuntimeSecretArn:
+    Type: String
+    Default: ""
+    Description: Optional Secrets Manager PDFX runtime secret ARN; empty disables Sentry wiring
+  SentryProject:
+    Type: String
+    Default: pdfx-prod
+    AllowedValues: [pdfx-dev, pdfx-prod]
+  SentryIngestionSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: Existing Sentry private-ingestion security group; no public ingress is added
   EnvironmentName:
     Type: String
     Default: pdfx
@@ -267,18 +287,89 @@ Parameters:
     Type: String
     Default: v2.30.3
 
+Rules:
+  SentryParametersTogether:
+    Assertions:
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref SentryRuntimeSecretArn, ""]
+            - !Equals [!Ref SentryIngestionSecurityGroupId, ""]
+          - !And
+            - !Not [!Equals [!Ref SentryRuntimeSecretArn, ""]]
+            - !Not [!Equals [!Ref SentryIngestionSecurityGroupId, ""]]
+        AssertDescription: Supply both the Sentry secret ARN and private ingestion security group, or neither
+
 Conditions:
+  HasSentry: !And
+    - !Not [!Equals [!Ref SentryRuntimeSecretArn, ""]]
+    - !Not [!Equals [!Ref SentryIngestionSecurityGroupId, ""]]
   AssociateBackendPublicIp: !Equals [!Ref BackendAssociatePublicIp, "true"]
   EnableBackendWarmPool: !Not [!Equals [!Ref BackendWarmPoolMinSize, 0]]
   HasAlarmActions: !Not [!Equals [!Ref AlarmSnsTopicArn, ""]]
 
 Resources:
+  SentryRuntimeReadPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasSentry
+    Properties:
+      PolicyName: pdfx-sentry-runtime-read
+      Roles: [!Ref BackendRole, !Ref ProxyTaskRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref SentryRuntimeSecretArn
+  SentryBackendIngestion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSentry
+    Properties:
+      GroupId: !Ref SentryIngestionSecurityGroupId
+      SourceSecurityGroupId: !Ref BackendSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9000
+      ToPort: 9000
+      Description: PDFX backend private Sentry ingestion
+  SentryProxyIngestion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSentry
+    Properties:
+      GroupId: !Ref SentryIngestionSecurityGroupId
+      SourceSecurityGroupId: !Ref ProxySecurityGroup
+      IpProtocol: tcp
+      FromPort: 9000
+      ToPort: 9000
+      Description: PDFX proxy private Sentry ingestion
+  SsmSentryRuntimeSecret:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/sentry-runtime-secret-id"
+      Type: String
+      Value: !If [HasSentry, !Ref SentryRuntimeSecretArn, disabled]
+  SsmSentryProject:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/sentry-project"
+      Type: String
+      Value: !Ref SentryProject
+  SsmSentryEnvironment:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/sentry-environment"
+      Type: String
+      Value: !Ref EnvironmentName
   AuditBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Ref AuditBucketName
       LifecycleConfiguration:
         Rules:
+          - Id: pdfx-expire-pipeline-checkpoints
+            Status: Enabled
+            ExpirationInDays: !Ref PipelineRetentionDays
+            Prefix: !Sub "${PipelinePrefix}/"
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
           - Id: pdfx-expire-extracted-images
             Status: Enabled
             ExpirationInDays: !Ref ImageRetentionDays
@@ -529,13 +620,15 @@ Resources:
 
               # Scrub production storage values from copied env files before
               # appending mirror-scoped S3 settings below.
-              grep -vE '^(AUDIT_S3_BUCKET|AUDIT_S3_BUCKET_SSM_PARAM|AUDIT_S3_PREFIX|IMAGE_URL_TTL_SECONDS|IMAGE_RETENTION_TTL_SECONDS|AWS_DEFAULT_REGION)=' .env > .env.scrubbed || true
+              grep -vE '^(AUDIT_S3_BUCKET|AUDIT_S3_BUCKET_SSM_PARAM|AUDIT_S3_PREFIX|IMAGE_URL_TTL_SECONDS|IMAGE_RETENTION_TTL_SECONDS|PIPELINE_S3_BUCKET|PIPELINE_S3_PREFIX|AWS_DEFAULT_REGION)=' .env > .env.scrubbed || true
               mv .env.scrubbed .env
 
               cat >> .env <<ENV_EOF
               AUDIT_S3_BUCKET=${AuditBucket}
               AUDIT_S3_BUCKET_SSM_PARAM=/${SsmParameterPath}/audit-s3-bucket
               AUDIT_S3_PREFIX=${AuditPrefix}
+              PIPELINE_S3_BUCKET=${AuditBucket}
+              PIPELINE_S3_PREFIX=${PipelinePrefix}
               AWS_DEFAULT_REGION=${AWS::Region}
               IMAGE_URL_TTL_SECONDS=3600
               IMAGE_RETENTION_TTL_SECONDS=$(( ${ImageRetentionDays} * 86400 ))
@@ -562,6 +655,18 @@ Resources:
               PDFX_MIGRATE_DATABASE_URL="$(aws ssm get-parameter --region "${AWS::Region}" --with-decryption \
                 --name "/${SsmParameterPath}/database-url-migrate" --query Parameter.Value --output text)"
               export DATABASE_URL PDFX_MIGRATE_DATABASE_URL
+              if [ -n "${SentryRuntimeSecretArn}" ]; then
+                grep -vE '^SENTRY_(DSN|RUNTIME_SECRET_ID|PROJECT|RELEASE|ENVIRONMENT|ALLOW_INSECURE_DSN)=' .env > .env.sentry || true
+                mv .env.sentry .env
+                cat >> .env <<SENTRY_EOF
+              SENTRY_RUNTIME_SECRET_ID=${SentryRuntimeSecretArn}
+              SENTRY_PROJECT=${SentryProject}
+              SENTRY_ENVIRONMENT=${EnvironmentName}
+              SENTRY_RELEASE=pdfx@$PINNED_TAG
+              SENTRY_ALLOW_INSECURE_DSN=true
+              SENTRY_EOF
+              fi
+              chmod 0600 .env
               mkdir -p /opt/pdfx
               [ -f /opt/pdfx/rds-ca.pem ] || curl -fsSL \
                 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /opt/pdfx/rds-ca.pem
@@ -912,6 +1017,16 @@ Resources:
             - ContainerPort: 80
               Protocol: tcp
           Environment:
+            - Name: SENTRY_RUNTIME_SECRET_ID
+              Value: !If [HasSentry, !Ref SentryRuntimeSecretArn, ""]
+            - Name: SENTRY_PROJECT
+              Value: !Ref SentryProject
+            - Name: SENTRY_ENVIRONMENT
+              Value: !Ref EnvironmentName
+            - Name: SENTRY_RELEASE
+              Value: !Sub "pdfx@${ProxyImageTag}"
+            - Name: SENTRY_ALLOW_INSECURE_DSN
+              Value: !If [HasSentry, "true", "false"]
             - Name: QUEUE_BACKEND
               Value: s3
             - Name: QUEUE_S3_BUCKET

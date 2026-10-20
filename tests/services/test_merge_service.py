@@ -142,7 +142,7 @@ class FakeSelectorLLM:
         )
         response_choice = ordered_ids.index(selected_id)
         request_sha256 = hashlib.sha256(
-            f"{reason}\0{baseline_id}\0{'\0'.join(ordered_ids)}".encode()
+            ("\0".join([reason, baseline_id, *ordered_ids])).encode()
         ).hexdigest()
         self.selection_call_traces.append({
             "tier": "sol",
@@ -2403,3 +2403,15 @@ def test_saved_cases_report_no_model_italics_and_schema_diagnostics(case_id):
     assert isinstance(italic_evidence["auxiliary_positive_outcome_counts"], dict)
     assert len(italic_evidence["protected_claim_ids_sha256"]) == 64
     assert audit
+
+
+@pytest.mark.parametrize("renderer", ["render_document_role_slots", "project_native_emphasis"])
+def test_merge_renderers_do_not_swallow_operational_admission_errors(monkeypatch, renderer):
+    from app.pipeline_errors import ProviderAdmissionError
+
+    artifacts = {"grobid": SourceArtifact.from_text("grobid", "# Title\n\n## Results\n\nGene dpp is active.\n")}
+    def unavailable(*args, **kwargs):
+        raise ProviderAdmissionError("admission unavailable")
+    monkeypatch.setattr(merge_service_module, renderer, unavailable)
+    with pytest.raises(ProviderAdmissionError):
+        merge_source_artifacts(artifacts["grobid"].text, "", "", None, completion_evidence=completion_evidence_for_finished_artifacts(artifacts), baseline_requirements=FRAGMENT_REQUIREMENTS)

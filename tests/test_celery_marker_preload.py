@@ -73,5 +73,5 @@ def test_worker_main_preloads_before_starting_celery(monkeypatch):
     assert events == [
         "torch",
         "preload",
-        ("celery", ["worker", "--loglevel=info", "--pool=solo", "-Q", "default"]),
+        ("celery", ["worker", "--loglevel=info", "--pool=solo", "-Q", "pdfx.extraction"]),
     ]

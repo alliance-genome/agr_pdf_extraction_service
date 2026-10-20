@@ -76,12 +76,14 @@ ENV
   ( cd deploy && \
     PDFX_GPU_IMAGE="${BACKEND_IMAGE_REPO}:${BACKEND_IMAGE_TAG}" \
     PDFX_DEPLOY_BUILD_MODE=never PDFX_DEPLOY_PULL_IMAGES=always \
+    PDFX_DEPLOY_COMPOSE_OVERRIDE="$SERVICE_DIR/deploy/aws/ami/bake-s3.yml" \
     PDFX_PREWARM_MODELS=marker GPU_MODE=on ./deploy.sh )
 
   # Exercise every extractor, then force real OCR with an image-only PDF.
   # Run inside the app container to inspect the Celery result directly: the
   # public status can report complete even when one extractor failed, and its
-  # available_extractors list depends on S3 uploads (disabled during the bake).
+  # available_extractors list alone does not prove successful OCR. The bake's
+  # isolated S3 emulator exercises the durable stage handoff and artifact uploads.
   local warmup_dir
   warmup_dir="$(docker exec pdfx-app mktemp -d /tmp/pdfx-bake-warmup.XXXXXX)"
   for fixture in warmup.py test-sample.pdf test-scan.pdf; do
@@ -95,10 +97,11 @@ ENV
 
   assert_caches_nonempty "$SERVICE_DIR"
 
-  # SC2015: intentional best-effort teardown -- if manage.sh down is unavailable/fails,
-  # fall back to `docker compose down`; both are idempotent cleanup, so C-runs-when-A-true is fine.
-  # shellcheck disable=SC2015
-  ( cd deploy && GPU_MODE=on ./manage.sh down 2>/dev/null || docker compose -f docker-compose.gpu.yml -p pdfx down )
+  # Remove the isolated S3 emulator and all runtime volumes before the snapshot.
+  # Model caches are host directories and deliberately survive this teardown.
+  ( cd deploy && PDFX_GPU_IMAGE="${BACKEND_IMAGE_REPO}:${BACKEND_IMAGE_TAG}" \
+    docker compose -f docker-compose.gpu.yml -f aws/ami/bake-s3.yml -p pdfx down -v )
+  rm -rf "$SERVICE_DIR/data/cache/"* "$SERVICE_DIR/data/uploads/"* "$SERVICE_DIR/data/pipeline/"*
 
   # --- hygiene: strip all secrets/identity before snapshot ---
   rm -f "$SERVICE_DIR/.env"

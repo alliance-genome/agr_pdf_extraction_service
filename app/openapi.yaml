@@ -201,6 +201,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExtractionStatusResponse"
+        "404":
+          description: No authoritative extraction record exists for this process ID.
+        "503":
+          description: Authoritative status storage is unavailable; retry later.
   /extract/{process_id}/cancel:
     post:
       tags: [Extractions]
@@ -524,7 +528,7 @@ components:
                 - type: integer
                 - type: string
                   enum: [unknown]
-              description: Celery Redis default queue depth when available.
+              description: Combined extraction and finalization Redis queue depth when available.
             broker_unacked:
               oneOf:
                 - type: integer
@@ -549,10 +553,14 @@ components:
                 - type: string
                   enum: [unknown]
               description: Count of extraction runs currently marked queued.
-            worker_state:
+            pipeline_dispatcher:
               type: string
-              enum: [busy, busy_or_unresponsive]
-              description: Present when a solo worker is busy and cannot answer inspect. `busy_or_unresponsive` is retained for compatibility with older deployments.
+              enum: [ok, unavailable]
+              description: Fresh dispatcher heartbeat.
+            finalization_worker:
+              type: string
+              enum: [ok, unavailable]
+              description: Fresh CPU finalizer heartbeat.
 
     ExtractionListItem:
       type: object
@@ -664,8 +672,23 @@ components:
             - running
             - succeeded
             - cancelled
+        pipeline:
+          type: object
+          description: Durable stage state; completion is authoritative in PostgreSQL.
+          properties:
+            stage:
+              type: string
+              enum: [extraction, finalization]
+            state:
+              type: string
+              enum: [ready, dispatched, running, terminal]
+            generation:
+              type: integer
+        progress:
+          type: object
+          additionalProperties: true
         detail:
-          description: Celery PROGRESS payload.
+          description: Persisted stage progress payload.
           oneOf:
             - type: object
               additionalProperties: true

@@ -1,5 +1,28 @@
 import logging
+import hashlib
 import os
+
+# Stage workers run exactly one job per OS process. This context also covers
+# their internal extractor/provider threads; the HTTP servers never set it.
+_job_context = {}
+
+
+def set_job_context(process_id=None, stage=None, generation=None):
+    global _job_context
+    _job_context = ({"_process_id": process_id,
+                     "_process_hash": hashlib.sha256(process_id.encode()).hexdigest(),
+                     "_stage": stage, "_generation": generation} if process_id else {})
+
+
+class JobFormatter(logging.Formatter):
+    def format(self, record):
+        message = super().format(record)
+        context = _job_context
+        if context:
+            message += (f" [process_id={context['_process_id']} process_hash={context['_process_hash']}"
+                        f" stage={context['_stage']} generation={context['_generation']}]")
+        return message
+
 
 NOISY_LOGGERS = {
     "transformers": logging.ERROR,
@@ -89,7 +112,7 @@ def setup_logging(component="worker"):
     # Console handler (keep for local dev and docker logs)
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter(
+    console.setFormatter(JobFormatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     ))
     root.addHandler(console)

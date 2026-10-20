@@ -26,6 +26,9 @@ from app.status_reader import RDSStatusReader
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+from pdfx_observability import initialize, capture_failure
+initialize("proxy")
+
 # --- Singletons (initialized once) ---
 ec2_mgr = EC2Manager()
 lifecycle = LifecycleManager(ec2_mgr)
@@ -125,7 +128,13 @@ def _record_job_event(process_id: str, event: str, *, reason: str | None = None)
         logger.info("job=%s event=%s", process_id, event)
 
 
+class ProxyJobFailure(RuntimeError):
+    """A job failed in proxy submission/reconciliation rather than the worker."""
+
+
 def _mark_job_failed(process_id: str, reason: str) -> None:
+    if process_id not in replay_submission_errors:
+        capture_failure(ProxyJobFailure(reason), process_id=process_id, stage="proxy")
     replay_submission_errors[process_id] = reason
     _cleanup_cached_payload(process_id, delete_remote=True)
     with suppress(Exception):
@@ -242,6 +251,16 @@ def _positive_int(value: Any) -> int:
 def _active_jobs_from_backend_checks(checks: Any) -> int:
     if not isinstance(checks, dict):
         return 0
+    durable_count = checks.get("pipeline_active_jobs")
+    if (
+        checks.get("database") == "ok"
+        and isinstance(durable_count, int)
+        and not isinstance(durable_count, bool)
+        and durable_count >= 0
+    ):
+        # Broker deliveries may outlive cancelled/failed jobs until visibility
+        # timeout. They are transport diagnostics, not authoritative work.
+        return durable_count
     return max(
         _positive_int(checks.get("fresh_active_runs")),
         _positive_int(checks.get("queued_runs")),
@@ -356,7 +375,8 @@ async def _ensure_queued_jobs_replaying(reason: str, *, known_queued: bool = Fal
     """Start durable queued-job replay after restarts or queued-job polls."""
     try:
         queued_count = await asyncio.to_thread(lambda: job_queue.size)
-    except Exception:
+    except Exception as exc:
+        capture_failure(exc, stage="queue")
         logger.exception("Failed to inspect queued jobs for replay (%s)", reason)
         return
 
@@ -383,7 +403,8 @@ async def _sync_state_then_replay_startup_queue() -> None:
         await _ensure_queued_jobs_replaying("startup sync")
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
+        capture_failure(exc, stage="queue")
         logger.exception("Failed to start queued-job replay after startup sync")
 
 
@@ -525,6 +546,36 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PDFX Proxy", version="1.1.0", lifespan=lifespan)
+
+
+class ProxyRequestFailure(RuntimeError):
+    """A handled proxy request failed operationally."""
+
+
+@app.middleware("http")
+async def sentry_request_context(request: Request, call_next):
+    process_id = None
+    parts = request.url.path.split("/")
+    if len(parts) >= 5 and parts[1:4] == ["api", "v1", "extract"]:
+        try:
+            process_id = str(uuid.UUID(parts[4]))
+        except ValueError:
+            pass
+    # The SDK creates the request isolation scope before this middleware.
+    # Keep its scope so automatic exception reporting retains these tags, and
+    # let that integration capture unhandled exceptions exactly once.
+    import hashlib
+    import sentry_sdk
+    sentry_sdk.set_tag("pdfx.stage", "proxy")
+    if process_id:
+        sentry_sdk.set_tag("pdfx.process_hash", hashlib.sha256(process_id.encode()).hexdigest())
+    response = await call_next(request)
+    # A stopped/warming backend is an expected health response. Failed
+    # curator operations still need reporting even when caught by a route.
+    if response.status_code >= 500 and not request.url.path.startswith("/api/v1/health"):
+        capture_failure(ProxyRequestFailure("Proxy request failed"), process_id=process_id, stage="proxy")
+    return response
+
 
 
 @app.middleware("http")
@@ -1661,7 +1712,8 @@ async def _prepare_expired_queue_head() -> str:
         return "handled"
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
+        capture_failure(exc, stage="queue")
         logger.exception("Failed to reconcile expired queued job %s", job.job_id)
         return "defer"
     finally:
@@ -1816,14 +1868,16 @@ async def _reconciler_loop():
             await _cleanup_expired_durable_records()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            capture_failure(exc, stage="queue")
             logger.exception("Expired durable-status cleanup pass failed")
 
         try:
             await _ensure_queued_jobs_replaying("periodic durable queue sweep")
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            capture_failure(exc, stage="queue")
             logger.exception("Periodic durable queue replay sweep failed")
 
         for process_id, tracker in list(job_trackers.items()):

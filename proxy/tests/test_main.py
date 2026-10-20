@@ -41,6 +41,12 @@ def _patch_singletons(monkeypatch):
     mock_lifecycle.touch = MagicMock()
     monkeypatch.setattr("app.main.lifecycle", mock_lifecycle)
 
+    # Route tests must not inherit a workstation/CI database connection.
+    # Database behavior is patched per case; the dedicated PostgreSQL test
+    # constructs its own reader using PDFX_TEST_DATABASE_URL.
+    from app.status_reader import RDSStatusReader
+    monkeypatch.setattr("app.main.status_reader", RDSStatusReader(""))
+
     # Reset job queue
     from app.job_queue import JobQueue
     monkeypatch.setattr("app.main.job_queue", JobQueue(max_size=10))
@@ -619,6 +625,9 @@ class TestExtractStatusEndpoint:
 
     def test_queued_job_refreshes_health_snapshot_before_busy_message(self, client, monkeypatch):
         import app.main as main_mod
+        # This case checks the status response's refresh, not the replay loop's
+        # independent refresh; do not let background scheduling race the count.
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", MagicMock())
         main_mod.job_queue.enqueue("refresh-test-123", b"pdf", {})
         main_mod.lifecycle.state = InstanceState.READY
         main_mod.lifecycle.private_ip = "172.31.1.100"
@@ -2428,3 +2437,33 @@ class TestExtractCancelEndpoint:
 
         assert len(main_mod.cancelled_jobs) == main_mod.MAX_LOCAL_CANCELLED_JOBS
         assert "cancel-0" not in main_mod.cancelled_jobs
+
+
+@pytest.mark.asyncio
+async def test_sentry_reports_handled_operational_failure_but_not_stopped_health(monkeypatch):
+    import app.main as main_mod
+    from starlette.requests import Request
+    captured = []
+    monkeypatch.setattr(main_mod, 'capture_failure', lambda exc, **kw: captured.append(kw))
+    async def unavailable(request):
+        return JSONResponse({'detail': 'unavailable'}, status_code=503)
+    process_id = '00000000-0000-0000-0000-000000000001'
+    request = Request({'type': 'http', 'method': 'GET', 'path': '/api/v1/extract/' + process_id, 'headers': []})
+    await main_mod.sentry_request_context(request, unavailable)
+    assert captured == [{'process_id': process_id, 'stage': 'proxy'}]
+    captured.clear()
+    request = Request({'type': 'http', 'method': 'GET', 'path': '/api/v1/health', 'headers': []})
+    await main_mod.sentry_request_context(request, unavailable)
+    assert captured == []
+
+
+def test_durable_idle_accounting_ignores_stale_broker_deliveries():
+    from app.main import _active_jobs_from_backend_checks
+    checks = {'database': 'ok', 'pipeline_active_jobs': 0,
+              'fresh_active_runs': 0, 'queued_runs': 0,
+              'broker_queued': 3, 'broker_unacked': 5}
+    assert _active_jobs_from_backend_checks(checks) == 0
+    checks['pipeline_active_jobs'] = 2
+    assert _active_jobs_from_backend_checks(checks) == 2
+    checks['database'] = 'unavailable'
+    assert _active_jobs_from_backend_checks(checks) == 5

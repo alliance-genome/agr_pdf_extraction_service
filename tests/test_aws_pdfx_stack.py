@@ -323,3 +323,12 @@ def test_docling_ocr_backend_has_cpu_onnxruntime_requirement():
     requirements = REQUIREMENTS_PATH.read_text()
 
     assert "onnxruntime>=1.18,<2" in requirements
+
+
+@pytest.mark.parametrize("compose_path", [GPU_COMPOSE_PATH, CPU_COMPOSE_PATH])
+def test_stage_workers_are_not_namespace_init(compose_path):
+    import yaml
+
+    services = yaml.safe_load(compose_path.read_text())["services"]
+    for role in ("worker", "finalizer"):
+        assert services[role]["init"] is True

@@ -1,0 +1,8 @@
+**
+!proxy
+!proxy/requirements.txt
+!proxy/app
+!proxy/app/**
+!pdfx_observability.py
+**/__pycache__
+**/*.pyc

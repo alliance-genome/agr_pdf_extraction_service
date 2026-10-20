@@ -16,7 +16,6 @@ Endpoints:
     GET  /api/v1/extract/<process_id>/artifacts/urls    - Pre-signed URLs for all artifact keys
 """
 
-import io
 import os
 import uuid
 import json
@@ -24,7 +23,8 @@ import logging
 import contextlib
 from datetime import datetime, timedelta, timezone
 
-from flask import Blueprint, request, jsonify, send_file, current_app
+from pdfx_observability import capture_failure
+from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from werkzeug.utils import secure_filename
@@ -32,11 +32,8 @@ from werkzeug.utils import secure_filename
 from config import Config
 from app.error_utils import summarize_error_message
 from app.image_metadata import copy_image_metadata, normalize_image_manifest_entry
-from app.models import ExtractionRun, get_session, update_extraction_run_if_nonterminal
+from app.models import ExtractionRun, PipelineJob, get_session, update_extraction_run_if_nonterminal
 from app.services.audit_logger import build_s3_client
-from app.services.merge_artifact import load_merge_bundle
-from app.services.page_provenance import merged_page_provenance_path
-from app.services.source_contracts import SourceArtifact
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +206,7 @@ def _claim_submission(
         current = db_session.get(ExtractionRun, process_id)
         return None, _run_submission_snapshot(current), None
     except Exception as exc:
+        capture_failure(exc, process_id=process_id, stage="api")
         logger.warning("Failed to claim extraction submission %s: %s", process_id, exc)
         with contextlib.suppress(Exception):
             db_session.rollback()
@@ -328,6 +326,7 @@ def _get_run_by_process_id(process_id):
             "llm_cost_usd": float(run.llm_cost_usd) if run.llm_cost_usd is not None else None,
         }
     except Exception as exc:
+        capture_failure(exc, process_id=process_id, stage="api")
         logger.warning("Failed to query extraction_run for %s: %s", process_id, exc)
         return None
     finally:
@@ -381,6 +380,21 @@ def _count_fresh_running_runs():
             db_session.close()
         except Exception:
             pass
+
+
+def _count_unfinished_pipeline_jobs():
+    db_session = _get_db_session()
+    if not db_session:
+        return "unknown"
+    try:
+        return db_session.query(PipelineJob).filter(
+            PipelineJob.state != "terminal"
+        ).count()
+    except Exception:
+        logger.warning("Failed to count durable unfinished pipeline jobs")
+        return "unknown"
+    finally:
+        db_session.close()
 
 
 def _check_db_ready():
@@ -607,23 +621,18 @@ def health():
         r = redis.from_url(current_app.config["CELERY_BROKER_URL"])
         r.ping()
         checks["redis"] = "ok"
-        checks["broker_queued"] = _redis_default_queue_depth(r)
+        checks["broker_queued"] = sum(r.llen(queue) for queue in ("pdfx.extraction", "pdfx.finalization"))
         checks["broker_unacked"] = _redis_unacked_count(r)
     except Exception:
         checks["redis"] = "unavailable"
         checks["broker_queued"] = "unknown"
         checks["broker_unacked"] = "unknown"
 
-    # Celery workers
-    try:
-        from celery_app import celery
-        inspector = celery.control.inspect(timeout=2)
-        # Count live worker nodes, not active tasks.
-        # `active()` can be empty when workers are idle.
-        ping = inspector.ping() if inspector else None
-        checks["workers"] = len(ping) if ping else 0
-    except Exception:
-        checks["workers"] = "unknown"
+    from app.pipeline_health import fresh
+    checks["pipeline_dispatcher"] = "ok" if fresh("dispatcher") else "unavailable"
+    checks["extraction_worker"] = "ok" if fresh("extraction") else "unavailable"
+    checks["finalization_worker"] = "ok" if fresh("finalization") else "unavailable"
+    checks["workers"] = sum(fresh(role) for role in ("extraction", "finalization"))
 
     db_status, db_error = _check_db_ready()
     checks["database"] = db_status
@@ -637,47 +646,29 @@ def health():
             checks["marker_models_error"] = marker_error
 
     if db_status == "ok":
+        checks["pipeline_active_jobs"] = _count_unfinished_pipeline_jobs()
         checks["active_runs"] = _count_runs_by_status(["running"])
         checks["fresh_active_runs"] = _count_fresh_running_runs()
         checks["queued_runs"] = _count_runs_by_status(["queued"])
     else:
+        checks["pipeline_active_jobs"] = "unknown"
         checks["active_runs"] = "unknown"
         checks["fresh_active_runs"] = "unknown"
         checks["queued_runs"] = "unknown"
 
     overall = "ok"
+    if any(checks[key] != "ok" for key in ("pipeline_dispatcher", "extraction_worker", "finalization_worker")):
+        overall = "unhealthy"
     if checks["grobid"] != "ok" or checks["redis"] != "ok":
         overall = "degraded"
     if checks["database"] != "ok":
         overall = "unhealthy"
     if checks.get("marker_models") not in {None, "ok"}:
         overall = "unhealthy"
-    if checks["workers"] == "unknown" and overall != "unhealthy":
-        overall = "degraded"
     if checks["redis"] == "unavailable":
         overall = "unhealthy"
-    if isinstance(checks["workers"], int) and checks["workers"] <= 0:
-        dependencies_accept_submissions = (
-            checks["grobid"] == "ok"
-            and checks["redis"] == "ok"
-            and checks["database"] == "ok"
-            and checks.get("marker_models") in {None, "ok"}
-        )
-        busy_solo_worker = (
-            dependencies_accept_submissions
-            and isinstance(checks["fresh_active_runs"], int)
-            and checks["fresh_active_runs"] > 0
-            and isinstance(checks["broker_unacked"], int)
-            and checks["broker_unacked"] > 0
-        )
-        if busy_solo_worker:
-            # Solo Celery workers cannot respond to inspect while processing a
-            # PDF. Redis still accepts queued work, and the unacked broker task
-            # confirms the running DB row is not merely stale.
-            checks["worker_state"] = "busy"
-            overall = "busy"
-        else:
-            overall = "unhealthy"
+    if any(checks[key] != "ok" for key in ("pipeline_dispatcher", "extraction_worker", "finalization_worker")):
+        overall = "unhealthy"
 
     status_code = 200 if overall != "unhealthy" else 503
     return jsonify({"status": overall, "checks": checks}), status_code
@@ -774,6 +765,7 @@ def list_extractions():
         }), 200
 
     except Exception as exc:
+        capture_failure(exc, stage="api")
         logger.warning("Failed to list extraction runs: %s", exc)
         return jsonify({"error": "Failed to query extraction runs"}), 500
     finally:
@@ -864,42 +856,34 @@ def submit_extraction():
     filename = secure_filename(file.filename)
     upload_dir = current_app.config["UPLOAD_FOLDER"]
     os.makedirs(upload_dir, exist_ok=True)
-    pdf_path = os.path.join(upload_dir, f"{process_id}_{filename}")
+    pdf_path = os.path.join(upload_dir, f"{process_id}_{uuid.uuid4().hex}.pdf")
     try:
         file.save(pdf_path)
     except Exception as exc:
         _mark_submission_failed(process_id, claimed_at, "Failed to persist uploaded PDF before publish")
+        capture_failure(exc, process_id=process_id, stage="api")
         logger.error("Failed to save uploaded PDF for %s: %s", process_id, exc)
         return jsonify({"process_id": process_id, "error": "Failed to persist uploaded PDF."}), 500
 
-    # --- Publish only after winning the durable submission claim --------------
-    from celery_app import extract_pdf
-
+    # Durable object + dispatch row are accepted independently of broker health.
+    from app.pipeline import accept
+    from app.pipeline_storage import PipelineStore
+    from pdfx_observability import stage_scope
     try:
-        task = extract_pdf.apply_async(
-            args=[pdf_path, methods],
-            kwargs={
-                "merge": merge,
-                "clear_cache": clear_cache,
-                "clear_cache_scope": clear_cache_scope,
-                "extract_images": extract_images,
-                "review_images": review_images,
-                "process_id": process_id,
-                "reference_curie": reference_curie,
+        with stage_scope(process_id, "submission"):
+            source = PipelineStore().put_file(pdf_path, f"{process_id}/source")
+            accept(process_id, source, {
+                "methods": methods, "merge": merge, "extract_images": extract_images,
+                "review_images": review_images, "reference_curie": reference_curie,
                 "mod_abbreviation": mod_abbreviation,
-            },
-            task_id=process_id,
-        )
+            }, claimed_at)
     except Exception as exc:
-        logger.error("Failed to enqueue extraction task: %s", exc)
-        if os.path.exists(pdf_path):
+        capture_failure(exc, process_id=process_id, stage="submission")
+        _mark_submission_failed(process_id, claimed_at, "Failed to commit durable extraction submission")
+        return jsonify({"process_id": process_id, "error": "Durable submission unavailable; retry with the same process_id."}), 503
+    finally:
+        with contextlib.suppress(FileNotFoundError):
             os.remove(pdf_path)
-        _mark_submission_failed(process_id, claimed_at, "Failed to publish extraction task")
-        return jsonify({"error": "Failed to enqueue extraction task. Is Redis available?"}), 503
-
-    # Only the owner of this exact pre-publish claim may move it to queued.
-    # A worker that already changed it to running is deliberately not reset.
-    _finish_submission_claim(process_id, claimed_at)
 
     logger.info(
         "Queued extraction %s for %s (methods=%s, merge=%s, clear_cache_scope=%s, extract_images=%s, review_images=%s, reference_curie=%s, mod=%s)",
@@ -936,9 +920,8 @@ def get_extraction_status(process_id):
     """
     Poll an extraction run by process_id.
 
-    Primary source is the extraction_run DB table. Falls back to Celery
-    result backend if the DB row hasn't been created yet (brief window
-    between enqueue and worker startup, or if DB was temporarily unavailable).
+    The committed database record is authoritative. Unknown IDs return 404;
+    database outages return 503 rather than manufacturing broker-based state.
     """
     run = _get_run_by_process_id(process_id)
     if run is not None:
@@ -968,130 +951,31 @@ def get_extraction_status(process_id):
             response["error_code"] = run["error_code"]
             response["error"] = summarize_error_message(run["error_message"])
 
-        # For non-terminal DB states, reconcile with Celery truth to avoid stale "pending".
-        if run["status"] in {"queued", "running"}:
-            try:
-                from celery_app import celery
-                result = celery.AsyncResult(process_id)
-                if result.state == "SUCCESS":
-                    response["status"] = "complete"
-                    if isinstance(result.result, dict):
-                        response["reference_curie"] = result.result.get("reference_curie") or response["reference_curie"]
-                        response["started_at"] = result.result.get("started_at") or response["started_at"]
-                        response["ended_at"] = result.result.get("ended_at") or response["ended_at"]
-                        response["log_s3_key"] = result.result.get("log_s3_key") or response["log_s3_key"]
-                        response["artifacts_json"] = result.result.get("artifacts_json") or response["artifacts_json"]
-                        response["image_count"] = _count_images(result.result) or response["image_count"]
-                        response["extract_images"] = result.result.get("extract_images", response["extract_images"])
-                        response["review_images"] = result.result.get("review_images", response["review_images"])
-                        response["llm_usage_json"] = result.result.get("llm_usage_json") or response["llm_usage_json"]
-                        response["llm_cost_usd"] = result.result.get("llm_cost_usd") or response["llm_cost_usd"]
-                        response["available_extractors"] = sorted(
-                            method
-                            for method in result.result.get("available_extractors", [])
-                            if method in VALID_METHODS
-                        )
-                    return jsonify(response), 200
-
-                if result.state == "FAILURE":
-                    response["status"] = "failed"
-                    response["error"] = summarize_error_message(result.info)
-                    return jsonify(response), 200
-                if result.state == "REVOKED":
-                    response["status"] = "cancelled"
-                    response["error"] = run.get("error_message") or "Extraction cancelled"
-                    return jsonify(response), 200
-
-                if result.state == "STARTED":
-                    response["status"] = "started"
-
-                if result.state == "PROGRESS" and result.info:
-                    info = result.info
-                    response["status"] = "progress"
-                    response["progress"] = {
-                        "stage": info.get("stage", info.get("step", "unknown")),
-                        "stage_display": info.get("stage_display", ""),
-                        "stages_completed": info.get("stages_completed", []),
-                        "stages_pending": info.get("stages_pending", []),
-                        "stages_total": info.get("stages_total", 0),
-                        "stages_done": info.get("stages_done", 0),
-                        "percent": info.get("percent", 0),
-                    }
-            except Exception as exc:
-                logger.debug("Could not fetch Celery state for %s: %s", process_id, exc)
+        # Durable pipeline state owns completion; intermediate task results cannot
+        # turn an extraction checkpoint into a completed document.
+        from app.pipeline import snapshot
+        pipeline_job = snapshot(process_id)
+        if pipeline_job:
+            response["pipeline"] = {
+                "stage": pipeline_job["stage"], "state": pipeline_job["state"],
+                "generation": pipeline_job["generation"],
+                "created_at": _to_iso(pipeline_job["created_at"]),
+                "deadline_at": _to_iso(pipeline_job["deadline_at"]),
+                "stage_started_at": _to_iso(pipeline_job["stage_started_at"]),
+                "extraction_ended_at": _to_iso(pipeline_job["extraction_ended_at"]),
+            }
+            if pipeline_job["progress"]:
+                response["progress"] = pipeline_job["progress"]
 
         if run["status"] == "failed":
             return jsonify(response), 200
 
         return jsonify(response), 200
 
-    # Celery fallback: DB row may not exist yet if the worker hasn't
-    # started or if the DB was temporarily unavailable at enqueue time.
-    from celery_app import celery
-
-    result = celery.AsyncResult(process_id)
-
-    if result.state == "PENDING":
-        return jsonify({"process_id": process_id, "status": "pending"}), 200
-
-    if result.state == "STARTED":
-        return jsonify({"process_id": process_id, "status": "started"}), 200
-
-    if result.state == "PROGRESS":
-        info = result.info or {}
-        return jsonify({
-            "process_id": process_id,
-            "status": "progress",
-            "progress": {
-                "stage": info.get("stage", info.get("step", "unknown")),
-                "stage_display": info.get("stage_display", ""),
-                "stages_completed": info.get("stages_completed", []),
-                "stages_pending": info.get("stages_pending", []),
-                "stages_total": info.get("stages_total", 0),
-                "stages_done": info.get("stages_done", 0),
-                "percent": info.get("percent", 0),
-            },
-            "detail": info,
-        }), 200
-
-    if result.state == "SUCCESS":
-        payload = {
-            "process_id": process_id,
-            "status": "complete",
-            "result": result.result,
-        }
-        if isinstance(result.result, dict):
-            payload["reference_curie"] = result.result.get("reference_curie")
-            payload["extract_images"] = result.result.get("extract_images", False)
-            payload["review_images"] = result.result.get("review_images", False)
-            payload["started_at"] = result.result.get("started_at")
-            payload["ended_at"] = result.result.get("ended_at")
-            payload["log_s3_key"] = result.result.get("log_s3_key")
-            payload["image_count"] = _count_images(result.result)
-            payload["available_extractors"] = sorted(
-                method
-                for method in result.result.get("available_extractors", [])
-                if method in VALID_METHODS
-            )
-        return jsonify(payload), 200
-
-    if result.state == "FAILURE":
-        return jsonify({
-            "process_id": process_id,
-            "status": "failed",
-            "error": summarize_error_message(result.info),
-        }), 200
-    if result.state == "REVOKED":
-        return jsonify({
-            "process_id": process_id,
-            "status": "cancelled",
-            "message": "Extraction cancelled",
-        }), 200
-
-    return jsonify({
-        "process_id": process_id,
-        "status": result.state.lower(),
-    }), 200
+    db_status, _ = _check_db_ready()
+    if db_status != "ok":
+        return jsonify({"process_id": process_id, "error": "Authoritative status database unavailable"}), 503
+    return jsonify({"process_id": process_id, "error": "Extraction not found"}), 404
 
 
 @api.route("/extract/<process_id>/cancel", methods=["POST"])
@@ -1106,14 +990,12 @@ def cancel_extraction(process_id):
             "message": f"Job already terminal ({run['status']})",
         }), 409
 
-    from celery_app import celery
-
-    try:
-        celery.control.revoke(process_id, terminate=True, signal="SIGTERM")
-    except Exception as exc:
-        logger.warning("Failed to revoke extraction task %s: %s", process_id, exc)
-
-    transitioned = _mark_run_cancelled(process_id, reason)
+    from app.pipeline import cancel
+    transitioned = cancel(process_id, reason)
+    if transitioned is None:
+        transitioned = _mark_run_cancelled(process_id, reason)
+    # Commit cancellation before signaling the process; watchdogs observe the DB
+    # fence and stop running work even when broker control messages are lost.
     if not transitioned:
         current = _get_run_by_process_id(process_id)
         if current and current["status"] in {"succeeded", "failed", "cancelled"}:
@@ -1231,184 +1113,24 @@ def download_result(process_id, method):
     Download the full markdown output for a completed extraction.
 
     The method can be an extractor, 'merged', 'audit', or 'page_provenance'.
-    Tries local cache first, falls back to S3 artifact if cache is missing.
+    Uses the artifact keys from the authoritative completed database record.
     """
     if method not in (*VALID_METHODS, "merged", "audit", "page_provenance"):
         return jsonify({"error": f"Invalid method: {method}"}), 400
 
-    from celery_app import celery
-
-    # Try local cache via Celery result
-    result = celery.AsyncResult(process_id)
-    if result.state == "SUCCESS":
-        data = result.result
-        download_paths = data.get("download_paths", {})
-        file_hash = data.get("file_hash", "")
-        verified_merge_payload = None
-        local_merge_verification_failed = False
-
-        if method in {"merged", "audit", "page_provenance"} and data.get("merged_cache_path"):
-            contract_id = data.get("merge_contract_id")
-            merged_path = data.get("merged_cache_path")
-            metrics_path = data.get("merge_metrics_path")
-            audit_path = data.get("merge_audit_path")
-            native_receipts = data.get("native_structure_receipt_digests")
-            skeleton_ids = data.get("document_skeleton_candidate_ids")
-            skeleton_projection_ids = data.get(
-                "document_skeleton_candidate_projection_ids"
-            )
-            pdf_sha256 = data.get("pdf_sha256")
-            source_page_map_sha256 = data.get("source_page_map_sha256")
-            if not all((contract_id, merged_path, metrics_path, audit_path)) or not all(
-                isinstance(value, dict)
-                for value in (
-                    native_receipts,
-                    skeleton_ids,
-                    skeleton_projection_ids,
-                    source_page_map_sha256,
-                )
-            ) or not isinstance(pdf_sha256, str):
-                local_merge_verification_failed = True
-                logger.warning(
-                    "Merge download bundle metadata is incomplete for %s; "
-                    "trying durable artifact",
-                    process_id,
-                )
-            else:
-                try:
-                    artifacts = {}
-                    completed_sources = data.get("available_extractors")
-                    if not isinstance(completed_sources, list):
-                        raise ValueError("merge result completed source set is invalid")
-                    completed_sources = [
-                        source
-                        for source in completed_sources
-                        if source in VALID_METHODS
-                    ]
-                    if not completed_sources:
-                        raise ValueError("merge result has no completed source set")
-                    for source in completed_sources:
-                        source_path = download_paths.get(source)
-                        if not source_path:
-                            raise ValueError(f"missing merge source path: {source}")
-                        with open(source_path, "r", encoding="utf-8") as handle:
-                            artifacts[source] = SourceArtifact.from_text(
-                                source, handle.read()
-                            )
-                    merged_text, _metrics, merge_audit = load_merge_bundle(
-                        merged_path=merged_path,
-                        metrics_path=metrics_path,
-                        audit_path=audit_path,
-                        artifacts=artifacts,
-                        expected_contract_id=contract_id,
-                        expected_native_structure_receipt_digests=native_receipts,
-                        expected_skeleton_candidate_ids=skeleton_ids,
-                        expected_skeleton_candidate_projection_ids=(
-                            skeleton_projection_ids
-                        ),
-                        expected_pdf_sha256=pdf_sha256,
-                        expected_source_page_map_sha256=source_page_map_sha256,
-                    )
-                    if method == "merged":
-                        verified_merge_payload = merged_text.encode("utf-8")
-                    elif method == "audit":
-                        verified_merge_payload = json.dumps(
-                            merge_audit,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    else:
-                        verified_merge_payload = merged_page_provenance_path(
-                            merged_path
-                        ).read_bytes()
-                except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
-                    local_merge_verification_failed = True
-                    logger.warning(
-                        "Merge download bundle verification failed for %s: %s; "
-                        "trying durable artifact",
-                        process_id,
-                        type(exc).__name__,
-                    )
-
-        if method == "merged":
-            filepath = data.get("merged_cache_path")
-        elif method == "audit":
-            filepath = download_paths.get("audit")
-        elif method == "page_provenance":
-            filepath = download_paths.get("page_provenance")
-        else:
-            filepath = download_paths.get(method)
-
-        local_file_available = (
-            method not in {"merged", "audit", "page_provenance"}
-            and filepath
-            and os.path.exists(filepath)
-        )
-        if verified_merge_payload is not None or local_file_available:
-            if method in {"audit", "page_provenance"}:
-                download_name = f"{file_hash}_{method}.json"
-                mimetype = "application/json"
-            else:
-                download_name = f"{file_hash}_{method}.md"
-                mimetype = "text/markdown"
-            return send_file(
-                io.BytesIO(verified_merge_payload)
-                if verified_merge_payload is not None
-                else filepath,
-                as_attachment=True,
-                download_name=download_name,
-                mimetype=mimetype,
-            )
-
-        celery_s3_key = _find_artifact_s3_key(
-            data.get("artifacts_json"),
-            method,
-        )
-        if celery_s3_key:
-            response = _s3_redirect_for_artifact(celery_s3_key)
-            if response:
-                return response
-
-    # Fallback: look up S3 artifact from DB
     run = _get_run_by_process_id(process_id)
     if run is None:
-        if (
-            method in {"merged", "audit", "page_provenance"}
-            and result.state == "SUCCESS"
-            and local_merge_verification_failed
-        ):
-            return jsonify({
-                "error": "Completed merge artifact is internally unavailable"
-            }), 500
         return jsonify({"error": "process_id not found"}), 404
-
-    known_completed_merge = (
-        method in {"merged", "audit", "page_provenance"}
-        and result.state == "SUCCESS"
-        and local_merge_verification_failed
-    )
-
-    if (
-        run["status"] not in ("succeeded", "complete")
-        and not known_completed_merge
-    ):
+    if run["status"] not in ("succeeded", "complete"):
         return jsonify({"error": "Job not complete yet.", "status": run["status"]}), 409
-
     s3_key = _find_artifact_s3_key(run.get("artifacts_json"), method)
     if s3_key:
-        resp = _s3_redirect_for_artifact(s3_key)
-        if resp:
-            return resp
-
-    if method in {"merged", "audit", "page_provenance"} and (
-        known_completed_merge
-        or run.get("consensus_metrics_json") is not None
-    ):
-        return jsonify({
-            "error": "Completed merge artifact is internally unavailable"
-        }), 500
-
+        response = _s3_redirect_for_artifact(s3_key)
+        if response:
+            return response
+        return jsonify({"error": "Durable artifact storage unavailable"}), 503
+    if method in {"merged", "audit", "page_provenance"} and run.get("consensus_metrics_json") is not None:
+        return jsonify({"error": "Completed merge artifact is internally unavailable"}), 500
     return jsonify({"error": f"Output file not found for method: {method}"}), 404
 
 
@@ -1420,17 +1142,8 @@ def download_result(process_id, method):
 def list_job_images(process_id):
     """List extracted images for a completed job.
 
-    Tries Celery result first, falls back to DB artifacts_json.
+    Uses the authoritative completed database record.
     """
-    from celery_app import celery
-
-    result = celery.AsyncResult(process_id)
-    if result.state == "SUCCESS":
-        data = result.result
-        images = data.get("images", [])
-        return jsonify({"process_id": process_id, "images": images}), 200
-
-    # Fallback: DB artifacts
     run = _get_run_by_process_id(process_id)
     if run is None:
         return jsonify({"error": "process_id not found"}), 404
@@ -1512,26 +1225,8 @@ def get_job_image_urls(process_id):
 def download_job_image(process_id, filename):
     """Download a single extracted image for a completed job.
 
-    Tries local cache first, falls back to S3 artifact.
+    Uses the artifact keys from the authoritative completed database record.
     """
-    from celery_app import celery
-    from werkzeug.utils import safe_join
-    from app.utils import get_images_dir
-
-    # Try local cache via Celery result
-    result = celery.AsyncResult(process_id)
-    if result.state == "SUCCESS":
-        data = result.result
-        file_hash = data.get("file_hash", "")
-        images_dir = get_images_dir(file_hash)
-        filepath = safe_join(images_dir, filename)
-        if filepath and os.path.isfile(filepath):
-            if os.path.realpath(filepath).startswith(os.path.realpath(images_dir)):
-                import mimetypes
-                mime = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
-                return send_file(filepath, mimetype=mime)
-
-    # Fallback: S3 artifact from DB
     run = _get_run_by_process_id(process_id)
     if run is None:
         return jsonify({"error": "process_id not found"}), 404

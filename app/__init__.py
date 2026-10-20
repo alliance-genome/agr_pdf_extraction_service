@@ -6,10 +6,23 @@ from app.services.model_policy import validate_runtime_model_policy
 
 
 def create_app():
+    from pdfx_observability import initialize
+    initialize("api")
     setup_logging(component="app")
     validate_runtime_model_policy()
     app = Flask(__name__)
     app.config.from_object(Config)
+
+    @app.before_request
+    def correlate_sentry_request():
+        import hashlib
+        import sentry_sdk
+        from flask import request
+        sentry_sdk.set_tag("pdfx.stage", "api")
+        process_id = (request.view_args or {}).get("process_id")
+        if process_id:
+            sentry_sdk.set_tag("pdfx.process_hash", hashlib.sha256(str(process_id).encode()).hexdigest())
+
 
     os.makedirs(app.config["CACHE_FOLDER"], exist_ok=True)
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)

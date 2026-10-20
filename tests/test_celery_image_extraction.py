@@ -587,10 +587,13 @@ def test_upload_artifacts_records_durable_merged_output(tmp_path, monkeypatch):
     merged_path = tmp_path / "v1_hash_docling_merged.md"
     merged_path.write_text("# Title\n\nMerged.", encoding="utf-8")
     Path(f"{merged_path}.page-provenance.json").write_bytes(b"{}\n")
+    audit_path = tmp_path / "audit.md"
+    audit_path.write_bytes(b"Scientific audit")
 
     class EnabledAuditLogger:
         def upload_artifact(self, filename, content, subdir=None, tags=None):
             expected = {
+                "audit.md": b"Scientific audit",
                 "merged.md": b"# Title\n\nMerged.",
                 "page_provenance.json": b"{}\n",
             }
@@ -602,16 +605,45 @@ def test_upload_artifacts_records_durable_merged_output(tmp_path, monkeypatch):
         {
             "file_hash": "hash",
             "merged_cache_path": str(merged_path),
-            "download_paths": {},
+            "download_paths": {"audit": str(audit_path)},
             "images": [],
         },
         merge=True,
     )
 
     assert artifacts["merged"] == "pdfx/audit/process/merged.md"
+    assert artifacts["audit"] == "pdfx/audit/process/audit.md"
     assert artifacts["page_provenance"] == (
         "pdfx/audit/process/page_provenance.json"
     )
+
+
+@pytest.mark.parametrize("failure", ["exception", "empty_receipt", "missing_file"])
+def test_upload_artifacts_requires_scientific_audit(tmp_path, failure):
+    merged = tmp_path / "merged.md"
+    merged.write_text("merged")
+    Path(f"{merged}.page-provenance.json").write_text("{}")
+    audit = tmp_path / "audit.md"
+    if failure != "missing_file":
+        audit.write_text("scientific audit")
+
+    class SelectiveFailure:
+        def upload_artifact(self, filename, content, **kwargs):
+            if filename == "audit.md":
+                if failure == "exception":
+                    raise OSError("audit upload failed")
+                return None
+            return "durable/" + filename
+
+    with pytest.raises(RuntimeError, match="durable merged audit"):
+        celery_app._upload_artifacts(
+            SelectiveFailure(),
+            {
+                "merged_cache_path": str(merged),
+                "download_paths": {"audit": str(audit)},
+            },
+            merge=True,
+        )
 
 
 def test_review_images_with_text_context_applies_llm_decision(monkeypatch):
@@ -717,3 +749,33 @@ def test_skipping_image_review_strips_cached_llm_metadata(tmp_path, monkeypatch)
     assert image["image_review_method"] is None
     assert image["image_review_classification"] is None
     assert "llm_cost_usd" not in result
+
+
+def test_native_receipt_is_not_published_when_required_style_upload_fails(tmp_path, monkeypatch):
+    import app.services.native_extractor_artifact as native
+    output = tmp_path / 'docling.md'
+    output.write_text('# Source')
+    receipt = tmp_path / 'receipt.json'
+    receipt.write_text('{}')
+    manifest = {'native_filename': 'native.json', 'page_provenance_filename': 'pages.json',
+                'native_style_filename': 'style.json', 'page_provenance_sha256': 'pages',
+                'native_sha256': 'native', 'native_media_type': 'application/json'}
+    monkeypatch.setattr(celery_app, 'load_native_extractor_artifact', lambda **kw: (manifest, b'{}'))
+    monkeypatch.setattr(celery_app, 'native_manifest_path', lambda *a: receipt)
+    monkeypatch.setattr(celery_app, 'source_page_provenance_path', lambda *a: receipt)
+    monkeypatch.setattr(native, 'native_style_artifact_path', lambda *a: receipt)
+    audit = SimpleNamespace(upload_artifact=lambda name, *a, **kw: None if name == 'style.json' else 'key/' + name)
+    artifacts = celery_app._upload_artifacts(audit, {'download_paths': {'docling': str(output)}, 'images': []}, False)
+    assert 'docling' not in artifacts.get('native', {})
+
+
+def test_image_review_does_not_swallow_provider_admission_failure():
+    from app.pipeline_errors import ProviderAdmissionError
+    from types import SimpleNamespace
+
+    def unavailable(image):
+        raise ProviderAdmissionError("admission unavailable")
+    with pytest.raises(ProviderAdmissionError):
+        celery_app._review_images_with_text_context(
+            [{"filename": "figure.png"}], SimpleNamespace(review_image_context=unavailable)
+        )

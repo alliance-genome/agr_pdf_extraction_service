@@ -1,19 +1,13 @@
 import os
-import uuid
 import time
 import json
 import logging
-import threading
-from collections import Counter
-from contextlib import contextmanager, suppress
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 from celery import Celery
-from celery.exceptions import Ignore, Retry
 from celery.signals import setup_logging as celery_setup_logging, worker_process_init
-from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
 
 from config import Config
 from app.error_utils import summarize_error_message
@@ -26,15 +20,8 @@ from app.image_metadata import (
     strip_text_image_review,
     write_image_manifest,
 )
-from app.models import (
-    ExtractionRun,
-    TERMINAL_EXTRACTION_STATUSES,
-    get_engine,
-    get_session,
-    update_extraction_run_if_nonterminal,
-)
-from app.services.audit_logger import AuditLogger
-from app.logging_config import setup_logging, MergingLoggerAdapter
+
+from app.logging_config import setup_logging
 from app.services.model_policy import validate_runtime_model_policy
 from app.services.merge_artifact import (
     load_merge_bundle,
@@ -63,8 +50,6 @@ from app.services.page_provenance import (
 
 logger = logging.getLogger(__name__)
 _torch_worker_configured = False
-_sqlite_attempt_locks: dict[str, threading.Lock] = {}
-_sqlite_attempt_locks_guard = threading.Lock()
 EXTRACTOR_METHODS = ("grobid", "docling", "marker")
 
 
@@ -210,6 +195,7 @@ celery = Celery(
 )
 
 celery.conf.update(
+    imports=("app.pipeline_tasks",),
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
@@ -217,11 +203,22 @@ celery.conf.update(
     task_track_started=True,
     task_acks_late=True,
     task_reject_on_worker_lost=Config.TASK_REJECT_ON_WORKER_LOST,
-    task_default_queue="default",  # explicit: workers listen on -Q default
+    task_default_queue="pdfx.unrouted",
     worker_prefetch_multiplier=1,  # one job at a time per worker process
     task_soft_time_limit=Config.TASK_SOFT_TIME_LIMIT_SECONDS,
     task_time_limit=Config.TASK_HARD_TIME_LIMIT_SECONDS,
 )
+
+
+from celery.signals import worker_ready
+
+
+@worker_ready.connect
+def _pipeline_worker_ready(**kwargs):
+    role = os.environ.get("PDFX_WORKER_ROLE")
+    if role in {"extraction", "finalization"}:
+        from app.pipeline_health import start
+        start(role)
 
 
 # ---------------------------------------------------------------------------
@@ -247,19 +244,6 @@ def _gpu_snapshot():
 # ---------------------------------------------------------------------------
 # Helpers (standalone -- no Flask app context needed)
 # ---------------------------------------------------------------------------
-
-def _now_utc():
-    return datetime.now(timezone.utc)
-
-
-def _safe_close_session(session):
-    if not session:
-        return
-    try:
-        session.close()
-    except Exception:
-        pass
-
 
 def _get_file_hash(file_path):
     """MD5 hash of a file."""
@@ -425,222 +409,6 @@ def _clear_cached_outputs(file_hash, clear_cache_scope):
     }
 
 
-def _get_db_session():
-    try:
-        return get_session()
-    except Exception as exc:
-        logger.warning("Database unavailable for extraction tracking: %s", exc)
-        return None
-
-
-def _upsert_extraction_run(
-    db_session,
-    process_id,
-    reference_curie=None,
-    mod_abbreviation=None,
-    source_pdf_md5=None,
-    source_referencefile_id=None,
-    config_version=None,
-    extract_images=None,
-    review_images=None,
-    status=None,
-    started_at=None,
-    ended_at=None,
-    error_code=None,
-    error_message=None,
-    artifacts_json=None,
-    consensus_metrics_json=None,
-    log_s3_key=None,
-    llm_usage_json=None,
-    llm_cost_usd=None,
-):
-    if not db_session:
-        return None
-
-    run = db_session.get(ExtractionRun, process_id)
-    values = {}
-    if reference_curie is not None:
-        values[ExtractionRun.reference_curie] = reference_curie
-    if mod_abbreviation is not None:
-        values[ExtractionRun.mod_abbreviation] = mod_abbreviation
-    if source_pdf_md5 is not None:
-        values[ExtractionRun.source_pdf_md5] = source_pdf_md5
-    if source_referencefile_id is not None:
-        values[ExtractionRun.source_referencefile_id] = source_referencefile_id
-    if config_version is not None:
-        values[ExtractionRun.config_version] = config_version
-    if extract_images is not None:
-        values[ExtractionRun.extract_images] = bool(extract_images)
-    if review_images is not None:
-        values[ExtractionRun.review_images] = bool(review_images)
-    if status is not None:
-        values[ExtractionRun.status] = status
-        if status in {"queued", "running"}:
-            values.update({
-                ExtractionRun.ended_at: None,
-                ExtractionRun.error_code: None,
-                ExtractionRun.error_message: None,
-                ExtractionRun.artifacts_json: None,
-                ExtractionRun.consensus_metrics_json: None,
-                ExtractionRun.log_s3_key: None,
-                ExtractionRun.llm_usage_json: None,
-                ExtractionRun.llm_cost_usd: None,
-            })
-        elif status == "succeeded":
-            values[ExtractionRun.error_code] = None
-            values[ExtractionRun.error_message] = None
-    if started_at is not None:
-        values[ExtractionRun.started_at] = started_at
-    if ended_at is not None:
-        values[ExtractionRun.ended_at] = ended_at
-    if error_code is not None:
-        values[ExtractionRun.error_code] = error_code
-    if error_message is not None:
-        values[ExtractionRun.error_message] = error_message
-    if artifacts_json is not None:
-        values[ExtractionRun.artifacts_json] = artifacts_json
-    if consensus_metrics_json is not None:
-        values[ExtractionRun.consensus_metrics_json] = consensus_metrics_json
-    if log_s3_key is not None:
-        values[ExtractionRun.log_s3_key] = log_s3_key
-    if llm_usage_json is not None:
-        values[ExtractionRun.llm_usage_json] = llm_usage_json
-    if llm_cost_usd is not None:
-        values[ExtractionRun.llm_cost_usd] = llm_cost_usd
-
-    if run is None:
-        run = ExtractionRun(process_id=process_id)
-        for column, value in values.items():
-            setattr(run, column.key, value)
-        db_session.add(run)
-        db_session.commit()
-        return run
-
-    if not values:
-        return run
-
-    updated, current = update_extraction_run_if_nonterminal(
-        db_session,
-        process_id,
-        values,
-    )
-    if not updated and current is not None and current.status in TERMINAL_EXTRACTION_STATUSES:
-        logger.info(
-            "Ignoring attempted terminal-state rewrite for process_id=%s current=%s requested=%s",
-            process_id,
-            current.status,
-            status,
-        )
-    return current
-
-
-def _safe_upsert_extraction_run(db_session, **kwargs):
-    if not db_session:
-        return False
-
-    def _is_unique_violation(exc):
-        orig = getattr(exc, "orig", None)
-        pgcode = getattr(orig, "pgcode", None)
-        if pgcode == "23505":  # Postgres unique_violation
-            return True
-        msg = str(orig or exc).lower()
-        return (
-            "duplicate key value" in msg
-            or "unique constraint" in msg
-            or "unique failed" in msg
-        )
-
-    try:
-        _upsert_extraction_run(db_session, **kwargs)
-        return True
-    except Exception as exc:
-        logger.warning("Failed to write extraction_run row for %s: %s", kwargs.get("process_id"), exc)
-        try:
-            db_session.rollback()
-        except Exception:
-            pass
-        # Common race: API inserts "queued" row while worker is upserting "running".
-        # Retry once after rollback so we don't lose DB state updates for this run.
-        if isinstance(exc, IntegrityError) or _is_unique_violation(exc):
-            try:
-                _upsert_extraction_run(db_session, **kwargs)
-                return True
-            except Exception as retry_exc:
-                logger.warning(
-                    "Retry write failed for extraction_run row %s: %s",
-                    kwargs.get("process_id"),
-                    retry_exc,
-                )
-                try:
-                    db_session.rollback()
-                except Exception:
-                    pass
-        return False
-
-
-class TerminalStatePersistenceError(RuntimeError):
-    """A task cannot acknowledge until RDS contains a terminal row."""
-
-
-class StatusDatabaseUnavailable(RuntimeError):
-    """A delivery cannot safely proceed without authoritative RDS ownership."""
-
-
-def _persist_terminal_extraction_run(db_session, **kwargs):
-    """Commit and verify one first-writer-wins terminal transition."""
-    session = db_session or _get_db_session()
-    if not session:
-        return False, session
-    if not _safe_upsert_extraction_run(session, **kwargs):
-        return False, session
-    try:
-        session.expire_all()
-        run = session.get(ExtractionRun, kwargs["process_id"])
-        return bool(run and run.status in TERMINAL_EXTRACTION_STATUSES), session
-    except Exception as exc:
-        logger.warning(
-            "Failed to verify terminal extraction_run row for %s: %s",
-            kwargs.get("process_id"),
-            exc,
-        )
-        with suppress(Exception):
-            session.rollback()
-        return False, session
-
-
-def _retry_terminal_state_persistence(task, process_id, cause=None):
-    """Retry with the stable task ID until authoritative terminal state commits."""
-    delay = max(1, Config.TERMINAL_STATE_RETRY_DELAY_SECONDS)
-    logger.error(
-        "Required terminal RDS write unavailable for %s; retrying in %ss",
-        process_id,
-        delay,
-    )
-    error = TerminalStatePersistenceError(
-        f"terminal RDS state unavailable for process_id={process_id}"
-    )
-    if cause is not None:
-        error.__cause__ = cause
-    raise task.retry(exc=error, countdown=delay, max_retries=None)
-
-
-def _retry_status_database(task, process_id, phase, cause=None):
-    """Retry with backoff instead of tight reject/requeue during an RDS outage."""
-    delay = max(1, Config.TERMINAL_STATE_RETRY_DELAY_SECONDS)
-    logger.error(
-        "Status database unavailable for %s process_id=%s; retrying in %ss",
-        phase,
-        process_id,
-        delay,
-    )
-    error = StatusDatabaseUnavailable(
-        f"status database unavailable for {phase} process_id={process_id}"
-    )
-    if cause is not None:
-        error.__cause__ = cause
-    raise task.retry(exc=error, countdown=delay, max_retries=None)
-
-
 def _safe_log_event(audit_logger, stage, status, **kwargs):
     if not audit_logger:
         return
@@ -709,7 +477,7 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
                 subdir=f"native/{method}",
             )
             if native_key and manifest_key and page_provenance_key:
-                artifacts.setdefault("native", {})[method] = {
+                native_receipt = {
                     "artifact": native_key,
                     "manifest": manifest_key,
                     "page_provenance": page_provenance_key,
@@ -719,6 +487,16 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
                     "sha256": manifest["native_sha256"],
                     "media_type": manifest["native_media_type"],
                 }
+                if manifest.get("native_style_filename"):
+                    from app.services.native_extractor_artifact import native_style_artifact_path
+                    style_key = audit_logger.upload_artifact(
+                        manifest["native_style_filename"], native_style_artifact_path(path).read_bytes(),
+                        subdir=f"native/{method}",
+                    )
+                    if not style_key:
+                        raise RuntimeError("Failed to upload required native style receipt")
+                    native_receipt["style"] = style_key
+                artifacts.setdefault("native", {})[method] = native_receipt
         except Exception as exc:
             logger.warning(
                 "Failed to upload native artifact for method %s: %s",
@@ -751,6 +529,8 @@ def _upload_artifacts(audit_logger, result, merge, pdf_path=None):
         if not page_key:
             raise RuntimeError("Failed to upload durable merged page provenance")
         artifacts["page_provenance"] = page_key
+        if not artifacts.get("audit"):
+            raise RuntimeError("Failed to upload durable merged audit")
 
     images = []
     if file_hash:
@@ -860,6 +640,7 @@ def _record_llm_cost_alert(cost_usd, usage, log=None):
 
 def _review_images_with_text_context(images, llm, log=None):
     """Apply optional text-only LLM review to image manifest entries."""
+    from app.pipeline_errors import StageControlError
     reviewed_images = []
     log = log or logger
     for image in images:
@@ -875,6 +656,8 @@ def _review_images_with_text_context(images, llm, log=None):
                 review_payload,
                 model=Config.IMAGE_TEXT_REVIEW_MODEL,
             )
+        except StageControlError:
+            raise
         except Exception as exc:
             reviewed["image_reviewed"] = False
             reviewed["image_review_method"] = "llm_text"
@@ -909,424 +692,6 @@ def _resolve_image_review_flags(extract_images=False, review_images=None):
 # ---------------------------------------------------------------------------
 # Extraction task
 # ---------------------------------------------------------------------------
-
-
-@contextmanager
-def _live_attempt_claim(process_id):
-    """Exclude concurrent deliveries while allowing takeover after process loss.
-
-    PostgreSQL session advisory locks are released by the server when a worker
-    process dies, which is the existing crash evidence needed by late-ack
-    redelivery. SQLite uses the same non-blocking contract for focused tests.
-    """
-    try:
-        engine = get_engine()
-    except Exception as exc:
-        raise StatusDatabaseUnavailable("live-attempt ownership engine unavailable") from exc
-    if engine.dialect.name == "postgresql":
-        connection = None
-        try:
-            connection = engine.connect()
-            connection = connection.execution_options(isolation_level="AUTOCOMMIT")
-        except Exception as exc:
-            if connection is not None:
-                connection.close()
-            raise StatusDatabaseUnavailable("live-attempt ownership connection unavailable") from exc
-        acquired = False
-        try:
-            try:
-                acquired = bool(
-                    connection.execute(
-                        text("SELECT pg_try_advisory_lock(hashtextextended(:process_id, 0))"),
-                        {"process_id": process_id},
-                    ).scalar()
-                )
-            except Exception as exc:
-                raise StatusDatabaseUnavailable("live-attempt ownership query unavailable") from exc
-            yield acquired
-        finally:
-            if acquired:
-                try:
-                    connection.execute(
-                        text("SELECT pg_advisory_unlock(hashtextextended(:process_id, 0))"),
-                        {"process_id": process_id},
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to release live-attempt lock for %s: %s", process_id, exc)
-            connection.close()
-        return
-
-    with _sqlite_attempt_locks_guard:
-        lock = _sqlite_attempt_locks.setdefault(process_id, threading.Lock())
-    acquired = lock.acquire(blocking=False)
-    try:
-        yield acquired
-    finally:
-        if acquired:
-            lock.release()
-            with _sqlite_attempt_locks_guard:
-                if not lock.locked():
-                    _sqlite_attempt_locks.pop(process_id, None)
-
-
-def _terminal_delivery_result(process_id):
-    session = get_session()
-    try:
-        run = session.get(ExtractionRun, process_id)
-        if run is None or run.status not in {"succeeded", "failed", "cancelled"}:
-            return None
-        status = {"succeeded": "complete"}.get(run.status, run.status)
-        result = {"process_id": process_id, "status": status}
-        if run.error_code:
-            result["error_code"] = run.error_code
-        if run.error_message:
-            result["error"] = summarize_error_message(run.error_message)
-        return result
-    finally:
-        _safe_close_session(session)
-
-
-@celery.task(bind=True, name="extract_pdf", max_retries=None)
-def extract_pdf(
-    self,
-    pdf_path,
-    methods,
-    merge=False,
-    clear_cache=False,
-    clear_cache_scope="none",
-    extract_images=False,
-    review_images=None,
-    process_id=None,
-    reference_curie=None,
-    mod_abbreviation=None,
-    source_referencefile_id=None,
-):
-    process_id = str(process_id or uuid.uuid4())
-    try:
-        with _live_attempt_claim(process_id) as acquired:
-            if not acquired:
-                logger.info("Duplicate live delivery suppressed for process_id=%s", process_id)
-                # A normal return would store Celery SUCCESS under the shared task
-                # ID and make status polling report completion while the owner runs.
-                raise Ignore()
-            try:
-                terminal = _terminal_delivery_result(process_id)
-            except Exception as exc:
-                raise StatusDatabaseUnavailable("terminal-state check unavailable") from exc
-            if terminal is not None:
-                logger.info("Terminal delivery no-op for process_id=%s status=%s", process_id, terminal["status"])
-                # A prior terminal commit may have become ambiguous only during its
-                # verification read. Its retry retained the stable input, so this
-                # authoritative terminal redelivery owns cleanup before IGNORE.
-                try:
-                    if pdf_path and os.path.exists(pdf_path):
-                        os.remove(pdf_path)
-                except OSError as exc:
-                    logger.warning("Failed to remove retained terminal input %s: %s", pdf_path, exc)
-                # Preserve the existing result-backend state for this stable task ID.
-                raise Ignore()
-            return _extract_pdf_impl(
-                self,
-                pdf_path,
-                methods,
-                merge=merge,
-                clear_cache=clear_cache,
-                clear_cache_scope=clear_cache_scope,
-                extract_images=extract_images,
-                review_images=review_images,
-                process_id=process_id,
-                reference_curie=reference_curie,
-                mod_abbreviation=mod_abbreviation,
-                source_referencefile_id=source_referencefile_id,
-            )
-    except StatusDatabaseUnavailable as exc:
-        _retry_status_database(self, process_id, "delivery ownership", cause=exc)
-
-
-def _extract_pdf_impl(
-    self,
-    pdf_path,
-    methods,
-    merge=False,
-    clear_cache=False,
-    clear_cache_scope="none",
-    extract_images=False,
-    review_images=None,
-    process_id=None,
-    reference_curie=None,
-    mod_abbreviation=None,
-    source_referencefile_id=None,
-):
-    """
-    Run PDF extraction in the background.
-
-    Args:
-        pdf_path: Absolute path to the uploaded PDF on disk.
-        methods: List of extractor names, e.g. ["grobid", "docling", "marker"].
-        merge: Whether to run the LLM merge step after extraction.
-        clear_cache: Legacy boolean full-clear flag (backward compatible).
-        clear_cache_scope: Scoped cache clear mode: none|merge|extraction|all.
-        extract_images: Whether Marker should extract figure images.
-        review_images: Whether to classify extracted image entries using nearby text.
-                       Defaults to extract_images when omitted.
-
-    Returns:
-        dict with status, file_hash, per-method outputs, and optional merged output.
-    """
-    process_id = str(process_id or uuid.uuid4())
-    extract_images, review_images = _resolve_image_review_flags(extract_images, review_images)
-    file_hash = None
-    db_session = _get_db_session()
-    audit_logger = None
-    terminal_state_persisted = False
-
-    # Per-job adapter — merges identity fields with per-event fields for GELF
-    adapter = MergingLoggerAdapter(logger, {
-        "_process_id": process_id,
-        "_reference_curie": reference_curie or "",
-        "_mod_abbreviation": mod_abbreviation or "",
-        "_file_hash": "",
-    })
-
-    os.makedirs(Config.CACHE_FOLDER, exist_ok=True)
-
-    try:
-        file_hash = _get_file_hash(pdf_path)
-        adapter.extra["_file_hash"] = file_hash
-    except FileNotFoundError:
-        error_message = f"PDF file not found: {pdf_path}"
-        adapter.error(
-            "PDF file not found",
-            extra={"_event": "job_failed", "_error_code": "file_not_found"},
-        )
-        terminal_state_persisted, db_session = _persist_terminal_extraction_run(
-            db_session,
-            process_id=process_id,
-            status="failed",
-            ended_at=_now_utc(),
-            error_code="FileNotFoundError",
-            error_message=error_message,
-        )
-        if not terminal_state_persisted:
-            _retry_terminal_state_persistence(self, process_id)
-        _safe_close_session(db_session)
-        return {"status": "failed", "error": error_message, "process_id": process_id}
-
-    # Clear cached outputs for this PDF if requested (scoped clear supported).
-    clear_scope = _normalize_clear_cache_scope(clear_cache_scope, clear_cache=clear_cache)
-    if clear_scope != "none":
-        cleared = _clear_cached_outputs(file_hash, clear_scope)
-        if cleared["removed_total"]:
-            adapter.info(
-                "Cleared %d cached artifact(s) for hash %s (scope=%s)",
-                cleared["removed_total"], file_hash, clear_scope,
-                extra={
-                    "_event": "cache_cleared",
-                    "_cache_clear_scope": clear_scope,
-                    "_files_removed": cleared["files_removed"],
-                    "_images_dirs_removed": cleared["images_dirs_removed"],
-                },
-            )
-
-    try:
-        attempt_id = f"attempt-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
-        audit_logger = AuditLogger(process_id, Config, attempt_id=attempt_id)
-    except Exception as exc:
-        adapter.warning("Failed to initialize audit logger: %s", exc)
-
-    # Per-publication file log — captures all log output for this run to a .txt file.
-    # Attaches a FileHandler to the root logger; removed in the finally block.
-    run_log_handler = None
-    version = Config.EXTRACTION_CONFIG_VERSION
-    cache_key = f"v{version}_{file_hash}_{'_'.join(sorted(methods))}"
-    run_log_path = os.path.join(Config.CACHE_FOLDER, f"{cache_key}_run.log")
-    try:
-        run_log_handler = logging.FileHandler(run_log_path, mode="w", encoding="utf-8")
-        run_log_handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-        ))
-        run_log_handler.setLevel(logging.DEBUG)
-        logging.getLogger().addHandler(run_log_handler)
-        adapter.info("Per-publication log: %s", run_log_path)
-    except Exception as exc:
-        adapter.warning("Failed to set up per-publication file log: %s", exc)
-        run_log_handler = None
-
-    _safe_log_event(audit_logger, "run", "queued", detail="Task accepted")
-
-    adapter.info(
-        "Job accepted: methods=%s, merge=%s, extract_images=%s, review_images=%s",
-        methods, merge, extract_images, review_images,
-        extra={
-            "_event": "job_accepted",
-            "_stage": "init",
-        },
-    )
-
-    started_at = _now_utc()
-    total_start = time.monotonic()
-
-    # Update DB row to running (row was created by the API handler).
-    # Uses upsert so it still works if the API-side insert failed.
-    if db_session:
-        ok = _safe_upsert_extraction_run(
-            db_session,
-            process_id=process_id,
-            reference_curie=reference_curie,
-            mod_abbreviation=mod_abbreviation,
-            source_pdf_md5=file_hash,
-            source_referencefile_id=source_referencefile_id,
-            config_version=Config.EXTRACTION_CONFIG_VERSION,
-            extract_images=extract_images,
-            review_images=review_images,
-            status="running",
-            started_at=started_at,
-            log_s3_key=audit_logger.get_log_s3_key() if audit_logger else None,
-        )
-        if not ok:
-            _safe_close_session(db_session)
-            db_session = None
-
-    _safe_log_event(audit_logger, "run", "running")
-
-    # Shared container so failure path can access LLM usage even if _run_extraction raises
-    _shared = {"llm": None}
-
-    try:
-        result = _run_extraction(
-            self,
-            pdf_path,
-            methods,
-            merge,
-            file_hash=file_hash,
-            audit_logger=audit_logger,
-            adapter=adapter,
-            run_log_path=run_log_path if run_log_handler else None,
-            extract_images=extract_images,
-            review_images=review_images,
-            _shared=_shared,
-            job_started_monotonic=total_start,
-        )
-
-        artifacts_json = _upload_artifacts(audit_logger, result, merge, pdf_path=pdf_path)
-
-        total_duration = round(time.monotonic() - total_start, 3)
-        _safe_log_event(audit_logger, "finalize", "succeeded", total_duration_s=total_duration)
-
-        adapter.info(
-            "Job complete in %.1fs", total_duration,
-            extra={"_event": "job_complete", "_duration_s": total_duration},
-        )
-
-        log_s3_key = audit_logger.get_log_s3_key() if audit_logger else None
-        ended_at = _now_utc()
-
-        terminal_state_persisted, db_session = _persist_terminal_extraction_run(
-            db_session,
-            process_id=process_id,
-            status="succeeded",
-            ended_at=ended_at,
-            artifacts_json=artifacts_json,
-            consensus_metrics_json=result.get("consensus_metrics"),
-            log_s3_key=log_s3_key,
-            llm_usage_json=result.get("llm_usage_json"),
-            llm_cost_usd=result.get("llm_cost_usd"),
-        )
-        if not terminal_state_persisted:
-            _retry_terminal_state_persistence(self, process_id)
-
-        result["process_id"] = process_id
-        result["reference_curie"] = reference_curie
-        result["mod_abbreviation"] = mod_abbreviation
-        result["started_at"] = started_at.isoformat().replace("+00:00", "Z")
-        result["ended_at"] = ended_at.isoformat().replace("+00:00", "Z")
-        result["log_s3_key"] = log_s3_key
-        result["artifacts_json"] = artifacts_json
-
-        return result
-
-    except Retry:
-        raise
-    except Exception as exc:
-        total_duration = round(time.monotonic() - total_start, 3)
-        error_message = summarize_error_message(exc)
-        _safe_log_event(
-            audit_logger,
-            "finalize",
-            "failed",
-            error_code=exc.__class__.__name__,
-            detail=error_message,
-            total_duration_s=total_duration,
-        )
-
-        error_code = "timeout" if "SoftTimeLimitExceeded" in type(exc).__name__ else type(exc).__name__
-        adapter.error(
-            "Job failed: %s", error_message,
-            extra={
-                "_event": "job_failed",
-                "_error_code": error_code,
-                "_duration_s": total_duration,
-            },
-        )
-
-        # Persist any LLM cost data even on failure (tokens were still spent)
-        fail_llm_usage = None
-        fail_llm_cost = None
-        if _shared.get("llm") is not None:
-            fail_llm_cost, fail_llm_usage = _compute_llm_accounting(
-                _shared["llm"],
-                log=adapter,
-            )
-            if fail_llm_usage is not None:
-                _record_llm_cost_alert(
-                    fail_llm_cost,
-                    fail_llm_usage,
-                    log=adapter,
-                )
-
-        terminal_state_persisted, db_session = _persist_terminal_extraction_run(
-            db_session,
-            process_id=process_id,
-            status="failed",
-            ended_at=_now_utc(),
-            error_code=exc.__class__.__name__,
-            error_message=error_message,
-            log_s3_key=audit_logger.get_log_s3_key() if audit_logger else None,
-            llm_usage_json=fail_llm_usage,
-            llm_cost_usd=fail_llm_cost,
-        )
-        if not terminal_state_persisted:
-            _retry_terminal_state_persistence(self, process_id, cause=exc)
-
-        raise
-
-    finally:
-        try:
-            if audit_logger:
-                audit_logger.flush()
-                if db_session:
-                    _safe_upsert_extraction_run(
-                        db_session,
-                        process_id=process_id,
-                        log_s3_key=audit_logger.get_log_s3_key(),
-                    )
-        except Exception as exc:
-            logger.warning("Failed during audit flush for process_id=%s: %s", process_id, exc)
-
-        # Remove per-publication file handler
-        if run_log_handler:
-            try:
-                logging.getLogger().removeHandler(run_log_handler)
-                run_log_handler.close()
-            except Exception:
-                pass
-
-        _safe_close_session(db_session)
-
-        # A retry/redelivery must retain its stable input until RDS proves a
-        # terminal transition. Cached outputs keep repair retries inexpensive.
-        if terminal_state_persisted and os.path.exists(pdf_path):
-            os.remove(pdf_path)
 
 
 def _run_single_extractor(
@@ -1517,6 +882,32 @@ def _recovery_time_available(job_started_monotonic):
 
 
 def _run_extraction(
+    self,
+    pdf_path,
+    methods,
+    merge,
+    file_hash=None,
+    audit_logger=None,
+    adapter=None,
+    run_log_path=None,
+    extract_images=False,
+    review_images=None,
+    _shared=None,
+    job_started_monotonic=None,
+):
+    """Direct-call convenience using the same stages as the durable pipeline."""
+    file_hash = file_hash or _get_file_hash(pdf_path)
+    if job_started_monotonic is None:
+        job_started_monotonic = time.monotonic()
+    options = dict(file_hash=file_hash, audit_logger=audit_logger, adapter=adapter,
+                   run_log_path=run_log_path, extract_images=extract_images,
+                   review_images=review_images, _shared=_shared,
+                   job_started_monotonic=job_started_monotonic)
+    source_state = _extract_sources(self, pdf_path, methods, merge, **options)
+    return _finalize_sources(self, pdf_path, methods, merge, source_state=source_state, **options)
+
+
+def _extract_sources(
     self,
     pdf_path,
     methods,
@@ -1733,6 +1124,9 @@ def _run_extraction(
             raise next(iter(extraction_errors.values()))
         raise ValueError("No extractor produced a usable artifact")
     if extractor_failures:
+        from pdfx_observability import capture_failure
+        for failure in extraction_errors.values():
+            capture_failure(failure, stage="extraction")
         log.warning(
             "Continuing with %d completed extractor(s); failed methods=%s",
             len(extractions),
@@ -1743,6 +1137,66 @@ def _run_extraction(
                 "_failed_extractors": sorted(extractor_failures),
             },
         )
+
+    return {
+        "extractions": extractions,
+        "methods_used": methods_used,
+        "cached_methods": cached_methods,
+        "extractor_failures": extractor_failures,
+        "retried_extractors": retried_extractors,
+        "emergency_ocr_used": emergency_ocr_used,
+        "all_stages": all_stages,
+        "completed_stages": completed_stages,
+        "failed_stages": failed_stages,
+        "use_parallel": use_parallel,
+    }
+
+
+def _finalize_sources(
+    self,
+    pdf_path,
+    methods,
+    merge,
+    file_hash=None,
+    audit_logger=None,
+    adapter=None,
+    run_log_path=None,
+    extract_images=False,
+    review_images=None,
+    _shared=None,
+    source_state=None,
+    job_started_monotonic=None,
+):
+    """Finalize an explicit extraction snapshot; never invoke extractors."""
+    if source_state is None:
+        raise ValueError("Finalization requires an extraction checkpoint")
+    log = adapter or logger
+    extract_images, review_images = _resolve_image_review_flags(extract_images, review_images)
+    extractions = source_state["extractions"]
+    methods_used = source_state["methods_used"]
+    cached_methods = source_state["cached_methods"]
+    extractor_failures = source_state["extractor_failures"]
+    retried_extractors = source_state["retried_extractors"]
+    emergency_ocr_used = source_state["emergency_ocr_used"]
+    all_stages = source_state["all_stages"]
+    completed_stages = source_state["completed_stages"]
+    failed_stages = source_state["failed_stages"]
+    use_parallel = source_state["use_parallel"]
+
+    def _emit_progress(current_stage, display_text):
+        pending = [s for s in all_stages if s not in completed_stages and s != current_stage]
+        self.update_state(state="PROGRESS", meta={
+            "step": current_stage,
+            "stage": current_stage,
+            "stage_display": display_text,
+            "stages_completed": list(completed_stages),
+            "stages_failed": list(failed_stages),
+            "stages_pending": pending,
+            "stages_total": len(all_stages),
+            "stages_done": len(completed_stages),
+            "percent": round(len(completed_stages) / len(all_stages) * 100),
+            "parallel": use_parallel,
+        })
 
     # --- Optional LLM merge ---------------------------------------------------
 

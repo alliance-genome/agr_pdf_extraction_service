@@ -57,20 +57,17 @@ def app_with_images(client):
 
 
 class TestImageDownloadEndpoint:
-    @patch("app.api._get_run_by_process_id", return_value=None)
-    @patch("celery_app.celery.AsyncResult")
-    def test_image_download_valid(self, async_result, _run, client, app_with_images):
-        """A completed process ID serves its locally cached image."""
-        fh = app_with_images["file_hash"]
-        fn = app_with_images["image_filename"]
-        async_result.return_value = MagicMock(
-            state="SUCCESS",
-            result={"file_hash": fh},
-        )
-        response = client.get(f"/api/v1/extract/process-1/images/{fn}")
+    @patch("app.api._s3_redirect_for_artifact", return_value=("image bytes", 200))
+    @patch("app.api._get_run_by_process_id")
+    def test_image_download_valid(self, run, redirect, client, app_with_images):
+        """A completed job serves only its committed durable image key."""
+        filename = app_with_images["image_filename"]
+        key = "winning-generation/images/" + filename
+        run.return_value = {"status": "succeeded", "artifacts_json": {"images": [{"filename": filename, "s3_key": key}]}}
+        with patch("celery_app.celery.AsyncResult", side_effect=AssertionError("Redis unavailable")):
+            response = client.get(f"/api/v1/extract/process-1/images/{filename}")
         assert response.status_code == 200
-        assert response.content_type == "image/png"
-        assert len(response.data) > 0
+        redirect.assert_called_once_with(key)
 
     @patch("app.api._get_run_by_process_id", return_value=None)
     @patch("celery_app.celery.AsyncResult")

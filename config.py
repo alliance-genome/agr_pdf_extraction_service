@@ -1,4 +1,5 @@
 import os
+import math
 
 
 class Config:
@@ -33,6 +34,35 @@ class Config:
     TASK_REJECT_ON_WORKER_LOST = os.environ.get("TASK_REJECT_ON_WORKER_LOST", "true").strip().lower() in {
         "1", "true", "yes", "on",
     }
+
+    # ---- Durable stage dispatcher -----------------------------------------
+    PIPELINE_HEALTH_DIRECTORY = os.environ.get("PIPELINE_HEALTH_DIRECTORY", os.path.join(CACHE_FOLDER, "pipeline-health"))
+    PIPELINE_HEALTH_MAX_AGE_SECONDS = int(os.environ.get("PIPELINE_HEALTH_MAX_AGE_SECONDS", 20))
+    PIPELINE_DB_TIMEOUT_SECONDS = int(os.environ.get("PIPELINE_DB_TIMEOUT_SECONDS", 10))
+    PIPELINE_S3_BUCKET = os.environ.get("PIPELINE_S3_BUCKET", "")
+    PIPELINE_S3_PREFIX = os.environ.get("PIPELINE_S3_PREFIX", "pdfx/pipeline")
+    PIPELINE_WORKSPACE = os.environ.get("PIPELINE_WORKSPACE", os.path.join(os.getcwd(), "data", "pipeline"))
+    SENTRY_DISPATCHER_ERROR_INTERVAL_SECONDS = float(os.environ.get("SENTRY_DISPATCHER_ERROR_INTERVAL_SECONDS", 300))
+    PIPELINE_GPU_ADMISSIONS = int(os.environ.get("PIPELINE_GPU_ADMISSIONS", 1))
+    PIPELINE_DISPATCH_BATCH_SIZE = int(os.environ.get("PIPELINE_DISPATCH_BATCH_SIZE", 100))
+    PIPELINE_ERROR_MESSAGE_MAX_CHARS = int(os.environ.get("PIPELINE_ERROR_MESSAGE_MAX_CHARS", 1000))
+    PIPELINE_FINALIZERS = int(os.environ.get("PIPELINE_FINALIZERS", 2))
+    PIPELINE_DOWNSTREAM_CAP = int(os.environ.get("PIPELINE_DOWNSTREAM_CAP", 4))
+    PIPELINE_PROVIDER_CONCURRENCY = int(os.environ.get("PIPELINE_PROVIDER_CONCURRENCY", 4))
+    PIPELINE_WATCHDOG_STARTUP_SECONDS = int(os.environ.get("PIPELINE_WATCHDOG_STARTUP_SECONDS", 30))
+    PIPELINE_LEASE_SECONDS = int(os.environ.get("PIPELINE_LEASE_SECONDS", 60))
+    PIPELINE_REPUBLISH_SECONDS = int(os.environ.get("PIPELINE_REPUBLISH_SECONDS", 30))
+    PIPELINE_MAX_ATTEMPTS = int(os.environ.get("PIPELINE_MAX_ATTEMPTS", 2))
+    PIPELINE_DEADLINE_SECONDS = int(os.environ.get("PIPELINE_DEADLINE_SECONDS", TASK_HARD_TIME_LIMIT_SECONDS))
+    PIPELINE_QUEUE_MAX_AGE_SECONDS = int(os.environ.get("PIPELINE_QUEUE_MAX_AGE_SECONDS", 86400))
+    PIPELINE_CHECKPOINT_MAX_BYTES = int(os.environ.get("PIPELINE_CHECKPOINT_MAX_BYTES", 2 * 1024 ** 3))
+    PIPELINE_CHECKPOINT_MAX_FILES = int(os.environ.get("PIPELINE_CHECKPOINT_MAX_FILES", 10000))
+    PIPELINE_MANIFEST_MAX_BYTES = int(os.environ.get("PIPELINE_MANIFEST_MAX_BYTES", 8 * 1024 ** 2))
+    for _name, _value in list(locals().items()):
+        if (_name.startswith("PIPELINE_") or _name == "SENTRY_DISPATCHER_ERROR_INTERVAL_SECONDS") and isinstance(_value, (int, float)) and (not math.isfinite(_value) or _value <= 0):
+            raise ValueError(f"{_name} must be positive")
+    if PIPELINE_LEASE_SECONDS < 15:
+        raise ValueError("PIPELINE_LEASE_SECONDS must be at least 15 seconds")
 
     # ---- Database --------------------------------------------------------
     DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://pdfx:pdfx@localhost:5432/pdfx")

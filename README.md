@@ -16,12 +16,15 @@ byte assembly itself. No model response can insert publication text.
   GROBID, Docling, and Marker with Docker Compose.
 - The proxy replays queued work only after the backend and Marker worker report
   ready.
-- Backend submission claims the caller-supplied process ID in RDS before
-  publishing Celery work. PostgreSQL advisory ownership excludes simultaneous
-  deliveries; worker-process loss releases that ownership so late-ack
-  redelivery can recover, while terminal rows remain immutable.
+- Backend submission stores the PDF and a durable PostgreSQL pipeline record.
+  A dispatcher feeds a preloaded solo GPU extraction worker and bounded CPU
+  finalizers. Immutable S3 checkpoints let extraction overlap merge work without
+  changing the scientific pipeline. Database ownership fences duplicate tasks.
 - Completed artifacts and audit logs are stored in S3. The GPU backend returns
   to zero desired capacity when idle.
+
+See [the staged pipeline and Sentry guide](docs/staged-pipeline.md) for
+ownership, recovery, limits, observability and rollout requirements.
 
 See [deploy/aws/pdfx.md](deploy/aws/pdfx.md) for the AWS runbook.
 
@@ -224,6 +227,32 @@ git diff --check
 
 For backend application tests, run `python -m pytest -q tests` in the pinned
 backend image or an environment installed from `requirements.txt`.
+
+The [Tests workflow](.github/workflows/tests.yml) runs separate backend and proxy
+jobs on every pull request and push to `main`. Both use Python 3.11 and a fresh
+PostgreSQL 16 service migrated to head. This includes the dispatcher concurrency,
+recovery, deadline and fencing tests, the proxy's real database query, API and
+scientific merge regressions, and Sentry privacy/error handling. Jobs need no
+AWS, Sentry or provider credentials and retain JUnit results as artifacts.
+
+For the same lightweight environment locally (Python 3.11, Bash and `zip`):
+
+```bash
+bash scripts/testing/install_test_dependencies.sh
+# Point both URLs at a disposable PostgreSQL database, never production.
+export DATABASE_URL=postgresql://pdfx:pdfx-ci-only@127.0.0.1:5432/pdfx_test
+export PDFX_TEST_DATABASE_URL="$DATABASE_URL"
+python -m alembic upgrade head
+python -m pytest -q -ra tests --ignore=tests/services/test_marker_service.py
+python -m pytest -q -ra proxy/tests
+```
+
+The installer applies runtime version constraints to `requirements-test.txt`, but omits
+Marker, Docling and model weights. The Marker service module is explicitly
+excluded because it imports that stack at collection; the real Docling renderer
+check skips when Docling is absent. Optional ignored local fixtures can also
+skip. These checks do not replace full dependency-image tests or real GPU/OCR
+validation. PostgreSQL tests must run in CI rather than skip for a missing URL.
 
 ## Deployment
 

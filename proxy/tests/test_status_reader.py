@@ -111,7 +111,7 @@ def test_active_work_lookup_is_shared_and_fail_closed(monkeypatch):
     assert reader.has_active_work() == (False, None)
 
 
-def test_active_work_lookup_only_counts_fresh_running_rows(monkeypatch):
+def test_active_work_lookup_bounds_never_claimed_replacement_guard(monkeypatch):
     connection = _Connection((False,))
     monkeypatch.setattr("app.status_reader.psycopg2.connect", lambda *_args, **_kwargs: connection)
     monkeypatch.setattr("app.status_reader.settings.SHARED_RUNNING_MAX_AGE_MINUTES", 60)
@@ -119,9 +119,10 @@ def test_active_work_lookup_only_counts_fresh_running_rows(monkeypatch):
 
     assert reader.configured is True
     assert reader.has_active_work() == (True, False)
-    assert "status = 'running'" in connection.cursor_instance.query
-    assert "started_at >= CURRENT_TIMESTAMP" in connection.cursor_instance.query
-    assert "'queued'" not in connection.cursor_instance.query
+    assert "status IN ('queued', 'running')" in connection.cursor_instance.query
+    assert "p.state <> 'terminal'" in connection.cursor_instance.query
+    assert "p.deadline_at > CURRENT_TIMESTAMP" in connection.cursor_instance.query
+    assert "extraction_run.started_at IS NOT NULL" in connection.cursor_instance.query
     assert connection.cursor_instance.params == (60,)
 
 

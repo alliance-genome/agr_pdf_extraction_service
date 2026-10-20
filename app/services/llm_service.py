@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.pipeline_errors import StageControlError
+
 import hashlib
 import json
 import logging
@@ -251,6 +253,11 @@ class LLM:
         self.usage = TokenAccumulator()
         self.selection_call_traces: list[dict] = []
 
+    def _provider_parse(self, **kwargs):
+        from app.pipeline import provider_slot
+        with provider_slot():
+            return self.client.chat.completions.parse(**kwargs)
+
     @staticmethod
     def _page_request_trace(payload: dict) -> dict:
         """Persist replayable page choices without duplicating publication text."""
@@ -419,7 +426,7 @@ class LLM:
                 "timeout_seconds": self.openai_timeout_seconds,
                 "max_retries": self.openai_max_retries,
             }
-            completion = self.client.chat.completions.parse(
+            completion = self._provider_parse(
                 model=runtime.model,
                 reasoning_effort=runtime.reasoning_effort,
                 messages=[
@@ -482,6 +489,8 @@ class LLM:
             )
             self.selection_call_traces.append(trace)
             return SelectionDecisionResponse(decisions=tuple(decisions))
+        except StageControlError:
+            raise
         except Exception as exc:
             failure = CandidateSelectionFailure(_failure_reason(exc))
             if trace is not None:
@@ -559,7 +568,7 @@ class LLM:
         }
         completion = None
         try:
-            completion = self.client.chat.completions.parse(
+            completion = self._provider_parse(
                 model=runtime.model,
                 reasoning_effort=runtime.reasoning_effort,
                 messages=[
@@ -601,6 +610,8 @@ class LLM:
                 }
             )
             return decisions, trace
+        except StageControlError:
+            raise
         except Exception as exc:
             trace.update(
                 {
@@ -687,7 +698,7 @@ class LLM:
             runtime = resolve_runtime_model("hard_selection")
             trace["model"] = runtime.model
             trace["reasoning_effort"] = runtime.reasoning_effort
-            completion = self.client.chat.completions.parse(
+            completion = self._provider_parse(
                 model=runtime.model,
                 reasoning_effort=runtime.reasoning_effort,
                 messages=[
@@ -731,6 +742,8 @@ class LLM:
             )
             self.selection_call_traces.append(trace)
             return selected_id
+        except StageControlError:
+            raise
         except Exception as exc:
             failure = CandidateSelectionFailure(_failure_reason(exc))
             trace.update(
@@ -807,7 +820,7 @@ class LLM:
                 "nearby_text",
             )
         }
-        completion = self.client.chat.completions.parse(
+        completion = self._provider_parse(
             model=runtime.model,
             reasoning_effort=runtime.reasoning_effort,
             messages=[

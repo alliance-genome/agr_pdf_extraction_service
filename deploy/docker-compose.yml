@@ -15,6 +15,7 @@ x-shared-env: &shared-env
   DATABASE_URL: postgresql://pdfx:${POSTGRES_PASSWORD:-pdfx}@postgres:5432/pdfx
   UPLOAD_FOLDER: /app/data/uploads
   CACHE_FOLDER: /app/data/cache
+  PIPELINE_WORKSPACE: /app/data/pipeline
   MAX_CONTENT_LENGTH: "524288000"
   TORCH_DEVICE: cpu
   CUDA_VISIBLE_DEVICES: ""
@@ -66,6 +67,8 @@ services:
       "app:create_app()"
 
   worker:
+    # Keep workers signalable and reap orphaned stage monitors.
+    init: true
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -88,12 +91,86 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    command: >
-      celery -A celery_app worker
-      --loglevel=info
-      --concurrency=${PDFX_WORKER_CONCURRENCY:-1}
-      --prefetch-multiplier=${PDFX_WORKER_PREFETCH_MULTIPLIER:-1}
-      -Q default
+    command: ["python", "-m", "app.worker_main"]
+
+  finalizer:
+    # Keep workers signalable and reap orphaned stage monitors.
+    init: true
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: pdfx-finalizer
+    hostname: pdfx-finalizer
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      <<: *shared-env
+      TORCH_DEVICE: cpu
+      DOCLING_DEVICE: cpu
+      MARKER_DEVICE: cpu
+      CUDA_VISIBLE_DEVICES: ""
+      NVIDIA_VISIBLE_DEVICES: void
+      PDFX_WORKER_PRELOAD_MARKER_MODELS: "off"
+      PDFX_WORKER_PRELOAD_MARKER_REQUIRED: "false"
+      OMP_NUM_THREADS: ${PDFX_FINALIZER_THREADS:-2}
+      MKL_NUM_THREADS: ${PDFX_FINALIZER_THREADS:-2}
+      NUMEXPR_NUM_THREADS: ${PDFX_FINALIZER_THREADS:-2}
+      AUDIT_FLUSH_ON_EVENT: "true"
+    volumes: *shared-volumes
+    cpus: ${PDFX_FINALIZER_CPUS:-4.0}
+    mem_limit: ${PDFX_FINALIZER_MEMORY:-8g}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.finalizer_main"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.pipeline_health import fresh; assert fresh('finalization')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  dispatcher:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: pdfx-dispatcher
+    hostname: pdfx-dispatcher
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      <<: *shared-env
+      TORCH_DEVICE: cpu
+      DOCLING_DEVICE: cpu
+      MARKER_DEVICE: cpu
+      CUDA_VISIBLE_DEVICES: ""
+      NVIDIA_VISIBLE_DEVICES: void
+      PDFX_WORKER_PRELOAD_MARKER_MODELS: "off"
+      PDFX_WORKER_PRELOAD_MARKER_REQUIRED: "false"
+      OMP_NUM_THREADS: ${PDFX_FINALIZER_THREADS:-2}
+      MKL_NUM_THREADS: ${PDFX_FINALIZER_THREADS:-2}
+      NUMEXPR_NUM_THREADS: ${PDFX_FINALIZER_THREADS:-2}
+      AUDIT_FLUSH_ON_EVENT: "true"
+    volumes: *shared-volumes
+    cpus: ${PDFX_DISPATCHER_CPUS:-1.0}
+    mem_limit: ${PDFX_DISPATCHER_MEMORY:-1g}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.dispatcher_main"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.pipeline_health import fresh; assert fresh('dispatcher')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
 
   grobid:
     image: grobid/grobid:0.8.2-crf

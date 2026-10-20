@@ -1,0 +1,88 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: ${{ matrix.suite }} tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [Backend, Proxy]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pdfx
+          # Disposable per-run value; no repository or production secret.
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          POSTGRES_DB: pdfx_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pdfx -d pdfx_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://pdfx:${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/pdfx_test
+      PDFX_TEST_DATABASE_URL: postgresql://pdfx:${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/pdfx_test
+      AWS_EC2_METADATA_DISABLED: 'true'
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+      SENTRY_ENABLED: 'false'
+      OPENAI_API_KEY: ''
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements-test.txt
+            requirements.txt
+            proxy/requirements.txt
+      - name: Install deployment-test utility
+        if: matrix.suite == 'Proxy'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zip
+      - name: Install CPU test dependencies
+        run: bash scripts/testing/install_test_dependencies.sh
+      - name: Migrate disposable test database
+        run: python -m alembic upgrade head
+      - name: Run backend tests
+        if: matrix.suite == 'Backend'
+        # Marker imports its full ML stack at collection; exercise that module
+        # in the production dependency image, not this CPU-only environment.
+        run: python -m pytest -q -ra tests --ignore=tests/services/test_marker_service.py --junitxml=test-results/backend.xml
+      - name: Run proxy tests
+        if: matrix.suite == 'Proxy'
+        # Run separately because both applications expose an app package.
+        run: python -m pytest -q -ra proxy/tests --junitxml=test-results/proxy.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.suite }}
+          path: test-results/*.xml
+          if-no-files-found: ignore
+          retention-days: 14

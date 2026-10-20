@@ -9,10 +9,11 @@ RUN apt-get update \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY proxy/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app/ app/
+COPY proxy/app/ app/
+COPY pdfx_observability.py .
 
 EXPOSE 80
 
