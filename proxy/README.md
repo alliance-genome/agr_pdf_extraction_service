@@ -295,16 +295,15 @@ ample scratch headroom during burst replay and overlapping task deployments.
 ### Build and Deploy
 
 ```bash
-# Run from repo root
-cd proxy
+# Run from repo root; the shared Sentry module is part of this context.
 
 # Build and push to ECR
-docker build -t agr_pdfx_proxy .
+docker build -f proxy/Dockerfile -t agr_pdfx_proxy .
 docker tag agr_pdfx_proxy:latest <account>.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_proxy:latest
 docker push <account>.dkr.ecr.us-east-1.amazonaws.com/agr_pdfx_proxy:latest
 
 # Register the ECS task definition and roll ECS service (reads /pdfx SSM parameters automatically)
-cd deploy
+cd proxy/deploy
 ./deploy.sh --profile <profile>
 
 # Optional: deploy an immutable image tag instead of :latest

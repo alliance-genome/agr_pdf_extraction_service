@@ -16,12 +16,15 @@ byte assembly itself. No model response can insert publication text.
   GROBID, Docling, and Marker with Docker Compose.
 - The proxy replays queued work only after the backend and Marker worker report
   ready.
-- Backend submission claims the caller-supplied process ID in RDS before
-  publishing Celery work. PostgreSQL advisory ownership excludes simultaneous
-  deliveries; worker-process loss releases that ownership so late-ack
-  redelivery can recover, while terminal rows remain immutable.
+- Backend submission stores the PDF and a durable PostgreSQL pipeline record.
+  A dispatcher feeds a preloaded solo GPU extraction worker and bounded CPU
+  finalizers. Immutable S3 checkpoints let extraction overlap merge work without
+  changing the scientific pipeline. Database ownership fences duplicate tasks.
 - Completed artifacts and audit logs are stored in S3. The GPU backend returns
   to zero desired capacity when idle.
+
+See [the staged pipeline and Sentry guide](docs/staged-pipeline.md) for
+ownership, recovery, limits, observability and rollout requirements.
 
 See [deploy/aws/pdfx.md](deploy/aws/pdfx.md) for the AWS runbook.
 

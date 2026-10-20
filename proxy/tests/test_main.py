@@ -2428,3 +2428,21 @@ class TestExtractCancelEndpoint:
 
         assert len(main_mod.cancelled_jobs) == main_mod.MAX_LOCAL_CANCELLED_JOBS
         assert "cancel-0" not in main_mod.cancelled_jobs
+
+
+@pytest.mark.asyncio
+async def test_sentry_reports_handled_operational_failure_but_not_stopped_health(monkeypatch):
+    import app.main as main_mod
+    from starlette.requests import Request
+    captured = []
+    monkeypatch.setattr(main_mod, 'capture_failure', lambda exc, **kw: captured.append(kw))
+    async def unavailable(request):
+        return JSONResponse({'detail': 'unavailable'}, status_code=503)
+    process_id = '00000000-0000-0000-0000-000000000001'
+    request = Request({'type': 'http', 'method': 'GET', 'path': '/api/v1/extract/' + process_id, 'headers': []})
+    await main_mod.sentry_request_context(request, unavailable)
+    assert captured == [{'process_id': process_id, 'stage': 'proxy'}]
+    captured.clear()
+    request = Request({'type': 'http', 'method': 'GET', 'path': '/api/v1/health', 'headers': []})
+    await main_mod.sentry_request_context(request, unavailable)
+    assert captured == []

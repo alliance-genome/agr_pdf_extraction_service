@@ -24,3 +24,7 @@ goal.md
 tests
 README.md
 docs
+
+# Local implementation plan and cloud/review evidence
+*.local.md
+.dispatcher-local

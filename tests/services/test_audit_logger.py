@@ -158,3 +158,16 @@ def test_context_manager_flushes_on_exit(mock_build_s3):
         audit.log("finalize", "succeeded")
 
     assert mock_s3.put_object.call_count == 1
+
+
+@patch('app.services.audit_logger.build_s3_client')
+def test_required_flush_failure_cannot_qualify_terminal_publication(mock_build_s3):
+    import pytest
+    mock_build_s3.return_value.put_object.side_effect = RuntimeError('storage unavailable')
+    audit = AuditLogger('process-required', DummyConfig)
+    audit.log('finalize', 'completed')
+    with pytest.raises(RuntimeError, match='Required audit'):
+        audit.flush(required=True)
+    mock_build_s3.return_value.put_object.side_effect = None
+    audit.flush(required=True)
+    assert mock_build_s3.return_value.put_object.call_count == 2

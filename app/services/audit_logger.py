@@ -176,7 +176,7 @@ class AuditLogger:
             logger.warning("Failed to upload audit artifact %s: %s", safe_filename, exc)
             return None
 
-    def flush(self):
+    def flush(self, *, required=False):
         with self._lock:
             if self._last_flushed_event_count == len(self._events):
                 return
@@ -202,6 +202,8 @@ class AuditLogger:
                 self._last_flushed_event_count = len(self._events)
             except Exception as exc:
                 logger.warning("Failed to flush audit log to S3 key %s: %s", self._log_s3_key, exc)
+                if required:
+                    raise RuntimeError("Required audit log publication failed") from exc
 
     def get_log_s3_key(self):
         return self._log_s3_key

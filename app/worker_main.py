@@ -15,6 +15,10 @@ def main(argv=None):
     this process. Keeping preload and Celery startup together lets the first
     real Marker task reuse the in-memory converter cache.
     """
+    import os
+    os.environ["PDFX_WORKER_ROLE"] = "extraction"
+    from pdfx_observability import initialize
+    initialize("extraction")
     validate_runtime_model_policy()
     _configure_torch_for_worker_process()
     _preload_marker_models_for_worker()
@@ -23,7 +27,7 @@ def main(argv=None):
         "--loglevel=info",
         "--pool=solo",
         "-Q",
-        "default",
+        "pdfx.extraction",
     ])
 
 

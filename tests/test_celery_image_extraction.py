@@ -717,3 +717,21 @@ def test_skipping_image_review_strips_cached_llm_metadata(tmp_path, monkeypatch)
     assert image["image_review_method"] is None
     assert image["image_review_classification"] is None
     assert "llm_cost_usd" not in result
+
+
+def test_native_receipt_is_not_published_when_required_style_upload_fails(tmp_path, monkeypatch):
+    import app.services.native_extractor_artifact as native
+    output = tmp_path / 'docling.md'
+    output.write_text('# Source')
+    receipt = tmp_path / 'receipt.json'
+    receipt.write_text('{}')
+    manifest = {'native_filename': 'native.json', 'page_provenance_filename': 'pages.json',
+                'native_style_filename': 'style.json', 'page_provenance_sha256': 'pages',
+                'native_sha256': 'native', 'native_media_type': 'application/json'}
+    monkeypatch.setattr(celery_app, 'load_native_extractor_artifact', lambda **kw: (manifest, b'{}'))
+    monkeypatch.setattr(celery_app, 'native_manifest_path', lambda *a: receipt)
+    monkeypatch.setattr(celery_app, 'source_page_provenance_path', lambda *a: receipt)
+    monkeypatch.setattr(native, 'native_style_artifact_path', lambda *a: receipt)
+    audit = SimpleNamespace(upload_artifact=lambda name, *a, **kw: None if name == 'style.json' else 'key/' + name)
+    artifacts = celery_app._upload_artifacts(audit, {'download_paths': {'docling': str(output)}, 'images': []}, False)
+    assert 'docling' not in artifacts.get('native', {})

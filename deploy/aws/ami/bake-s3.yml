@@ -1,0 +1,50 @@
+# AMI warm-up ONLY: ephemeral S3 emulator, with no host ports or real credentials.
+# Production never loads this overlay. Reboot/durability tests use real S3 instead.
+x-bake-storage: &bake-storage
+  AWS_ACCESS_KEY_ID: testing
+  AWS_SECRET_ACCESS_KEY: testing
+  AWS_ENDPOINT_URL_S3: http://bake-s3:5000
+  AWS_DEFAULT_REGION: us-east-1
+  AUDIT_S3_BUCKET: pdfx-bake
+  AUDIT_S3_BUCKET_SSM_PARAM: ""
+  PIPELINE_S3_BUCKET: pdfx-bake
+  SENTRY_ENABLED: "false"
+  SENTRY_DSN: ""
+
+services:
+  bake-s3:
+    image: ghcr.io/getmoto/motoserver:5.2.4@sha256:66672d842bf19618966890c574d85198abe92800f4b3b2b5f791015fa1b58831
+    environment:
+      MOTO_PORT: "5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+  bake-s3-init:
+    image: ${PDFX_GPU_IMAGE:?PDFX_GPU_IMAGE must be set for AMI warm-up}
+    environment: *bake-storage
+    depends_on:
+      bake-s3:
+        condition: service_healthy
+    command: ["python", "-c", "import boto3; boto3.client('s3').create_bucket(Bucket='pdfx-bake')"]
+  app:
+    environment: *bake-storage
+    depends_on:
+      bake-s3-init:
+        condition: service_completed_successfully
+  worker:
+    environment: *bake-storage
+    depends_on:
+      bake-s3-init:
+        condition: service_completed_successfully
+  finalizer:
+    environment: *bake-storage
+    depends_on:
+      bake-s3-init:
+        condition: service_completed_successfully
+  dispatcher:
+    environment: *bake-storage
+    depends_on:
+      bake-s3-init:
+        condition: service_completed_successfully

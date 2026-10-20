@@ -1,6 +1,7 @@
 """Bake qualification must exercise OCR and reject partial extractor success."""
 
 import copy
+from contextlib import closing
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,7 +58,7 @@ def test_scan_requires_recognized_text_not_merely_nonempty_output():
 
 
 def test_scan_fixture_has_image_objects_and_no_selectable_text():
-    with pdfium.PdfDocument(FIXTURES / "test-scan.pdf") as document:
+    with closing(pdfium.PdfDocument(FIXTURES / "test-scan.pdf")) as document:
         assert len(document) == 1
         page = document[0]
         text = page.get_textpage()

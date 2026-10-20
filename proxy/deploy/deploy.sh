@@ -213,6 +213,16 @@ TASK_DEF=$(sed \
     -e "s|\${LOG_REGION}|${REGION}|g" \
     "${SCRIPT_DIR}/task-definition.template.json")
 
+# Resolve non-secret Sentry references. Actual DSN stays in Secrets Manager and
+# is read in memory by the task role; IaC grants that role only this secret.
+PDFX_SENTRY_SECRET=$(read_optional_param "${SSM_PREFIX}/sentry-runtime-secret-id")
+PDFX_SENTRY_PROJECT=$(read_optional_param "${SSM_PREFIX}/sentry-project")
+PDFX_SENTRY_ENVIRONMENT=$(read_optional_param "${SSM_PREFIX}/sentry-environment")
+TASK_DEF=$(printf '%s' "$TASK_DEF" | \
+    PDFX_SENTRY_SECRET="$PDFX_SENTRY_SECRET" PDFX_SENTRY_PROJECT="$PDFX_SENTRY_PROJECT" \
+    PDFX_SENTRY_ENVIRONMENT="$PDFX_SENTRY_ENVIRONMENT" PDFX_SENTRY_RELEASE="$IMAGE_TAG" \
+    python3 "${SCRIPT_DIR}/sentry_task_config.py")
+
 # --- Generate IAM policy ---
 echo "==> Generating IAM policy..."
 IAM_POLICY=$(sed \

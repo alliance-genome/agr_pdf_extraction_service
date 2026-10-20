@@ -246,6 +246,7 @@ case "$args" in
   *"ssm get-parameter"*"/task-role-name"*) echo task-role ;;
   *"ssm get-parameter"*"/audit-s3-bucket"*) echo audit-bucket ;;
   *"ssm get-parameter"*"/backend-asg-name"*) echo pdfx-backend ;;
+  *"ssm get-parameter"*"/sentry-"*) echo disabled ;;
   *"ssm get-parameter"*) echo configured ;;
   *"ecs register-task-definition"*) echo arn:aws:ecs:us-east-1:123456789012:task-definition/pdfx-proxy:52 ;;
   *"ecs update-service"*) echo '{}' ;;
@@ -293,6 +294,7 @@ case "$args" in
   *"ssm get-parameter"*"/task-role-name"*) echo task-role ;;
   *"ssm get-parameter"*"/audit-s3-bucket"*) echo audit-bucket ;;
   *"ssm get-parameter"*"/backend-asg-name"*) echo pdfx-backend ;;
+  *"ssm get-parameter"*"/sentry-"*) echo disabled ;;
   *"ssm get-parameter"*) echo configured ;;
   *"ecs register-task-definition"*) echo arn:aws:ecs:us-east-1:123456789012:task-definition/pdfx-proxy:52 ;;
   *"ecs update-service"*) echo '{}' ;;
@@ -468,3 +470,21 @@ def test_iam_policy_is_environment_parameterized_and_allows_image_tags():
     assert "pdfx-expire-proxy-queue-claims" in stack_text
     assert "ProxyTaskEphemeralStorageGiB" in stack_text
     assert "EphemeralStorage:" in stack_text
+
+
+def test_sentry_task_configuration_preserves_kill_switch_and_requires_explicit_project():
+    import importlib.util
+    import pytest
+    path = Path(__file__).resolve().parents[1] / 'deploy' / 'sentry_task_config.py'
+    spec = importlib.util.spec_from_file_location('sentry_task_config', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    task = {'containerDefinitions': [{'environment': [{'name': 'SENTRY_ENABLED', 'value': 'false'}]}]}
+    with pytest.raises(ValueError):
+        module.configure(task, 'runtime-secret', '', 'production', 'sha')
+    result = module.configure(task, 'runtime-secret', 'pdfx-prod', 'production', 'sha')
+    values = {v['name']: v['value'] for v in result['containerDefinitions'][0]['environment']}
+    assert values['SENTRY_ENABLED'] == 'false'
+    assert values['SENTRY_RELEASE'] == 'pdfx@sha'
+    assert values['SENTRY_PROJECT'] == 'pdfx-prod'
+    assert 'SENTRY_DSN' not in values

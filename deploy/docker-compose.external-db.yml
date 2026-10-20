@@ -41,3 +41,25 @@ services:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set for external-db mode}
     volumes:
       - /opt/pdfx/rds-ca.pem:/opt/pdfx/rds-ca.pem:ro
+
+  finalizer:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+      grobid:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set for external-db mode}
+    volumes:
+      - /opt/pdfx/rds-ca.pem:/opt/pdfx/rds-ca.pem:ro
+
+  dispatcher:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+      grobid:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set for external-db mode}
+    volumes:
+      - /opt/pdfx/rds-ca.pem:/opt/pdfx/rds-ca.pem:ro

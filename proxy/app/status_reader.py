@@ -43,14 +43,15 @@ class RDSStatusReader:
                 with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                     cursor.execute(
                         """
-                        SELECT process_id, reference_curie, mod_abbreviation,
-                               source_pdf_md5, extract_images, review_images,
-                               status, started_at, ended_at, error_code,
-                               error_message, artifacts_json, log_s3_key,
-                               consensus_metrics_json, llm_usage_json,
-                               llm_cost_usd
-                          FROM extraction_run
-                         WHERE process_id = %s
+                        SELECT r.process_id, r.reference_curie, r.mod_abbreviation, r.source_pdf_md5, r.extract_images, r.review_images, r.status, r.started_at, r.ended_at, r.error_code, r.error_message, r.artifacts_json, r.log_s3_key, r.consensus_metrics_json, r.llm_usage_json, r.llm_cost_usd,
+                               CASE WHEN p.process_id IS NOT NULL THEN json_build_object(
+                                 'stage', p.stage, 'state', p.state, 'generation', p.generation,
+                                 'created_at', p.created_at, 'deadline_at', p.deadline_at,
+                                 'stage_started_at', p.stage_started_at,
+                                 'extraction_ended_at', p.extraction_ended_at) END AS pipeline,
+                               p.progress
+                          FROM extraction_run r LEFT JOIN pipeline_job p USING (process_id)
+                         WHERE r.process_id = %s
                         """,
                         (process_id,),
                     )
@@ -72,13 +73,14 @@ class RDSStatusReader:
                         SELECT EXISTS (
                             SELECT 1
                               FROM extraction_run
-                             WHERE status = 'running'
-                               AND started_at IS NOT NULL
-                               AND started_at >= CURRENT_TIMESTAMP
-                                   - (%s * INTERVAL '1 minute')
+                             WHERE status IN ('queued', 'running')
+                               AND EXISTS (SELECT 1 FROM pipeline_job p
+                                           WHERE p.process_id = extraction_run.process_id
+                                             AND p.state <> 'terminal'
+                                             AND p.deadline_at > CURRENT_TIMESTAMP)
                         )
                         """,
-                        (max(1, settings.SHARED_RUNNING_MAX_AGE_MINUTES),),
+                        (),
                     )
                     row = cursor.fetchone()
             return True, bool(row and row[0])

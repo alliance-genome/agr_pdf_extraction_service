@@ -19,3 +19,9 @@ services:
 
   worker:
     volumes: *prebuilt-volumes
+
+  finalizer:
+    volumes: *prebuilt-volumes
+
+  dispatcher:
+    volumes: *prebuilt-volumes

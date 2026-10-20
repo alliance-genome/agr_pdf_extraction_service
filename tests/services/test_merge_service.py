@@ -142,7 +142,7 @@ class FakeSelectorLLM:
         )
         response_choice = ordered_ids.index(selected_id)
         request_sha256 = hashlib.sha256(
-            f"{reason}\0{baseline_id}\0{'\0'.join(ordered_ids)}".encode()
+            ("\0".join([reason, baseline_id, *ordered_ids])).encode()
         ).hexdigest()
         self.selection_call_traces.append({
             "tier": "sol",
