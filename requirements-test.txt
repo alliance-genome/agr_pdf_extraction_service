@@ -1,0 +1,27 @@
+# CPU-only CI environment. Runtime versions remain constrained by the production
+# manifests through scripts/testing/install_test_dependencies.sh. Constraints
+# do not install the heavy extraction/model packages.
+-r proxy/requirements.txt
+
+flask
+openai
+pydantic
+agr-abc-document-parsers
+mistune
+rapidfuzz
+regex
+scipy
+numba
+numpy
+celery[redis]
+redis
+gunicorn
+pygelf
+pyyaml
+pypdfium2
+sqlalchemy
+alembic
+sentry-sdk[flask,celery,fastapi]
+
+pytest>=8,<10
+pytest-asyncio>=0.24,<2

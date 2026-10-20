@@ -41,6 +41,12 @@ def _patch_singletons(monkeypatch):
     mock_lifecycle.touch = MagicMock()
     monkeypatch.setattr("app.main.lifecycle", mock_lifecycle)
 
+    # Route tests must not inherit a workstation/CI database connection.
+    # Database behavior is patched per case; the dedicated PostgreSQL test
+    # constructs its own reader using PDFX_TEST_DATABASE_URL.
+    from app.status_reader import RDSStatusReader
+    monkeypatch.setattr("app.main.status_reader", RDSStatusReader(""))
+
     # Reset job queue
     from app.job_queue import JobQueue
     monkeypatch.setattr("app.main.job_queue", JobQueue(max_size=10))
@@ -619,6 +625,9 @@ class TestExtractStatusEndpoint:
 
     def test_queued_job_refreshes_health_snapshot_before_busy_message(self, client, monkeypatch):
         import app.main as main_mod
+        # This case checks the status response's refresh, not the replay loop's
+        # independent refresh; do not let background scheduling race the count.
+        monkeypatch.setattr(main_mod, "_ensure_replay_task", MagicMock())
         main_mod.job_queue.enqueue("refresh-test-123", b"pdf", {})
         main_mod.lifecycle.state = InstanceState.READY
         main_mod.lifecycle.private_ip = "172.31.1.100"

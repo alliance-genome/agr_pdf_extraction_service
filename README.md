@@ -228,6 +228,32 @@ git diff --check
 For backend application tests, run `python -m pytest -q tests` in the pinned
 backend image or an environment installed from `requirements.txt`.
 
+The [Tests workflow](.github/workflows/tests.yml) runs separate backend and proxy
+jobs on every pull request and push to `main`. Both use Python 3.11 and a fresh
+PostgreSQL 16 service migrated to head. This includes the dispatcher concurrency,
+recovery, deadline and fencing tests, the proxy's real database query, API and
+scientific merge regressions, and Sentry privacy/error handling. Jobs need no
+AWS, Sentry or provider credentials and retain JUnit results as artifacts.
+
+For the same lightweight environment locally (Python 3.11, Bash and `zip`):
+
+```bash
+bash scripts/testing/install_test_dependencies.sh
+# Point both URLs at a disposable PostgreSQL database, never production.
+export DATABASE_URL=postgresql://pdfx:pdfx-ci-only@127.0.0.1:5432/pdfx_test
+export PDFX_TEST_DATABASE_URL="$DATABASE_URL"
+python -m alembic upgrade head
+python -m pytest -q -ra tests --ignore=tests/services/test_marker_service.py
+python -m pytest -q -ra proxy/tests
+```
+
+The installer applies runtime version constraints to `requirements-test.txt`, but omits
+Marker, Docling and model weights. The Marker service module is explicitly
+excluded because it imports that stack at collection; the real Docling renderer
+check skips when Docling is absent. Optional ignored local fixtures can also
+skip. These checks do not replace full dependency-image tests or real GPU/OCR
+validation. PostgreSQL tests must run in CI rather than skip for a missing URL.
+
 ## Deployment
 
 Proxy deployments update the ECS task definition through
