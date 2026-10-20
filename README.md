@@ -245,11 +245,7 @@ end-to-end extraction, queue drain, and return to cost-safe idle capacity.
 - Prefer IAM roles, SSM, and ECS secret injection over copied environment
   values.
 
-## License
-
-See [LICENSE](LICENSE).
-
-### Backend database driver contract
+## Backend database driver contract
 
 Backend requirements constrain SQLAlchemy to `>=2.0,<2.1` and install
 `psycopg2-binary`. SQLAlchemy 2.1 changes the driver selected by plain
@@ -261,3 +257,7 @@ Both backend Dockerfiles run `deploy/check_database_driver.py` before image
 publication. It constructs application and migration engines for plain and
 explicit Psycopg 2 URLs without opening a database connection. A missing or
 unexpected driver fails the image build before starting a GPU AMI bake.
+
+## License
+
+See [LICENSE](LICENSE).
