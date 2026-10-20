@@ -182,6 +182,8 @@ def initialize(component):
         return False
     try:
         parsed = urlsplit(dsn)
+        # urllib validates numeric/range constraints lazily, as the SDK does.
+        _ = parsed.port
         if parsed.scheme != "https" and not (
             parsed.scheme == "http"
             and os.getenv("SENTRY_ALLOW_INSECURE_DSN", "false").lower() == "true"
