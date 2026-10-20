@@ -385,11 +385,58 @@ def test_runtime_permission_preflight_rejects_read_only_role(jobs):
                 check_pipeline_database(connection)
             connection.execute(text("RESET ROLE"))
             connection.execute(
-                text(
-                    f"GRANT INSERT,UPDATE,DELETE ON extraction_run,pipeline_job TO {role}"
-                )
+                text(f"GRANT INSERT,UPDATE ON extraction_run,pipeline_job TO {role}")
             )
             connection.execute(text(f"SET LOCAL ROLE {role}"))
             check_pipeline_database(connection)
         finally:
             transaction.rollback()
+
+
+def test_provider_admission_wait_does_not_become_a_provider_timeout(jobs, monkeypatch):
+    import time
+    from types import SimpleNamespace
+    from sqlalchemy import text
+    from app.models import get_engine
+
+    pid = jobs()
+    dispatch()
+    pipeline.claim(pid, 1, "extraction")
+    pipeline.handoff(pid, 1, {})
+    dispatch()
+    pipeline.claim(pid, 2, "finalization")
+    monkeypatch.setattr(Config, "PIPELINE_PROVIDER_CONCURRENCY", 1)
+    # The former local timeout would see >180 seconds while the actual durable
+    # job deadline remains healthy. Admission must wait, not fabricate an LLM
+    # timeout that scientific fallback handlers could consume.
+    ticks = iter([0, 181, 182, 183])
+    monkeypatch.setattr(
+        pipeline,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(ticks), sleep=time.sleep),
+    )
+    pipeline.set_active_job(pid, 2)
+    try:
+        with (
+            get_engine()
+            .connect()
+            .execution_options(isolation_level="AUTOCOMMIT") as lock
+        ):
+            lock.execute(text("SELECT pg_advisory_lock(765123, 0)"))
+            with ThreadPoolExecutor(1) as pool:
+
+                def request():
+                    with pipeline.provider_slot():
+                        return "provider_called"
+
+                future = pool.submit(request)
+                time.sleep(0.3)
+                try:
+                    assert not future.done()
+                    assert pipeline.snapshot(pid)["provider_started"] is False
+                finally:
+                    lock.execute(text("SELECT pg_advisory_unlock(765123, 0)"))
+                assert future.result(timeout=5) == "provider_called"
+        assert pipeline.snapshot(pid)["provider_started"] is True
+    finally:
+        pipeline.set_active_job()

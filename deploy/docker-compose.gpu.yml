@@ -107,6 +107,8 @@ services:
       "app:create_app()"
 
   worker:
+    # Keep workers signalable and reap orphaned stage monitors.
+    init: true
     build:
       context: ..
       dockerfile: deploy/Dockerfile.gpu
@@ -158,6 +160,8 @@ services:
         tag: "pdfx-worker"
 
   finalizer:
+    # Keep workers signalable and reap orphaned stage monitors.
+    init: true
     build:
       context: ..
       dockerfile: deploy/Dockerfile.gpu

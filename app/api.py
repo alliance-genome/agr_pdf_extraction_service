@@ -32,7 +32,7 @@ from werkzeug.utils import secure_filename
 from config import Config
 from app.error_utils import summarize_error_message
 from app.image_metadata import copy_image_metadata, normalize_image_manifest_entry
-from app.models import ExtractionRun, get_session, update_extraction_run_if_nonterminal
+from app.models import ExtractionRun, PipelineJob, get_session, update_extraction_run_if_nonterminal
 from app.services.audit_logger import build_s3_client
 
 logger = logging.getLogger(__name__)
@@ -382,6 +382,21 @@ def _count_fresh_running_runs():
             pass
 
 
+def _count_unfinished_pipeline_jobs():
+    db_session = _get_db_session()
+    if not db_session:
+        return "unknown"
+    try:
+        return db_session.query(PipelineJob).filter(
+            PipelineJob.state != "terminal"
+        ).count()
+    except Exception:
+        logger.warning("Failed to count durable unfinished pipeline jobs")
+        return "unknown"
+    finally:
+        db_session.close()
+
+
 def _check_db_ready():
     db_session = _get_db_session()
     if not db_session:
@@ -631,10 +646,12 @@ def health():
             checks["marker_models_error"] = marker_error
 
     if db_status == "ok":
+        checks["pipeline_active_jobs"] = _count_unfinished_pipeline_jobs()
         checks["active_runs"] = _count_runs_by_status(["running"])
         checks["fresh_active_runs"] = _count_fresh_running_runs()
         checks["queued_runs"] = _count_runs_by_status(["queued"])
     else:
+        checks["pipeline_active_jobs"] = "unknown"
         checks["active_runs"] = "unknown"
         checks["fresh_active_runs"] = "unknown"
         checks["queued_runs"] = "unknown"

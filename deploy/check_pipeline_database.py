@@ -9,7 +9,7 @@ def check_pipeline_database(connection):
         raise RuntimeError("The staged runtime requires PostgreSQL")
     missing = []
     for table in ("extraction_run", "pipeline_job"):
-        for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+        for privilege in ("SELECT", "INSERT", "UPDATE"):
             allowed = connection.execute(
                 text("SELECT has_table_privilege(current_user, :table, :privilege)"),
                 {"table": table, "privilege": privilege},

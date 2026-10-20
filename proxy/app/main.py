@@ -251,6 +251,16 @@ def _positive_int(value: Any) -> int:
 def _active_jobs_from_backend_checks(checks: Any) -> int:
     if not isinstance(checks, dict):
         return 0
+    durable_count = checks.get("pipeline_active_jobs")
+    if (
+        checks.get("database") == "ok"
+        and isinstance(durable_count, int)
+        and not isinstance(durable_count, bool)
+        and durable_count >= 0
+    ):
+        # Broker deliveries may outlive cancelled/failed jobs until visibility
+        # timeout. They are transport diagnostics, not authoritative work.
+        return durable_count
     return max(
         _positive_int(checks.get("fresh_active_runs")),
         _positive_int(checks.get("queued_runs")),

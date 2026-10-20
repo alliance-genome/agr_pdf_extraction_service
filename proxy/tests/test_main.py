@@ -2446,3 +2446,15 @@ async def test_sentry_reports_handled_operational_failure_but_not_stopped_health
     request = Request({'type': 'http', 'method': 'GET', 'path': '/api/v1/health', 'headers': []})
     await main_mod.sentry_request_context(request, unavailable)
     assert captured == []
+
+
+def test_durable_idle_accounting_ignores_stale_broker_deliveries():
+    from app.main import _active_jobs_from_backend_checks
+    checks = {'database': 'ok', 'pipeline_active_jobs': 0,
+              'fresh_active_runs': 0, 'queued_runs': 0,
+              'broker_queued': 3, 'broker_unacked': 5}
+    assert _active_jobs_from_backend_checks(checks) == 0
+    checks['pipeline_active_jobs'] = 2
+    assert _active_jobs_from_backend_checks(checks) == 2
+    checks['database'] = 'unavailable'
+    assert _active_jobs_from_backend_checks(checks) == 5

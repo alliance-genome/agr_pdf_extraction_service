@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 from app import pipeline
+from app.pipeline_health import touch
 from config import Config
 from pdfx_observability import initialize, capture_failure
 
@@ -56,6 +57,7 @@ def main(process_id, generation, stage):
                 if missing_owner is not None:
                     raise pipeline.OwnershipLost("Worker ownership connection was lost")
             pipeline.heartbeat(process_id, generation)
+            touch(stage)
             if not announced:
                 print("READY", flush=True)
                 announced = True

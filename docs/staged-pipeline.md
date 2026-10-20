@@ -31,6 +31,9 @@ when the live lock has been released. A separate watchdog process enforces the
 job deadline and cancellation even if a native extension holds the worker's
 Python GIL. A separate stdlib-only sentinel supervises watchdog death; both
 monitors share the worker-owned stop pipe and use exact-process handles.
+Worker services must retain Compose `init: true`: Linux protects namespace
+PID 1 from same-namespace kill signals, so the actual worker must be a child
+of the container init process. Init also reaps orphaned monitors.
 Losing the ownership connection or either monitor stops that worker
 process. A GPU worker restart reloads its models; a finalizer restart affects
 only its prefork child.
@@ -62,6 +65,13 @@ accounting includes queued finalization even when the GPU queue is empty.
 
 ## Deployment
 
+Keep the PR's `no-deploy` label through merge: this change requires an ordered
+release, and the existing merge workflow otherwise deploys the proxy before
+backend schema preparation. Do not enable automatic deployment for this PR.
+The new proxy requires `pipeline_job`; deploy it only after draining old work,
+applying the migration/grants and starting the staged backend. Mixed old/new
+workers and pre-migration proxy startup are deliberately unsupported.
+
 1. Drain the existing proxy/backend queue and all active jobs. Do not mix old
    monolithic workers with the staged scheduler for in-flight work.
 2. Configure the pipeline S3 bucket/prefix and lifecycle retention. The AWS
@@ -69,13 +79,15 @@ accounting includes queued finalization even when the GPU queue is empty.
    checkpoint retention longer than the maximum job lifetime plus recovery
    margin. Persistent PostgreSQL must outlive a backend replacement for durable
    recovery; production uses the external database Compose overlay.
-3. Apply the Alembic migration before starting the new API, dispatcher or workers.
+3. Apply the Alembic migration before starting the new API, proxy, dispatcher or workers.
    The additive `pipeline_job` table references existing public run records.
-   Grant the existing runtime role SELECT, INSERT, UPDATE and DELETE on that
-   table (or verify the migration owner's existing default privileges). The proxy
+   Grant the backend runtime role SELECT, INSERT and UPDATE on both
+   `extraction_run` and `pipeline_job` (or verify existing default privileges).
+   Grant the proxy role SELECT on both tables. The proxy
    still enforces read-only transactions. `deploy.sh` checks runtime privileges
    after migration and fails before starting services if grants are missing.
-4. Deploy one immutable image to app, worker, finalizer and dispatcher. The GPU
+4. Deploy one immutable backend image to app, worker, finalizer and dispatcher,
+   then deploy the matching proxy. The GPU
    Compose file grants GPU access only to the extraction worker. Do not mount
    source over the image. Check readiness and submit both text and scanned PDFs.
 5. Verify durable artifacts, both queues, Sentry and idle shutdown. Existing
@@ -127,3 +139,17 @@ absence from production, then verify each deployed component's ingestion.
 Configure project issue-owner notification rules and test their routing. A
 successful SDK send alone does not prove an event was stored or an alert was
 received.
+
+Operational choices: a stage stops immediately if its independent ownership
+monitor cannot confirm database ownership. This intentionally favors fencing
+and bounded native work over continuing through transient database errors;
+post-provider interruptions remain explicit uncertain outcomes. Reporting
+service outages are different and do not stop work. Invalid Sentry project,
+secret schema or transport configuration remains an explicit startup error.
+
+Global provider admission waits are bounded by the durable job deadline, not a
+separate short local timeout that could trigger scientific fallback without a
+provider call. Idle accounting uses nonterminal durable jobs when available;
+broker queued/unacked counts remain diagnostics and do not extend the idle
+lifetime of completed or cancelled work. The watchdog refreshes extraction
+liveness independently of the worker GIL during active native work.

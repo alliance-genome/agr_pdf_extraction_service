@@ -394,7 +394,6 @@ def provider_slot():
         yield
         return
     process_id, generation = _active_job
-    started = time.monotonic()
     engine = get_engine()
     connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
     slot = None
@@ -409,10 +408,9 @@ def provider_slot():
                     slot = number
                     break
             if slot is None:
-                if time.monotonic() - started >= Config.PIPELINE_PROVIDER_WAIT_SECONDS:
-                    raise TimeoutError(
-                        "Global provider concurrency budget wait expired"
-                    )
+                # Local admission contention must not become a scientific
+                # provider timeout/fallback. owned() and the watchdog enforce
+                # the job deadline while this call waits for an available slot.
                 time.sleep(0.1)
         with session() as db:
             _, job = owned(db, process_id, generation)

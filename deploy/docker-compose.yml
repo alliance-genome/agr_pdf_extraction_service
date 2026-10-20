@@ -67,6 +67,8 @@ services:
       "app:create_app()"
 
   worker:
+    # Keep workers signalable and reap orphaned stage monitors.
+    init: true
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -92,6 +94,8 @@ services:
     command: ["python", "-m", "app.worker_main"]
 
   finalizer:
+    # Keep workers signalable and reap orphaned stage monitors.
+    init: true
     build:
       context: ..
       dockerfile: deploy/Dockerfile

@@ -1060,3 +1060,20 @@ def test_health_requires_finalizer_even_with_empty_gpu_queue(client,monkeypatch)
         response=client.get('/api/v1/health')
     assert response.status_code==503
     assert response.get_json()['checks']['finalization_worker']=='unavailable'
+
+
+def test_health_counts_durable_jobs_despite_stale_broker_deliveries(client):
+    pid = submit(client).get_json()['process_id']
+    redis = MagicMock()
+    redis.llen.return_value = 3
+    redis.hlen.return_value = 2
+    redis.zcard.return_value = 2
+    with patch('requests.get', return_value=SimpleNamespace(status_code=200)), patch('redis.from_url', return_value=redis):
+        assert client.get('/api/v1/health').get_json()['checks']['pipeline_active_jobs'] == 1
+        from app.pipeline import cancel
+        cancel(pid, 'finished lab work')
+        checks = client.get('/api/v1/health').get_json()['checks']
+    assert checks['database'] == 'ok'
+    assert checks['pipeline_active_jobs'] == 0
+    assert checks['broker_unacked'] == 2
+    assert checks['broker_queued'] == 6

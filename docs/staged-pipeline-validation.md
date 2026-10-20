@@ -39,13 +39,21 @@ comparison or evidence of saturated GPU use.
 
 - Fresh schema migration, and upgrade of the baseline database with its ten
   existing runs: process IDs, terminal states and artifact metadata preserved.
-  Runtime permission checks reject a SELECT-only application role.
+  Runtime permission checks reject a SELECT-only application role and accept
+  SELECT/INSERT/UPDATE without DELETE. A separate real-PostgreSQL proxy test
+  verifies joined status, queued-finalizer accounting, read-only enforcement
+  and unknown/unavailable state before migration.
 - Real PostgreSQL tests cover concurrent dispatchers, duplicate claims, fencing,
   publish failure, backpressure, deadlines, terminal immutability, cross-process
   provider budgets and recovery. A native call deliberately holding the GIL was
   killed by the external watchdog and its deadline persisted. Killing either
   watchdog or sentinel while a worker held the native GIL also terminated
-  that worker and released ownership. A reporting-secret endpoint outage
+  that worker and released ownership. Actual Compose GPU-worker tests verify
+  `init: true`, worker PID greater than 1, container restart and released locks
+  after native-GIL hangs under deadline expiry, watchdog death and cancellation.
+  Active extraction health remained fresh after 22 seconds holding the GIL.
+  Terminal jobs reported zero durable active work despite stale broker unacked
+  messages. A reporting-secret endpoint outage
   did not prevent watchdog readiness.
 - Redis stopped during acceptance, duplicate submission, then Redis restarted
   with an empty queue: the same durable job completed.
@@ -79,7 +87,9 @@ comparison or evidence of saturated GPU use.
   unhandled-error correlation, redaction and one-event reporting. Caught real
   checkpoint and uncertain-provider failures also reached development Sentry.
 
-The backend suite runs in the deployed Python/CUDA dependency image; proxy tests
+The backend dependency-image suite passed 558 tests (23 skipped, including
+16 opt-in PostgreSQL cases run separately). The proxy suite passed 212 tests
+and its additional opt-in PostgreSQL case passed separately. Proxy tests
 run separately because both packages are named `app`. PostgreSQL tests opt in
 through `PDFX_TEST_DATABASE_URL`, pointing only to a migrated disposable test
 DB. Scientific merge, native artifact and page-provenance regression suites
