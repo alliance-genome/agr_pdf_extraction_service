@@ -43,6 +43,13 @@ comparison or evidence of saturated GPU use.
   SELECT/INSERT/UPDATE without DELETE. A separate real-PostgreSQL proxy test
   verifies joined status, queued-finalizer accounting, read-only enforcement
   and unknown/unavailable state before migration.
+- A simulated 30-job batch spanning an hour retained each job's full execution
+  budget at first claim; the CPU handoff did not reset that budget. Separate
+  queue-age expiration remains bounded.
+- Admission connection, ownership-query and slot-query faults propagate through
+  source/page/bounded-choice, title/style, outer merge and image-review handlers
+  rather than publishing scientific fallbacks. Actual provider failures retain
+  their prior tested fallback behavior. Malformed Sentry secrets disable reporting.
 - Real PostgreSQL tests cover concurrent dispatchers, duplicate claims, fencing,
   publish failure, backpressure, deadlines, terminal immutability, cross-process
   provider budgets and recovery. A native call deliberately holding the GIL was
@@ -87,9 +94,11 @@ comparison or evidence of saturated GPU use.
   unhandled-error correlation, redaction and one-event reporting. Caught real
   checkpoint and uncertain-provider failures also reached development Sentry.
 
-The backend dependency-image suite passed 558 tests (23 skipped, including
-16 opt-in PostgreSQL cases run separately). The proxy suite passed 212 tests
-and its additional opt-in PostgreSQL case passed separately. Proxy tests
+The AWS dependency-image suite passed 558 tests before final review fixes.
+The final admission/error and queue-budget fixes were additionally validated
+in a local Python 3.11 CUDA dependency image built from the available pinned
+backend base: 576 passed, 24 skipped, with 17 real-PostgreSQL pipeline tests
+run separately. The final proxy run passed 213 tests including its opt-in PostgreSQL case. Proxy tests
 run separately because both packages are named `app`. PostgreSQL tests opt in
 through `PDFX_TEST_DATABASE_URL`, pointing only to a migrated disposable test
 DB. Scientific merge, native artifact and page-provenance regression suites

@@ -832,3 +832,21 @@ def test_large_structural_alignment_exposes_source_backed_candidate_regions():
 
     assert len(plan.graph.regions) == 120
     assert len(plan.selection_graph.regions) == 120
+
+
+def test_source_merge_failsafe_propagates_operational_admission_failure():
+    from app.pipeline_errors import ProviderAdmissionError
+
+    artifacts = {
+        source: SourceArtifact.from_text(source, f"# Title\n\nGene {symbol} is active.")
+        for source, symbol in (("grobid", "Gg1"), ("docling", "Gγ1"), ("marker", "G g 1"))
+    }
+    baseline = select_baseline(
+        artifacts,
+        completion_evidence=completion_evidence_for_finished_artifacts(artifacts),
+        requirements=RELAXED,
+    )
+    def unavailable(*args):
+        raise ProviderAdmissionError("local admission unavailable")
+    with pytest.raises(ProviderAdmissionError):
+        merge_with_baseline_failsafe(baseline, artifacts, selection_resolver=unavailable)

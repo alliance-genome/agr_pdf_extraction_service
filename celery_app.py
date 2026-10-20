@@ -640,6 +640,7 @@ def _record_llm_cost_alert(cost_usd, usage, log=None):
 
 def _review_images_with_text_context(images, llm, log=None):
     """Apply optional text-only LLM review to image manifest entries."""
+    from app.pipeline_errors import StageControlError
     reviewed_images = []
     log = log or logger
     for image in images:
@@ -655,6 +656,8 @@ def _review_images_with_text_context(images, llm, log=None):
                 review_payload,
                 model=Config.IMAGE_TEXT_REVIEW_MODEL,
             )
+        except StageControlError:
+            raise
         except Exception as exc:
             reviewed["image_reviewed"] = False
             reviewed["image_review_method"] = "llm_text"

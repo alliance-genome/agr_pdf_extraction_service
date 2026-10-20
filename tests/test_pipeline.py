@@ -261,13 +261,12 @@ def _native_hang_child(url, pid, ready=None):
             ctypes.PyDLL(None).sleep(60)
 
 
-def test_external_watchdog_kills_native_hang_and_persists_deadline(jobs):
+def test_external_watchdog_kills_native_hang_and_persists_deadline(jobs, monkeypatch):
     import multiprocessing
 
     pid = jobs()
     dispatch()
-    with pipeline.session() as db:
-        db.get(PipelineJob, pid).deadline_at = pipeline.now() + timedelta(seconds=3)
+    monkeypatch.setenv("PIPELINE_DEADLINE_SECONDS", "3")
     child = multiprocessing.get_context("spawn").Process(
         target=_native_hang_child, args=(os.environ["PDFX_TEST_DATABASE_URL"], pid)
     )
@@ -440,3 +439,33 @@ def test_provider_admission_wait_does_not_become_a_provider_timeout(jobs, monkey
         assert pipeline.snapshot(pid)["provider_started"] is True
     finally:
         pipeline.set_active_job()
+
+
+def test_large_backend_batch_gets_full_execution_budget_at_first_claim(
+    jobs, monkeypatch
+):
+    clock = [pipeline.now()]
+    monkeypatch.setattr(pipeline, "now", lambda: clock[0])
+    monkeypatch.setattr(Config, "PIPELINE_DEADLINE_SECONDS", 300)
+    monkeypatch.setattr(Config, "PIPELINE_QUEUE_MAX_AGE_SECONDS", 86400)
+    ids = [jobs() for _ in range(30)]
+    submitted = clock[0]
+    for _ in ids:
+        dispatch()
+        pid = next(pid for pid in ids if (job := pipeline.snapshot(pid))["stage"] == "extraction" and job["state"] == "dispatched")
+        claimed = pipeline.claim(pid, 1, "extraction")
+        assert claimed is not None
+        deadline = pipeline.aware(claimed["deadline_at"])
+        assert deadline == clock[0] + timedelta(seconds=300)
+        assert pipeline.aware(claimed["execution_started_at"]) == clock[0]
+        clock[0] += timedelta(seconds=120)
+        pipeline.handoff(pid, 1, {})
+        dispatch()
+        finalizer = pipeline.claim(pid, 2, "finalization")
+        assert pipeline.aware(finalizer["deadline_at"]) == deadline
+        assert pipeline.aware(
+            finalizer["execution_started_at"]
+        ) == deadline - timedelta(seconds=300)
+        pipeline.complete(pid, 2, {"status": "success"}, {})
+    assert (clock[0] - submitted).total_seconds() > 2100
+    assert all(pipeline.snapshot(pid)["state"] == "terminal" for pid in ids)

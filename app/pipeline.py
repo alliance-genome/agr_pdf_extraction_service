@@ -12,6 +12,12 @@ import time
 
 from sqlalchemy import select, text, case, func, and_
 from sqlalchemy.orm import Session
+from app.pipeline_errors import (
+    OwnershipLost,
+    PipelineDeadlineExceeded,
+    ProviderAdmissionError,
+    StageControlError,
+)
 from app.models import (
     ExtractionRun,
     PipelineJob,
@@ -28,14 +34,6 @@ def now():
 
 def aware(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
-
-
-class OwnershipLost(RuntimeError):
-    pass
-
-
-class PipelineDeadlineExceeded(TimeoutError):
-    pass
 
 
 class UncertainProviderOutcome(RuntimeError):
@@ -100,7 +98,7 @@ def accept(process_id, source, options, claimed_at):
                 options=options,
                 created_at=timestamp,
                 deadline_at=timestamp
-                + timedelta(seconds=Config.PIPELINE_DEADLINE_SECONDS),
+                + timedelta(seconds=Config.PIPELINE_QUEUE_MAX_AGE_SECONDS),
                 stage="extraction",
                 state="ready",
                 generation=1,
@@ -140,15 +138,23 @@ def claim(process_id, generation, stage):
             expired = PipelineDeadlineExceeded("Pipeline deadline expired")
             _fail(run, job, expired)
         else:
+            if run.started_at is None:
+                # A batch waiting behind earlier PDFs has its own queue-age
+                # bound. Start execution time once, preserving it on retries
+                # and across the CPU handoff.
+                run.started_at = now()
+                job.deadline_at = run.started_at + timedelta(
+                    seconds=Config.PIPELINE_DEADLINE_SECONDS
+                )
             job.state = "running"
             job.heartbeat_at = job.stage_started_at = now()
             job.attempts += 1
             run.status = "running"
-            run.started_at = run.started_at or now()
             result = {
                 col.name: getattr(job, col.name)
                 for col in PipelineJob.__table__.columns
             }
+            result["execution_started_at"] = run.started_at
     if expired:
         capture_failure(
             expired, process_id=process_id, stage=stage, generation=generation
@@ -394,27 +400,37 @@ def provider_slot():
         yield
         return
     process_id, generation = _active_job
-    engine = get_engine()
-    connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+    connection = None
     slot = None
     try:
-        while slot is None:
+        try:
+            connection = (
+                get_engine().connect().execution_options(isolation_level="AUTOCOMMIT")
+            )
+            while slot is None:
+                with session() as db:
+                    owned(db, process_id, generation)
+                for number in range(Config.PIPELINE_PROVIDER_CONCURRENCY):
+                    if connection.execute(
+                        text("SELECT pg_try_advisory_lock(765123, :slot)"),
+                        {"slot": number},
+                    ).scalar():
+                        slot = number
+                        break
+                if slot is None:
+                    # Local admission contention must not become a scientific
+                    # provider timeout/fallback. owned() and the watchdog enforce
+                    # the job deadline while this call waits for an available slot.
+                    time.sleep(0.1)
             with session() as db:
-                owned(db, process_id, generation)
-            for number in range(Config.PIPELINE_PROVIDER_CONCURRENCY):
-                if connection.execute(
-                    text("SELECT pg_try_advisory_lock(765123, :slot)"), {"slot": number}
-                ).scalar():
-                    slot = number
-                    break
-            if slot is None:
-                # Local admission contention must not become a scientific
-                # provider timeout/fallback. owned() and the watchdog enforce
-                # the job deadline while this call waits for an available slot.
-                time.sleep(0.1)
-        with session() as db:
-            _, job = owned(db, process_id, generation)
-            job.provider_started = True
+                _, job = owned(db, process_id, generation)
+                job.provider_started = True
+        except StageControlError:
+            raise
+        except Exception as exc:
+            raise ProviderAdmissionError(
+                "Provider admission could not confirm current ownership and capacity"
+            ) from exc
         import sentry_sdk
 
         with sentry_sdk.start_span(op="pdfx.provider", description="pdfx.provider"):
@@ -433,4 +449,5 @@ def provider_slot():
                 )
             except Exception:
                 connection.invalidate()
-        connection.close()
+        if connection is not None:
+            connection.close()

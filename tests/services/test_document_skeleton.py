@@ -3237,7 +3237,8 @@ def test_below_floor_mappable_unit_reaches_numbered_selection():
     assert projected["model_selected_target"] is True
 
 
-def test_numbered_selection_failure_records_unavailable_without_crashing():
+@pytest.mark.parametrize("operational", [False, True])
+def test_numbered_selection_failure_records_unavailable_without_crashing(operational):
     marker = SourceArtifact.from_text(
         "marker",
         "Anchor before.\n\nPreviously described (30).\n\nAnchor after.\n",
@@ -3253,9 +3254,25 @@ def test_numbered_selection_failure_records_unavailable_without_crashing():
         after="Anchor after.",
     )
 
+    from app.pipeline_errors import ProviderAdmissionError
     def unavailable_selector(**_kwargs):
+        if operational:
+            raise ProviderAdmissionError("admission unavailable")
         raise RuntimeError("selection service unavailable")
 
+    if operational:
+        with pytest.raises(ProviderAdmissionError):
+            rendered, audit, events = project_native_emphasis(
+                final.text,
+                _audit(final),
+                {
+                    "marker": build_document_skeleton(marker, native),
+                    "grobid": build_document_skeleton(final, None),
+                },
+                {"marker": marker, "grobid": final},
+                style_selection_resolver=unavailable_selector,
+            )
+        return
     rendered, audit, events = project_native_emphasis(
         final.text,
         _audit(final),

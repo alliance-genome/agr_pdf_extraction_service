@@ -165,16 +165,18 @@ def initialize(component):
                     retries={"total_max_attempts": attempts},
                 ),
             ).get_secret_value(SecretId=secret_id)
-        except (BotoCoreError, ClientError):
+            dsn = json.loads(response["SecretString"])["projects"][project][
+                "dsn_private_vpc"
+            ]
+            if not isinstance(dsn, str):
+                raise TypeError("Sentry secret DSN must be a string")
+        except (BotoCoreError, ClientError, KeyError, ValueError, TypeError):
             # Reporting availability must not change extraction outcomes.
             # Do not log exception details, which can contain credential context.
             logging.getLogger(__name__).warning(
-                "Sentry secret lookup unavailable; reporting disabled for this process"
+                "Sentry secret unavailable or malformed; reporting disabled for this process"
             )
             return False
-        dsn = json.loads(response["SecretString"])["projects"][project][
-            "dsn_private_vpc"
-        ]
     if not dsn:
         return False
     parsed = urlsplit(dsn)

@@ -571,3 +571,49 @@ def test_concurrent_page_calls_account_usage_once_without_mutating_trace_order()
     assert summary["total_completion_tokens"] == 160
     assert summary["total_cached_tokens"] == 80
     assert summary["breakdown"]["page_resolution_luna"]["calls"] == 8
+
+
+@pytest.mark.parametrize("operation", ["source", "page", "bounded_id"])
+@pytest.mark.parametrize("failure_at", ["connect", "ownership", "slot"])
+def test_provider_admission_database_errors_never_become_scientific_fallback(monkeypatch, operation, failure_at):
+    from contextlib import contextmanager
+    from sqlalchemy.exc import OperationalError
+    from app import pipeline
+    from app.pipeline_errors import ProviderAdmissionError
+
+    error = OperationalError("synthetic admission query", {}, OSError("connection reset"))
+    connection = MagicMock()
+    engine = MagicMock()
+    engine.connect.return_value.execution_options.return_value = connection
+    monkeypatch.setattr(pipeline, "get_engine", lambda: engine)
+    monkeypatch.setattr(pipeline, "capture_failure", lambda *a, **kw: None)
+
+    @contextmanager
+    def session():
+        yield object()
+
+    monkeypatch.setattr(pipeline, "session", session)
+    monkeypatch.setattr(pipeline, "owned", lambda *a: (None, SimpleNamespace(provider_started=False)))
+    if failure_at == "connect":
+        engine.connect.side_effect = error
+    elif failure_at == "ownership":
+        def unavailable(*args):
+            raise error
+        monkeypatch.setattr(pipeline, "owned", unavailable)
+    else:
+        connection.execute.side_effect = error
+    llm = _llm_with_parsed(None)
+    pipeline.set_active_job("synthetic-job", 1)
+    try:
+        with pytest.raises(ProviderAdmissionError) as caught:
+            if operation == "source":
+                llm.resolve_candidate_selections(*_selection_contract())
+            elif operation == "page":
+                llm.resolve_page_choices(_page_request())
+            else:
+                llm.resolve_bounded_id_choice(reason="title", baseline_id="none", choices=[{"candidate_id": "none"}])
+        assert caught.value.__cause__ is error
+        llm.client.chat.completions.parse.assert_not_called()
+        assert llm.selection_call_traces == []
+    finally:
+        pipeline.set_active_job()

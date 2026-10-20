@@ -7,6 +7,8 @@ heading marker, but it never authors body or heading text.
 
 from __future__ import annotations
 
+from app.pipeline_errors import StageControlError
+
 import hashlib
 import html
 import json
@@ -4243,6 +4245,8 @@ def _compile_positive_style_overlay(
                             if selected_id == none_id
                             else "final_unit_pair_ambiguous"
                         )
+                    except StageControlError:
+                        raise
                     except Exception:
                         selected_id = none_id
                         decline_reason = "model_selection_unavailable"
@@ -5386,6 +5390,8 @@ def render_document_role_slots(
                             },
                             *title_events,
                         ])
+            except StageControlError:
+                raise
             except Exception as exc:
                 events.append({
                     "operation": "alliance_model_title_selection",

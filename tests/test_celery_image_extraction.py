@@ -767,3 +767,15 @@ def test_native_receipt_is_not_published_when_required_style_upload_fails(tmp_pa
     audit = SimpleNamespace(upload_artifact=lambda name, *a, **kw: None if name == 'style.json' else 'key/' + name)
     artifacts = celery_app._upload_artifacts(audit, {'download_paths': {'docling': str(output)}, 'images': []}, False)
     assert 'docling' not in artifacts.get('native', {})
+
+
+def test_image_review_does_not_swallow_provider_admission_failure():
+    from app.pipeline_errors import ProviderAdmissionError
+    from types import SimpleNamespace
+
+    def unavailable(image):
+        raise ProviderAdmissionError("admission unavailable")
+    with pytest.raises(ProviderAdmissionError):
+        celery_app._review_images_with_text_context(
+            [{"filename": "figure.png"}], SimpleNamespace(review_image_context=unavailable)
+        )

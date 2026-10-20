@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.pipeline_errors import StageControlError
+
 import hashlib
 import json
 import logging
@@ -487,6 +489,8 @@ class LLM:
             )
             self.selection_call_traces.append(trace)
             return SelectionDecisionResponse(decisions=tuple(decisions))
+        except StageControlError:
+            raise
         except Exception as exc:
             failure = CandidateSelectionFailure(_failure_reason(exc))
             if trace is not None:
@@ -606,6 +610,8 @@ class LLM:
                 }
             )
             return decisions, trace
+        except StageControlError:
+            raise
         except Exception as exc:
             trace.update(
                 {
@@ -736,6 +742,8 @@ class LLM:
             )
             self.selection_call_traces.append(trace)
             return selected_id
+        except StageControlError:
+            raise
         except Exception as exc:
             failure = CandidateSelectionFailure(_failure_reason(exc))
             trace.update(

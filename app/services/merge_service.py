@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.pipeline_errors import StageControlError
+
 import hashlib
 import re
 import unicodedata
@@ -1286,6 +1288,8 @@ def merge_source_artifacts(
         skeleton_transformations = reconcile_document_transformations(
             audit, skeleton_transformations
         )
+    except StageControlError:
+        raise
     except Exception as exc:
         result = merge_with_baseline_failsafe(
             baseline,
@@ -1327,6 +1331,8 @@ def merge_source_artifacts(
             *skeleton_transformations,
             *emphasis_transformations,
         ]
+    except StageControlError:
+        raise
     except Exception as exc:
         merged_warnings.append(
             f"native_emphasis_projection_declined:{type(exc).__name__}"

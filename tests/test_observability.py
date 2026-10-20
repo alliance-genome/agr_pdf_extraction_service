@@ -259,3 +259,32 @@ def test_flask_unhandled_exception_is_redacted_and_correlated(monkeypatch):
         original_init(
             dsn="", default_integrations=False, auto_enabling_integrations=False
         )
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "not-json",
+        "{}",
+        '{"projects":null}',
+        '{"projects":{"pdfx-dev":{"dsn_private_vpc":123}}}',
+    ],
+)
+def test_malformed_reporting_secret_disables_reporting_without_content(
+    monkeypatch, caplog, secret
+):
+    import boto3
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("SENTRY_RUNTIME_SECRET_ID", "runtime-secret")
+    monkeypatch.setenv("SENTRY_PROJECT", "pdfx-dev")
+    monkeypatch.setattr(
+        boto3,
+        "client",
+        lambda *a, **kw: SimpleNamespace(
+            get_secret_value=lambda **kw: {"SecretString": secret}
+        ),
+    )
+    assert initialize("extraction") is False
+    assert "reporting disabled" in caplog.text
+    assert secret not in caplog.text

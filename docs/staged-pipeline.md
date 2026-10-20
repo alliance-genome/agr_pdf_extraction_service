@@ -29,7 +29,7 @@ A generation number fences stale notifications. Each stage also holds a live
 PostgreSQL session advisory lock. The dispatcher recovers a stale heartbeat only
 when the live lock has been released. A separate watchdog process enforces the
 job deadline and cancellation even if a native extension holds the worker's
-Python GIL. A separate stdlib-only sentinel supervises watchdog death; both
+Python GIL. A separate dedicated sentinel supervises watchdog death; both
 monitors share the worker-owned stop pipe and use exact-process handles.
 Worker services must retain Compose `init: true`: Linux protects namespace
 PID 1 from same-namespace kill signals, so the actual worker must be a child
@@ -58,8 +58,11 @@ Downloads and image listings no longer depend on Redis or a worker-local cache.
 The default limits are one admitted GPU extraction, two finalizers, four
 unfinished downstream/admitted jobs, and four provider calls. Limits, timeouts,
 checkpoint sizes, recovery attempts and container resources are documented in
-`.env.example`. The deadline includes the backend queue and both stages; the
-proxy's pre-backend durable queue retains its separate existing age limit.
+`.env.example`. A separate backend queue-age limit (24 hours by default) applies until the
+first extraction claim. At that claim, the execution deadline starts once and
+covers both stages, retries and handoff waits. Queue time does not consume the
+scientific finalization budget. The proxy's pre-backend durable queue retains
+its separate existing age limit.
 Health requires fresh dispatcher, GPU-worker and finalizer heartbeats, and idle
 accounting includes queued finalization even when the GPU queue is empty.
 
@@ -120,7 +123,8 @@ otherwise HTTPS is required. An empty DSN/reference or `SENTRY_ENABLED=false`
 disables reporting. Preserve the kill switch during emergency troubleshooting.
 Secret lookup uses bounded connect/read timeouts and attempts; AWS lookup
 failures disable reporting in that process and emit a content-free log warning.
-They do not fail extraction. Invalid project/transport settings still fail
+They do not fail extraction. Malformed secret contents also disable reporting. Invalid explicit
+project/transport settings still fail
 explicitly. After a lookup outage, restart the affected service to reinitialize
 reporting; watchdog processes also attempt initialization for each new stage.
 
@@ -144,8 +148,8 @@ Operational choices: a stage stops immediately if its independent ownership
 monitor cannot confirm database ownership. This intentionally favors fencing
 and bounded native work over continuing through transient database errors;
 post-provider interruptions remain explicit uncertain outcomes. Reporting
-service outages are different and do not stop work. Invalid Sentry project,
-secret schema or transport configuration remains an explicit startup error.
+service outages are different and do not stop work. Invalid explicit Sentry project or transport configuration remains a startup
+error; malformed runtime-secret contents disable reporting with a warning.
 
 Global provider admission waits are bounded by the durable job deadline, not a
 separate short local timeout that could trigger scientific fallback without a
@@ -153,3 +157,8 @@ provider call. Idle accounting uses nonterminal durable jobs when available;
 broker queued/unacked counts remain diagnostics and do not extend the idle
 lifetime of completed or cancelled work. The watchdog refreshes extraction
 liveness independently of the worker GIL during active native work.
+
+Admission database/ownership failures propagate through all scientific model,
+source-selection, title/style and outer merge handlers as operational control
+errors. They fail the stage explicitly; only actual provider-response failures
+retain the existing scientific retry/fallback behavior.

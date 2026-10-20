@@ -153,7 +153,7 @@ def _run_stage(process_id, generation, stage):
                     raise RuntimeError("Durable audit/artifact storage is unavailable")
                 progress = Progress(process_id, generation)
                 elapsed = (
-                    pipeline.now() - pipeline.aware(job["created_at"])
+                    pipeline.now() - pipeline.aware(job["execution_started_at"])
                 ).total_seconds()
                 started = time.monotonic() - elapsed
                 common = dict(
@@ -220,7 +220,7 @@ def _run_stage(process_id, generation, stage):
                             process_id=process_id,
                             artifacts_json=artifacts,
                             reference_curie=options.get("reference_curie"),
-                            started_at=pipeline.aware(job["created_at"]).isoformat(),
+                            started_at=pipeline.aware(job["execution_started_at"]).isoformat(),
                             ended_at=pipeline.now().isoformat(),
                             log_s3_key=audit.get_log_s3_key(),
                         )

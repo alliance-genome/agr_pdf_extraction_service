@@ -1,4 +1,4 @@
-"""Stdlib-only supervision of the lease watchdog, outside the worker GIL.
+"""Dedicated supervision of the lease watchdog, outside the worker GIL.
 
 Both monitors inherit the worker-owned stop pipe. EOF takes precedence over
 process death, so normal teardown cannot kill a worker finishing its stage.
