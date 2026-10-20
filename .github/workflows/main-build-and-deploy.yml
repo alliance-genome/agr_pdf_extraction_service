@@ -87,7 +87,7 @@ jobs:
 
             # These paths affect the backend image, the checked-out deploy
             # code embedded in the AMI, or the bake itself.
-            if grep -Eq '^(\.dockerignore$|requirements\.txt$|alembic\.ini$|alembic/|app/|celery_app\.py$|config\.py$|deploy/Dockerfile\.gpu$|deploy/gpu-constraints\.txt$|deploy/deploy\.sh$|deploy/manage\.sh$|deploy/nginx\.conf$|deploy/docker-compose[^/]*\.yml$|deploy/aws/ami/(pdfx-backend\.pkr\.hcl|provision\.sh)$)' <<< "$changed_files"; then
+            if grep -Eq '^(\.dockerignore$|requirements\.txt$|alembic\.ini$|alembic/|app/|celery_app\.py$|config\.py$|deploy/Dockerfile\.gpu$|deploy/check_database_driver\.py$|deploy/gpu-constraints\.txt$|deploy/deploy\.sh$|deploy/manage\.sh$|deploy/nginx\.conf$|deploy/docker-compose[^/]*\.yml$|deploy/aws/ami/(pdfx-backend\.pkr\.hcl|provision\.sh)$)' <<< "$changed_files"; then
               backend_changed=true
             fi
 
