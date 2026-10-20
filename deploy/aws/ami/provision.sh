@@ -4,7 +4,7 @@ set -euo pipefail
 # --- testable helper: fail if any required cache dir is empty ---
 assert_caches_nonempty() {
   # Gate only on dirs known to populate: HF_HOME/Transformers/Torch all redirect to
-  # data/models, and any extraction runs OCR so data/rapidocr_models fills. data/model_cache
+  # data/models; the image-only warm-up exercises lazy OCR models. data/model_cache
   # (/root/.cache) is NOT asserted -- nothing reliably writes it, so gating on it would fail a
   # healthy bake (design-review N2).
   local root="$1" rc=0 d
@@ -78,21 +78,20 @@ ENV
     PDFX_DEPLOY_BUILD_MODE=never PDFX_DEPLOY_PULL_IMAGES=always \
     PDFX_PREWARM_MODELS=marker GPU_MODE=on ./deploy.sh )
 
-  # Warm the LAZY caches (Docling/rapidocr/GROBID) with one real extraction.
-  # merge=false: skip the LLM merge (needs a real key) but still run grobid+docling+marker,
-  # which is what warms the caches. Without it the run ends 'failed' (api.py merge default=true).
-  cp "$SERVICE_DIR/deploy/aws/ami/test-sample.pdf" /tmp/sample.pdf
-  local pid
-  pid="$(curl -sS -X POST http://127.0.0.1:5000/api/v1/extract \
-    -F 'file=@/tmp/sample.pdf' -F 'merge=false' | jq -r '.process_id')"
-  echo "warm-up extraction process_id=$pid"
-  for _ in $(seq 1 120); do
-    status="$(curl -sS "http://127.0.0.1:5000/api/v1/extract/${pid}" | jq -r '.status')"
-    [ "$status" = "complete" ] && break
-    [ "$status" = "failed" ] && { echo "ERROR: warm-up extraction failed"; exit 1; }
-    sleep 5
+  # Exercise every extractor, then force real OCR with an image-only PDF.
+  # Run inside the app container to inspect the Celery result directly: the
+  # public status can report complete even when one extractor failed, and its
+  # available_extractors list depends on S3 uploads (disabled during the bake).
+  local warmup_dir
+  warmup_dir="$(docker exec pdfx-app mktemp -d /tmp/pdfx-bake-warmup.XXXXXX)"
+  for fixture in warmup.py test-sample.pdf test-scan.pdf; do
+    docker cp "$SERVICE_DIR/deploy/aws/ami/$fixture" "pdfx-app:$warmup_dir/$fixture"
   done
-  [ "$status" = "complete" ] || { echo "ERROR: warm-up extraction did not complete (status=$status)"; exit 1; }
+  docker exec \
+    -e PDFX_BAKE_WARMUP_TIMEOUT_SECONDS="${PDFX_BAKE_WARMUP_TIMEOUT_SECONDS:-600}" \
+    -e PDFX_BAKE_HTTP_TIMEOUT_SECONDS="${PDFX_BAKE_HTTP_TIMEOUT_SECONDS:-30}" \
+    pdfx-app python3.11 "$warmup_dir/warmup.py"
+  docker exec pdfx-app rm -rf "$warmup_dir"
 
   assert_caches_nonempty "$SERVICE_DIR"
 
