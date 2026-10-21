@@ -10,12 +10,12 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from app.artifacts import ArtifactReader, METHODS
 from app.auth import CognitoAuth
 from app.config import settings
 from app.ec2_manager import EC2Manager
@@ -548,6 +548,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="PDFX Proxy", version="1.1.0", lifespan=lifespan)
 
 
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.exception_handlers import http_exception_handler
+
+
+@app.exception_handler(StarletteHTTPException)
+async def report_http_failure(request, exc):
+    if exc.status_code >= 500 and not request.url.path.startswith("/api/v1/health"):
+        capture_failure(exc, process_id=getattr(request.state, "sentry_process_id", None), stage="proxy")
+        request.state.sentry_failure_captured = True
+    return await http_exception_handler(request, exc)
+
+
 class ProxyRequestFailure(RuntimeError):
     """A handled proxy request failed operationally."""
 
@@ -569,10 +581,12 @@ async def sentry_request_context(request: Request, call_next):
     sentry_sdk.set_tag("pdfx.stage", "proxy")
     if process_id:
         sentry_sdk.set_tag("pdfx.process_hash", hashlib.sha256(process_id.encode()).hexdigest())
+    request.state.sentry_process_id = process_id
     response = await call_next(request)
     # A stopped/warming backend is an expected health response. Failed
     # curator operations still need reporting even when caught by a route.
-    if response.status_code >= 500 and not request.url.path.startswith("/api/v1/health"):
+    if (response.status_code >= 500 and not request.url.path.startswith("/api/v1/health")
+            and not getattr(request.state, "sentry_failure_captured", False)):
         capture_failure(ProxyRequestFailure("Proxy request failed"), process_id=process_id, stage="proxy")
     return response
 
@@ -1361,160 +1375,66 @@ async def cancel_extraction(
         raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
 
 
-# --- Extract: download artifact output (auth required, proxied to EC2) ---
+# --- Durable artifacts: authentication + RDS/S3, never backend lifecycle ---
+
+async def _artifact_run(process_id, authorization, *, completed=True):
+    _require_auth(authorization)
+    reader = ArtifactReader(status_reader)
+    backend_id = proxy_to_backend_process.get(process_id, process_id)
+    run = await asyncio.to_thread(reader.lookup, backend_id, completed=completed)
+    return reader, run
+
 
 @app.get("/api/v1/extract/{process_id}/download/{method}")
-async def download_extraction_output(
-    process_id: str,
-    method: str,
-    authorization: str = Header(None),
-):
+async def download_extraction_output(process_id: str, method: str, authorization: str = Header(None)):
     _require_auth(authorization)
-    lifecycle.touch()
-
-    await _ensure_backend_ready_for_proxy("artifact download")
-
-    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
-    download_url = f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}/download/{method}"
-    try:
-        async with httpx.AsyncClient(
-            timeout=settings.FORWARD_TIMEOUT_SECONDS,
-            follow_redirects=True,
-        ) as client:
-            if authorization:
-                try:
-                    upstream = await client.get(download_url, headers={"Authorization": authorization})
-                except TypeError:
-                    upstream = await client.get(download_url)
-            else:
-                upstream = await client.get(download_url)
-
-        content_type = upstream.headers.get("content-type", "application/octet-stream")
-        content_disposition = upstream.headers.get("content-disposition")
-        response_headers = {"content-type": content_type}
-        if content_disposition:
-            response_headers["content-disposition"] = content_disposition
-
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=response_headers,
-        )
-    except Exception as exc:
-        logger.error("Failed to proxy download request for %s/%s: %s", process_id, method, exc)
-        raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
+    if method not in METHODS:
+        raise HTTPException(400, "Invalid method")
+    reader, run = await _artifact_run(process_id, authorization)
+    return await asyncio.to_thread(reader.download, run, method)
 
 
 @app.get("/api/v1/extract/{process_id}/images")
-async def list_extraction_images(
-    process_id: str,
-    authorization: str = Header(None),
-):
-    _require_auth(authorization)
-    lifecycle.touch()
-
-    return await _proxy_backend_json_get(
-        process_id,
-        f"/api/v1/extract/{{backend_process_id}}/images",
-        authorization=authorization,
-        error_context="image list",
-    )
+async def list_extraction_images(process_id: str, authorization: str = Header(None)):
+    reader, run = await _artifact_run(process_id, authorization)
+    return {"process_id": process_id, "images": reader.images(run), "source": "s3"}
 
 
 @app.get("/api/v1/extract/{process_id}/images/urls")
-async def get_extraction_image_urls(
-    process_id: str,
-    authorization: str = Header(None),
-):
-    _require_auth(authorization)
-    lifecycle.touch()
-
-    return await _proxy_backend_json_get(
-        process_id,
-        f"/api/v1/extract/{{backend_process_id}}/images/urls",
-        authorization=authorization,
-        error_context="image URL manifest",
-    )
+async def get_extraction_image_urls(process_id: str, authorization: str = Header(None)):
+    reader, run = await _artifact_run(process_id, authorization)
+    return await asyncio.to_thread(reader.image_urls, run, process_id)
 
 
 @app.get("/api/v1/extract/{process_id}/images/{filename}")
-async def download_extraction_image(
-    process_id: str,
-    filename: str,
-    authorization: str = Header(None),
-):
-    _require_auth(authorization)
-    lifecycle.touch()
+async def download_extraction_image(process_id: str, filename: str, authorization: str = Header(None)):
+    reader, run = await _artifact_run(process_id, authorization)
+    return await asyncio.to_thread(reader.image, run, filename)
 
-    await _ensure_backend_ready_for_proxy("image download")
 
-    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
-    image_url = (
-        f"{lifecycle.ec2_base_url}/api/v1/extract/{backend_process_id}"
-        f"/images/{quote(filename, safe='')}"
-    )
-    try:
-        async with httpx.AsyncClient(
-            timeout=settings.FORWARD_TIMEOUT_SECONDS,
-            follow_redirects=True,
-        ) as client:
-            if authorization:
-                try:
-                    upstream = await client.get(image_url, headers={"Authorization": authorization})
-                except TypeError:
-                    upstream = await client.get(image_url)
-            else:
-                upstream = await client.get(image_url)
+@app.get("/api/v1/extract/{process_id}/artifacts")
+async def get_extraction_artifacts(process_id: str, authorization: str = Header(None)):
+    _, run = await _artifact_run(process_id, authorization, completed=False)
+    return {"process_id": process_id, "artifacts_json": run.get("artifacts_json") or {}}
 
-        response_headers = {
-            "content-type": upstream.headers.get("content-type", "application/octet-stream"),
-        }
-        content_disposition = upstream.headers.get("content-disposition")
-        if content_disposition:
-            response_headers["content-disposition"] = content_disposition
 
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=response_headers,
-        )
-    except Exception as exc:
-        logger.error("Failed to proxy image download request for %s/%s: %s", process_id, filename, exc)
-        raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
+@app.get("/api/v1/extract/{process_id}/artifacts/urls")
+async def get_extraction_artifact_urls(process_id: str, authorization: str = Header(None)):
+    reader, run = await _artifact_run(process_id, authorization, completed=False)
+    return await asyncio.to_thread(reader.artifact_urls, run, process_id)
+
+
+@app.get("/api/v1/extract/{process_id}/logs")
+async def get_extraction_logs(process_id: str, authorization: str = Header(None)):
+    reader, run = await _artifact_run(process_id, authorization, completed=False)
+    if not run.get("log_s3_key"):
+        raise HTTPException(404, "No audit log available for this process")
+    ttl = max(1, settings.ARTIFACT_URL_TTL_SECONDS)
+    url = await asyncio.to_thread(reader.presign, run["log_s3_key"], ttl)
+    return {"log_url": url, "expires_in": ttl}
 
 
 # --- Proxy helpers ---
-
-
-async def _proxy_backend_json_get(
-    process_id: str,
-    path_template: str,
-    *,
-    authorization: str | None,
-    error_context: str,
-) -> JSONResponse:
-    await _ensure_backend_ready_for_proxy(error_context)
-
-    backend_process_id = proxy_to_backend_process.get(process_id, process_id)
-    backend_path = path_template.format(backend_process_id=backend_process_id)
-    backend_url = f"{lifecycle.ec2_base_url}{backend_path}"
-    try:
-        async with httpx.AsyncClient(timeout=settings.FORWARD_TIMEOUT_SECONDS) as client:
-            if authorization:
-                try:
-                    upstream = await client.get(backend_url, headers={"Authorization": authorization})
-                except TypeError:
-                    upstream = await client.get(backend_url)
-            else:
-                upstream = await client.get(backend_url)
-
-        payload = _coerce_json_payload(upstream)
-        if isinstance(payload, dict) and backend_process_id != process_id:
-            payload["process_id"] = process_id
-        return JSONResponse(status_code=upstream.status_code, content=payload)
-    except Exception as exc:
-        logger.error("Failed to proxy %s request for %s: %s", error_context, process_id, exc)
-        raise HTTPException(status_code=502, detail="Failed to reach EC2 backend")
 
 
 def _coerce_json_payload(resp: httpx.Response) -> dict[str, Any]:

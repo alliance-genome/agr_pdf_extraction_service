@@ -11,7 +11,7 @@ from celery.signals import setup_logging as celery_setup_logging, worker_process
 
 from config import Config
 from app.error_utils import summarize_error_message
-from app.image_metadata import (
+from pdfx_image_metadata import (
     IMAGE_MANIFEST_FILENAME,
     apply_text_image_review,
     copy_image_metadata,

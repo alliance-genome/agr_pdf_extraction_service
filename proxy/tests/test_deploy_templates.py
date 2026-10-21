@@ -488,3 +488,16 @@ def test_sentry_task_configuration_preserves_kill_switch_and_requires_explicit_p
     assert values['SENTRY_RELEASE'] == 'pdfx@sha'
     assert values['SENTRY_PROJECT'] == 'pdfx-prod'
     assert 'SENTRY_DSN' not in values
+
+
+def test_durable_artifacts_storage_is_wired_in_both_deploy_paths():
+    root = Path(__file__).resolve().parents[2]
+    task = json.loads((root / "proxy/deploy/task-definition.template.json").read_text())
+    env = {item["name"]: item["value"] for item in task["containerDefinitions"][0]["environment"]}
+    assert env["ARTIFACT_S3_BUCKET"] == "${QUEUE_S3_BUCKET}"
+    assert env["ARTIFACT_S3_PREFIX"] == "${ARTIFACT_S3_PREFIX}"
+    deploy = (root / "proxy/deploy/deploy.sh").read_text()
+    assert 'ARTIFACT_S3_PREFIX=${ARTIFACT_S3_PREFIX:-pdfx/audit}' in deploy
+    cfn = (root / "deploy/aws/pdfx-stack.yaml").read_text()
+    assert 'Name: ARTIFACT_S3_BUCKET\n              Value: !Ref AuditBucket' in cfn
+    assert 'Name: ARTIFACT_S3_PREFIX\n              Value: !Ref AuditPrefix' in cfn

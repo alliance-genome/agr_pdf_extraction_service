@@ -525,3 +525,28 @@ Use `/pdfx/cognito-accepted-client-ids` and
 
 ### Always-On Worker Window
 During high-throughput curation windows, set `ALWAYS_ON_MODE=true` and redeploy proxy. This disables idle auto-stop until reverted.
+
+### Durable downloads
+
+Artifact downloads, images, image URL manifests, audit logs and artifact URL
+manifests read authoritative RDS receipts and S3 directly, even when the GPU is
+stopped. They require the same Cognito authorization as extraction. They never
+wake EC2 or resubmit a job. Invalid IDs/methods return 400, unknown/missing
+artifacts 404, unfinished downloads 409, and unavailable RDS/S3 503.
+
+Set `STATUS_DATABASE_URL` to the read-only status database and
+`ARTIFACT_S3_BUCKET` / `ARTIFACT_S3_PREFIX` to the backend audit storage location
+(default prefix `pdfx/audit`). The deploy script uses the audit bucket SSM
+parameter and optional `audit-s3-prefix` (default `pdfx/audit`). The task role
+needs `s3:GetObject` on this prefix; the existing queue bucket policy includes
+that access. No additional S3 write permission is needed for downloads.
+Downloads stream in `ARTIFACT_STREAM_CHUNK_BYTES` chunks (65536 default), with
+`ARTIFACT_S3_TIMEOUT_SECONDS=10` and `ARTIFACT_S3_MAX_ATTEMPTS=2` bounding I/O.
+Signed artifact/log URLs use `ARTIFACT_URL_TTL_SECONDS=3600`; image manifests use
+`IMAGE_URL_TTL_SECONDS=3600` and advertise `IMAGE_RETENTION_TTL_SECONDS=604800`.
+Set retention to match the bucket lifecycle. Client disconnects close S3 bodies.
+
+The Sentry SDK owns unhandled exceptions. The proxy exception handler owns
+handled HTTP 5xx errors (preserving frames), and middleware owns otherwise
+returned 5xx responses. Request-local state prevents double reporting; expected
+health warm-up and ordinary 4xx responses remain quiet.

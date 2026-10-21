@@ -1029,6 +1029,10 @@ Resources:
               Value: !If [HasSentry, "true", "false"]
             - Name: QUEUE_BACKEND
               Value: s3
+            - Name: ARTIFACT_S3_BUCKET
+              Value: !Ref AuditBucket
+            - Name: ARTIFACT_S3_PREFIX
+              Value: !Ref AuditPrefix
             - Name: QUEUE_S3_BUCKET
               Value: !Ref AuditBucket
             - Name: QUEUE_S3_PREFIX

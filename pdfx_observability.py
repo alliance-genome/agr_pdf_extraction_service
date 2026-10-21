@@ -221,7 +221,12 @@ def initialize(component):
         from sentry_sdk.integrations.fastapi import FastApiIntegration
         from sentry_sdk.integrations.starlette import StarletteIntegration
 
-        integrations.extend([FastApiIntegration(), StarletteIntegration()])
+        # Handled HTTP failures belong to the proxy exception/response handlers.
+        # SDK middleware still owns uncaught exceptions, preserving their frames.
+        integrations.extend([
+            FastApiIntegration(failed_request_status_codes=set()),
+            StarletteIntegration(failed_request_status_codes=set()),
+        ])
     elif component in {"worker", "extraction", "finalization"}:
         from sentry_sdk.integrations.celery import CeleryIntegration
 

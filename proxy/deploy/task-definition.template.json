@@ -20,6 +20,8 @@
         }
       ],
       "environment": [
+        {"name": "ARTIFACT_S3_BUCKET", "value": "${QUEUE_S3_BUCKET}"},
+        {"name": "ARTIFACT_S3_PREFIX", "value": "${ARTIFACT_S3_PREFIX}"},
         {"name": "QUEUE_BACKEND", "value": "s3"},
         {"name": "QUEUE_S3_BUCKET", "value": "${QUEUE_S3_BUCKET}"},
         {"name": "QUEUE_S3_PREFIX", "value": "${QUEUE_S3_PREFIX}"},

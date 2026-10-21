@@ -4,5 +4,6 @@
 !proxy/app
 !proxy/app/**
 !pdfx_observability.py
+!pdfx_image_metadata.py
 **/__pycache__
 **/*.pyc
