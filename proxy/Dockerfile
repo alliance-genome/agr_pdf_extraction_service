@@ -13,7 +13,7 @@ COPY proxy/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY proxy/app/ app/
-COPY pdfx_observability.py .
+COPY pdfx_observability.py pdfx_image_metadata.py .
 
 EXPOSE 80
 

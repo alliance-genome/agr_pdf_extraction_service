@@ -31,7 +31,7 @@ from werkzeug.utils import secure_filename
 
 from config import Config
 from app.error_utils import summarize_error_message
-from app.image_metadata import copy_image_metadata, normalize_image_manifest_entry
+from pdfx_image_metadata import copy_image_metadata, normalize_image_manifest_entry
 from app.models import ExtractionRun, PipelineJob, get_session, update_extraction_run_if_nonterminal
 from app.services.audit_logger import build_s3_client
 

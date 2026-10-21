@@ -1,4 +1,4 @@
-from app.image_metadata import (
+from pdfx_image_metadata import (
     annotate_image_diagnostics,
     apply_text_image_review,
     build_image_manifest_entry,

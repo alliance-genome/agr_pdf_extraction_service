@@ -3,7 +3,7 @@ import hashlib
 
 from flask import current_app as app
 
-from app.image_metadata import (
+from pdfx_image_metadata import (
     IMAGE_MANIFEST_FILENAME,
     list_image_directory,
     list_manifest_images,

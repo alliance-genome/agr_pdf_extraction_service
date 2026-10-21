@@ -16,7 +16,7 @@ from marker.output import text_from_rendered
 from marker.renderers.json import JSONRenderer
 from marker.schema import BlockTypes
 
-from app.image_metadata import (
+from pdfx_image_metadata import (
     annotate_image_diagnostics,
     build_image_manifest_entry,
     extract_image_references,

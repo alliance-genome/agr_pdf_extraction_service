@@ -52,6 +52,15 @@ class Settings:
     REPLAY_RETRY_DELAY_SECONDS: int = int(os.environ.get("REPLAY_RETRY_DELAY_SECONDS", "30"))
     REPLAY_MAX_QUEUE_AGE_SECONDS: int = int(os.environ.get("REPLAY_MAX_QUEUE_AGE_SECONDS", "86400"))
 
+    ARTIFACT_S3_BUCKET: str = os.environ.get("ARTIFACT_S3_BUCKET", "").strip()
+    ARTIFACT_S3_PREFIX: str = os.environ.get("ARTIFACT_S3_PREFIX", "pdfx/audit").strip().strip("/")
+    ARTIFACT_S3_TIMEOUT_SECONDS: int = int(os.environ.get("ARTIFACT_S3_TIMEOUT_SECONDS", "10"))
+    ARTIFACT_S3_MAX_ATTEMPTS: int = int(os.environ.get("ARTIFACT_S3_MAX_ATTEMPTS", "2"))
+    ARTIFACT_STREAM_CHUNK_BYTES: int = int(os.environ.get("ARTIFACT_STREAM_CHUNK_BYTES", "65536"))
+    ARTIFACT_URL_TTL_SECONDS: int = int(os.environ.get("ARTIFACT_URL_TTL_SECONDS", "3600"))
+    IMAGE_URL_TTL_SECONDS: int = int(os.environ.get("IMAGE_URL_TTL_SECONDS", "3600"))
+    IMAGE_RETENTION_TTL_SECONDS: int = int(os.environ.get("IMAGE_RETENTION_TTL_SECONDS", str(int(os.environ.get("IMAGE_RETENTION_DAYS", "7")) * 86400)))
+
     STATUS_DATABASE_URL: str = os.environ.get("STATUS_DATABASE_URL", os.environ.get("DATABASE_URL", "")).strip()
     STATUS_DB_TIMEOUT_SECONDS: int = int(os.environ.get("STATUS_DB_TIMEOUT_SECONDS", "5"))
     STATUS_ERROR_MESSAGE_MAX_CHARS: int = int(os.environ.get("STATUS_ERROR_MESSAGE_MAX_CHARS", "4000"))
