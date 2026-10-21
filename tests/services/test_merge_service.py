@@ -1767,7 +1767,7 @@ def test_delivery_baseline_does_not_relax_intro_or_body_heading_groups():
     assert metrics["delivery_assurance"] == "unverified_failsafe"
     assert metrics["structure_assurance"] == "single_structural_unit_failsafe"
     assert metrics["warnings"] == [
-        "relaxed_delivery_baseline:unverified_largest_safe_source",
+        "relaxed_delivery_baseline:unverified_body_preferred_source",
         "deterministic_trailing_newline_normalization",
     ]
 
@@ -1795,7 +1795,7 @@ def test_relaxed_delivery_baseline_still_merges_all_usable_sources():
     )
 
     assert metrics["baseline_selection_relaxation"] == (
-        "unverified_largest_safe_source"
+        "unverified_body_preferred_source"
     )
     assert metrics["candidate_region_count"] >= 1
     assert metrics["candidate_construction_counts"][
@@ -2415,3 +2415,134 @@ def test_merge_renderers_do_not_swallow_operational_admission_errors(monkeypatch
     monkeypatch.setattr(merge_service_module, renderer, unavailable)
     with pytest.raises(ProviderAdmissionError):
         merge_source_artifacts(artifacts["grobid"].text, "", "", None, completion_evidence=completion_evidence_for_finished_artifacts(artifacts), baseline_requirements=FRAGMENT_REQUIREMENTS)
+
+
+@pytest.mark.parametrize("body", ["Rosa26", "α", "References"])
+@pytest.mark.parametrize("body_source", ["grobid", "docling", "marker"])
+def test_sparse_body_is_not_displaced_by_heading_only_peer(body, body_source):
+    texts = {source: "## References" for source in ("grobid", "docling", "marker")}
+    texts[body_source] = body
+    artifacts = {source: SourceArtifact.from_text(source, text) for source, text in texts.items()}
+    merged, metrics, audit = merge_source_artifacts(
+        texts["grobid"], texts["docling"], texts["marker"], None,
+        completion_evidence=completion_evidence_for_finished_artifacts(artifacts),
+    )
+    assert merged is not None
+    assert merged.strip() == body
+    assert metrics["baseline_source"] == body_source
+    assert metrics["merge_quality"] == "baseline_fallback"
+    assert metrics["delivery_assurance"] == "unverified_failsafe"
+    assert audit
+
+
+@pytest.mark.parametrize("texts,expected", [
+    ({"grobid": "## References", "docling": "Rosa26", "marker": None}, "Rosa26"),
+    ({"grobid": None, "docling": "Rosa26", "marker": None}, "Rosa26"),
+    ({"grobid": "## References", "docling": None, "marker": None}, "## References"),
+    ({"grobid": "## Results", "docling": "## References", "marker": None}, "## References"),
+    ({"grobid": "## References\n\n1. Example 2026.", "docling": None, "marker": None}, "## References\n\n1. Example 2026."),
+])
+def test_sparse_delivery_retains_available_source_and_degraded_receipt(texts, expected):
+    artifacts = {source: SourceArtifact.from_text(source, text) for source, text in texts.items() if text}
+    merged, metrics, _audit = merge_source_artifacts(
+        texts["grobid"], texts["docling"], texts["marker"], None,
+        completion_evidence=completion_evidence_for_finished_artifacts(artifacts),
+    )
+    assert merged.strip() == expected
+    assert metrics["delivery_assurance"] == "unverified_failsafe"
+    assert metrics["merge_quality"] == "baseline_fallback"
+    assert "relaxed_delivery_baseline:unverified_body_preferred_source" in metrics["warnings"]
+
+
+def test_sparse_delivery_does_not_choose_unfinished_body_source():
+    texts = {"grobid": "## References", "docling": "Rosa26"}
+    artifacts = {source: SourceArtifact.from_text(source, text) for source, text in texts.items()}
+    merged, metrics, _audit = merge_source_artifacts(
+        texts["grobid"], texts["docling"], None, None,
+        completion_evidence=completion_evidence_for_finished_artifacts({"grobid": artifacts["grobid"]}),
+    )
+    assert merged.strip() == "## References"
+    assert metrics["baseline_source"] == "grobid"
+    assert metrics["delivery_assurance"] == "unverified_failsafe"
+
+
+def test_sparse_delivery_with_no_usable_source_reports_failure():
+    merged, metrics, audit = merge_source_artifacts("", " \n", None, None, completion_evidence={})
+    assert merged is None
+    assert metrics["failed"] is True
+    assert metrics["failure_reason"] == "no_usable_extractor"
+    assert audit == []
+
+
+def test_sparse_body_bundle_keeps_source_provenance_and_degraded_quality(tmp_path):
+    artifacts = {
+        "grobid": SourceArtifact.from_text("grobid", "## References"),
+        "docling": SourceArtifact.from_text("docling", "Rosa26"),
+    }
+    merged, metrics, audit = merge_source_artifacts(
+        artifacts["grobid"].text, artifacts["docling"].text, None, None,
+        completion_evidence=completion_evidence_for_finished_artifacts(artifacts),
+    )
+    manifest = persist_merge_bundle(
+        merged_path=str(tmp_path / "merged.md"), metrics_path=str(tmp_path / "metrics.json"),
+        audit_path=str(tmp_path / "audit.json"), text=merged, metrics=metrics, audit=audit,
+        artifacts=artifacts,
+        skeletons={source: build_document_skeleton(artifact, None) for source, artifact in artifacts.items()},
+        expected_contract_id=Config.MERGE_CONTRACT_ID,
+        page_provenance_bytes=_bundle_page_provenance(merged, metrics, audit),
+        pdf_sha256=TEST_PDF_SHA256,
+        source_page_map_sha256=_bundle_source_page_map_sha256(metrics),
+    )
+    assert Path(manifest).is_file()
+    assert (tmp_path / "merged.md").read_text().strip() == "Rosa26"
+    receipt = json.loads((tmp_path / "metrics.json").read_text())
+    assert receipt["delivery_assurance"] == "unverified_failsafe"
+    assert receipt["baseline_source"] == "docling"
+    assert receipt["merge_quality"] == "baseline_fallback"
+
+
+def test_sparse_fallback_keeps_verified_page_coverage_without_qualified_label():
+    artifacts = {source: SourceArtifact.from_text(source, "Rosa26") for source in ("docling", "marker")}
+    evidence = {
+        source: BaselineCompletionEvidence(
+            artifact_digest=artifact.digest, extraction_succeeded=True, artifact_complete=True,
+            expected_page_count=1, covered_page_count=1, pdf_digest=TEST_PDF_SHA256,
+            coverage_method=PAGE_COVERAGE_METHOD,
+            page_coverage_digest=page_coverage_proof_digest(
+                source=source, artifact_digest=artifact.digest, pdf_digest=TEST_PDF_SHA256,
+                expected_page_count=1, covered_page_count=1),
+            completion_basis="page_coverage",
+        ) for source, artifact in artifacts.items()
+    }
+    merged, metrics, _audit = merge_source_artifacts(
+        None, "Rosa26", "Rosa26", None, completion_evidence=evidence,
+        native_structures={
+            "docling": NativeStructureArtifact.for_test("docling", artifacts["docling"], json.dumps({
+                "schema_name": "DoclingDocument", "texts": [{"self_ref": "#/texts/0", "label": "text", "text": "Rosa26"}],
+            }).encode()),
+            "marker": NativeStructureArtifact.for_test("marker", artifacts["marker"], json.dumps({
+                "block_type": "Document", "children": [{"id": "/page/0/Text/0", "block_type": "Text", "html": "<p>Rosa26</p>"}],
+            }).encode()),
+        },
+    )
+    assert merged.strip() == "Rosa26"
+    assert metrics["delivery_assurance"] == "page_coverage_verified"
+    assert metrics["merge_quality"] == "baseline_fallback"
+    assert metrics["qualification_outcome"] == "failsafe"
+    assert "baseline_structure_unverified" in metrics["qualification_reasons"]
+
+
+@pytest.mark.parametrize("relaxation,expected", [
+    (None, ("qualified", [])),
+    ("terminal_heading_group", ("qualified", [])),
+    ("unverified_body_preferred_source", ("failsafe", ["baseline_structure_unverified"])),
+])
+def test_qualification_retains_sparse_baseline_uncertainty_with_clean_receipts(relaxation, expected):
+    assert merge_service_module._qualification(
+        abc_report={"validator_clean": True},
+        semantic_report={"reader_payload_retained": True, "protected_italics_retained": True},
+        italic_report={"all_protected_italics_retained": True, "native_evidence_ready": True},
+        delivery_assurance="page_coverage_verified", baseline_selection_relaxation=relaxation,
+        repetition_diagnostics=[], final_safety_reasons=(), structural_resolution_failure=None,
+        unresolved_region_count=0,
+    ) == expected

@@ -57,6 +57,25 @@ GROBID TEI does not currently provide a reliable complete page inventory to
 this adapter. Its manifest records page coverage as unavailable, so a
 GROBID-baseline delivery is labeled `failsafe` rather than `qualified`.
 
+## Sparse source delivery
+
+When no source passes the complete-paper checks, the delivery fallback prefers
+an artifact with non-heading Markdown units over a heading-only artifact, then
+compares source size and unit count. This preserves short text such as `Rosa26`
+when another extractor emits only `## References`. The rule uses Markdown
+structure, not gene names, heading vocabulary, or scientific interpretation.
+Heading-only sources remain deliverable when no body-bearing source is available;
+genuine reference entries remain source content. Completion and byte-safety
+checks still apply before a source can be selected.
+
+These deliveries retain `merge_quality=baseline_fallback`. When page coverage
+is unverified, they retain `delivery_assurance=unverified_failsafe`; verified
+page-coverage evidence keeps its existing assurance classification. Their receipt records
+`baseline_selection_relaxation=unverified_body_preferred_source`; preserving
+available text does not establish that extraction is scientifically complete.
+This relaxed baseline also carries `qualification_outcome=failsafe` with the
+reason `baseline_structure_unverified`, even when page coverage is verified.
+
 ## Source-backed merge
 
 The merger has one runtime implementation:
