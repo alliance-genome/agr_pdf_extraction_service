@@ -741,6 +741,7 @@ def _qualification(
     semantic_report: Mapping,
     italic_report: Mapping,
     delivery_assurance: str,
+    baseline_selection_relaxation: str | None,
     repetition_diagnostics: list[dict],
     final_safety_reasons: tuple[str, ...],
     structural_resolution_failure: str | None,
@@ -749,6 +750,8 @@ def _qualification(
     """Derive the single qualified/failsafe outcome from final receipts."""
 
     reasons = []
+    if baseline_selection_relaxation == "unverified_body_preferred_source":
+        reasons.append("baseline_structure_unverified")
     if abc_report.get("validator_clean") is not True:
         reasons.append("alliance_validator_not_clean")
     if semantic_report.get("reader_payload_retained") is not True:
@@ -1107,12 +1110,17 @@ def merge_source_artifacts(
                 baseline = max(
                     safe_sources,
                     key=lambda item: (
+                        # Preserve body-bearing fragments before comparing size.
+                        # A heading-only artifact is still deliverable when no
+                        # extractor has body units; no heading vocabulary or
+                        # scientific interpretation is used here.
+                        any(unit.unit_type != "heading" for unit in item.units),
                         len(item.artifact.raw_utf8),
                         len(item.units),
                         item.artifact.source,
                     ),
                 )
-                relaxed_delivery_baseline_reason = "unverified_largest_safe_source"
+                relaxed_delivery_baseline_reason = "unverified_body_preferred_source"
         except Exception as baseline_exc:
             return (
                 None,
@@ -1556,6 +1564,7 @@ def merge_source_artifacts(
         semantic_report=semantic_report,
         italic_report=italic_report,
         delivery_assurance=delivery_assurance,
+        baseline_selection_relaxation=relaxed_delivery_baseline_reason,
         repetition_diagnostics=repetition_diagnostics,
         final_safety_reasons=final_safety_reasons,
         structural_resolution_failure=structural_resolution_failure,
