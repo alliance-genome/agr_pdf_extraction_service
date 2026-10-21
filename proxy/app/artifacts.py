@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+import threading
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -14,6 +15,11 @@ from app.config import settings
 from pdfx_image_metadata import normalize_image_manifest_entry, copy_image_metadata
 
 METHODS = {"grobid", "docling", "marker", "merged", "audit", "page_provenance"}
+
+
+_client_lock = threading.Lock()
+_s3_client = None
+_s3_client_config = None
 
 
 class ArtifactStreamResponse(StreamingResponse):
@@ -50,11 +56,19 @@ class ArtifactReader:
     def client(self):
         if not settings.ARTIFACT_S3_BUCKET or not settings.ARTIFACT_S3_PREFIX:
             raise HTTPException(503, "Durable artifact storage unconfigured")
-        return boto3.client("s3", region_name=settings.EC2_REGION, config=Config(
-            connect_timeout=max(1, settings.ARTIFACT_S3_TIMEOUT_SECONDS),
-            read_timeout=max(1, settings.ARTIFACT_S3_TIMEOUT_SECONDS),
-            retries={"total_max_attempts": max(1, settings.ARTIFACT_S3_MAX_ATTEMPTS), "mode": "standard"},
-        ))
+        global _s3_client, _s3_client_config
+        config_key = (settings.EC2_REGION, max(1, settings.ARTIFACT_S3_TIMEOUT_SECONDS),
+                      max(1, settings.ARTIFACT_S3_MAX_ATTEMPTS))
+        # Sessions are not thread-safe. Construct a dedicated session/client once
+        # under the lock; subsequent requests share the thread-safe client/pool.
+        with _client_lock:
+            if _s3_client is None or _s3_client_config != config_key:
+                _s3_client = boto3.Session().client("s3", region_name=config_key[0], config=Config(
+                    connect_timeout=config_key[1], read_timeout=config_key[1],
+                    retries={"total_max_attempts": config_key[2], "mode": "standard"},
+                ))
+                _s3_client_config = config_key
+            return _s3_client
 
     @staticmethod
     def key(key):
@@ -68,9 +82,8 @@ class ArtifactReader:
 
     def stream(self, key):
         key = self.key(key)
-        client = self.client()
         try:
-            obj = client.get_object(Bucket=settings.ARTIFACT_S3_BUCKET, Key=key)
+            obj = self.client().get_object(Bucket=settings.ARTIFACT_S3_BUCKET, Key=key)
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "404", "NotFound"}:
                 raise HTTPException(404, "Stored artifact not found") from exc

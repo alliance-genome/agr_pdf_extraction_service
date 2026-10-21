@@ -161,6 +161,8 @@ TASK_ROLE_NAME=$(read_param "${SSM_PREFIX}/task-role-name")
 QUEUE_S3_BUCKET=$(read_param "${SSM_PREFIX}/audit-s3-bucket")
 ARTIFACT_S3_PREFIX=$(read_optional_param "${SSM_PREFIX}/audit-s3-prefix")
 ARTIFACT_S3_PREFIX=${ARTIFACT_S3_PREFIX:-pdfx/audit}
+IMAGE_RETENTION_DAYS=$(read_optional_param "${SSM_PREFIX}/image-retention-days")
+IMAGE_RETENTION_DAYS=${IMAGE_RETENTION_DAYS:-7}
 
 # Ensure optional parameters exist so the task definition's `secrets`
 # references resolve on first deploy. Operator must have
@@ -209,6 +211,7 @@ TASK_DEF=$(sed \
     -e "s|\${ECR_IMAGE}|${ECR_IMAGE}|g" \
     -e "s|\${QUEUE_S3_BUCKET}|${QUEUE_S3_BUCKET}|g" \
     -e "s|\${ARTIFACT_S3_PREFIX}|${ARTIFACT_S3_PREFIX}|g" \
+    -e "s|\${IMAGE_RETENTION_DAYS}|${IMAGE_RETENTION_DAYS}|g" \
     -e "s|\${QUEUE_S3_PREFIX}|${QUEUE_PREFIX}|g" \
     -e "s|\${QUEUE_S3_REGION}|${REGION}|g" \
     -e "s|\${SSM_PREFIX}|${SSM_PREFIX}|g" \
@@ -234,6 +237,7 @@ IAM_POLICY=$(sed \
     -e "s|\${BACKEND_ASG_RESOURCE}|${BACKEND_ASG_RESOURCE}|g" \
     -e "s|\${QUEUE_S3_BUCKET}|${QUEUE_S3_BUCKET}|g" \
     -e "s|\${ARTIFACT_S3_PREFIX}|${ARTIFACT_S3_PREFIX}|g" \
+    -e "s|\${IMAGE_RETENTION_DAYS}|${IMAGE_RETENTION_DAYS}|g" \
     -e "s|\${REGION}|${REGION}|g" \
     -e "s|\${SSM_PARAMETER_RESOURCE}|${SSM_PARAMETER_RESOURCE}|g" \
     "${SCRIPT_DIR}/iam-policy.template.json")

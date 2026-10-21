@@ -544,6 +544,9 @@ Downloads stream in `ARTIFACT_STREAM_CHUNK_BYTES` chunks (65536 default), with
 `ARTIFACT_S3_TIMEOUT_SECONDS=10` and `ARTIFACT_S3_MAX_ATTEMPTS=2` bounding I/O.
 Signed artifact/log URLs use `ARTIFACT_URL_TTL_SECONDS=3600`; image manifests use
 `IMAGE_URL_TTL_SECONDS=3600` and advertise `IMAGE_RETENTION_TTL_SECONDS=604800`.
+The stack publishes `audit-s3-prefix` and `image-retention-days` to SSM so the
+CLI deploy uses the same values. `IMAGE_RETENTION_DAYS=7` supplies the advertised
+retention unless `IMAGE_RETENTION_TTL_SECONDS` explicitly overrides it.
 Set retention to match the bucket lifecycle. Client disconnects close S3 bodies.
 
 The Sentry SDK owns unhandled exceptions. The proxy exception handler owns

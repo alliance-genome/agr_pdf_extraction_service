@@ -59,7 +59,7 @@ class Settings:
     ARTIFACT_STREAM_CHUNK_BYTES: int = int(os.environ.get("ARTIFACT_STREAM_CHUNK_BYTES", "65536"))
     ARTIFACT_URL_TTL_SECONDS: int = int(os.environ.get("ARTIFACT_URL_TTL_SECONDS", "3600"))
     IMAGE_URL_TTL_SECONDS: int = int(os.environ.get("IMAGE_URL_TTL_SECONDS", "3600"))
-    IMAGE_RETENTION_TTL_SECONDS: int = int(os.environ.get("IMAGE_RETENTION_TTL_SECONDS", "604800"))
+    IMAGE_RETENTION_TTL_SECONDS: int = int(os.environ.get("IMAGE_RETENTION_TTL_SECONDS", str(int(os.environ.get("IMAGE_RETENTION_DAYS", "7")) * 86400)))
 
     STATUS_DATABASE_URL: str = os.environ.get("STATUS_DATABASE_URL", os.environ.get("DATABASE_URL", "")).strip()
     STATUS_DB_TIMEOUT_SECONDS: int = int(os.environ.get("STATUS_DB_TIMEOUT_SECONDS", "5"))

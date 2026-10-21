@@ -158,8 +158,16 @@ def test_actual_s3_client_is_bounded(monkeypatch):
     import app.artifacts as module
     monkeypatch.setattr(module.settings, "ARTIFACT_S3_BUCKET", "artifacts")
     factory = MagicMock()
-    monkeypatch.setattr(module.boto3, "client", factory)
-    ArtifactReader(None).client()
+    monkeypatch.setattr(module, "_s3_client", None)
+    session = MagicMock()
+    session.return_value.client = factory
+    monkeypatch.setattr(module.boto3, "Session", session)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        clients = list(pool.map(lambda _: ArtifactReader(None).client(), range(20)))
+    assert all(client is clients[0] for client in clients)
+    session.assert_called_once()
+    factory.assert_called_once()
     config = factory.call_args.kwargs["config"]
     assert config.connect_timeout == module.settings.ARTIFACT_S3_TIMEOUT_SECONDS
     assert config.read_timeout == module.settings.ARTIFACT_S3_TIMEOUT_SECONDS
@@ -178,3 +186,8 @@ def test_native_receipt_manifest_preserves_nested_paths_without_media_types(clie
     expected = {f"$.native.{method}.{field}" for method in ("grobid", "docling", "marker") for field in fields}
     assert expected <= {entry["name"] for entry in entries}
     assert not any("media_type" in entry["name"] or "sha256" in entry["name"] for entry in entries)
+
+
+def test_s3_client_initialization_failure_is_503(client, storage, monkeypatch):
+    monkeypatch.setattr(ArtifactReader, "client", MagicMock(side_effect=RuntimeError("credential provider unavailable")))
+    assert client.get(f"/api/v1/extract/{PID}/download/grobid", headers=AUTH).status_code == 503

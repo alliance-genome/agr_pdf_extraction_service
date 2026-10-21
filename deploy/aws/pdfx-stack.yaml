@@ -869,6 +869,18 @@ Resources:
       Name: !Sub "/${SsmParameterPath}/audit-s3-bucket"
       Type: String
       Value: !Ref AuditBucket
+  SsmAuditPrefix:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/audit-s3-prefix"
+      Type: String
+      Value: !Ref AuditPrefix
+  SsmImageRetentionDays:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${SsmParameterPath}/image-retention-days"
+      Type: String
+      Value: !Sub "${ImageRetentionDays}"
   SsmExecutionRoleName:
     Type: AWS::SSM::Parameter
     Properties:
@@ -1029,6 +1041,8 @@ Resources:
               Value: !If [HasSentry, "true", "false"]
             - Name: QUEUE_BACKEND
               Value: s3
+            - Name: IMAGE_RETENTION_DAYS
+              Value: !Sub "${ImageRetentionDays}"
             - Name: ARTIFACT_S3_BUCKET
               Value: !Ref AuditBucket
             - Name: ARTIFACT_S3_PREFIX
