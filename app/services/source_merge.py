@@ -114,7 +114,7 @@ _SCOPE_NONLOCAL_MIN_TOKENS = 5
 _SCOPE_NONLOCAL_MIN_CHARACTERS = 24
 _SCOPE_REPLACEMENT_MIN_SIMILARITY = 55.0
 _REPETITION_POLICY_VERSION = "excess-repetition-v4"
-# NUL cannot appear in publishable text, so fenced lines cannot collide with it.
+# NUL is rejected from publishable output, so a real line should never collide.
 _REPETITION_HEADING_PREFIX = "\x00 "
 _REPETITION_PARAGRAPH_MIN_NORMALIZED_CHARACTERS = 80
 _REPETITION_PARAGRAPH_MIN_ANCHOR_TOKENS = 8

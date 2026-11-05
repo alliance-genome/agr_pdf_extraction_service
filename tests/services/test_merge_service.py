@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from app.pipeline_errors import PipelineDeadlineExceeded
 import app.services.merge_service as merge_service_module
 from app.services.merge_service import (
     BoundedCandidateSelector,
@@ -2632,6 +2633,24 @@ def test_source_delivery_records_non_validator_rejections(monkeypatch, failure):
         assert events[0]["operation"] == "select_baseline"
         assert events[0]["error_code"] == "ValueError"
     assert "private document content" not in json.dumps(events)
+
+
+def test_terminal_delivery_propagates_stage_control_errors(monkeypatch):
+    artifact = SourceArtifact.from_text("marker", "# Title\n\nBody text.\n")
+
+    def deadline(*_args, **_kwargs):
+        raise PipelineDeadlineExceeded("stage deadline")
+
+    monkeypatch.setattr(merge_service_module, "select_baseline", deadline)
+
+    with pytest.raises(PipelineDeadlineExceeded):
+        merge_service_module._zero_error_source_delivery(
+            {"marker": artifact},
+            completion_evidence_for_finished_artifacts({"marker": artifact}),
+            {"marker": build_document_skeleton(artifact, None)},
+            preferred_source="marker",
+            rejected_result=None,
+        )
 
 
 def test_merge_audit_sink_failure_is_nonfatal():

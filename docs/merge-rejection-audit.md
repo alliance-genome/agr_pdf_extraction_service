@@ -1,7 +1,7 @@
 # Merge rejection audit
 
 Finalization writes content-free diagnostics into its existing S3 NDJSON audit
-log before returning a terminal merge failure:
+log on the Alliance-validation fallback path:
 
 - `merge_validation/rejected` records the initial Alliance validation report,
   including rule IDs, parser identity, and output digest.
