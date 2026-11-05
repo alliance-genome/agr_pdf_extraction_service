@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from app.pipeline_errors import PipelineDeadlineExceeded
 import app.services.merge_service as merge_service_module
 from app.services.merge_service import (
     BoundedCandidateSelector,
@@ -495,6 +496,37 @@ def test_baseline_retained_native_italics_reconcile_without_replacement():
     assert receipt["canonical_output_emphasis_interval_count"] == 1
     assert receipt["auxiliary_positive_emphasis_count"] == 0
     assert receipt["all_native_body_italics_retained"] is True
+
+
+def test_title_demotion_during_merge_is_not_rejected_as_added_repetition():
+    title = (
+        "Molecular characterization of conserved signaling pathways "
+        "regulating neuronal development in Drosophila melanogaster"
+    )
+    marker = (
+        f"# {title}\n\n# {title}\n\n"
+        "## Abstract\n\nGene dpp is active in many tissues during development.\n\n"
+        "## Results\n\nGene dpp is active.\n"
+    )
+
+    merged, metrics, _audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": SourceArtifact.from_text("marker", marker)}
+        ),
+        native_structures={},
+        benchmark_mode=True,
+    )
+
+    lines = merged.splitlines()
+    assert lines.count(f"## {title}") == 2
+    assert f"# {title}" not in lines
+    assert "Gene dpp is active." in lines
+    assert metrics["merge_quality"] == "baseline_fallback"
+    assert metrics["repetition_diagnostics"] == []
 
 
 def _plain_marker_with_native_dpp():
@@ -2546,3 +2578,104 @@ def test_qualification_retains_sparse_baseline_uncertainty_with_clean_receipts(r
         repetition_diagnostics=[], final_safety_reasons=(), structural_resolution_failure=None,
         unresolved_region_count=0,
     ) == expected
+
+
+def test_terminal_delivery_failure_records_validator_reasons(monkeypatch):
+    marker, artifact, native = _plain_marker_with_native_dpp()
+    events = []
+    real_report = merge_service_module.abc_markdown_report
+
+    def invalid(text):
+        return {**real_report(text), "valid": False, "error_rule_ids": ["S01"]}
+
+    monkeypatch.setattr(merge_service_module, "abc_markdown_report", invalid)
+    with pytest.raises(merge_service_module.ConsensusContractError):
+        merge_finished_extractor_outputs(
+            "", "", marker, None,
+            native_structures={"marker": native},
+            audit_event=lambda stage, status, **details: events.append(
+                dict(stage=stage, status=status, **details)
+            ),
+        )
+    assert events[0]["stage"] == "merge_validation"
+    rejected = events[-1]
+    assert rejected["source"] == "marker"
+    assert rejected["status"] == "rejected"
+    assert "alliance_errors" in rejected["reasons"]
+    assert rejected["validation"]["error_rule_ids"] == ["S01"]
+    assert marker not in json.dumps(events)
+
+
+@pytest.mark.parametrize("failure", ["exception", "repetition", "safety"])
+def test_source_delivery_records_non_validator_rejections(monkeypatch, failure):
+    from types import SimpleNamespace
+    marker, artifact, native = _plain_marker_with_native_dpp()
+    skeleton = build_document_skeleton(artifact, native=native)
+    events = []
+    if failure == "exception":
+        def broken(*args, **kwargs):
+            raise ValueError("private document content must not enter the audit")
+        monkeypatch.setattr(merge_service_module, "select_baseline", broken)
+    elif failure == "repetition":
+        monkeypatch.setattr(merge_service_module, "repetition_diagnostics_metric", lambda *a: [{"kind": "paragraph"}])
+    else:
+        monkeypatch.setattr(merge_service_module, "final_document_safety_reasons", lambda *a: ("unsafe_table",))
+    result = merge_service_module._zero_error_source_delivery(
+        {"marker": artifact}, completion_evidence_for_finished_artifacts({"marker": artifact}),
+        {"marker": skeleton}, preferred_source="marker",
+        rejected_result=SimpleNamespace(),
+        audit_event=lambda stage, status, **kw: events.append(kw),
+    )
+    assert result is None
+    expected = {"exception": "candidate_exception", "repetition": "excess_repetition", "safety": "document_safety"}[failure]
+    assert expected in events[0]["reasons"]
+    if failure == "exception":
+        assert events[0]["operation"] == "select_baseline"
+        assert events[0]["error_code"] == "ValueError"
+    assert "private document content" not in json.dumps(events)
+
+
+def test_terminal_delivery_propagates_stage_control_errors(monkeypatch):
+    artifact = SourceArtifact.from_text("marker", "# Title\n\nBody text.\n")
+
+    def deadline(*_args, **_kwargs):
+        raise PipelineDeadlineExceeded("stage deadline")
+
+    monkeypatch.setattr(merge_service_module, "select_baseline", deadline)
+
+    with pytest.raises(PipelineDeadlineExceeded):
+        merge_service_module._zero_error_source_delivery(
+            {"marker": artifact},
+            completion_evidence_for_finished_artifacts({"marker": artifact}),
+            {"marker": build_document_skeleton(artifact, None)},
+            preferred_source="marker",
+            rejected_result=None,
+        )
+
+
+def test_merge_audit_sink_failure_is_nonfatal():
+    def broken(*args, **kwargs):
+        raise RuntimeError("unavailable")
+    merge_service_module._emit_merge_audit(broken, "source_delivery", "rejected")
+
+
+def test_source_delivery_records_missing_prerequisites():
+    artifact = SourceArtifact.from_text("marker", "# Heading\n\nSome body text.\n")
+    events = []
+    result = merge_service_module._zero_error_source_delivery(
+        {"marker": artifact}, {}, {}, preferred_source="marker", rejected_result=None,
+        audit_event=lambda stage, status, **kw: events.append(kw),
+    )
+    assert result is None
+    assert events[0]["reasons"] == ["missing_skeleton", "missing_completion_evidence"]
+
+
+def test_baseline_rejection_retains_safe_reason_codes():
+    artifact = SourceArtifact.from_text("docling", "# Title\n\nBad\x00control text.\n")
+    with pytest.raises(merge_service_module.BaselineSelectionError) as caught:
+        merge_service_module.select_baseline(
+            {"docling": artifact},
+            completion_evidence=completion_evidence_for_finished_artifacts({"docling": artifact}),
+            requirements=FRAGMENT_REQUIREMENTS,
+        )
+    assert caught.value.rejections == {"docling": ["forbidden_controls"]}

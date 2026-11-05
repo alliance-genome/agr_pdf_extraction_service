@@ -1359,6 +1359,9 @@ def _finalize_sources(
                             runtime_native_structure_failures
                         ),
                         benchmark_mode=Config.PDFX_BENCHMARK_MODE,
+                        audit_event=lambda stage, status, **details: _safe_log_event(
+                            audit_logger, stage, status, **details
+                        ),
                     )
                 )
                 if consensus_metrics is not None:
