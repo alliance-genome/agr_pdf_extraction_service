@@ -49,7 +49,7 @@ def test_workflow_supports_merged_prs_and_manual_recovery():
     assert "force_proxy_deploy:" in workflow
     assert "force_backend_bake:" in workflow
     assert "backend_build_subnet_id:" in workflow
-    assert "default: subnet-81c95ee4" in workflow
+    assert "default: subnet-3ebf4477" in workflow
     assert "no-deploy" in workflow
 
 
@@ -99,7 +99,7 @@ def test_workflow_uses_one_environment_scoped_oidc_release_job():
     assert "role-duration-seconds: 10800" in workflow_text
     assert "file: ./deploy/Dockerfile.gpu" in workflow_text
     assert 'backend_git_ref="${SOURCE_REF}"' in workflow_text
-    assert "BUILD_SUBNET_ID: ${{ inputs.backend_build_subnet_id || 'subnet-81c95ee4' }}" in workflow_text
+    assert "BUILD_SUBNET_ID: ${{ inputs.backend_build_subnet_id || 'subnet-3ebf4477' }}" in workflow_text
 
 
 def test_change_scope_avoids_unrelated_builds_and_covers_backend_inputs():
