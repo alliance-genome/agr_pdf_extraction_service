@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from collections import Counter
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from celery import Celery
@@ -287,6 +288,18 @@ def _is_cached(file_hash, method):
     return os.path.exists(_cached_path(file_hash, method))
 
 
+def _docling_predates_soft_hyphen_normalization(output_path):
+    """Find cached Docling Markdown that normalization could now make usable."""
+
+    if "\u00ad" not in Path(output_path).read_text(encoding="utf-8"):
+        return False
+    manifest, _native_bytes = load_native_extractor_artifact(
+        source="docling",
+        output_filename=output_path,
+    )
+    return "markdown_normalization" not in manifest["options"]
+
+
 def _is_extractor_cached(file_hash, method, extract_images=False):
     output_path = _cached_path(file_hash, method)
     if not os.path.exists(output_path):
@@ -295,6 +308,8 @@ def _is_extractor_cached(file_hash, method, extract_images=False):
         source=method,
         output_filename=output_path,
     ):
+        return False
+    if method == "docling" and _docling_predates_soft_hyphen_normalization(output_path):
         return False
     if method == "marker" and extract_images:
         return _has_image_extraction_manifest(file_hash)

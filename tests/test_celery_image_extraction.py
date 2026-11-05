@@ -8,6 +8,7 @@ import pytest
 
 import celery_app
 from app.services.native_extractor_artifact import persist_native_extractor_artifact
+from app.services.native_style import unavailable_native_style_bytes
 from app.services.page_provenance import build_source_page_provenance_bytes
 
 
@@ -28,6 +29,71 @@ def test_cache_without_native_artifact_is_rejected(tmp_path, monkeypatch):
 
     assert not celery_app._is_extractor_cached(
         "cached-empty", "grobid", extract_images=False
+    )
+
+
+@pytest.mark.parametrize(
+    "markdown, normalization, expected_cached",
+    [
+        pytest.param("# Title\n\nprotein-coding gene", None, True, id="clean"),
+        pytest.param(
+            "# Title\n\nprotein-\u00ad coding gene", None, False, id="predates-normalization"
+        ),
+        pytest.param(
+            "# Title\n\nsig\u00adnal gene",
+            {"policy": "docling-soft-hyphen-v1", "remaining": 1},
+            True,
+            id="normalized-with-leftover",
+        ),
+    ],
+)
+def test_docling_cache_with_unnormalized_soft_hyphens_is_stale(
+    tmp_path, monkeypatch, markdown, normalization, expected_cached
+):
+    monkeypatch.setattr(celery_app.Config, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(celery_app.Config, "EXTRACTION_CONFIG_VERSION", "1")
+    cache_path = Path(celery_app._cached_path("paper", "docling"))
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"pdf bytes")
+    cache_path.write_text(markdown, encoding="utf-8")
+    native = b'{"document":"exact"}'
+    versions = {"docling": "2.113.0", "docling-core": "2.87.1"}
+    options = {
+        "do_ocr": True,
+        "generate_parsed_pages": True,
+        "native_style_cell_collection": "word_cells",
+        "native_style_sidecar": True,
+        "page_provenance": "digest_sentinel_v1",
+    }
+    if normalization is not None:
+        options["markdown_normalization"] = normalization
+    persist_native_extractor_artifact(
+        source="docling",
+        output_filename=cache_path,
+        native_bytes=native,
+        native_media_type="application/json",
+        pdf_path=pdf,
+        extractor_versions=versions,
+        options=options,
+        page_provenance_bytes=build_source_page_provenance_bytes(
+            source="docling",
+            pdf_sha256=hashlib.sha256(b"pdf bytes").hexdigest(),
+            native_bytes=native,
+            markdown_bytes=cache_path.read_bytes(),
+            expected_page_count=1,
+            extractor_versions=versions,
+            options=options,
+            evidence_ranges=[],
+            residual_reason="fixture",
+        ),
+        expected_page_count=1,
+        covered_pages=[1],
+        native_style_bytes=unavailable_native_style_bytes("docling", "fixture"),
+    )
+
+    assert (
+        celery_app._is_extractor_cached("paper", "docling", extract_images=False)
+        is expected_cached
     )
 
 
