@@ -103,7 +103,9 @@ _SCOPE_NEIGHBORHOOD_TOKEN_LIMIT = 100_000
 _SCOPE_NONLOCAL_MIN_TOKENS = 5
 _SCOPE_NONLOCAL_MIN_CHARACTERS = 24
 _SCOPE_REPLACEMENT_MIN_SIMILARITY = 55.0
-_REPETITION_POLICY_VERSION = "excess-repetition-v3"
+_REPETITION_POLICY_VERSION = "excess-repetition-v4"
+# NUL cannot appear in publishable text, so fenced lines cannot collide with it.
+_REPETITION_HEADING_PREFIX = "\x00 "
 _REPETITION_PARAGRAPH_MIN_NORMALIZED_CHARACTERS = 80
 _REPETITION_PARAGRAPH_MIN_ANCHOR_TOKENS = 8
 _REPETITION_SHINGLE_WIDTH = 12
@@ -3324,6 +3326,34 @@ def repetition_policy_metric() -> dict:
     }
 
 
+def _repetition_block_key(
+    block: str,
+    fence: tuple[str, int] | None,
+) -> tuple[str, tuple[str, int] | None]:
+    """Fingerprint a block with ATX heading levels canonicalized.
+
+    Rendering may change a heading's level, as when titleless fallback demotes
+    H1 to H2. That reformatting must not read as a new copy of the heading.
+    Fenced lines are not headings and keep their exact markers, so fence state
+    is carried across the blank-line-separated blocks of one document.
+    """
+
+    lines = []
+    for line in re.split(r"\r?\n", block):
+        if fence is not None:
+            if _fence_closes(line, *fence):
+                fence = None
+        elif (opening := _fence_open(line)) is not None and not (
+            opening[0] == "`" and "`" in opening[2]
+        ):
+            # CommonMark: a backtick fence's info string cannot contain backticks.
+            fence = opening[:2]
+        elif _HEADING_RE.match(line):
+            line = _REPETITION_HEADING_PREFIX + _HEADING_RE.sub("", line)
+        lines.append(line)
+    return _comparison_key("\n".join(lines)), fence
+
+
 def _paragraph_repetition_occurrences(
     text: str,
 ) -> dict[str, tuple[tuple[int, int], ...]]:
@@ -3346,9 +3376,9 @@ def _paragraph_repetition_occurrences(
         char_cursor = position
 
     occurrences: dict[str, list[tuple[int, int]]] = {}
+    fence = None
     for start, end in char_ranges:
-        block = text[start:end]
-        normalized = _comparison_key(block)
+        normalized, fence = _repetition_block_key(text[start:end], fence)
         if (
             len(normalized) < _REPETITION_PARAGRAPH_MIN_NORMALIZED_CHARACTERS
             or len(_ANCHOR_TOKEN_RE.findall(normalized))

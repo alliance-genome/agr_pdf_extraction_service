@@ -685,6 +685,128 @@ def test_repetition_detector_reports_only_excess_over_all_sources():
     assert all(item["excess_count"] >= 1 for item in diagnostics)
 
 
+_LONG_TITLE = (
+    "Molecular characterization of conserved signaling pathways "
+    "regulating neuronal development in Drosophila melanogaster"
+)
+
+
+def _paragraph_diagnostics(text, *sources):
+    return [
+        item
+        for item in repetition_diagnostics_metric(
+            text,
+            tuple(
+                SourceArtifact.from_text(name, source)
+                for name, source in zip(("grobid", "marker"), sources)
+            ),
+        )
+        if item["kind"] == "paragraph_fingerprint"
+    ]
+
+
+@pytest.mark.parametrize(
+    "source, output",
+    [
+        pytest.param(
+            f"# {_LONG_TITLE}\n\n## {_LONG_TITLE}\n",
+            f"## {_LONG_TITLE}\n\n## {_LONG_TITLE}\n",
+            id="source-copies-at-mixed-levels",
+        ),
+        pytest.param(
+            f"# {_LONG_TITLE}\n\n# {_LONG_TITLE}\n",
+            f"## {_LONG_TITLE}\n\n## {_LONG_TITLE}\n",
+            id="all-source-copies-demoted",
+        ),
+        pytest.param(
+            f"# {_LONG_TITLE}\r\n\r\n## {_LONG_TITLE}\r\n",
+            f"## {_LONG_TITLE}\r\n\r\n## {_LONG_TITLE}\r\n",
+            id="crlf",
+        ),
+    ],
+)
+def test_heading_level_change_is_not_added_repetition(source, output):
+    assert repetition_diagnostics_metric(
+        output, (SourceArtifact.from_text("grobid", source),)
+    ) == []
+
+
+def test_added_heading_copy_is_still_reported_with_original_byte_ranges():
+    title = f"Étude {_LONG_TITLE}"
+    source = f"# {title}\n\n## {title}\n"
+    output = f"Préface.\n\n# {title}\n\n### {title}\n\n## {title}"
+
+    [diagnostic] = _paragraph_diagnostics(output, source)
+
+    assert diagnostic["output_count"] == 3
+    assert diagnostic["max_source_count"] == 2
+    assert diagnostic["excess_count"] == 1
+    raw = output.encode("utf-8")
+    assert [raw[start:end].decode("utf-8") for start, end in diagnostic["output_byte_ranges"]] == [
+        f"# {title}",
+        f"### {title}",
+        f"## {title}",
+    ]
+
+
+def test_heading_comment_lines_inside_fences_keep_their_exact_text():
+    comment = f"# {_LONG_TITLE}"
+    source = f"```\n\n{comment}\n\n#{comment}\n\n```\n"
+    output = f"```\n\n#{comment}\n\n#{comment}\n\n```\n"
+
+    [diagnostic] = _paragraph_diagnostics(output, source)
+
+    assert diagnostic["output_count"] == 2
+    assert diagnostic["max_source_count"] == 1
+
+
+def test_headings_after_a_closed_fence_are_level_insensitive_again():
+    fence = "```\n\ncode\n\n```\n\n"
+    source = f"{fence}# {_LONG_TITLE}\n\n## {_LONG_TITLE}\n"
+    output = f"{fence}## {_LONG_TITLE}\n\n## {_LONG_TITLE}\n"
+
+    assert _paragraph_diagnostics(output, source) == []
+
+
+def test_fenced_h1_does_not_count_as_a_source_copy_of_a_heading():
+    source = f"```\n\n# {_LONG_TITLE}\n\n```\n\n## {_LONG_TITLE}\n"
+    output = f"## {_LONG_TITLE}\n\n## {_LONG_TITLE}\n"
+
+    [diagnostic] = _paragraph_diagnostics(output, source)
+
+    assert diagnostic["output_count"] == 2
+    assert diagnostic["max_source_count"] == 1
+
+
+def test_backticks_in_a_fence_info_string_do_not_open_a_fence():
+    stray = "```inline``` text\n\n"
+    source = f"{stray}# {_LONG_TITLE}\n\n## {_LONG_TITLE}\n"
+    output = f"{stray}## {_LONG_TITLE}\n\n## {_LONG_TITLE}\n"
+
+    assert _paragraph_diagnostics(output, source) == []
+
+
+def test_paragraph_promoted_to_duplicate_heading_is_still_reported():
+    source = f"{_LONG_TITLE}\n\n## {_LONG_TITLE}\n"
+    output = f"## {_LONG_TITLE}\n\n## {_LONG_TITLE}\n"
+
+    [diagnostic] = _paragraph_diagnostics(output, source)
+
+    assert diagnostic["max_source_count"] == 1
+
+
+def test_paragraph_length_threshold_does_not_depend_on_heading_level():
+    # 77 characters: "# title" is 79 (below the 80 minimum), "## title" would be 80.
+    title = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omic"
+    assert len(title) == 77
+
+    h1 = _paragraph_diagnostics(f"# {title}\n\n# {title}\n", "unrelated text\n")
+    h2 = _paragraph_diagnostics(f"## {title}\n\n## {title}\n", "unrelated text\n")
+
+    assert h1 == []
+    assert h2 == []
+
+
 def _baseline_document(artifact: SourceArtifact) -> BaselineDocument:
     units = scan_structural_units(artifact)
     return BaselineDocument(

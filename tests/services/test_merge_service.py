@@ -497,6 +497,37 @@ def test_baseline_retained_native_italics_reconcile_without_replacement():
     assert receipt["all_native_body_italics_retained"] is True
 
 
+def test_title_demotion_during_merge_is_not_rejected_as_added_repetition():
+    title = (
+        "Molecular characterization of conserved signaling pathways "
+        "regulating neuronal development in Drosophila melanogaster"
+    )
+    marker = (
+        f"# {title}\n\n# {title}\n\n"
+        "## Abstract\n\nGene dpp is active in many tissues during development.\n\n"
+        "## Results\n\nGene dpp is active.\n"
+    )
+
+    merged, metrics, _audit = merge_source_artifacts(
+        "",
+        "",
+        marker,
+        None,
+        completion_evidence=completion_evidence_for_finished_artifacts(
+            {"marker": SourceArtifact.from_text("marker", marker)}
+        ),
+        native_structures={},
+        benchmark_mode=True,
+    )
+
+    lines = merged.splitlines()
+    assert lines.count(f"## {title}") == 2
+    assert f"# {title}" not in lines
+    assert "Gene dpp is active." in lines
+    assert metrics["merge_quality"] == "baseline_fallback"
+    assert metrics["repetition_diagnostics"] == []
+
+
 def _plain_marker_with_native_dpp():
     marker = "# Title\n\n## Results\n\nGene dpp is active.\n"
     artifact = SourceArtifact.from_text("marker", marker)
