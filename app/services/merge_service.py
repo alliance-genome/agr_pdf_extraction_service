@@ -52,6 +52,7 @@ from app.services.semantic_payload import (
     semantic_payload_reader_report,
 )
 from app.services.source_merge import (
+    BaselineSelectionError,
     BaselineCompletionEvidence,
     BaselineRequirements,
     SelectionResolution,
@@ -878,6 +879,18 @@ def _finalize_output(
     return text, audit, warnings
 
 
+def _emit_merge_audit(audit_event, stage, status, **details):
+    """Audit delivery must not change candidate selection or mask its error."""
+    if audit_event is None:
+        return
+    try:
+        audit_event(stage, status, **details)
+    except StageControlError:
+        raise
+    except Exception:
+        pass
+
+
 def _zero_error_source_delivery(
     artifacts: Mapping[SourceName, SourceArtifact],
     completion_evidence: Mapping[SourceName, BaselineCompletionEvidence],
@@ -885,6 +898,7 @@ def _zero_error_source_delivery(
     *,
     preferred_source: SourceName,
     rejected_result,
+    audit_event=None,
 ):
     """Return a complete exact-source document whose Alliance errors are zero.
 
@@ -893,6 +907,18 @@ def _zero_error_source_delivery(
     markers, and accepts the result only after the exact pinned validator says
     it is valid with no errors.
     """
+
+    def record(source, status, **details):
+        _emit_merge_audit(audit_event, "source_delivery", status, source=source, **details)
+
+    for source in sorted(artifacts):
+        missing = []
+        if source not in skeletons:
+            missing.append("missing_skeleton")
+        if source not in completion_evidence:
+            missing.append("missing_completion_evidence")
+        if missing:
+            record(source, "rejected", reasons=missing)
 
     candidates = sorted(
         (
@@ -918,12 +944,14 @@ def _zero_error_source_delivery(
     )
     for source in candidates:
         artifact = artifacts[source]
+        operation = "select_baseline"
         try:
             baseline = select_baseline(
                 {source: artifact},
                 completion_evidence={source: completion_evidence[source]},
                 requirements=requirements,
             )
+            operation = "merge_baseline"
             candidate_result = merge_with_baseline_failsafe(
                 baseline,
                 {source: artifact},
@@ -942,6 +970,7 @@ def _zero_error_source_delivery(
                 }
                 for span in candidate_result.document.provenance
             ]
+            operation = "render_skeleton"
             text, audit, transformations = render_document_skeleton(
                 candidate_result.document.text,
                 audit,
@@ -949,19 +978,30 @@ def _zero_error_source_delivery(
                 force_titleless=True,
             )
             text, audit, newline_normalized = normalize_trailing_newline(text, audit)
+            operation = "validate_candidate"
             report = abc_markdown_report(text)
-            if (
-                report.get("valid") is not True
-                or report.get("error_rule_ids") != []
-                or report.get("failure_code") is not None
-                or report.get("parser_version_exact") is not True
-                or report.get("parser_implementation_exact") is not True
-                or repetition_diagnostics_metric(
-                    text,
-                    tuple(artifacts[item] for item in sorted(artifacts)),
-                )
-                or final_document_safety_reasons(text)
+            reasons = []
+            for failed, reason in (
+                (report.get("valid") is not True, "alliance_invalid"),
+                (report.get("error_rule_ids") != [], "alliance_errors"),
+                (report.get("failure_code") is not None, "validator_failure"),
+                (report.get("parser_version_exact") is not True, "parser_version_mismatch"),
+                (report.get("parser_implementation_exact") is not True, "parser_implementation_mismatch"),
             ):
+                if failed:
+                    reasons.append(reason)
+            if repetition_diagnostics_metric(
+                text, tuple(artifacts[item] for item in sorted(artifacts))
+            ):
+                reasons.append("excess_repetition")
+            safety_reasons = final_document_safety_reasons(text)
+            if safety_reasons:
+                reasons.append("document_safety")
+            if reasons:
+                record(
+                    source, "rejected", reasons=reasons,
+                    validation=report, safety_reasons=list(safety_reasons),
+                )
                 continue
             candidate_result = replace(
                 candidate_result,
@@ -987,6 +1027,7 @@ def _zero_error_source_delivery(
             warnings = [f"alliance_error_source_delivery:{source}"]
             if newline_normalized:
                 warnings.append("deterministic_trailing_newline_normalization")
+            record(source, "accepted", validation=report)
             return (
                 candidate_result,
                 text,
@@ -995,7 +1036,16 @@ def _zero_error_source_delivery(
                 transformations,
                 skeletons[source],
             )
-        except Exception:
+        except StageControlError:
+            raise
+        except Exception as exc:
+            record(
+                source, "rejected", reasons=["candidate_exception"],
+                error_code=type(exc).__name__, operation=operation,
+                baseline_rejections=(
+                    exc.rejections if isinstance(exc, BaselineSelectionError) else {}
+                ),
+            )
             continue
     return None
 
@@ -1011,6 +1061,7 @@ def merge_source_artifacts(
     native_structure_failures: Mapping[SourceName, str] | None = None,
     baseline_requirements: BaselineRequirements | None = None,
     benchmark_mode: bool = False,
+    audit_event=None,
 ) -> tuple[str | None, dict, list]:
     """Merge exact source spans and expose only candidate IDs to Terra/Sol."""
 
@@ -1421,12 +1472,16 @@ def merge_source_artifacts(
         or precommit_abc_report.get("error_rule_ids") != []
         or precommit_abc_report.get("failure_code") is not None
     ):
+        _emit_merge_audit(
+            audit_event, "merge_validation", "rejected", validation=precommit_abc_report
+        )
         zero_error_delivery = _zero_error_source_delivery(
             artifacts,
             completion_evidence,
             skeletons,
             preferred_source=result.document.baseline_source,
             rejected_result=result,
+            audit_event=audit_event,
         )
         if zero_error_delivery is None:
             raise ConsensusContractError(
@@ -1777,6 +1832,7 @@ def merge_finished_extractor_outputs(
     native_structures: Mapping[SourceName, NativeStructureArtifact] | None = None,
     native_structure_failures: Mapping[SourceName, str] | None = None,
     benchmark_mode: bool = False,
+    audit_event=None,
 ) -> tuple[str | None, dict, list]:
     """Merge after all requested extractor calls terminate."""
 
@@ -1802,4 +1858,5 @@ def merge_finished_extractor_outputs(
         native_structures=native_structures,
         native_structure_failures=native_structure_failures,
         benchmark_mode=benchmark_mode,
+        audit_event=audit_event,
     )

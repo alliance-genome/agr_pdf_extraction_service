@@ -35,6 +35,16 @@ from app.services.source_contracts import (
 )
 
 
+class BaselineSelectionError(ConsensusContractError):
+    """A selection failure with content-free, application-owned reason codes."""
+
+    def __init__(self, message, rejections=None):
+        super().__init__(message)
+        self.rejections = {
+            source: reason.split("+") for source, reason in (rejections or {}).items()
+        }
+
+
 StructuralUnitType = Literal[
     "heading",
     "paragraph",
@@ -1885,8 +1895,8 @@ def select_baseline(
         reasons = ", ".join(
             f"{source}={reason}" for source, reason in sorted(rejected.items())
         )
-        raise ConsensusContractError(
-            f"no clean baseline source is available ({reasons})"
+        raise BaselineSelectionError(
+            f"no clean baseline source is available ({reasons})", rejected
         )
 
     repetition_profiles = {
