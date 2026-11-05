@@ -408,6 +408,39 @@ def test_bounded_composite_alignment_selects_source_backed_italics_across_n_to_m
     ] == 1
 
 
+def test_composite_peer_with_unsafe_characters_does_not_discard_the_merge_plan():
+    baseline_artifact = SourceArtifact.from_text(
+        "marker",
+        "# Title\n\n## Results\n\nGene dpp is active and robust.\n",
+    )
+    docling_artifact = SourceArtifact.from_text(
+        "docling",
+        "# Title\n\n## Results\n\nGene *dpp* is active\n\nand \u00ad robust.\n",
+    )
+    artifacts = {"marker": baseline_artifact, "docling": docling_artifact}
+    skeletons = {
+        source: build_document_skeleton(artifact, None)
+        for source, artifact in artifacts.items()
+    }
+
+    plan = build_candidate_merge_plan(
+        _baseline_document(baseline_artifact),
+        artifacts,
+        skeleton_occurrence_ids={
+            (source, occurrence.unit_id): occurrence.occurrence_id
+            for source, skeleton in skeletons.items()
+            for occurrence in skeleton.occurrences
+        },
+        skeleton_slot_keys={
+            (source, occurrence.unit_id): occurrence.slot_key
+            for source, skeleton in skeletons.items()
+            for occurrence in skeleton.occurrences
+        },
+    )
+
+    assert plan.construction_counts.get("composite_alignment_region", 0) == 0
+
+
 def test_oversized_n_to_m_run_stays_out_of_composite_comparison():
     payload = "a" * 20_010
     baseline_artifact = SourceArtifact.from_text(
