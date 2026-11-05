@@ -1,8 +1,10 @@
 """Docling-based PDF extraction service with process-local converter caching."""
 
+import hashlib
 import json
 import os
 import logging
+import re
 from importlib.metadata import version
 from pathlib import Path
 
@@ -48,6 +50,50 @@ _cached_converters = {}  # keyed by Docling accelerator and OCR configuration
 # contract. A subset check could miss a page decrease in serialized content.
 DOCLING_MARKDOWN_CONTENT_LAYERS = frozenset({ContentLayer.BODY})
 DOCLING_MARKDOWN_TRAVERSE_PICTURES = False
+
+_SOFT_HYPHEN = "\u00ad"
+_SOFT_HYPHEN_POLICY = "docling-soft-hyphen-v1"
+# Only shapes with a visible hyphen beside the soft hyphen, so no visible character
+# is added or removed. Any other soft hyphen stays in place and the publishable-text
+# check still rejects the source: it may stand for a hyphen or minus sign, and
+# "dpp<SHY> lacZ" cannot be told apart from a word split across a line.
+_SOFT_HYPHEN_RE = re.compile(
+    # "protein-<SHY> coding" is a compound unless a coordinating word follows
+    # ("3-<SHY> to 4"). "dose-<SHY> to-response" is still a compound.
+    r"(?P<hyphenated_compounds>(?<=[^\W_])-\u00ad[ \t]+(?=[^\W_])"
+    r"(?!(?i:(?:and|or|nor|to|versus|vs|but|as|through|than|plus|via)\b(?!-))))"
+    r"|(?P<spaced_hyphens>-\u00ad(?=[ \t]))"
+)
+
+
+def normalize_docling_soft_hyphens(markdown: str) -> tuple[str, dict | None]:
+    """Remove soft hyphens from known Docling shapes and describe what changed.
+
+    Docling can render a PDF hyphen as a hyphen, a soft hyphen, and a space.
+    Removing only the soft hyphen would leave "protein- coding", so compounds
+    also lose the space. The receipt is None when no soft hyphen is present.
+    """
+
+    if _SOFT_HYPHEN not in markdown:
+        return markdown, None
+
+    counts = dict.fromkeys(_SOFT_HYPHEN_RE.groupindex, 0)
+
+    def replace(match: re.Match) -> str:
+        line_start = markdown.rfind("\n", 0, match.start()) + 1
+        if not markdown[line_start : match.start()].strip():
+            # "- Item" would become a Markdown list item.
+            return match.group(0)
+        counts[match.lastgroup] += 1
+        return "-"
+
+    normalized = _SOFT_HYPHEN_RE.sub(replace, markdown)
+    return normalized, {
+        "policy": _SOFT_HYPHEN_POLICY,
+        "raw_markdown_sha256": hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
+        **counts,
+        "remaining": normalized.count(_SOFT_HYPHEN),
+    }
 
 
 def _docling_primary_page_order_is_monotonic(document) -> bool:
@@ -268,6 +314,13 @@ class Docling(PDFExtractor):
             included_content_layers=set(DOCLING_MARKDOWN_CONTENT_LAYERS),
             traverse_pictures=DOCLING_MARKDOWN_TRAVERSE_PICTURES,
         )
+        # Before page ranges and digests, so every sidecar describes the final
+        # bytes. The native document keeps Docling's original text.
+        paginated_markdown, markdown_normalization = normalize_docling_soft_hyphens(
+            paginated_markdown
+        )
+        if markdown_normalization is not None:
+            logger.info("Docling soft hyphen normalization: %s", markdown_normalization)
         markdown, page_ranges = docling_markdown_with_page_ranges(
             paginated_markdown,
             sentinel=page_sentinel,
@@ -322,6 +375,8 @@ class Docling(PDFExtractor):
             "native_style_sidecar": True,
             "page_provenance": "digest_sentinel_v1",
         }
+        if markdown_normalization is not None:
+            options["markdown_normalization"] = markdown_normalization
         markdown_bytes = markdown.encode("utf-8")
         page_provenance_bytes = build_source_page_provenance_bytes(
             source="docling",

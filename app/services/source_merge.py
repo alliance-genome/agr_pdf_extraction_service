@@ -855,6 +855,11 @@ def _composite_unit(
         return None
     byte_start = selected[0].byte_start
     byte_end = selected[-1].byte_end
+    # One unpublishable candidate would otherwise fail the whole merge plan.
+    if unsafe_unicode_characters(
+        artifact.raw_utf8[byte_start:byte_end].decode("utf-8", errors="strict")
+    ):
+        return None
     non_emphasis_ast_digest = _composite_non_emphasis_ast_digest(
         artifact, selected
     )

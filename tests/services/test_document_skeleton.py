@@ -385,6 +385,51 @@ def test_docling_absent_formatting_and_grobid_reference_style_are_not_body_evide
     )
 
 
+def test_native_soft_hyphens_do_not_block_style_mapping_to_normalized_markdown():
+    artifact = SourceArtifact.from_text(
+        "docling", "# Title\n\n## Results\n\nThe wing-specific dpp works.\n"
+    )
+    native_line = "The wing-\u00ad specific dpp works."
+    italic_start = native_line.index("dpp")
+    style = _style("docling", native_line, italic_start, italic_start + 3)
+    native = _native(
+        "docling",
+        artifact,
+        {
+            "schema_name": "DoclingDocument",
+            "body": {
+                "children": [
+                    {"$ref": "#/texts/0"},
+                    {"$ref": "#/texts/1"},
+                    {"$ref": "#/texts/2"},
+                ]
+            },
+            "texts": [
+                {"self_ref": "#/texts/0", "label": "title", "text": "Title"},
+                {
+                    "self_ref": "#/texts/1",
+                    "label": "text",
+                    "text": "Results",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "self_ref": "#/texts/2",
+                    "label": "text",
+                    "text": native_line,
+                    "prov": [{"page_no": 1}],
+                },
+            ],
+        },
+        style,
+    )
+
+    skeleton = build_document_skeleton(artifact, native)
+
+    assert skeleton.native_body_emphasis_count == 1
+    assert skeleton.mapped_native_body_emphasis_count == 1
+    assert skeleton.unmapped_native_style_emphasis_count == 0
+
+
 def test_docling_native_style_line_maps_and_projects_without_changing_visible_text():
     artifact = SourceArtifact.from_text(
         "docling", "# Title\n\n## Results\n\nGene dpp works.\n\n...\n"

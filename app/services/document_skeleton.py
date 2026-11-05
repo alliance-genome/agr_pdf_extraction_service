@@ -99,7 +99,9 @@ _BARE_AFFILIATION = re.compile(
     rb"^(?P<number>\d{1,2})(?P<space>[ \t]+)(?=[A-Z])"
 )
 _PROJECTION_LIST_MARKER = re.compile(rb"^\s*(?:[-+*]|\d+[.)]|\[\d+\])\s+")
-_PROJECTION_TOKEN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+# Soft hyphens are invisible and normalized out of Docling Markdown, though the
+# native sidecars keep them, so they must not count as tokens when aligning.
+_PROJECTION_TOKEN = re.compile(r"\w+|[^\w\s\u00ad]", re.UNICODE)
 _FROZEN_NATIVE_MAPPING_UNIT_TYPES = frozenset(
     {"paragraph", "list", "figure_caption"}
 )

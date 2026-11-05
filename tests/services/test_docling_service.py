@@ -128,7 +128,14 @@ sys.modules["rapidocr"] = rapidocr_pkg
 sys.modules["rapidocr.utils"] = rapidocr_utils
 sys.modules["rapidocr.utils.typings"] = rapidocr_typings
 
+import hashlib
+import json
+
+import pytest
+
+from app.services import docling_service
 from app.services.docling_service import Docling, _cached_converters, _get_converter
+from app.services.source_contracts import unsafe_unicode_characters
 
 
 class _FakeDocument:
@@ -253,6 +260,158 @@ def test_docling_extract_writes_clean_markdown_and_native_document(monkeypatch, 
     assert manifest["covered_pages"] == [1, 2, 3]
     assert manifest["options"]["native_style_cell_collection"] == "word_cells"
     assert manifest["page_provenance_filename"].endswith("page-provenance.json")
+    assert "markdown_normalization" not in manifest["options"]
+
+
+SHY = "\u00ad"
+
+
+@pytest.mark.parametrize(
+    "raw, expected, count_key",
+    [
+        (f"protein-{SHY} coding gene", "protein-coding gene", "hyphenated_compounds"),
+        (f"full-{SHY}  length", "full-length", "hyphenated_compounds"),
+        (f"Smad-{SHY} Dependent", "Smad-Dependent", "hyphenated_compounds"),
+        (f"méta-{SHY} état", "méta-état", "hyphenated_compounds"),
+        (f"x-{SHY} android", "x-android", "hyphenated_compounds"),
+        (f"dose-{SHY} to-response", "dose-to-response", "hyphenated_compounds"),
+        (f"enhancer-{SHY}  and tether", "enhancer-  and tether", "spaced_hyphens"),
+        (f"pre-{SHY} OR post", "pre- OR post", "spaced_hyphens"),
+        (f"3-{SHY} to 4", "3- to 4", "spaced_hyphens"),
+        (f"value -{SHY} other", "value - other", "spaced_hyphens"),
+        (f"N-{SHY} versus C-terminal", "N- versus C-terminal", "spaced_hyphens"),
+        (f"N-{SHY} vs C-terminal", "N- vs C-terminal", "spaced_hyphens"),
+        (f"N-{SHY} but not C-terminal", "N- but not C-terminal", "spaced_hyphens"),
+        (f"N-{SHY} as well as C-", "N- as well as C-", "spaced_hyphens"),
+        (f"mono-{SHY} through tri-", "mono- through tri-", "spaced_hyphens"),
+        (f"pre-{SHY} than post-", "pre- than post-", "spaced_hyphens"),
+        (f"pre-{SHY} plus post-", "pre- plus post-", "spaced_hyphens"),
+        (f"N-{SHY} via C-", "N- via C-", "spaced_hyphens"),
+    ],
+)
+def test_soft_hyphen_shapes_normalize_without_corrupting_words(raw, expected, count_key):
+    normalized, receipt = docling_service.normalize_docling_soft_hyphens(raw)
+
+    assert normalized == expected
+    assert receipt[count_key] == 1
+    assert receipt["remaining"] == 0
+    assert receipt["raw_markdown_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        f"sig{SHY}nal",
+        f"word{SHY} Capital",
+        f"word{SHY} 9",
+        f"line-{SHY}\nbreak",
+        f"line{SHY}\nbreak",
+        f"-{SHY}word",
+        f"end{SHY}",
+        f"dG = {SHY} 5.2",
+        f"| wt | {SHY} | + |",
+        f"10 {SHY} 20 um",
+        f"a {SHY} b",
+        f"x{SHY} yz",
+        f"xy {SHY} z",
+        f"max{SHY} imum",
+        f"Signal{SHY} regulated",
+        f"dpp{SHY} lacZ",
+        f"dpp {SHY} wg",
+        f"well {SHY} suited",
+        f"-{SHY} Item",
+        f"  -{SHY} 5",
+        f"first line\n-{SHY} Item",
+    ],
+)
+def test_unproven_soft_hyphen_shapes_stay_rejected(raw):
+    normalized, receipt = docling_service.normalize_docling_soft_hyphens(raw)
+
+    assert normalized == raw
+    assert unsafe_unicode_characters(normalized) == (SHY,)
+    assert receipt["remaining"] == 1
+
+
+def test_soft_hyphen_normalization_leaves_other_controls_for_rejection():
+    normalized, receipt = docling_service.normalize_docling_soft_hyphens(
+        f"protein-{SHY} coding\u200bgene"
+    )
+
+    assert normalized == "protein-coding\u200bgene"
+    assert unsafe_unicode_characters(normalized) == ("\u200b",)
+    assert receipt["remaining"] == 0
+
+
+def test_text_without_soft_hyphens_has_no_normalization_receipt():
+    assert docling_service.normalize_docling_soft_hyphens("plain-text - here") == (
+        "plain-text - here",
+        None,
+    )
+
+
+class _SoftHyphenDocument(_FakeDocument):
+    def export_to_markdown(self, page_break_placeholder="", **_kwargs):
+        self.rendered = (
+            f"A protein-{SHY} coding gene.{page_break_placeholder}\n\n"
+            f"A mé-{SHY} tal ion.{page_break_placeholder}\n\n"
+            f"Last wing-{SHY} specific page."
+        )
+        return self.rendered
+
+    def export_to_dict(self, **kwargs):
+        payload = super().export_to_dict(**kwargs)
+        payload["texts"][0]["text"] = f"protein-{SHY} coding"
+        return payload
+
+
+def test_docling_extract_normalizes_markdown_and_keeps_sidecars_consistent(
+    monkeypatch, tmp_path
+):
+    fake_doc = _SoftHyphenDocument()
+    monkeypatch.setattr(
+        "app.services.docling_service._get_converter",
+        lambda *_args, **_kwargs: _FakeConverter(fake_doc),
+    )
+    monkeypatch.setattr(
+        "app.services.docling_service.version",
+        lambda package: {"docling": "2.113.0", "docling-core": "2.87.1"}[package],
+    )
+    pdf_path = tmp_path / "test.pdf"
+    output_path = tmp_path / "output.md"
+    pdf_path.write_bytes(b"dummy pdf content")
+
+    Docling().extract(str(pdf_path), str(output_path))
+
+    assert output_path.read_text(encoding="utf-8") == (
+        "A protein-coding gene.\n\nA mé-tal ion.\n\nLast wing-specific page."
+    )
+
+    from app.services.native_extractor_artifact import load_native_extractor_artifact
+
+    manifest, native = load_native_extractor_artifact(
+        source="docling", output_filename=output_path
+    )
+    assert f"protein-{SHY} coding".encode() in native
+    assert manifest["options"]["markdown_normalization"] == {
+        "policy": "docling-soft-hyphen-v1",
+        "raw_markdown_sha256": hashlib.sha256(fake_doc.rendered.encode()).hexdigest(),
+        "hyphenated_compounds": 3,
+        "spaced_hyphens": 0,
+        "remaining": 0,
+    }
+
+    provenance = json.loads(
+        (tmp_path / manifest["page_provenance_filename"]).read_text(encoding="utf-8")
+    )
+    raw = output_path.read_bytes()
+    assert [
+        (item["page_number"], raw[item["byte_start"] : item["byte_end"]].decode("utf-8"))
+        for item in provenance["ranges"]
+    ] == [
+        (1, "A protein-coding gene."),
+        (2, "\n\nA mé-tal ion."),
+        (3, "\n\nLast wing-specific page."),
+    ]
 
 
 def test_docling_non_monotonic_primary_page_order_fails_closed(monkeypatch, tmp_path):
